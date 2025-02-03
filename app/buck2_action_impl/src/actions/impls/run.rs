@@ -97,6 +97,10 @@ use crate::actions::impls::run::dep_files::RunActionDepFiles;
 use crate::actions::impls::run::metadata::metadata_content;
 use crate::context::run::RunActionError;
 
+use buck2_directory::directory::directory::Directory;
+use buck2_directory::directory::directory_iterator::DirectoryIterator;
+use derive_more::Debug;
+
 pub(crate) mod audit_dep_files;
 pub(crate) mod dep_files;
 mod metadata;
@@ -627,7 +631,18 @@ impl RunAction {
                     }
                 };
                 //println!("before exec_cmd. prepared_action = {}", prepared_action.action_and_blobs);
-                println!("before exec_cmd. meh = {}", "meh");
+                let x = req.paths().input_directory();
+                println!("before exec_cmd");
+                println!("req.paths().input_directory() = {}", x);
+                let it = x.unordered_walk_leaves().with_paths();
+                let mut collected = it.collect::<Vec<_>>();
+                collected.sort_by_key(|(name, _)| name.clone());
+                let mut it = collected.into_iter();
+                //let mut it = it.into_iter();
+                //it.next();
+
+                println!("it.count() = {}", it.count());
+                println!("------------------------------------------------------");
                 ctx.exec_cmd(manager, &req, &prepared_action).await
             }
         };
