@@ -94,6 +94,7 @@ fn print_retry() -> anyhow::Result<()> {
 // it must be single-threaded. Commands that want to be multi-threaded/async
 // will start up their own tokio runtime.
 fn main() -> ! {
+    println!("buck2-custom");
     buck2_core::client_only::CLIENT_ONLY_VAL.init(cfg!(client_only));
     #[cfg(not(client_only))]
     {

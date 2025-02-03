@@ -626,7 +626,8 @@ impl RunAction {
                         }
                     }
                 };
-
+                //println!("before exec_cmd. prepared_action = {}", prepared_action.action_and_blobs);
+                println!("before exec_cmd. meh = {}", "meh");
                 ctx.exec_cmd(manager, &req, &prepared_action).await
             }
         };
