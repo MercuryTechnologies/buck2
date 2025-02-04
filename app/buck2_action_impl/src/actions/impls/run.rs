@@ -639,9 +639,14 @@ impl RunAction {
                 collected.sort_by_key(|(name, _)| name.clone());
                 let mut it = collected.into_iter();
                 //let mut it = it.into_iter();
-                //it.next();
+                //println!("it.count() = {}", it.count());
+                loop {
+                  match it.next() {
+                      Some((y, z)) => println!("Some {}, {}", y.as_str(), z),
+                      None => break,
+                  };
+                };
 
-                println!("it.count() = {}", it.count());
                 println!("------------------------------------------------------");
                 ctx.exec_cmd(manager, &req, &prepared_action).await
             }
