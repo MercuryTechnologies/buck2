@@ -538,6 +538,7 @@ impl RunAction {
         &self,
         ctx: &mut dyn ActionExecutionCtx,
     ) -> Result<ExecuteResult, ExecuteError> {
+        println! ("IWKIM: execute_inner called");
         let knobs = ctx.run_action_knobs();
         let process_dep_files = !self.inner.dep_files.labels.is_empty() || knobs.hash_all_commands;
         let (prepared_run_action, dep_file_visitor) = if !process_dep_files {

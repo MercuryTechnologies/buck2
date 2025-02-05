@@ -224,6 +224,7 @@ impl PreparedCommandOptionalExecutor for ActionCacheChecker {
         manager: CommandExecutionManager,
         cancellations: &CancellationContext,
     ) -> ControlFlow<CommandExecutionResult, CommandExecutionManager> {
+        println! ("IWKIM: ActionCacheChecker::maybe_execute");
         let action_digest = &command.prepared_action.action_and_blobs.action;
         let details = RemoteCommandExecutionDetails::new(
             action_digest.dupe(),
@@ -286,6 +287,7 @@ impl PreparedCommandOptionalExecutor for RemoteDepFileCacheChecker {
         manager: CommandExecutionManager,
         cancellations: &CancellationContext,
     ) -> ControlFlow<CommandExecutionResult, CommandExecutionManager> {
+        println!("IWKIM: RemoteDepFileCacheChecker::maybe_execute");
         // If the remote dep file key is not set, just fallback to the next execution method
         let remote_dep_file_key = match command.request.remote_dep_file_key() {
             None => {

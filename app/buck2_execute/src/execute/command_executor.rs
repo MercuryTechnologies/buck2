@@ -120,6 +120,7 @@ impl CommandExecutor {
         prepared_command: &PreparedCommand<'_, '_>,
         cancellations: &CancellationContext<'_>,
     ) -> ControlFlow<CommandExecutionResult, CommandExecutionManager> {
+        println!("IWKIM: CommandExecutor::action_cache");
         self.0
             .cache_checker
             .maybe_execute(prepared_command, manager, cancellations)
