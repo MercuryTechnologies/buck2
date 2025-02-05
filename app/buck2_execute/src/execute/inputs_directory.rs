@@ -24,7 +24,7 @@ pub fn inputs_directory(
     for input in inputs {
         match input {
             CommandExecutionInput::Artifact(group) => {
-                println!("IWKIM: inputs_directory Artifact");
+                //println!("IWKIM: inputs_directory Artifact");
                 group.add_to_directory(&mut builder, fs)?;
             }
             CommandExecutionInput::ActionMetadata(metadata) => {
@@ -41,7 +41,7 @@ pub fn inputs_directory(
             CommandExecutionInput::ScratchPath(path) => {
                 let path = fs.buck_out_path_resolver().resolve_scratch(path);
                 println!("IWKIM: inputs_directory ScratchPath {}", path);
-                builder.insert(&path, DirectoryEntry::Dir(ActionDirectoryBuilder::empty()))?;
+                //builder.insert(&path, DirectoryEntry::Dir(ActionDirectoryBuilder::empty()))?;
             }
         };
     }
