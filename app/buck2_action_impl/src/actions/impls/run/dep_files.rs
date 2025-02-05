@@ -219,7 +219,7 @@ pub(crate) struct DepFileState {
 #[derive(Allocative)]
 pub(crate) struct CommandDigests {
     pub(crate) cli: ExpandedCommandLineDigest,
-    pub(crate) directory: FileDigest,
+    //pub(crate) directory: FileDigest,
 }
 
 impl DepFileState {
@@ -406,7 +406,7 @@ impl CommonDigests {
 pub(crate) struct DepFileBundle {
     dep_files_key: DepFilesKey,
     pub(crate) remote_dep_file_action: ActionDigestAndBlobs,
-    input_directory_digest: FileDigest,
+    //input_directory_digest: FileDigest,
     shared_declared_inputs: PartitionedInputs<ActionSharedDirectory>,
     declared_dep_files: DeclaredDepFiles,
     filtered_input_fingerprints: Option<StoredFingerprints>,
@@ -461,7 +461,7 @@ impl DepFileBundle {
             match_if_identical_action(
                 ctx,
                 &self.dep_files_key,
-                &self.input_directory_digest,
+                //&self.input_directory_digest,
                 &self.common_digests.commandline_cli_digest,
                 declared_outputs,
                 &self.declared_dep_files,
@@ -495,7 +495,7 @@ impl DepFileBundle {
             match_or_clear_dep_file(
                 ctx,
                 &self.dep_files_key,
-                &self.input_directory_digest,
+                //&self.input_directory_digest,
                 &self.common_digests.commandline_cli_digest,
                 &self.shared_declared_inputs,
                 declared_outputs,
@@ -665,7 +665,7 @@ pub(crate) fn make_dep_file_bundle<'a>(
     Ok(DepFileBundle {
         dep_files_key,
         remote_dep_file_action,
-        input_directory_digest,
+        //input_directory_digest,
         shared_declared_inputs,
         declared_dep_files,
         common_digests,
@@ -676,11 +676,11 @@ pub(crate) fn make_dep_file_bundle<'a>(
 
 /// See if there is an identical action that matches in the cache.
 /// If there is, return the outputs. Otherwise, additionally return a boolean to indicate if the lookup was a miss.
-#[instrument(level = "debug", skip(input_directory_digest,cli_digest,ctx), fields(key = %key))]
+// #[instrument(level = "debug", skip(input_directory_digest,cli_digest,ctx), fields(key = %key))]
 pub(crate) async fn match_if_identical_action(
     ctx: &dyn ActionExecutionCtx,
     key: &DepFilesKey,
-    input_directory_digest: &FileDigest,
+    //input_directory_digest: &FileDigest,
     cli_digest: &ExpandedCommandLineDigest,
     declared_outputs: &[BuildArtifact],
     declared_dep_files: &DeclaredDepFiles,
@@ -693,7 +693,7 @@ pub(crate) async fn match_if_identical_action(
     let actions_match = check_action(
         key,
         &previous_state,
-        input_directory_digest,
+        //input_directory_digest,
         cli_digest,
         declared_outputs,
         declared_dep_files,
@@ -715,11 +715,11 @@ pub(crate) async fn match_if_identical_action(
 }
 
 /// Match the dep file recorded for key, or clear it from the map (if it exists).
-#[instrument(level = "debug", skip(input_directory_digest,cli_digest,declared_inputs,ctx), fields(key = %key))]
+// #[instrument(level = "debug", skip(input_directory_digest,cli_digest,declared_inputs,ctx), fields(key = %key))]
 pub(crate) async fn match_or_clear_dep_file(
     ctx: &dyn ActionExecutionCtx,
     key: &DepFilesKey,
-    input_directory_digest: &FileDigest,
+    //input_directory_digest: &FileDigest,
     cli_digest: &ExpandedCommandLineDigest,
     declared_inputs: &PartitionedInputs<ActionSharedDirectory>,
     declared_outputs: &[BuildArtifact],
@@ -733,7 +733,7 @@ pub(crate) async fn match_or_clear_dep_file(
     let dep_files_match = dep_files_match(
         key,
         &previous_state,
-        input_directory_digest,
+        // input_directory_digest,
         cli_digest,
         declared_inputs,
         declared_outputs,
@@ -785,7 +785,7 @@ async fn outputs_match(
 fn check_action(
     key: &DepFilesKey,
     previous_state: &DepFileState,
-    input_directory_digest: &FileDigest,
+    //input_directory_digest: &FileDigest,
     cli_digest: &ExpandedCommandLineDigest,
     declared_outputs: &[BuildArtifact],
     declared_dep_files: &DeclaredDepFiles,
@@ -810,18 +810,19 @@ fn check_action(
         return InitialDepFileLookupResult::Miss;
     }
 
-    if *input_directory_digest == previous_state.digests.directory {
-        // The actions are identical
-        tracing::trace!("Dep files hit: Command line and directory have not changed");
-        return InitialDepFileLookupResult::Hit;
-    }
+    //if *input_directory_digest == previous_state.digests.directory {
+    //    // The actions are identical
+    //    tracing::trace!("Dep files hit: Command line and directory have not changed");
+    //    return InitialDepFileLookupResult::Hit;
+    //}
+    return InitialDepFileLookupResult::Hit;    
     InitialDepFileLookupResult::CheckFilteredInputs
 }
 
 async fn dep_files_match(
     key: &DepFilesKey,
     previous_state: &DepFileState,
-    input_directory_digest: &FileDigest,
+    // input_directory_digest: &FileDigest,
     cli_digest: &ExpandedCommandLineDigest,
     declared_inputs: &PartitionedInputs<ActionSharedDirectory>,
     declared_outputs: &[BuildArtifact],
@@ -831,7 +832,7 @@ async fn dep_files_match(
     let initial_check = check_action(
         key,
         previous_state,
-        input_directory_digest,
+        //input_directory_digest,
         cli_digest,
         declared_outputs,
         declared_dep_files,
@@ -978,7 +979,7 @@ pub(crate) async fn populate_dep_files(
     let DepFileBundle {
         declared_dep_files,
         dep_files_key,
-        input_directory_digest,
+        //input_directory_digest,
         shared_declared_inputs,
         filtered_input_fingerprints,
         common_digests,
@@ -988,7 +989,7 @@ pub(crate) async fn populate_dep_files(
         declared_dep_files.is_empty() || ctx.run_action_knobs().eager_dep_files;
     let digests = CommandDigests {
         cli: common_digests.commandline_cli_digest,
-        directory: input_directory_digest,
+        //directory: input_directory_digest,
     };
 
     let state = match filtered_input_fingerprints {

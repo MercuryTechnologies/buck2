@@ -547,6 +547,7 @@ impl RunAction {
                 None,
             )
         } else {
+            println! ("IWKIM: execute_inner: am I here with hash_all_commands = true?");
             let mut visitor = DepFilesCommandLineVisitor::new(&self.inner.dep_files);
             let prepared = self.prepare(&mut visitor, ctx)?;
             (prepared, Some(visitor))

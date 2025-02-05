@@ -235,6 +235,20 @@ impl HasCommandExecutor for CommandExecutorFactory {
                 if self.strategy.ban_local() {
                     None
                 } else {
+                    println!("IWKIM: get_command_executor here");
+                    // test
+                    //let action_cache_checker = Arc::new(ActionCacheChecker {
+                    //        artifact_fs: artifact_fs.clone(),
+                    //        materializer: self.materializer.dupe(),
+                    //        //re_client: self.get_prepared_re_client(),
+                    //        //re_use_case: self.get_prepared_re_use_case(remote_options.re_use_case),
+                    //        //re_action_key: remote_options.re_action_key.clone(),
+                    //        upload_all_actions: self.upload_all_actions,
+                    //        knobs: self.executor_global_knobs.dupe(),
+                    //        paranoid: self.paranoid.dupe(),
+                    //        //remote_dep_file_checker,
+                    //    }) as _;
+
                     Some(CommandExecutorResponse {
                         executor: Arc::new(local_executor_new(local)),
                         platform: Default::default(),
