@@ -699,6 +699,12 @@ pub(crate) async fn match_if_identical_action(
         declared_dep_files,
     );
 
+    match actions_match {
+        InitialDepFileLookupResult::Hit => println!("IWKIM: match_if_identical_action, Hit"),
+        InitialDepFileLookupResult::Miss => println!("IWKIM: match_if_identical_action, Miss"),
+        InitialDepFileLookupResult::CheckFilteredInputs => println!("IWKIM: match_if_identical_action, CheckFilteredInputs"),
+    };
+    
     if actions_match == InitialDepFileLookupResult::Hit
         && outputs_match(ctx, &previous_state).await?
     {
@@ -793,24 +799,30 @@ fn check_action(
     if !declared_dep_files.declares_same_dep_files(&previous_state.declared_dep_files) {
         // We first need to check if the same dep files existed before or not. If not, then we
         // can't assume they'll still be on disk, and we have to bail.
+        println!("IWKIM: 1");
         tracing::trace!("Dep files miss: Dep files declaration has changed");
         DEP_FILES.remove(key);
         return InitialDepFileLookupResult::Miss;
     }
 
     if !outputs_are_reusable(declared_outputs, &previous_state.result) {
+        println!("IWKIM: 2");        
         tracing::trace!("Dep files miss: Output declaration has changed");
         DEP_FILES.remove(key);
         return InitialDepFileLookupResult::Miss;
     }
 
     if *cli_digest != previous_state.digests.cli {
+        println!("IWKIM: 3");        
         tracing::trace!("Dep files miss: Command line has changed");
         DEP_FILES.remove(key);
         return InitialDepFileLookupResult::Miss;
     }
 
+    println!("IWKIM: input_directory_digest = {}, previous_state.digests.directory = {}", *input_directory_digest, previous_state.digests.directory);
+    
     if *input_directory_digest == previous_state.digests.directory {
+        println!("IWKIM: 4");        
         // The actions are identical
         tracing::trace!("Dep files hit: Command line and directory have not changed");
         return InitialDepFileLookupResult::Hit;

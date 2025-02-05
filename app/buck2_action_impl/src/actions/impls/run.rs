@@ -577,8 +577,10 @@ impl RunAction {
             } else {
                 req
             };
+            println!("IWKIM: Some bundle?");
             (Some(bundle), req)
         } else {
+            println!("IWKIM: No bundle?");
             (None, req)
         };
 
@@ -618,6 +620,7 @@ impl RunAction {
             action_cache_result
         };
 
+        println!("IWKIM: should_fully_check_dep_file_cache = {}", should_fully_check_dep_file_cache);
         // If the cache queries did not yield to a result, fallback to local dep file query (continuation), then execution.
         let mut result = match result {
             ControlFlow::Break(res) => res,
@@ -632,6 +635,8 @@ impl RunAction {
                         }
                     }
                 };
+                let x = req.paths().input_directory();
+                println!("IWKIM: req.paths().input_directory() = {}", x);                
                 //println!("before exec_cmd. prepared_action = {}", prepared_action.action_and_blobs);
                 /* let x = req.paths().input_directory();
                 println!("before exec_cmd");
