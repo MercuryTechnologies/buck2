@@ -214,7 +214,7 @@ impl LocalExecutor {
         digest_config: DigestConfig,
         local_resource_holders: &[LocalResourceHolder],
     ) -> CommandExecutionResult {
-        println! ("IWKIM: local.rs LocalExecutor::exec_request.");
+        //println! ("IWKIM: local.rs LocalExecutor::exec_request.");
         let args = &request.all_args_vec();
         if args.is_empty() {
             return manager.error("no_args", LocalExecutionError::NoArgs);

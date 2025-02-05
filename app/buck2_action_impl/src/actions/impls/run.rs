@@ -538,7 +538,7 @@ impl RunAction {
         &self,
         ctx: &mut dyn ActionExecutionCtx,
     ) -> Result<ExecuteResult, ExecuteError> {
-        println! ("IWKIM: execute_inner called");
+        // println! ("IWKIM: execute_inner called");
         let knobs = ctx.run_action_knobs();
         let process_dep_files = !self.inner.dep_files.labels.is_empty() || knobs.hash_all_commands;
         let (prepared_run_action, dep_file_visitor) = if !process_dep_files {
@@ -547,7 +547,7 @@ impl RunAction {
                 None,
             )
         } else {
-            println! ("IWKIM: execute_inner: am I here with hash_all_commands = true?");
+            // println! ("IWKIM: execute_inner: am I here with hash_all_commands = true?");
             let mut visitor = DepFilesCommandLineVisitor::new(&self.inner.dep_files);
             let prepared = self.prepare(&mut visitor, ctx)?;
             (prepared, Some(visitor))
@@ -633,7 +633,7 @@ impl RunAction {
                     }
                 };
                 //println!("before exec_cmd. prepared_action = {}", prepared_action.action_and_blobs);
-                let x = req.paths().input_directory();
+                /* let x = req.paths().input_directory();
                 println!("before exec_cmd");
                 println!("req.paths().input_directory() = {}", x);
                 let it = x.unordered_walk_leaves().with_paths();
@@ -647,9 +647,9 @@ impl RunAction {
                       Some((y, z)) => println!("Some {}, {}", y.as_str(), z),
                       None => break,
                   };
-                };
+                }; */
 
-                println!("------------------------------------------------------");
+                // println!("------------------------------------------------------");
                 ctx.exec_cmd(manager, &req, &prepared_action).await
             }
         };

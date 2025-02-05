@@ -238,7 +238,7 @@ impl CommandExecutionPaths {
             ))),
         )?;
 
-        println! ("IWKIM: Called here");
+        // println! ("IWKIM: Called here");
         let input_directory = builder.fingerprint(digest_config.as_directory_serializer());
 
         let mut input_files_bytes = 0;

@@ -87,7 +87,7 @@ impl PreparedCommandOptionalExecutor for Arc<dyn PreparedCommandOptionalExecutor
         manager: CommandExecutionManager,
         cancellations: &CancellationContext,
     ) -> ControlFlow<CommandExecutionResult, CommandExecutionManager> {
-        println!("IWKIM: prepared.rs, maybe_execute. am I here?");
+        // println!("IWKIM: prepared.rs, maybe_execute. am I here?");
         (**self)
             .maybe_execute(command, manager, cancellations)
             .await
@@ -105,7 +105,7 @@ impl PreparedCommandOptionalExecutor for NoOpCommandOptionalExecutor {
         manager: CommandExecutionManager,
         _cancellations: &CancellationContext,
     ) -> ControlFlow<CommandExecutionResult, CommandExecutionManager> {
-        println!("IWKIM: NoOpCommandOptionalExecutor. I am here!");
+        // println!("IWKIM: NoOpCommandOptionalExecutor. I am here!");
         ControlFlow::Continue(manager)
     }
 }

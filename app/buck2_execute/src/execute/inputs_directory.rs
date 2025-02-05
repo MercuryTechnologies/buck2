@@ -29,7 +29,7 @@ pub fn inputs_directory(
             }
             CommandExecutionInput::ActionMetadata(metadata) => {
                 let path = fs.buck_out_path_resolver().resolve_gen(&metadata.path);
-                println!("IWKIM: inputs_directory ActionMetadata {}", path);
+                // println!("IWKIM: inputs_directory ActionMetadata {}", path);
                 builder.insert(
                     &path,
                     DirectoryEntry::Leaf(ActionDirectoryMember::File(FileMetadata {
@@ -40,7 +40,7 @@ pub fn inputs_directory(
             }
             CommandExecutionInput::ScratchPath(path) => {
                 let path = fs.buck_out_path_resolver().resolve_scratch(path);
-                println!("IWKIM: inputs_directory ScratchPath {}", path);
+                // println!("IWKIM: inputs_directory ScratchPath {}", path);
                 //builder.insert(&path, DirectoryEntry::Dir(ActionDirectoryBuilder::empty()))?;
             }
         };

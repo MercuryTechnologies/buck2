@@ -63,7 +63,7 @@ impl DigestConfig {
     }
 
     pub fn as_directory_serializer(&self) -> &ReDirectorySerializer {
-        println! ("IWKIM: DigestConfig::as_directory_serializer");
+        // println! ("IWKIM: DigestConfig::as_directory_serializer");
         ReDirectorySerializer::ref_cast(&self.inner.cas_digest_config)
     }
 

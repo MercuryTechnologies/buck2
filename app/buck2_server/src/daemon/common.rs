@@ -235,7 +235,7 @@ impl HasCommandExecutor for CommandExecutorFactory {
                 if self.strategy.ban_local() {
                     None
                 } else {
-                    println!("IWKIM: get_command_executor here");
+                    // println!("IWKIM: get_command_executor here");
                     // test
                     //let action_cache_checker = Arc::new(ActionCacheChecker {
                     //        artifact_fs: artifact_fs.clone(),
