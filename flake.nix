@@ -38,7 +38,7 @@
           Security
         ]);
         packages = [ pkgs.cargo-bloat my-rust-bin pkgs.mold-wrapped pkgs.reindeer pkgs.lld_16 pkgs.clang_16 ];
-        shellHook = 
+        shellHook =
           ''
             export BUCK2_BUILD_PROTOC=${pkgs.protobuf}/bin/protoc
             export BUCK2_BUILD_PROTOC_INCLUDE=${pkgs.protobuf}/include
@@ -48,5 +48,8 @@
             export RUSTFLAGS="-C linker=clang -C link-arg=-fuse-ld=mold $RUSTFLAGS"
           '';
       };
+
+      packages.buck2 = pkgs.callPackage ./custom/build.nix { };
+
     });
 }
