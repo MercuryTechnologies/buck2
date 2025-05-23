@@ -153,6 +153,11 @@ struct ReUploadEvent<'a> {
     pub inner: &'a buck2_data::ReUploadEnd,
 }
 
+struct CacheUploadEvent<'a> {
+    pub parent_span_id: u64,
+    pub inner: &'a buck2_data::CacheUploadEnd,
+}
+
 impl WhatUploadedCommand {
     pub fn exec(self, _matches: BuckArgMatches<'_>, ctx: ClientCommandContext<'_>) -> ExitResult {
         let Self {
@@ -213,6 +218,18 @@ impl WhatUploadedCommand {
                                             total_digests_uploaded += record.digests_uploaded;
                                             total_bytes_uploaded += record.bytes_uploaded;
                                             print_uploads(&mut output, &record)?;
+                                        }
+                                    }
+                                    Some(buck2_data::span_end_event::Data::CacheUpload(ref u)) => {
+                                        let upload = CacheUploadEvent {
+                                            parent_span_id: event.parent_id,
+                                            inner: u,
+                                        };
+                                        match u.name {
+                                            Some(ref name) => {
+                                                buck2_client_ctx::eprintln!("IWKIM: CacheUpload detected. {} {}", name.category, name.identifier)?;
+                                            }
+                                            _ => {}
                                         }
                                     }
                                     _ => {}
