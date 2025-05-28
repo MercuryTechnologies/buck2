@@ -21,6 +21,7 @@ use serde::Serialize;
 
 use crate::legacy_configs::configs::LegacyBuckConfig;
 use crate::legacy_configs::key::BuckconfigKeyRef;
+use crate::manifold::BucketsConfig;
 
 pub const DEFAULT_RETAINED_EVENT_LOGS: usize = 12;
 
@@ -517,6 +518,7 @@ pub struct DaemonStartupConfig {
     pub http: HttpConfig,
     pub resource_control: ResourceControlConfig,
     pub log_download_method: LogDownloadMethod,
+    pub buckets_config: Option<BucketsConfig>,
     pub health_check_config: HealthCheckConfig,
     pub retained_event_logs: usize,
     pub macos_qos_class: Option<String>,
@@ -593,6 +595,7 @@ impl DaemonStartupConfig {
                 .map(ToOwned::to_owned),
             http: HttpConfig::from_config(config)?,
             resource_control: ResourceControlConfig::from_config(config)?,
+            buckets_config: BucketsConfig::from_config(config)?,
             log_download_method,
             health_check_config: HealthCheckConfig::from_config(config)?,
             retained_event_logs: config
@@ -653,6 +656,8 @@ impl DaemonStartupConfig {
             } else {
                 LogDownloadMethod::None
             },
+            // TODO(jadel): is this a regression in test vs before?
+            buckets_config: None,
             health_check_config: HealthCheckConfig::default(),
             retained_event_logs: DEFAULT_RETAINED_EVENT_LOGS,
             macos_qos_class: None,
