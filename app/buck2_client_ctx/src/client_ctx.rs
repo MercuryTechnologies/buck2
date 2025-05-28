@@ -10,10 +10,10 @@
 use std::future::Future;
 use std::time::Duration;
 
+use buck2_cli_proto::ClientContext;
 use buck2_cli_proto::client_context::HostArchOverride as GrpcHostArchOverride;
 use buck2_cli_proto::client_context::HostPlatformOverride as GrpcHostPlatformOverride;
 use buck2_cli_proto::client_context::PreemptibleWhen as GrpcPreemptibleWhen;
-use buck2_cli_proto::ClientContext;
 use buck2_common::argv::Argv;
 use buck2_common::init::LogDownloadMethod;
 use buck2_common::invocation_paths::InvocationPaths;
@@ -24,16 +24,17 @@ use buck2_core::fs::working_dir::AbsWorkingDir;
 use buck2_error::BuckErrorContext;
 use buck2_event_observer::verbosity::Verbosity;
 use buck2_wrapper_common::invocation_id::TraceId;
+use buck2_common::manifold::BucketsConfig;
 use dupe::Dupe;
 use tokio::runtime::Runtime;
 
 use crate::client_metadata::ClientMetadata;
-use crate::common::ui::CommonConsoleOptions;
 use crate::common::BuckArgMatches;
 use crate::common::CommonEventLogOptions;
 use crate::common::HostArchOverride;
 use crate::common::HostPlatformOverride;
 use crate::common::PreemptibleWhen;
+use crate::common::ui::CommonConsoleOptions;
 use crate::console_interaction_stream::ConsoleInteractionStream;
 use crate::daemon_constraints::get_possibly_nested_invocation_daemon_uuid;
 use crate::immediate_config::ImmediateConfigContext;
@@ -305,5 +306,13 @@ impl<'a> ClientCommandContext<'a> {
             .unwrap()
             .log_download_method
             .clone()
+    }
+
+    pub fn buckets_config(&self) -> buck2_error::Result<Option<BucketsConfig>> {
+        Ok(self
+            .immediate_config
+            .daemon_startup_config()?
+            .buckets_config
+            .clone())
     }
 }
