@@ -114,7 +114,7 @@ impl StarlarkProfilingManager {
     }
 
     async fn upload_profile_to_manifold(&self, svg_path: &AbsPath) -> buck2_error::Result<String> {
-        let manifold = ManifoldClient::new().await?;
+        let manifold = ManifoldClient::new_with_config(None).await?;
         let manifold_filename = format!("flat/{}-profile-merged.svg", self.trace_id);
         manifold
             .upload_file(
