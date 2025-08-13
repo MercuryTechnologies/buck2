@@ -431,6 +431,10 @@ pub struct Buck2OssReConfiguration {
     pub max_total_batch_size: Option<usize>,
     /// Maximum number of concurrent upload requests for each action.
     pub max_concurrent_uploads_per_action: Option<usize>,
+    /// Time that digests are assumed to live in CAS after being touched.
+    pub cas_ttl_secs: Option<i64>,
+    /// Maximum retries for network requests.
+    pub max_retries: usize,
 }
 
 #[derive(Clone, Debug, Default, Allocative)]
@@ -532,6 +536,16 @@ impl Buck2OssReConfiguration {
                 section: BUCK2_RE_CLIENT_CFG_SECTION,
                 property: "max_concurrent_uploads_per_action",
             })?,
+            cas_ttl_secs: legacy_config.parse(BuckconfigKeyRef {
+                section: BUCK2_RE_CLIENT_CFG_SECTION,
+                property: "cas_ttl_secs",
+            })?,
+            max_retries: legacy_config
+                .parse(BuckconfigKeyRef {
+                    section: BUCK2_RE_CLIENT_CFG_SECTION,
+                    property: "max_retries",
+                })?
+                .unwrap_or(0),
         })
     }
 }
