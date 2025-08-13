@@ -228,6 +228,8 @@ pub struct RERuntimeOpts {
     use_fbcode_metadata: bool,
     /// Maximum number of concurrent upload requests.
     max_concurrent_uploads_per_action: Option<usize>,
+    /// Maximum retries for network requests.
+    max_retries: usize,
 }
 
 struct InstanceName(Option<String>);
@@ -354,6 +356,7 @@ impl REClientBuilder {
             RERuntimeOpts {
                 use_fbcode_metadata: opts.use_fbcode_metadata,
                 max_concurrent_uploads_per_action: opts.max_concurrent_uploads_per_action,
+                max_retries: opts.max_retries,
             },
             grpc_clients,
             capabilities,
@@ -1634,6 +1637,14 @@ mod tests {
 
     use super::*;
 
+    fn test_re_runtime_opts() -> RERuntimeOpts {
+        RERuntimeOpts {
+            use_fbcode_metadata: false,
+            max_concurrent_uploads_per_action: None,
+            max_retries: 0,
+        }
+    }
+
     #[tokio::test]
     async fn test_download_named() -> anyhow::Result<()> {
         let work = tempfile::tempdir()?;
@@ -1697,6 +1708,7 @@ mod tests {
         };
 
         download_impl(
+            &test_re_runtime_opts(),
             &InstanceName(None),
             req,
             10000,
@@ -1803,6 +1815,7 @@ mod tests {
         };
 
         download_impl(
+            &test_re_runtime_opts(),
             &InstanceName(None),
             req,
             10, // kept small to simulate a large file download
@@ -1884,6 +1897,7 @@ mod tests {
         };
 
         let res = download_impl(
+            &test_re_runtime_opts(),
             &InstanceName(None),
             req,
             100000,
@@ -1970,6 +1984,7 @@ mod tests {
         let counter = AtomicU16::new(0);
 
         let res = download_impl(
+            &test_re_runtime_opts(),
             &InstanceName(None),
             req,
             7,
@@ -2038,6 +2053,7 @@ mod tests {
         };
 
         let res = download_impl(
+            &test_re_runtime_opts(),
             &InstanceName(None),
             req,
             10, // intentionally small value to keep data in the test blobs small
@@ -2093,6 +2109,7 @@ mod tests {
         let res = BatchReadBlobsResponse { responses: vec![] };
 
         let res = download_impl(
+            &test_re_runtime_opts(),
             &InstanceName(None),
             req,
             100000,
@@ -2131,6 +2148,7 @@ mod tests {
         };
 
         download_impl(
+            &test_re_runtime_opts(),
             &InstanceName(Some("instance".to_owned())),
             req,
             0,
