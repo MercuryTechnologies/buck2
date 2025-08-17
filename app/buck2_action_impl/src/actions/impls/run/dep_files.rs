@@ -828,13 +828,14 @@ fn check_action(
     declared_outputs: &[BuildArtifact],
     declared_dep_files: &DeclaredDepFiles,
 ) -> InitialDepFileLookupResult {
+    /*
     if !declared_dep_files.declares_same_dep_files(&previous_state.declared_dep_files) {
         // We first need to check if the same dep files existed before or not. If not, then we
         // can't assume they'll still be on disk, and we have to bail.
         tracing::trace!("Dep files miss: Dep files declaration has changed");
         DEP_FILES.remove(key);
         return InitialDepFileLookupResult::Miss;
-    }
+    }*/
 
     if !outputs_are_reusable(declared_outputs, &previous_state.result) {
         tracing::trace!("Dep files miss: Output declaration has changed");
