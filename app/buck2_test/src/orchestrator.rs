@@ -25,6 +25,8 @@ use std::time::Duration;
 use allocative::Allocative;
 use anyhow::Context;
 use async_trait::async_trait;
+use buck2_cli_proto::test_request::TestOutputMode;
+use buck2_test_api::data::TestStatus;
 use buck2_build_api::actions::artifact::get_artifact_fs::GetArtifactFs;
 use buck2_build_api::actions::execute::dice_data::CommandExecutorResponse;
 use buck2_build_api::actions::execute::dice_data::DiceHasCommandExecutor;
@@ -187,6 +189,7 @@ pub struct BuckTestOrchestrator<'a: 'static> {
     events: EventDispatcher,
     liveliness_observer: Arc<dyn LivelinessObserver>,
     cancellations: &'a CancellationContext,
+    test_output_mode: TestOutputMode,
 }
 
 impl<'a> BuckTestOrchestrator<'a> {
@@ -196,6 +199,7 @@ impl<'a> BuckTestOrchestrator<'a> {
         liveliness_observer: Arc<dyn LivelinessObserver>,
         results_channel: UnboundedSender<anyhow::Result<ExecutorMessage>>,
         cancellations: &'a CancellationContext,
+        test_output_mode: TestOutputMode,
     ) -> anyhow::Result<BuckTestOrchestrator<'a>> {
         let events = dice.per_transaction_data().get_dispatcher().dupe();
         Ok(Self::from_parts(
@@ -205,6 +209,7 @@ impl<'a> BuckTestOrchestrator<'a> {
             results_channel,
             events,
             cancellations,
+            test_output_mode,
         ))
     }
 
@@ -215,6 +220,7 @@ impl<'a> BuckTestOrchestrator<'a> {
         results_channel: UnboundedSender<anyhow::Result<ExecutorMessage>>,
         events: EventDispatcher,
         cancellations: &'a CancellationContext,
+        test_output_mode: TestOutputMode,
     ) -> BuckTestOrchestrator<'a> {
         Self {
             dice,
@@ -223,6 +229,7 @@ impl<'a> BuckTestOrchestrator<'a> {
             events,
             liveliness_observer,
             cancellations,
+            test_output_mode,
         }
     }
 
@@ -758,11 +765,25 @@ impl TestOrchestrator for BuckTestOrchestrator<'_> {
     }
 
     async fn report_test_result(&self, r: TestResult) -> anyhow::Result<()> {
-        let event = buck2_data::instant_event::Data::TestResult(translations::convert_test_result(
-            r.clone(),
-            &self.session,
-        )?);
-        self.events.instant_event(event);
+        // Only send test result events based on the output mode
+        let should_send_event = match self.test_output_mode {
+            TestOutputMode::All => true,  // Show all test results
+            TestOutputMode::Errors => {
+                // Only show failed test results
+                matches!(r.status, 
+                    TestStatus::FAIL | TestStatus::FATAL | TestStatus::TIMEOUT | TestStatus::LISTING_FAILED)
+            },
+            TestOutputMode::None => false,  // Don't show any test results
+        };
+        
+        if should_send_event {
+            let event = buck2_data::instant_event::Data::TestResult(translations::convert_test_result(
+                r.clone(),
+                &self.session,
+            )?);
+            self.events.instant_event(event);
+        }
+        
         self.results_channel
             .unbounded_send(Ok(ExecutorMessage::TestResult(r)))
             .map_err(|_| anyhow::Error::msg("Test result was received after end-of-tests"))?;
@@ -2329,6 +2350,7 @@ mod tests {
                 sender,
                 EventDispatcher::null(),
                 CancellationContext::testing(),
+                TestOutputMode::All, // Default to showing all output in tests
             ),
             receiver,
         ))
