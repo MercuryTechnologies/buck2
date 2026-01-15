@@ -94,6 +94,7 @@ use tonic::transport::Channel;
 use tonic::transport::Identity;
 use tonic::transport::Uri;
 use tonic::transport::channel::ClientTlsConfig;
+use tracing::debug;
 
 use crate::error::*;
 use crate::metadata::*;
@@ -784,6 +785,9 @@ impl REClient {
             ..Default::default()
         };
 
+        debug!(?request, "RE ACTION REQUEST");
+        debug!(?metadata, "RE ACTION REQUEST METADATA");
+
         let stream = retry(
             || async {
                 let mut client = self.grpc_clients.execution_client.clone();
@@ -809,6 +813,14 @@ impl REClient {
                 None => return Ok(None),
             };
 
+            debug!(?msg, "RE ACTION RESPONSE");
+
+            if let Some(metadata) = &msg.metadata {
+                if let Ok(meta) = ExecuteOperationMetadata::decode(&metadata.value[..]) {
+                    debug!(?meta, "RE ACTION RESPONSE METADATA");
+                }
+            }
+
             let status = if msg.done {
                 match msg
                     .result
@@ -831,6 +843,8 @@ impl REClient {
                         let action_result = execute_response_grpc
                             .result
                             .with_context(|| "The action result is not defined.")?;
+
+                        debug!(?action_result, "BUCK2 ACTION RESULT");
 
                         let action_result = convert_action_result(action_result)?;
 
