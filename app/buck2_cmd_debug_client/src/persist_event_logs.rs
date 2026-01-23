@@ -15,9 +15,9 @@ use buck2_client_ctx::common::BuckArgMatches;
 use buck2_client_ctx::events_ctx::EventsCtx;
 use buck2_client_ctx::exit_result::ExitResult;
 use buck2_common::chunk_reader::ChunkReader;
-use buck2_common::manifold;
-use buck2_common::manifold::ManifoldChunkedUploader;
-use buck2_common::manifold::ManifoldClient;
+use buck2_common::log_upload::Bucket;
+use buck2_common::log_upload::ChunkedUploader;
+use buck2_common::log_upload::LogUploadClient;
 use buck2_core::soft_error;
 use buck2_data::InstantEvent;
 use buck2_data::PersistEventLogSubprocess;
@@ -181,9 +181,9 @@ async fn upload_task(
         return Ok(());
     }
 
-    let manifold_client = ManifoldClient::new().await?;
+    let client = LogUploadClient::new().await?;
     let manifold_path = format!("flat/{manifold_name}");
-    let mut uploader = Uploader::new(file_mutex, &manifold_path, &manifold_client)?;
+    let mut uploader = Uploader::new(file_mutex, &manifold_path, &client).await?;
 
     loop {
         tokio::select! {
@@ -218,51 +218,54 @@ async fn upload_task(
     // Last chunk to upload is smaller than &reader
     uploader.upload_chunk().await?;
 
+    // Finalize the upload. For Manifold this is a no-op, but for S3 this
+    // completes the multipart upload. Without this call, S3 uploads would
+    // be left incomplete and the object would not be created.
+    uploader.finish().await?;
+
     Ok(())
 }
 
 /// Provides methods to:
 /// - decide when to upload a chunk of the log file
-/// - do the actual upload, which is mostly managed by `ManifoldChunkedUploader`
+/// - do the actual upload, which is mostly managed by the chunked uploader
 struct Uploader<'a> {
     file_mutex: &'a Mutex<File>,
-    manifold: ManifoldChunkedUploader<'a>,
+    inner: Box<dyn ChunkedUploader>,
     reader: ChunkReader,
     total_bytes: u64,
     last_upload_attempt: Instant,
 }
 
 impl<'a> Uploader<'a> {
-    fn new(
+    async fn new(
         file_mutex: &'a Mutex<File>,
-        manifold_path: &'a str,
-        manifold_client: &'a ManifoldClient,
+        manifold_path: &str,
+        client: &LogUploadClient,
     ) -> buck2_error::Result<Self> {
-        let manifold = manifold_client.start_chunked_upload(
-            manifold::Bucket::EVENT_LOGS,
-            manifold_path,
-            manifold_event_log_ttl()?,
-        );
+        let inner = client
+            .start_chunked_upload(Bucket::EVENT_LOGS, manifold_path, manifold_event_log_ttl()?)
+            .await?;
 
         Ok(Self {
             file_mutex,
-            manifold,
+            inner,
             reader: ChunkReader::new()?,
             total_bytes: 0,
             last_upload_attempt: Instant::now(),
         })
     }
 
-    /// Uploads at most 'chunk size' bytes to Manifold
+    /// Uploads at most 'chunk size' bytes
     async fn upload_chunk(&mut self) -> buck2_error::Result<()> {
         let mut file = self.file_mutex.lock().await;
-        file.seek(io::SeekFrom::Start(self.manifold.position()))
+        file.seek(io::SeekFrom::Start(self.inner.position()))
             .await
             .buck_error_context("Failed to seek log file")?;
         let buf = self.reader.read(&mut *file).await?;
         drop(file);
 
-        self.manifold.write(buf.into()).await?;
+        self.inner.write(buf.into()).await?;
         Ok(())
     }
 
@@ -273,17 +276,23 @@ impl<'a> Uploader<'a> {
     fn can_fill_chunk(&mut self) -> buck2_error::Result<bool> {
         Ok(self
             .total_bytes
-            .checked_sub(self.manifold.position())
+            .checked_sub(self.inner.position())
             .ok_or(PersistEventLogError::ReadBytesOverflow)?
             > self.reader.chunk_size())
     }
 
     fn something_to_upload(&self) -> bool {
-        self.total_bytes > self.manifold.position()
+        self.total_bytes > self.inner.position()
     }
 
     fn wait(&self) -> Duration {
         MAX_WAIT.saturating_sub(Instant::now() - self.last_upload_attempt)
+    }
+
+    /// Finalize the upload. For Manifold this is a no-op since appends are
+    /// immediately persisted. For S3 this completes the multipart upload.
+    async fn finish(&mut self) -> buck2_error::Result<()> {
+        self.inner.finish().await
     }
 }
 

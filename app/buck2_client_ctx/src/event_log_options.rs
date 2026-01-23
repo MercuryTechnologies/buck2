@@ -174,6 +174,34 @@ impl EventLogOptions {
                         .spawn()?,
                 )
             }
+            LogDownloadMethod::S3 { bucket } => {
+                // Use S3 SDK directly instead of shelling out to AWS CLI
+                crate::eprintln!(
+                    "Downloading from S3: s3://{}/buck2_logs/flat/{}",
+                    bucket,
+                    log_file_name
+                )?;
+
+                let client = buck2_common::s3::S3Client::with_bucket(bucket.clone()).await?;
+                client
+                    .download(
+                        buck2_common::s3::Bucket::EVENT_LOGS,
+                        &format!("flat/{}", log_file_name),
+                        temp_path.path(),
+                    )
+                    .await?;
+
+                // Skip the subprocess wait logic below
+                fs_util::create_dir_all(
+                    log_path
+                        .parent()
+                        .buck_error_context("Error identifying log dir")?,
+                )?;
+                fs_util::rename(temp_path.path(), &log_path)?;
+                crate::eprintln!("Downloaded event-log to `{}`", log_path.display())?;
+                temp_path.close()?;
+                return Ok(log_path.into_abs_path_buf());
+            }
             LogDownloadMethod::None => {
                 return Err(EventLogOptionsError::LogNotFoundLocally(trace_id.dupe()).into());
             }

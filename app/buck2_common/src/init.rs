@@ -402,6 +402,8 @@ impl ResourceControlConfig {
 pub enum LogDownloadMethod {
     Manifold,
     Curl(String),
+    /// S3 bucket for log downloads. Uses AWS CLI: `aws s3 cp s3://{bucket}/... /path`
+    S3 { bucket: String },
     None,
 }
 
@@ -496,7 +498,14 @@ impl DaemonStartupConfig {
                         Ok(LogDownloadMethod::Curl(log_url.to_owned()))
                     }
                 } else {
-                    Ok(LogDownloadMethod::None)
+                    // Check for S3 bucket (via environment variable, same as upload)
+                    // This provides symmetry: if uploads go to S3, downloads come from S3
+                    match std::env::var("BUCK2_LOG_BUCKET_NAME") {
+                        Ok(bucket) if !bucket.is_empty() => {
+                            Ok(LogDownloadMethod::S3 { bucket })
+                        }
+                        _ => Ok(LogDownloadMethod::None),
+                    }
                 }
             }
         }?;

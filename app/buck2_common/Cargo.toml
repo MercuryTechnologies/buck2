@@ -69,6 +69,12 @@ nix = { workspace = true }
 tower = { workspace = true }
 xattr = { workspace = true }
 
+# AWS SDK for S3 log uploads (OSS alternative to Manifold)
+[target.'cfg(not(fbcode_build))'.dependencies]
+aws-config = { workspace = true }
+aws-sdk-s3 = { workspace = true }
+hostname = { workspace = true }
+
 [dev-dependencies]
 assert_matches = { workspace = true }
 indoc = { workspace = true }

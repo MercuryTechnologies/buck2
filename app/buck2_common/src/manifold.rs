@@ -9,10 +9,12 @@
  */
 
 use std::io;
+use std::sync::Arc;
 use std::time::Duration;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 
+use async_trait::async_trait;
 use buck2_fs::paths::abs_path::AbsPath;
 use buck2_http::HttpClient;
 use buck2_http::HttpClientBuilder;
@@ -29,6 +31,7 @@ use tokio::fs::File;
 use tokio::io::AsyncRead;
 
 use crate::chunk_reader::ChunkReader;
+use crate::chunked_uploader::ChunkedUploader;
 
 #[derive(Copy, Clone, Dupe)]
 pub struct Ttl {
@@ -286,7 +289,7 @@ impl ManifoldClient {
         R: AsyncRead + Unpin,
     {
         let reader = ChunkReader::new()?;
-        let mut upload = self.start_chunked_upload(bucket, path, ttl);
+        let mut position = 0u64;
         let mut first = true;
         loop {
             let chunk = reader.read(read).await?;
@@ -294,23 +297,30 @@ impl ManifoldClient {
                 break;
             }
             first = false;
-            upload.write(chunk.into()).await?;
+            let len = u64::try_from(chunk.len())?;
+            if position == 0 {
+                self.write(bucket, path, chunk.into(), ttl).await?;
+            } else {
+                self.append(bucket, path, chunk.into(), position).await?;
+            }
+            position += len;
         }
         buck2_error::Ok(())
     }
 
-    pub fn start_chunked_upload<'a>(
-        &'a self,
+    pub fn start_chunked_upload(
+        self: &Arc<Self>,
         bucket: Bucket,
-        path: &'a str,
+        path: &str,
         ttl: Ttl,
-    ) -> ManifoldChunkedUploader<'a> {
+    ) -> ManifoldChunkedUploader {
         ManifoldChunkedUploader {
-            manifold: self,
+            manifold: Arc::clone(self),
             position: 0,
             bucket,
-            path,
+            path: path.to_owned(),
             ttl,
+            finished: false,
         }
     }
 
@@ -335,26 +345,27 @@ async fn consume_response<'a>(mut res: Response<BoxStream<'a, hyper::Result<Byte
 }
 
 /// Keep track of a chunk upload to a given Manifold key.
-pub struct ManifoldChunkedUploader<'a> {
-    manifold: &'a ManifoldClient,
+pub struct ManifoldChunkedUploader {
+    manifold: Arc<ManifoldClient>,
     position: u64,
     bucket: Bucket,
-    path: &'a str,
+    path: String,
     ttl: Ttl,
+    finished: bool,
 }
 
-impl ManifoldChunkedUploader<'_> {
-    pub async fn write(&mut self, chunk: Bytes) -> buck2_error::Result<()> {
+impl ManifoldChunkedUploader {
+    async fn write_impl(&mut self, chunk: Bytes) -> buck2_error::Result<()> {
         let len = u64::try_from(chunk.len())?;
 
         if self.position == 0 {
             // First chunk
             self.manifold
-                .write(self.bucket, self.path, chunk, self.ttl)
+                .write(self.bucket, &self.path, chunk, self.ttl)
                 .await?
         } else {
             self.manifold
-                .append(self.bucket, self.path, chunk, self.position)
+                .append(self.bucket, &self.path, chunk, self.position)
                 .await?
         }
 
@@ -362,9 +373,27 @@ impl ManifoldChunkedUploader<'_> {
 
         Ok(())
     }
+}
 
-    pub fn position(&self) -> u64 {
+#[async_trait]
+impl ChunkedUploader for ManifoldChunkedUploader {
+    async fn write(&mut self, chunk: Bytes) -> buck2_error::Result<()> {
+        self.write_impl(chunk).await
+    }
+
+    fn position(&self) -> u64 {
         self.position
+    }
+
+    /// Complete the upload.
+    ///
+    /// For Manifold, this is a no-op since each append is immediately persisted.
+    /// This method exists for API compatibility with S3ChunkedUploader, which
+    /// requires explicit completion of multipart uploads.
+    async fn finish(&mut self) -> buck2_error::Result<()> {
+        self.finished = true;
+        // Manifold appends are immediately persisted, no finalization needed.
+        Ok(())
     }
 }
 
