@@ -449,6 +449,12 @@ pub struct Buck2OssReConfiguration {
     pub grpc_keepalive_timeout_secs: Option<u64>,
     /// Whether to send HTTP/2 pings when connection is idle.
     pub grpc_keepalive_while_idle: Option<bool>,
+    /// Maximum number of concurrent execution requests.
+    pub execution_concurrency_limit: Option<usize>,
+    /// Maximum retries for network requests.
+    pub max_retries: usize,
+    /// Timeout for RPC requests in seconds. Defaults to 60s.
+    pub grpc_timeout: u64,
 }
 
 #[derive(Clone, Debug, Default, Allocative)]
@@ -566,6 +572,25 @@ impl Buck2OssReConfiguration {
                 section: BUCK2_RE_CLIENT_CFG_SECTION,
                 property: "grpc_keepalive_while_idle",
             })?,
+<<<<<<< HEAD
+=======
+            execution_concurrency_limit: legacy_config.parse(BuckconfigKeyRef {
+                section: BUCK2_RE_CLIENT_CFG_SECTION,
+                property: "execution_concurrency_limit",
+            })?,
+            max_retries: legacy_config
+                .parse(BuckconfigKeyRef {
+                    section: BUCK2_RE_CLIENT_CFG_SECTION,
+                    property: "max_retries",
+                })?
+                .unwrap_or(0),
+            grpc_timeout: legacy_config
+                .parse(BuckconfigKeyRef {
+                    section: BUCK2_RE_CLIENT_CFG_SECTION,
+                    property: "grpc_timeout",
+                })?
+                .unwrap_or(60),
+>>>>>>> f795cd5f96 (Add rpc timeout config and wire it up)
         })
     }
 }
