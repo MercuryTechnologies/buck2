@@ -698,6 +698,7 @@ impl REClient {
         request: ActionResultRequest,
     ) -> anyhow::Result<ActionResultResponse> {
         retry(
+            "GetActionResultRequest",
             || async {
                 let mut client = self.grpc_clients.action_cache_client.clone();
                 let request = request.clone();
@@ -734,6 +735,7 @@ impl REClient {
         request: WriteActionResultRequest,
     ) -> anyhow::Result<WriteActionResultResponse> {
         retry(
+            "UpdateActionResult",
             || async {
                 let mut client = self.grpc_clients.action_cache_client.clone();
                 let request = request.clone();
@@ -789,6 +791,7 @@ impl REClient {
         debug!(?metadata, "RE ACTION REQUEST METADATA");
 
         let stream = retry(
+            "Execute",
             || async {
                 let mut client = self.grpc_clients.execution_client.clone();
                 let request = request.clone();
@@ -928,6 +931,7 @@ impl REClient {
                 let runtime_opts = self.runtime_opts;
 
                 retry(
+                    "BatchUpdateBlobs",
                     move || {
                         let metadata = metadata.clone();
                         let mut cas_client = cas_client.clone();
@@ -956,6 +960,7 @@ impl REClient {
                 let runtime_opts = self.runtime_opts;
 
                 retry(
+                    "BS.write",
                     move || {
                         let metadata = metadata.clone();
                         let mut bytestream_client = bytestream_client.clone();
@@ -1021,6 +1026,7 @@ impl REClient {
                 let runtime_opts = self.runtime_opts;
 
                 retry(
+                    "BatchReadBlobs",
                     move || {
                         let metadata = metadata.clone();
                         let mut client = client.clone();
@@ -1049,6 +1055,7 @@ impl REClient {
                 async move {
                     let client = self.grpc_clients.bytestream_client.clone();
                     retry(
+                        "Read",
                         move || {
                             let metadata = metadata.clone();
                             let mut client = client.clone();
@@ -1120,6 +1127,7 @@ impl REClient {
                 tracing::debug!(num_digests = digests_to_check.len(), "FindMissingBlobs");
                 let runtime_opts = self.runtime_opts;
                 let missing_blobs = retry(
+                    "FindMissingBlobs",
                     || {
                         let mut cas_client = cas_client.clone();
                         let metadata = metadata.clone();
@@ -1620,6 +1628,7 @@ where
     Cas: Future<Output = anyhow::Result<BatchReadBlobsResponse>>,
 {
     retry(
+        "BatchReadBlobs",
         || async { cas_f(read_blobs_request.clone()).await },
         opts.max_retries,
         INITIAL_DELAY,

@@ -13,6 +13,7 @@ use crate::error::{REClientError, TCode};
 use tracing::warn;
 
 pub async fn retry<F, Fut, T>(
+    method: &str,
     mut f: F,
     max_retries: usize,
     initial_delay: Duration,
@@ -53,7 +54,10 @@ where
                 };
 
                 if retryable == Retryable::Wait {
-                    warn!("Retrying request after error: {}. Attempt {}/{} (waiting {:?})", msg, retries, max_retries, delay);
+                    warn!(
+                        "Retrying {} request after error: {}. Attempt {}/{} (waiting {:?})",
+                        method, msg, retries, max_retries, delay
+                    );
                     tokio::time::sleep(delay).await;
 
                     delay *= 2;
@@ -61,7 +65,10 @@ where
                         delay = max_delay;
                     }
                 } else {
-                    warn!("Retrying request after error: {}. Attempt {}/{}", msg, retries, max_retries);
+                    warn!(
+                        "Retrying {} request after error: {}. Attempt {}/{}",
+                        method, msg, retries, max_retries
+                    );
                 }
             }
         }
