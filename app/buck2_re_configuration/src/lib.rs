@@ -156,6 +156,9 @@ mod fbcode {
         pub engine_host: Option<String>,
         pub engine_port: Option<i32>,
         // End Thrift settings
+
+        // gRPC concurrency limit
+        pub grpc_concurrency_limit: i32,
     }
 
     impl RemoteExecutionStaticMetadataImpl for RemoteExecutionStaticMetadata {
