@@ -783,7 +783,7 @@ async fn prepare_and_execute(
 ) -> Result<ExecuteData, ExecuteError> {
     let execute_on_dice = match key.stage.as_ref() {
         TestStage::Listing { cacheable, .. } => *cacheable,
-        TestStage::Testing { .. } => false,
+        TestStage::Testing { .. } => true,
     };
     if execute_on_dice {
         let result = tokio::select! {
@@ -1205,7 +1205,7 @@ impl BuckTestOrchestrator<'_> {
         request: CommandExecutionRequest,
         liveliness_observer: Arc<dyn LivelinessObserver>,
         re_cache_enabled: bool,
-        supports_test_execution_caching: bool,
+        _supports_test_execution_caching: bool,
     ) -> Result<ExecuteData, ExecuteError> {
         let events = dice.per_transaction_data().get_dispatcher().dupe();
         let manager = CommandExecutionManager::new(
@@ -1220,8 +1220,6 @@ impl BuckTestOrchestrator<'_> {
             target: test_target_label.target(),
             action_key_suffix: create_action_key_suffix(stage),
         };
-
-        // For test execution, we currently do not do any cache queries
 
         let prepared_action = match executor.prepare_action(&request, digest_config, false) {
             Ok(prepared_action) => prepared_action,
@@ -1315,24 +1313,26 @@ impl BuckTestOrchestrator<'_> {
                 let start = TestRunStart {
                     suite: test_suite.clone(),
                 };
-                events
+                let (result, cached) = events
                     .span_async(start, async move {
-                        let result = if supports_test_execution_caching {
+                        let (result, cached) = if re_cache_enabled {
                             match executor
                                 .action_cache(manager, &prepared_command, cancellation)
                                 .await
                             {
                                 ControlFlow::Continue(manager) => {
-                                    executor
+                                    let result = executor
                                         .exec_cmd(manager, &prepared_command, cancellation)
-                                        .await
+                                        .await;
+                                    (result, false)
                                 }
-                                ControlFlow::Break(result) => result,
+                                ControlFlow::Break(result) => (result, true),
                             }
                         } else {
-                            executor
+                            let result = executor
                                 .exec_cmd(manager, &prepared_command, cancellation)
-                                .await
+                                .await;
+                            (result, false)
                         };
                         let end = TestRunEnd {
                             suite: test_suite,
@@ -1347,9 +1347,31 @@ impl BuckTestOrchestrator<'_> {
                             )
                             .ok(),
                         };
-                        (result, end)
+                        ((result, cached), end)
                     })
-                    .await
+                    .await;
+                if !cached && re_cache_enabled {
+                    let info = CacheUploadInfo {
+                        target: &test_target as _,
+                        digest_config,
+                        mergebase: &None,
+                        re_platform: executor.re_platform(),
+                    };
+                    let _result = match executor
+                        .cache_upload(
+                            &info,
+                            &result,
+                            None,
+                            None,
+                            &prepared_action.action_and_blobs,
+                        )
+                        .await
+                    {
+                        Ok(result) => result,
+                        Err(e) => return Err(ExecuteError::Error(e.into())),
+                    };
+                }
+                result
             }
         };
         let command_execution = Some(
@@ -1455,8 +1477,8 @@ impl BuckTestOrchestrator<'_> {
     fn executor_config_with_remote_cache_override<'a>(
         test_target_node: &'a ConfiguredTargetNode,
         executor_override: Option<&'a CommandExecutorConfig>,
-        stage: &TestStage,
-        supports_test_execution_caching: bool,
+        _stage: &TestStage,
+        _supports_test_execution_caching: bool,
     ) -> buck2_error::Result<Cow<'a, CommandExecutorConfig>> {
         let executor_config = match executor_override {
             Some(o) => o,
@@ -1466,36 +1488,15 @@ impl BuckTestOrchestrator<'_> {
                 .buck_error_context("Error accessing executor config")?,
         };
 
-        if let TestStage::Listing { .. } = &stage {
-            return Ok(Cow::Borrowed(executor_config));
-        }
-
-        if supports_test_execution_caching {
-            return Ok(Cow::Borrowed(executor_config));
-        }
-
-        match &executor_config.executor {
-            Executor::RemoteEnabled(options) if options.remote_cache_enabled => {
-                let mut exec_options = options.clone();
-                exec_options.remote_cache_enabled = false;
-                let executor_config = CommandExecutorConfig {
-                    executor: Executor::RemoteEnabled(exec_options),
-                    options: executor_config.options.dupe(),
-                };
-                Ok(Cow::Owned(executor_config))
-            }
-            Executor::Local(_) | Executor::RemoteEnabled(_) | Executor::None => {
-                Ok(Cow::Borrowed(executor_config))
-            }
-        }
+        Ok(Cow::Borrowed(executor_config))
     }
 
     async fn get_command_executor(
         dice: &mut DiceComputations<'_>,
         fs: &ArtifactFs,
         executor_config: &CommandExecutorConfig,
-        stage: &TestStage,
-        supports_test_execution_caching: bool,
+        _stage: &TestStage,
+        _supports_test_execution_caching: bool,
     ) -> buck2_error::Result<CommandExecutor> {
         let CommandExecutorResponse {
             executor,
@@ -1505,21 +1506,6 @@ impl BuckTestOrchestrator<'_> {
             cache_uploader,
             output_trees_download_config: _,
         } = dice.get_command_executor_from_dice(executor_config).await?;
-
-        let (cache_uploader, action_cache_checker) = match stage {
-            TestStage::Listing { .. } => (cache_uploader, action_cache_checker),
-            TestStage::Testing { .. } => {
-                (
-                    // We never upload local test executions
-                    Arc::new(NoOpCacheUploader {}) as _,
-                    if supports_test_execution_caching {
-                        action_cache_checker
-                    } else {
-                        Arc::new(NoOpCommandOptionalExecutor {}) as _
-                    },
-                )
-            }
-        };
 
         let executor = CommandExecutor::new(
             executor,
