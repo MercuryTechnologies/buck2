@@ -46,6 +46,7 @@ use buck2_cli_proto::HasClientContext;
 use buck2_cli_proto::TestRequest;
 use buck2_cli_proto::TestResponse;
 use buck2_cli_proto::representative_config_flag;
+use buck2_cli_proto::test_request::TestOutputMode;
 use buck2_common::dice::cells::HasCellResolver;
 use buck2_common::events::HasEvents;
 use buck2_common::legacy_configs::dice::HasLegacyConfigs;
@@ -144,6 +145,7 @@ struct TestOutcome {
     executor_stdout: String,
     executor_stderr: String,
     build_target_result: BuildTargetResult,
+    test_output_mode: TestOutputMode,
 }
 
 impl TestOutcome {
@@ -169,6 +171,7 @@ struct ExecutorReport {
     used_internal_runner: bool,
     statuses: TestStatuses,
     info_messages: Vec<String>,
+    test_results: Vec<TestResult>,
 }
 
 impl ExecutorReport {
@@ -176,6 +179,7 @@ impl ExecutorReport {
         match status {
             ExecutorMessage::TestResult(res) => {
                 self.statuses.ingest(res, session);
+                self.test_results.push(res.clone());
             }
             ExecutorMessage::ExitCode(exit_code) => {
                 self.executor_exit_code = Some(*exit_code);
@@ -547,6 +551,11 @@ async fn test(
         test_executor_args.insert(0, "--undeclared-outputs-dir".to_owned());
     }
 
+    let test_output_mode = request
+        .test_output_mode
+        .try_into()
+        .unwrap_or(TestOutputMode::All);
+
     let (streaming_build_result_tx, streaming_build_result_rx) =
         streaming_build_result_channel(build_opts);
 
@@ -576,6 +585,7 @@ async fn test(
         streaming_build_result_tx,
         build_start,
         graph_properties,
+        test_output_mode,
     );
 
     let test_outcome = maybe_stream_build_reports(
@@ -697,13 +707,77 @@ async fn test(
         None
     };
 
+    // Filter executor output based on test output mode
+    let (filtered_stdout, filtered_stderr) = match test_outcome.test_output_mode {
+        TestOutputMode::None => {
+            // Show no output
+            (String::new(), String::new())
+        }
+        TestOutputMode::Errors => {
+            // Only show output from failed tests
+            // Since most test executors don't provide per-test output details,
+            // and we cannot distinguish which output comes from which test when
+            // they're combined, we choose to show no output rather than risk
+            // showing output from passing tests.
+
+            // Check if we have individual test outputs we can filter
+            let mut failed_test_output = String::new();
+            let mut found_individual_outputs = false;
+
+            for test_result in &test_outcome.executor_report.test_results {
+                match test_result.status {
+                    TestStatus::FAIL
+                    | TestStatus::FATAL
+                    | TestStatus::TIMEOUT
+                    | TestStatus::LISTING_FAILED => {
+                        if !test_result.details.is_empty() {
+                            found_individual_outputs = true;
+                            failed_test_output
+                                .push_str(&format!("\n=== {} ===\n", test_result.name));
+                            failed_test_output.push_str(&test_result.details);
+                            if !test_result.details.ends_with('\n') {
+                                failed_test_output.push('\n');
+                            }
+                        }
+                    }
+                    _ => {
+                        // Skip output from passing/skipped tests
+                    }
+                }
+            }
+
+            if found_individual_outputs {
+                // We have per-test details, use only the failed test outputs
+                (failed_test_output.clone(), failed_test_output)
+            } else {
+                // We don't have per-test details. Rather than showing all output
+                // (which would include passing tests), show nothing.
+                // This ensures we never show passing test output with --test-output=errors
+                let has_failures = test_statuses.failed.as_ref().map_or(false, |f| f.count > 0)
+                    || test_statuses.fatals.as_ref().map_or(false, |f| f.count > 0);
+
+                if has_failures {
+                    // Add a note explaining why output is suppressed
+                    let msg = "\nNote: Test output suppressed with --test-output=errors because the test executor does not provide per-test output details.\n";
+                    (msg.to_string(), String::new())
+                } else {
+                    (String::new(), String::new())
+                }
+            }
+        }
+        TestOutputMode::All => {
+            // Show all output (default behavior)
+            (test_outcome.executor_stdout, test_outcome.executor_stderr)
+        }
+    };
+
     Ok(TestResponse {
         executor_exit_code,
         build_errors: test_outcome.build_errors,
         test_errors: test_outcome.test_errors,
         test_statuses: Some(test_statuses),
-        executor_stdout: test_outcome.executor_stdout,
-        executor_stderr: test_outcome.executor_stderr,
+        executor_stdout: filtered_stdout,
+        executor_stderr: filtered_stderr,
         executor_info_messages: test_outcome.executor_report.info_messages,
         serialized_build_report,
         // Rule types are sourced from `TargetRuleTypeName` instant events
@@ -733,6 +807,7 @@ async fn test_targets(
     streaming_build_result_tx: Option<UnboundedSender<BuildTargetResult>>,
     build_start: Instant,
     graph_properties: GraphPropertiesOptions,
+    test_output_mode: TestOutputMode,
 ) -> buck2_error::Result<TestOutcome> {
     let session = Arc::new(session);
 
@@ -835,6 +910,7 @@ async fn test_targets(
                     test_status_sender,
                     CancellationContext::never_cancelled(), // sending the orchestrator directly to be spawned by make_server, which never calls it.
                     internal_runner_config.clone(),
+                    test_output_mode,
                 )
                 .await
                 .buck_error_context("Failed to create a BuckTestOrchestrator")?;
@@ -865,6 +941,7 @@ async fn test_targets(
                         build_run_info,
                         build_start,
                         graph_properties,
+                        test_output_mode,
                     },
                     streaming_build_result_tx,
                 );
@@ -1001,6 +1078,7 @@ async fn test_targets(
         executor_stderr: executor_output.stderr,
         executor_report,
         build_target_result,
+        test_output_mode,
     })
 }
 
@@ -1036,7 +1114,7 @@ enum TestDriverTask {
     RecordErrors { events: Vec<BuildEvent> },
 }
 
-#[derive(Copy, Clone, Dupe)]
+#[derive(Copy, Clone)]
 struct TestDriverState<'a, 'e> {
     ctx: &'a DiceTransaction,
     label_filtering: &'a Arc<TestLabelFiltering>,
@@ -1056,6 +1134,7 @@ struct TestDriverState<'a, 'e> {
     build_run_info: bool,
     build_start: Instant,
     graph_properties: GraphPropertiesOptions,
+    test_output_mode: TestOutputMode,
 }
 
 type DriverWorkResult = ControlFlow<Vec<BuildEvent>, Vec<TestDriverTask>>;
@@ -1759,6 +1838,7 @@ async fn test_target<'a, 'e>(
                         driver_state.internal_test_status_sender.clone(),
                         CancellationContext::never_cancelled(),
                         driver_state.internal_runner_config.clone(),
+                        driver_state.test_output_mode,
                     )
                     .await
                     .buck_error_context("Failed to create internal BuckTestOrchestrator")?;
