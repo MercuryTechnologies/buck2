@@ -230,6 +230,7 @@ impl RemoteExecutionClient {
         action_digest: ActionDigest,
         use_case: RemoteExecutorUseCase,
     ) -> buck2_error::Result<Option<ActionResultResponse>> {
+        let _permit = self.data.client.grpc_semaphore.acquire().await.expect("Semaphore should never be closed");
         self.data
             .action_cache
             .op(self.data.client.action_cache(action_digest, use_case))
@@ -275,6 +276,7 @@ impl RemoteExecutionClient {
         inlined_blobs_with_digest: Vec<InlinedBlobWithDigest>,
         use_case: RemoteExecutorUseCase,
     ) -> buck2_error::Result<()> {
+        let _permit = self.data.client.grpc_semaphore.acquire().await.expect("Semaphore should never be closed");
         self.data
             .uploads
             .op(self.data.client.upload_files_and_directories(
@@ -342,6 +344,7 @@ impl RemoteExecutionClient {
         digests: Vec<TDigest>,
         use_case: RemoteExecutorUseCase,
     ) -> buck2_error::Result<Vec<T>> {
+        let _permit = self.data.client.grpc_semaphore.acquire().await.expect("Semaphore should never be closed");
         self.data
             .downloads
             .op(self
@@ -360,6 +363,7 @@ impl RemoteExecutionClient {
         digest: &TDigest,
         use_case: RemoteExecutorUseCase,
     ) -> buck2_error::Result<Vec<u8>> {
+        let _permit = self.data.client.grpc_semaphore.acquire().await.expect("Semaphore should never be closed");
         self.data
             .downloads
             .op(self.data.client.download_blob(digest, use_case))
@@ -426,6 +430,7 @@ impl RemoteExecutionClient {
         platform: &RE::Platform,
         write_type: ActionCacheWriteType,
     ) -> buck2_error::Result<WriteActionResultResponse> {
+        let _permit = self.data.client.grpc_semaphore.acquire().await.expect("Semaphore should never be closed");
         self.data
             .write_action_results
             .op(self
@@ -483,6 +488,9 @@ struct RemoteExecutionClientImpl {
     /// How many files we can be downloading concurrently.
     #[allocative(skip)]
     download_files_semapore: Arc<Semaphore>,
+    /// Global limit on all concurrent gRPC calls (action cache, downloads, etc)
+    #[allocative(skip)]
+    grpc_semaphore: Arc<Semaphore>,
     /// How many files to kick off downloading concurrently for one request. This should be smaller
     /// than the files semaphore to ensure we can actually *acquire* that semaphore.
     download_chunk_size: usize,
@@ -941,6 +949,7 @@ impl RemoteExecutionClientImpl {
                 cas_semaphore: Arc::new(Semaphore::new(static_metadata.cas_semaphore_size())),
                 exec_semaphore: Arc::new(Semaphore::new(static_metadata.exec_semaphore_size())),
                 download_files_semapore: Arc::new(Semaphore::new(download_concurrency)),
+                grpc_semaphore: Arc::new(Semaphore::new(400)), // TODO: make this configurable
                 download_chunk_size,
                 respect_file_symlinks,
                 persistent_cache_mode,
@@ -1274,16 +1283,21 @@ impl RemoteExecutionClientImpl {
         // 4. We get Ok(0 everywhere), which means it worked
 
         // Obtain a stream of events from RE. If this fails then that is case #1 above so we
-        // bail.
-        let mut receiver = self
-            .client()
-            .get_execution_client()
-            .execute_with_progress(metadata, request)
-            // boxed() to segment the future
-            .boxed()
-            .await
-            .map_err(anyhow::Error::from)
-            .context("Failed to start remote execution")?;
+        // bail. The semaphore is held only for the initial gRPC call that establishes the stream,
+        // then released before entering the streaming loop so it doesn't block other calls for
+        // the entire (potentially long) duration of remote execution.
+        let mut receiver = {
+            let _permit = self.grpc_semaphore.acquire().await.expect("Semaphore should never be closed");
+            self
+                .client()
+                .get_execution_client()
+                .execute_with_progress(metadata, request)
+                // boxed() to segment the future
+                .boxed()
+                .await
+                .map_err(anyhow::Error::from)
+                .context("Failed to start remote execution")?
+        };
 
         // Now we wait until the ExecuteResponse shows up, and produce events accordingly. If
         // this doesn't give us an ExecuteResponse then this is case #1 again so we also fail.
@@ -1581,6 +1595,7 @@ impl RemoteExecutionClientImpl {
                 )
                 .await
                 .buck_error_context("Failed to acquire download_files_semapore")?;
+            let _grpc_permit = self.grpc_semaphore.acquire().await.expect("Semaphore should never be closed");
 
             let response = with_error_handler(
                 "materialize_files",
