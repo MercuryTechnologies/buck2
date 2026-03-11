@@ -16,6 +16,7 @@ mod metadata;
 mod pool;
 mod request;
 mod response;
+mod retry;
 mod stats;
 
 use std::sync::Arc;
@@ -29,6 +30,7 @@ pub use grpc::*;
 pub use metadata::*;
 pub use request::*;
 pub use response::*;
+pub use retry::*;
 
 /// The global version of the network stats full of atomics
 #[derive(Default, Debug)]

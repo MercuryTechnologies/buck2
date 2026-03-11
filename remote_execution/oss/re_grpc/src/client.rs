@@ -100,8 +100,11 @@ use crate::pool::PooledChannel;
 use crate::pool::create_channel;
 use crate::request::*;
 use crate::response::*;
+use crate::retry::retry;
 
 const DEFAULT_MAX_TOTAL_BATCH_SIZE: usize = 4 * 1000 * 1000;
+const INITIAL_DELAY: Duration = Duration::from_millis(100);
+const MAX_DELAY: Duration = Duration::from_secs(10);
 
 fn tdigest_to(tdigest: TDigest) -> Digest {
     Digest {
@@ -181,6 +184,7 @@ pub struct RECapabilities {
 }
 
 /// Contains runtime options for the remote execution client as set under `buck2_re_client`
+#[derive(Clone, Copy)]
 pub struct RERuntimeOpts {
     /// Use the Meta version of the request metadata
     use_fbcode_metadata: bool,
@@ -190,8 +194,13 @@ pub struct RERuntimeOpts {
     cas_ttl_secs: i64,
     /// Maximum number of digests per `FindMissingBlobs` RPC.
     find_missing_blobs_batch_size: usize,
+    /// Maximum retries for RPC requests. Defaults to 5.
+    max_retries: usize,
+    /// Timeout for RPC requests.
+    rpc_timeout: Duration,
 }
 
+#[derive(Clone)]
 struct InstanceName(Option<String>);
 
 impl InstanceName {
@@ -336,6 +345,8 @@ impl REClientBuilder {
                 // on the TTL of the remote blob.
                 cas_ttl_secs: opts.cas_ttl_secs.unwrap_or(3 * 60 * 60),
                 find_missing_blobs_batch_size: opts.find_missing_blobs_batch_size.unwrap_or(100),
+                max_retries: opts.max_retries,
+                rpc_timeout: Duration::from_secs(opts.grpc_timeout),
             },
             capabilities,
             instance_name,
@@ -555,82 +566,6 @@ impl BatchUploadReqAggregator {
     }
 }
 
-/// Returns true if an error is a transient connection/transport error worth
-/// retrying. Walks the error chain checking for:
-///   - `tonic::Status` with codes the gRPC retry policy treats as transient
-///     (Unavailable, ResourceExhausted, Aborted)
-///   - `io::Error` of a kind that indicates a transport-level disruption
-///     (BrokenPipe, ConnectionReset/Aborted, UnexpectedEof, TimedOut)
-///
-/// `tonic::transport::Error` is not matched directly — its transient subset
-/// surfaces as an `io::Error` somewhere in the chain, which we catch above.
-/// Non-transient transport errors (TLS handshake, invalid URI) do not have
-/// an `io::Error` source, so they correctly do not retry.
-fn is_retryable(err: &anyhow::Error) -> bool {
-    for cause in err.chain() {
-        if let Some(status) = cause.downcast_ref::<tonic::Status>() {
-            match status.code() {
-                tonic::Code::Unavailable
-                | tonic::Code::ResourceExhausted
-                | tonic::Code::Aborted => return true,
-                _ => {}
-            }
-        }
-        if let Some(io_err) = cause.downcast_ref::<std::io::Error>() {
-            match io_err.kind() {
-                std::io::ErrorKind::BrokenPipe
-                | std::io::ErrorKind::ConnectionReset
-                | std::io::ErrorKind::ConnectionAborted
-                | std::io::ErrorKind::UnexpectedEof
-                | std::io::ErrorKind::TimedOut => return true,
-                _ => {}
-            }
-        }
-    }
-    false
-}
-
-/// Retry a fallible async operation on transient connection errors.
-///
-/// On retryable failure, the closure is called again from scratch — acquiring
-/// a fresh connection from the pool, rebuilding the request, etc. Up to 5
-/// attempts with exponential backoff (100ms, 200ms, 400ms, 800ms — capped at
-/// 5s) plus 0–50ms of jitter to avoid synchronized retry storms across
-/// concurrent in-flight requests.
-async fn retry<F, Fut, T>(f: F) -> anyhow::Result<T>
-where
-    F: Fn() -> Fut,
-    Fut: Future<Output = anyhow::Result<T>>,
-{
-    use rand::RngExt;
-
-    const MAX_ATTEMPTS: u32 = 5;
-    const INITIAL_DELAY: Duration = Duration::from_millis(100);
-    const MAX_DELAY: Duration = Duration::from_secs(5);
-
-    let mut delay = INITIAL_DELAY;
-    for attempt in 1..=MAX_ATTEMPTS {
-        match f().await {
-            Ok(v) => return Ok(v),
-            Err(e) if is_retryable(&e) && attempt < MAX_ATTEMPTS => {
-                let jitter = Duration::from_millis(rand::rng().random_range(0..50));
-                let sleep_for = delay + jitter;
-                tracing::warn!(
-                    "Transient error (attempt {}/{}), retrying in {:?}: {:#}",
-                    attempt,
-                    MAX_ATTEMPTS,
-                    sleep_for,
-                    e
-                );
-                tokio::time::sleep(sleep_for).await;
-                delay = (delay * 2).min(MAX_DELAY);
-            }
-            Err(e) => return Err(e),
-        }
-    }
-    unreachable!()
-}
-
 impl REClient {
     fn new(
         runtime_opts: RERuntimeOpts,
@@ -668,26 +603,32 @@ impl REClient {
         metadata: &RemoteExecutionMetadata,
         request: ActionResultRequest,
     ) -> anyhow::Result<ActionResultResponse> {
-        retry(|| async {
-            let res = self
-                .action_cache_client()
-                .await?
-                .get_action_result(with_re_metadata(
-                    GetActionResultRequest {
-                        instance_name: self.instance_name.as_str().to_owned(),
-                        action_digest: Some(tdigest_to(request.digest.clone())),
-                        ..Default::default()
-                    },
-                    metadata,
-                    self.runtime_opts.use_fbcode_metadata,
-                ))
-                .await?;
+        retry(
+            || async {
+                let res = self
+                    .action_cache_client()
+                    .await?
+                    .get_action_result(with_re_metadata(
+                        GetActionResultRequest {
+                            instance_name: self.instance_name.as_str().to_owned(),
+                            action_digest: Some(tdigest_to(request.digest.clone())),
+                            ..Default::default()
+                        },
+                        metadata,
+                        self.runtime_opts,
+                    ))
+                    .await?;
 
-            Ok(ActionResultResponse {
-                action_result: convert_action_result(res.into_inner())?,
-                ttl: 0,
-            })
-        })
+                Ok(ActionResultResponse {
+                    action_result: convert_action_result(res.into_inner())?,
+                    ttl: 0,
+                })
+            },
+            self.runtime_opts.max_retries,
+            INITIAL_DELAY,
+            MAX_DELAY,
+            false,
+        )
         .await
     }
 
@@ -698,28 +639,34 @@ impl REClient {
     ) -> anyhow::Result<WriteActionResultResponse> {
         let action_result = convert_t_action_result2(request.action_result)?;
 
-        retry(|| async {
-            let res = self
-                .action_cache_client()
-                .await?
-                .update_action_result(with_re_metadata(
-                    UpdateActionResultRequest {
-                        instance_name: self.instance_name.as_str().to_owned(),
-                        action_digest: Some(tdigest_to(request.action_digest.clone())),
-                        action_result: Some(action_result.clone()),
-                        results_cache_policy: None,
-                        ..Default::default()
-                    },
-                    metadata,
-                    self.runtime_opts.use_fbcode_metadata,
-                ))
-                .await?;
+        retry(
+            || async {
+                let res = self
+                    .action_cache_client()
+                    .await?
+                    .update_action_result(with_re_metadata(
+                        UpdateActionResultRequest {
+                            instance_name: self.instance_name.as_str().to_owned(),
+                            action_digest: Some(tdigest_to(request.action_digest.clone())),
+                            action_result: Some(action_result.clone()),
+                            results_cache_policy: None,
+                            ..Default::default()
+                        },
+                        metadata,
+                        self.runtime_opts,
+                    ))
+                    .await?;
 
-            Ok(WriteActionResultResponse {
-                actual_action_result: convert_action_result(res.into_inner())?,
-                ttl_seconds: 0,
-            })
-        })
+                Ok(WriteActionResultResponse {
+                    actual_action_result: convert_action_result(res.into_inner())?,
+                    ttl_seconds: 0,
+                })
+            },
+            self.runtime_opts.max_retries,
+            INITIAL_DELAY,
+            MAX_DELAY,
+            false,
+        )
         .await
     }
 
@@ -737,26 +684,32 @@ impl REClient {
             .map(|ep| ep.priority)
             .unwrap_or_default();
 
-        let stream = retry(|| async {
-            let stream = self
-                .execution_client()
-                .await?
-                .execute(with_re_metadata(
-                    GExecuteRequest {
-                        instance_name: self.instance_name.as_str().to_owned(),
-                        skip_cache_lookup: execute_request.skip_cache_lookup,
-                        execution_policy: Some(ExecutionPolicy { priority }),
-                        results_cache_policy: Some(ResultsCachePolicy { priority: 0 }),
-                        action_digest: Some(action_digest.clone()),
-                        ..Default::default()
-                    },
-                    metadata,
-                    self.runtime_opts.use_fbcode_metadata,
-                ))
-                .await?
-                .into_inner();
-            anyhow::Ok(stream)
-        })
+        let stream = retry(
+            || async {
+                let stream = self
+                    .execution_client()
+                    .await?
+                    .execute(with_re_metadata(
+                        GExecuteRequest {
+                            instance_name: self.instance_name.as_str().to_owned(),
+                            skip_cache_lookup: execute_request.skip_cache_lookup,
+                            execution_policy: Some(ExecutionPolicy { priority }),
+                            results_cache_policy: Some(ResultsCachePolicy { priority: 0 }),
+                            action_digest: Some(action_digest.clone()),
+                            ..Default::default()
+                        },
+                        metadata,
+                        self.runtime_opts,
+                    ))
+                    .await?
+                    .into_inner();
+                anyhow::Ok(stream)
+            },
+            self.runtime_opts.max_retries,
+            INITIAL_DELAY,
+            MAX_DELAY,
+            true,
+        )
         .await?;
 
         let stream = futures::stream::try_unfold(stream, move |mut stream| async {
@@ -859,34 +812,53 @@ impl REClient {
         request: UploadRequest,
     ) -> anyhow::Result<UploadResponse> {
         upload_impl(
+            &self.runtime_opts,
             &self.instance_name,
             request,
             self.bystream_compressor,
             self.capabilities.max_total_batch_size,
             self.runtime_opts.max_concurrent_uploads_per_action,
             |re_request| async move {
-                let resp = self
-                    .cas_client()
-                    .await?
-                    .batch_update_blobs(with_re_metadata(
-                        re_request,
-                        metadata,
-                        self.runtime_opts.use_fbcode_metadata,
-                    ))
-                    .await?;
-                Ok(resp.into_inner())
+                retry(
+                    || async {
+                        let resp = self
+                            .cas_client()
+                            .await?
+                            .batch_update_blobs(with_re_metadata(
+                                re_request.clone(),
+                                metadata,
+                                self.runtime_opts,
+                            ))
+                            .await?;
+                        Ok(resp.into_inner())
+                    },
+                    self.runtime_opts.max_retries,
+                    INITIAL_DELAY,
+                    MAX_DELAY,
+                    false,
+                )
+                .await
             },
             |segments| async move {
-                let resp = self
-                    .bytestream_client()
-                    .await?
-                    .write(with_re_metadata(
-                        futures::stream::iter(segments),
-                        metadata,
-                        self.runtime_opts.use_fbcode_metadata,
-                    ))
-                    .await?;
-                Ok(resp.into_inner())
+                retry(
+                    || async {
+                        let resp = self
+                            .bytestream_client()
+                            .await?
+                            .write(with_re_metadata(
+                                futures::stream::iter(segments.clone()),
+                                metadata,
+                                self.runtime_opts,
+                            ))
+                            .await?;
+                        Ok(resp.into_inner())
+                    },
+                    self.runtime_opts.max_retries,
+                    INITIAL_DELAY,
+                    MAX_DELAY,
+                    false,
+                )
+                .await
             },
         )
         .await
@@ -923,34 +895,64 @@ impl REClient {
         request: DownloadRequest,
     ) -> anyhow::Result<DownloadResponse> {
         download_impl(
+            &self.runtime_opts,
             &self.instance_name,
             request,
             self.bystream_compressor,
             self.capabilities.max_total_batch_size,
             |re_request| async move {
-                let resp = self
-                    .cas_client()
-                    .await?
-                    .batch_read_blobs(with_re_metadata(
-                        re_request,
-                        metadata,
-                        self.runtime_opts.use_fbcode_metadata,
-                    ))
-                    .await?;
-                Ok(resp.into_inner())
+                retry(
+                    || async {
+                        let resp = self
+                            .cas_client()
+                            .await?
+                            .batch_read_blobs(with_re_metadata(
+                                re_request.clone(),
+                                metadata,
+                                self.runtime_opts,
+                            ))
+                            .await?;
+                        Ok(resp.into_inner())
+                    },
+                    self.runtime_opts.max_retries,
+                    INITIAL_DELAY,
+                    MAX_DELAY,
+                    // Blobs can transiently 404 while propagating across a distributed CAS.
+                    true,
+                )
+                .await
             },
             |read_request| async move {
-                let response = self
-                    .bytestream_client()
-                    .await?
-                    .read(with_re_metadata(
-                        read_request,
-                        metadata,
-                        self.runtime_opts.use_fbcode_metadata,
-                    ))
-                    .await?
-                    .into_inner();
-                Ok(Box::pin(response.into_stream()))
+                retry(
+                    || async {
+                        let response = self
+                            .bytestream_client()
+                            .await?
+                            .read(with_re_metadata(
+                                read_request.clone(),
+                                metadata,
+                                self.runtime_opts,
+                            ))
+                            .await?
+                            .into_inner();
+                        Ok(Box::pin(response.into_stream())
+                            as Pin<
+                                Box<
+                                    dyn Stream<
+                                            Item = Result<
+                                                re_grpc_proto::google::bytestream::ReadResponse,
+                                                tonic::Status,
+                                            >,
+                                        > + Send,
+                                >,
+                            >)
+                    },
+                    self.runtime_opts.max_retries,
+                    INITIAL_DELAY,
+                    MAX_DELAY,
+                    false,
+                )
+                .await
             },
         )
         .await
@@ -988,23 +990,29 @@ impl REClient {
             if !digests_to_check.is_empty() {
                 tracing::debug!(num_digests = digests_to_check.len(), "FindMissingBlobs");
                 let blob_digests: Vec<_> = digests_to_check.map(|b| tdigest_to(b.clone()));
-                let resp: FindMissingBlobsResponse = retry(|| async {
-                    let resp = self
-                        .cas_client()
-                        .await?
-                        .find_missing_blobs(with_re_metadata(
-                            FindMissingBlobsRequest {
-                                instance_name: self.instance_name.as_str().to_owned(),
-                                blob_digests: blob_digests.clone(),
-                                ..Default::default()
-                            },
-                            metadata,
-                            self.runtime_opts.use_fbcode_metadata,
-                        ))
-                        .await
-                        .context("Failed to request what blobs are not present on remote")?;
-                    Ok(resp.into_inner())
-                })
+                let resp: FindMissingBlobsResponse = retry(
+                    || async {
+                        let resp = self
+                            .cas_client()
+                            .await?
+                            .find_missing_blobs(with_re_metadata(
+                                FindMissingBlobsRequest {
+                                    instance_name: self.instance_name.as_str().to_owned(),
+                                    blob_digests: blob_digests.clone(),
+                                    ..Default::default()
+                                },
+                                metadata,
+                                self.runtime_opts,
+                            ))
+                            .await
+                            .context("Failed to request what blobs are not present on remote")?;
+                        Ok(resp.into_inner())
+                    },
+                    self.runtime_opts.max_retries,
+                    INITIAL_DELAY,
+                    MAX_DELAY,
+                    false,
+                )
                 .await?;
 
                 // Update the results and the cache
@@ -1292,6 +1300,7 @@ fn convert_t_action_result2(t_action_result: TActionResult2) -> anyhow::Result<A
 }
 
 async fn download_impl<Byt, BytRet, Cas>(
+    opts: &RERuntimeOpts,
     instance_name: &InstanceName,
     request: DownloadRequest,
     bystream_compressor: Option<Compressor>,
@@ -1301,7 +1310,7 @@ async fn download_impl<Byt, BytRet, Cas>(
 ) -> anyhow::Result<DownloadResponse>
 where
     Byt: Future<Output = anyhow::Result<Pin<Box<BytRet>>>>,
-    BytRet: Stream<Item = Result<ReadResponse, tonic::Status>> + Send,
+    BytRet: Stream<Item = Result<ReadResponse, tonic::Status>> + Send + ?Sized,
     Cas: Future<Output = anyhow::Result<BatchReadBlobsResponse>>,
 {
     fn resource_name(
@@ -1409,12 +1418,9 @@ where
 
     let mut batched_blobs_response = HashMap::new();
     for read_blob_req in requests {
-        let resp = retry(|| async {
-            cas_f(read_blob_req.clone())
-                .await
-                .context("Failed to make BatchReadBlobs request")
-        })
-        .await?;
+        let resp = cas_f(read_blob_req.clone())
+            .await
+            .context("Failed to make BatchReadBlobs request")?;
         for r in resp.responses.into_iter() {
             let digest = tdigest_from(r.digest.context("Response digest not found.")?);
             check_status(r.status.unwrap_or_default())?;
@@ -1436,12 +1442,18 @@ where
     let mut inlined_blobs = vec![];
     for digest in inlined_digests {
         let data = if digest.size_in_bytes as usize >= max_total_batch_size {
-            retry(|| async {
-                let mut accum = vec![];
-                let mut reader = bystream_fut(digest.clone()).await?;
-                tokio::io::copy(&mut reader, &mut accum).await?;
-                Ok(accum)
-            })
+            retry(
+                || async {
+                    let mut accum = vec![];
+                    let mut reader = bystream_fut(digest.clone()).await?;
+                    tokio::io::copy(&mut reader, &mut accum).await?;
+                    Ok(accum)
+                },
+                opts.max_retries,
+                INITIAL_DELAY,
+                MAX_DELAY,
+                false,
+            )
             .await?
         } else {
             get(&digest)?
@@ -1454,42 +1466,52 @@ where
     }
 
     let writes = file_digests.iter().map(|req| async {
-        let mut opts = OpenOptions::new();
-        opts.read(true).write(true).create(true).truncate(true);
+        let mut open_options = OpenOptions::new();
+        open_options
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true);
         #[cfg(unix)]
         {
             if req.is_executable {
-                opts.mode(0o755);
+                open_options.mode(0o755);
             } else {
-                opts.mode(0o644);
+                open_options.mode(0o644);
             }
         }
 
-        retry(|| async {
-            let mut file = opts
-                .open(&req.named_digest.name)
-                .await
-                .context("Error opening")?;
+        retry(
+            || async {
+                let mut file = open_options
+                    .open(&req.named_digest.name)
+                    .await
+                    .context("Error opening")?;
 
-            // If the data is small enough to be transferred in a batch
-            // blob update, write it all at once to the file. Otherwise, it'll
-            // be streamed in chunks as the remote responds.
-            if req.named_digest.digest.size_in_bytes < max_total_batch_size as i64 {
-                let data = get(&req.named_digest.digest)?;
-                file.write_all(&data)
-                    .await
-                    .with_context(|| format!("Error writing: {}", req.named_digest.digest))?;
-            } else {
-                let mut reader = bystream_fut(req.named_digest.digest.clone()).await?;
-                tokio::io::copy(&mut reader, &mut file)
-                    .await
-                    .with_context(|| {
-                        format!("Error writing chunk of: {}", req.named_digest.digest)
-                    })?;
-            }
-            file.flush().await.context("Error flushing")?;
-            anyhow::Ok(())
-        })
+                // If the data is small enough to be transferred in a batch
+                // blob update, write it all at once to the file. Otherwise, it'll
+                // be streamed in chunks as the remote responds.
+                if req.named_digest.digest.size_in_bytes < max_total_batch_size as i64 {
+                    let data = get(&req.named_digest.digest)?;
+                    file.write_all(&data)
+                        .await
+                        .with_context(|| format!("Error writing: {}", req.named_digest.digest))?;
+                } else {
+                    let mut reader = bystream_fut(req.named_digest.digest.clone()).await?;
+                    tokio::io::copy(&mut reader, &mut file)
+                        .await
+                        .with_context(|| {
+                            format!("Error writing chunk of: {}", req.named_digest.digest)
+                        })?;
+                }
+                file.flush().await.context("Error flushing")?;
+                anyhow::Ok(())
+            },
+            opts.max_retries,
+            INITIAL_DELAY,
+            MAX_DELAY,
+            false,
+        )
         .await
         .with_context(|| {
             format!(
@@ -1509,6 +1531,7 @@ where
 }
 
 async fn upload_impl<Byt, Cas>(
+    opts: &RERuntimeOpts,
     instance_name: &InstanceName,
     request: UploadRequest,
     bystream_compressor: Option<Compressor>,
@@ -1617,10 +1640,17 @@ where
             &blob.digest,
         );
         let fut = async move {
-            retry(|| async {
-                bystream_fut(resource_name.clone(), Box::new(Cursor::new(data.clone()))).await?;
-                Ok(vec![hash.clone()])
-            })
+            retry(
+                || async {
+                    bystream_fut(resource_name.clone(), Box::new(Cursor::new(data.clone())))
+                        .await?;
+                    Ok(vec![hash.clone()])
+                },
+                opts.max_retries,
+                INITIAL_DELAY,
+                MAX_DELAY,
+                false,
+            )
             .await
         };
         upload_futures.push(Box::pin(fut));
@@ -1644,14 +1674,20 @@ where
         );
 
         let fut = async move {
-            retry(|| async {
-                let file = tokio::fs::File::open(&name)
-                    .await
-                    .with_context(|| format!("Opening `{name}` for reading failed"))?;
+            retry(
+                || async {
+                    let file = tokio::fs::File::open(&name)
+                        .await
+                        .with_context(|| format!("Opening `{name}` for reading failed"))?;
 
-                bystream_fut(resource_name.clone(), Box::new(BufReader::new(file))).await?;
-                Ok(vec![hash.clone()])
-            })
+                    bystream_fut(resource_name.clone(), Box::new(BufReader::new(file))).await?;
+                    Ok(vec![hash.clone()])
+                },
+                opts.max_retries,
+                INITIAL_DELAY,
+                MAX_DELAY,
+                false,
+            )
             .await
         };
         upload_futures.push(Box::pin(fut));
@@ -1698,7 +1734,7 @@ where
                 .map(|x| x.digest.as_ref().unwrap().hash.clone())
                 .collect::<Vec<String>>();
 
-            let response = retry(|| async { cas_f(re_request.clone()).await }).await?;
+            let response = cas_f(re_request.clone()).await?;
             let failures: Vec<String> = response
                 .responses
                 .iter()
@@ -1742,7 +1778,7 @@ where
 fn with_re_metadata<T>(
     t: T,
     metadata: &RemoteExecutionMetadata,
-    use_fbcode_metadata: bool,
+    runtime_opts: RERuntimeOpts,
 ) -> tonic::Request<T> {
     // This creates a new Tonic request with attached metadata for the RE
     // backend. There are two cases here we need to support:
@@ -1764,8 +1800,9 @@ fn with_re_metadata<T>(
     // Meta builds catch those issues earlier.
 
     let mut msg = tonic::Request::new(t);
+    msg.set_timeout(runtime_opts.rpc_timeout);
 
-    if use_fbcode_metadata {
+    if runtime_opts.use_fbcode_metadata {
         // This is pretty ugly, but the protobuf spec that defines this is
         // internal, so considering field numbers need to be stable anyway (=
         // low risk), and this is not used in prod (= low impact if this goes
@@ -1860,6 +1897,17 @@ mod tests {
 
     use super::*;
 
+    fn test_re_runtime_opts() -> RERuntimeOpts {
+        RERuntimeOpts {
+            use_fbcode_metadata: false,
+            max_concurrent_uploads_per_action: None,
+            cas_ttl_secs: 0,
+            find_missing_blobs_batch_size: 100,
+            max_retries: 0,
+            rpc_timeout: Duration::from_secs(60),
+        }
+    }
+
     #[tokio::test]
     async fn test_download_named() -> anyhow::Result<()> {
         let work = tempfile::tempdir()?;
@@ -1923,6 +1971,7 @@ mod tests {
         };
 
         download_impl(
+            &test_re_runtime_opts(),
             &InstanceName(None),
             req,
             None,
@@ -2030,6 +2079,7 @@ mod tests {
         };
 
         download_impl(
+            &test_re_runtime_opts(),
             &InstanceName(None),
             req,
             None,
@@ -2112,6 +2162,7 @@ mod tests {
         };
 
         let res = download_impl(
+            &test_re_runtime_opts(),
             &InstanceName(None),
             req,
             None,
@@ -2199,6 +2250,7 @@ mod tests {
         let counter = AtomicU16::new(0);
 
         let res = download_impl(
+            &test_re_runtime_opts(),
             &InstanceName(None),
             req,
             None,
@@ -2268,6 +2320,7 @@ mod tests {
         };
 
         let res = download_impl(
+            &test_re_runtime_opts(),
             &InstanceName(None),
             req,
             None,
@@ -2324,6 +2377,7 @@ mod tests {
         let res = BatchReadBlobsResponse { responses: vec![] };
 
         let res = download_impl(
+            &test_re_runtime_opts(),
             &InstanceName(None),
             req,
             None,
@@ -2363,6 +2417,7 @@ mod tests {
         };
 
         download_impl(
+            &test_re_runtime_opts(),
             &InstanceName(Some("instance".to_owned())),
             req,
             None,
@@ -2433,6 +2488,7 @@ mod tests {
         };
 
         upload_impl(
+            &test_re_runtime_opts(),
             &InstanceName(None),
             req,
             None,
@@ -2517,6 +2573,7 @@ mod tests {
         };
 
         upload_impl(
+            &test_re_runtime_opts(),
             &InstanceName(None),
             req,
             None,
@@ -2592,6 +2649,7 @@ mod tests {
         };
 
         upload_impl(
+            &test_re_runtime_opts(),
             &InstanceName(None),
             req,
             None,
@@ -2654,6 +2712,7 @@ mod tests {
         };
 
         let resp: Result<UploadResponse, anyhow::Error> = upload_impl(
+            &test_re_runtime_opts(),
             &InstanceName(None), // TODO
             req,
             None,
@@ -2716,6 +2775,7 @@ mod tests {
         };
 
         upload_impl(
+            &test_re_runtime_opts(),
             &InstanceName(None),
             req,
             None,
@@ -2756,6 +2816,7 @@ mod tests {
         ] {
             assert!(
                 upload_impl(
+                    &test_re_runtime_opts(),
                     &InstanceName(None),
                     UploadRequest {
                         files_with_digest: Some(vec![NamedDigest {
@@ -2781,6 +2842,7 @@ mod tests {
 
             assert!(
                 upload_impl(
+                    &test_re_runtime_opts(),
                     &InstanceName(None),
                     UploadRequest {
                         files_with_digest: Some(vec![NamedDigest {
@@ -2835,6 +2897,7 @@ mod tests {
         };
 
         upload_impl(
+            &test_re_runtime_opts(),
             &InstanceName(Some("instance".to_owned())),
             req,
             None,
@@ -2882,6 +2945,7 @@ mod tests {
         };
 
         upload_impl(
+            &test_re_runtime_opts(),
             &InstanceName(Some("instance".to_owned())),
             req,
             Some(Compressor::Zstd),
@@ -2951,6 +3015,7 @@ mod tests {
 
         let blob_data_ref = &blob_data;
         upload_impl(
+            &test_re_runtime_opts(),
             &InstanceName(Some("instance".to_owned())),
             req,
             Some(Compressor::Zstd),
@@ -2990,6 +3055,7 @@ mod tests {
         let compressed_data_ref = &compressed_data;
 
         let d_resp = download_impl(
+            &test_re_runtime_opts(),
             &InstanceName(None),
             DownloadRequest {
                 inlined_digests: Some(vec![TDigest {
