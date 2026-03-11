@@ -54,7 +54,7 @@ impl ImportPath {
 
     pub fn new_with_build_file_cells(
         path: CellPath,
-        build_file_cell: BuildFileCell,
+        mut build_file_cell: BuildFileCell,
     ) -> buck2_error::Result<Self> {
         if path.parent().is_none() {
             return Err(ImportPathError::Invalid(path).into());
@@ -68,6 +68,8 @@ impl ImportPath {
             return Err(ImportPathError::Suffix(path).into());
         }
 
+        build_file_cell = BuildFileCell::new(path.cell());
+
         Ok(Self {
             path,
             build_file_cell,
@@ -77,7 +79,7 @@ impl ImportPath {
     /// LSP creates imports for non-bzl files.
     pub fn new_hack_for_lsp(
         path: CellPath,
-        build_file_cell: BuildFileCell,
+        mut build_file_cell: BuildFileCell,
     ) -> buck2_error::Result<Self> {
         if path.parent().is_none() {
             return Err(ImportPathError::Invalid(path).into());
@@ -86,6 +88,8 @@ impl ImportPath {
         if path.path().as_str().contains('?') {
             return Err(ImportPathError::Invalid(path).into());
         }
+
+        build_file_cell = BuildFileCell::new(path.cell());
 
         Ok(Self {
             path,
