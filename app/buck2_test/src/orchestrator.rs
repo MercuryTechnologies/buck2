@@ -1064,8 +1064,6 @@ impl BuckTestOrchestrator<'_> {
             action_key_suffix: create_action_key_suffix(stage),
         };
 
-        // For test execution, we currently do not do any cache queries
-
         let prepared_action = match executor.prepare_action(&request, digest_config, false) {
             Ok(prepared_action) => prepared_action,
             Err(e) => return Err(ExecuteError::Error(e)),
@@ -1158,24 +1156,26 @@ impl BuckTestOrchestrator<'_> {
                 let start = TestRunStart {
                     suite: test_suite.clone(),
                 };
-                events
+                let (result, cached) = events
                     .span_async(start, async move {
-                        let result = if supports_test_execution_caching {
+                        let (result, cached) = if supports_test_execution_caching || re_cache_enabled {
                             match executor
                                 .action_cache(manager, &prepared_command, cancellation)
                                 .await
                             {
                                 ControlFlow::Continue(manager) => {
-                                    executor
+                                    let result = executor
                                         .exec_cmd(manager, &prepared_command, cancellation)
-                                        .await
+                                        .await;
+                                    (result, false)
                                 }
-                                ControlFlow::Break(result) => result,
+                                ControlFlow::Break(result) => (result, true),
                             }
                         } else {
-                            executor
+                            let result = executor
                                 .exec_cmd(manager, &prepared_command, cancellation)
-                                .await
+                                .await;
+                            (result, false)
                         };
                         let end = TestRunEnd {
                             suite: test_suite,
@@ -1190,9 +1190,31 @@ impl BuckTestOrchestrator<'_> {
                             )
                             .ok(),
                         };
-                        (result, end)
+                        ((result, cached), end)
                     })
-                    .await
+                    .await;
+                if !cached && re_cache_enabled {
+                    let info = CacheUploadInfo {
+                        target: &test_target as _,
+                        digest_config,
+                        mergebase: &None,
+                        re_platform: executor.re_platform(),
+                    };
+                    let _result = match executor
+                        .cache_upload(
+                            &info,
+                            &result,
+                            None,
+                            None,
+                            &prepared_action.action_and_blobs,
+                        )
+                        .await
+                    {
+                        Ok(result) => result,
+                        Err(e) => return Err(ExecuteError::Error(e.into())),
+                    };
+                }
+                result
             }
         };
 
@@ -1354,6 +1376,7 @@ impl BuckTestOrchestrator<'_> {
                 )
             }
         };
+
 
         let executor = CommandExecutor::new(
             executor,
