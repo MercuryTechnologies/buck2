@@ -550,14 +550,14 @@ struct TestExecutionKey {
 #[derive(Clone, Dupe, Debug, Eq, Hash, PartialEq, Allocative)]
 enum TestExecutionPrefix {
     Listing,
-    Testing(Arc<ForwardRelativePathBuf>),
+    Testing,
 }
 
 impl TestExecutionPrefix {
-    fn new(stage: &TestStage, session: &TestSession) -> Self {
+    fn new(stage: &TestStage, _session: &TestSession) -> Self {
         match stage {
             TestStage::Listing { .. } => TestExecutionPrefix::Listing,
-            TestStage::Testing { .. } => TestExecutionPrefix::Testing(session.prefix().dupe()),
+            TestStage::Testing { .. } => TestExecutionPrefix::Testing,
         }
     }
 }
@@ -566,7 +566,7 @@ impl Display for TestExecutionPrefix {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             TestExecutionPrefix::Listing => write!(f, "Listing"),
-            TestExecutionPrefix::Testing(prefix) => write!(f, "Testing({prefix})"),
+            TestExecutionPrefix::Testing => write!(f, "Testing"),
         }
     }
 }
@@ -616,7 +616,7 @@ async fn prepare_and_execute(
 ) -> Result<ExecuteData, ExecuteError> {
     let execute_on_dice = match key.stage.as_ref() {
         TestStage::Listing { cacheable, .. } => *cacheable,
-        TestStage::Testing { .. } => false,
+        TestStage::Testing { .. } => true,
     };
     if execute_on_dice {
         let result = tokio::select! {
@@ -2023,9 +2023,9 @@ async fn resolve_output_root(
                 .resolve_test_discovery(test_target)?
                 .into_forward_relative_path_buf()
         }
-        TestExecutionPrefix::Testing(prefix) => prefix.join(ForwardRelativePathBuf::unchecked_new(
-            Uuid::new_v4().to_string(),
-        )),
+        TestExecutionPrefix::Testing => {
+            ForwardRelativePathBuf::unchecked_new(Uuid::new_v4().to_string())
+        }
     };
     Ok(output_root)
 }
