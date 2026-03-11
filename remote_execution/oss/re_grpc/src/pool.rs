@@ -57,6 +57,7 @@ pub struct ChannelConfig {
     grpc_keepalive_time_secs: Option<u64>,
     grpc_keepalive_timeout_secs: Option<u64>,
     grpc_keepalive_while_idle: Option<bool>,
+    grpc_timeout: u64,
 }
 
 fn substitute_env_vars(s: &str) -> anyhow::Result<String> {
@@ -101,6 +102,7 @@ impl ChannelConfig {
             grpc_keepalive_time_secs: opts.grpc_keepalive_time_secs,
             grpc_keepalive_timeout_secs: opts.grpc_keepalive_timeout_secs,
             grpc_keepalive_while_idle: opts.grpc_keepalive_while_idle,
+            grpc_timeout: opts.grpc_timeout,
         })
     }
 
@@ -197,7 +199,8 @@ fn create_endpoint(
         .keep_alive_timeout(Duration::from_secs(
             config.grpc_keepalive_timeout_secs.unwrap_or(10),
         ))
-        .keep_alive_while_idle(config.grpc_keepalive_while_idle.unwrap_or(true));
+        .keep_alive_while_idle(config.grpc_keepalive_while_idle.unwrap_or(true))
+        .timeout(Duration::from_secs(config.grpc_timeout));
 
     Ok(endpoint)
 }
@@ -209,6 +212,7 @@ fn channel_from_endpoint(endpoint: &tonic::transport::Endpoint) -> Channel {
     // be set here instead of on the endpoint
     let mut http = HttpConnector::new();
     http.enforce_http(false);
+    http.set_keepalive(Some(Duration::from_secs(180)));
     let connector = CountingConnector::new(http);
 
     // We need to use a lazy channel so the pool isn't blocked waiting for new

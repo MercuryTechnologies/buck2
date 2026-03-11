@@ -522,6 +522,8 @@ pub struct Buck2OssReConfiguration {
     pub max_connections: Option<usize>,
     /// Maximum concurrent streams per connection.
     pub max_concurrency_per_connection: Option<usize>,
+    /// Timeout for RPC requests in seconds. Defaults to 60s.
+    pub grpc_timeout: u64,
 }
 
 #[derive(Clone, Debug, Default, Allocative)]
@@ -659,6 +661,12 @@ impl Buck2OssReConfiguration {
                 section: BUCK2_RE_CLIENT_CFG_SECTION,
                 property: "max_concurrency_per_connection",
             })?,
+            grpc_timeout: legacy_config
+                .parse(BuckconfigKeyRef {
+                    section: BUCK2_RE_CLIENT_CFG_SECTION,
+                    property: "grpc_timeout",
+                })?
+                .unwrap_or(60),
         })
     }
 }

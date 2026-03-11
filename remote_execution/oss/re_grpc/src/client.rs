@@ -610,7 +610,9 @@ fn is_retryable(err: &anyhow::Error) -> bool {
                 tonic::Code::Unavailable
                 | tonic::Code::ResourceExhausted
                 | tonic::Code::Aborted
-                | tonic::Code::Cancelled => return true,
+                | tonic::Code::Cancelled
+                | tonic::Code::Internal
+                | tonic::Code::Unknown => return true,
                 _ => {}
             }
         }
@@ -628,6 +630,12 @@ fn is_retryable(err: &anyhow::Error) -> bool {
         }
     }
     false
+}
+
+fn is_deadline_exceeded(err: &anyhow::Error) -> bool {
+    err.chain()
+        .filter_map(|cause| cause.downcast_ref::<tonic::Status>())
+        .any(|status| status.code() == tonic::Code::DeadlineExceeded)
 }
 
 /// Attaches an RE classification to gRPC errors, preserving the original chain
@@ -686,7 +694,7 @@ where
     for attempt in 1..=MAX_ATTEMPTS {
         match f().await {
             Ok(v) => return Ok(v),
-            Err(e) if is_retryable(&e) && attempt < MAX_ATTEMPTS => {
+            Err(e) if (is_retryable(&e) || is_deadline_exceeded(&e)) && attempt < MAX_ATTEMPTS => {
                 let sleep_for = delay_with_jitter(delay);
                 tracing::debug!(
                     "Transient error (attempt {}/{}), retrying in {:?}: {:#}",
