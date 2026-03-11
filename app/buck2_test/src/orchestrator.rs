@@ -565,14 +565,14 @@ struct TestExecutionKey {
 #[derive(Clone, Dupe, Debug, Eq, Hash, PartialEq, Allocative, Pagable)]
 enum TestExecutionPrefix {
     Listing,
-    Testing,
+    Testing(Arc<ForwardRelativePathBuf>),
 }
 
 impl TestExecutionPrefix {
-    fn new(stage: &TestStage, _session: &TestSession) -> Self {
+    fn new(stage: &TestStage, session: &TestSession) -> Self {
         match stage {
             TestStage::Listing { .. } => TestExecutionPrefix::Listing,
-            TestStage::Testing { .. } => TestExecutionPrefix::Testing,
+            TestStage::Testing { .. } => TestExecutionPrefix::Testing(session.prefix().dupe()),
         }
     }
 }
@@ -581,7 +581,7 @@ impl Display for TestExecutionPrefix {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             TestExecutionPrefix::Listing => write!(f, "Listing"),
-            TestExecutionPrefix::Testing => write!(f, "Testing"),
+            TestExecutionPrefix::Testing(prefix) => write!(f, "Testing({prefix})"),
         }
     }
 }
