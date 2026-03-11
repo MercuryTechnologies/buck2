@@ -24,6 +24,7 @@ static BUCK2_RE_CLIENT_CFG_SECTION: &str = "buck2_re_client";
 pub trait RemoteExecutionStaticMetadataImpl: Sized {
     fn from_legacy_config(legacy_config: &LegacyBuckConfig) -> buck2_error::Result<Self>;
     fn cas_semaphore_size(&self) -> usize;
+    fn exec_semaphore_size(&self) -> usize;
 }
 
 #[derive(Clone, Debug, Allocative)]
@@ -374,6 +375,10 @@ mod fbcode {
         fn cas_semaphore_size(&self) -> usize {
             self.cas_connection_count as usize * 30
         }
+
+        fn exec_semaphore_size(&self) -> usize {
+            self.execution_concurrency_limit as usize
+        }
     }
 }
 
@@ -395,6 +400,10 @@ mod not_fbcode {
         fn cas_semaphore_size(&self) -> usize {
             // FIXME: make this configurable?
             1024
+        }
+
+        fn exec_semaphore_size(&self) -> usize {
+            self.0.execution_concurrency_limit.unwrap_or(400)
         }
     }
 }
