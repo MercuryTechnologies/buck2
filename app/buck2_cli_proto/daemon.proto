@@ -578,6 +578,18 @@ message TestRequest {
   // should be built instead of only test providers. When unset, this defaults
   // to the `buck2.test_builds_targets` buckconfig.
   optional bool build_run_info = 16;
+
+  enum TestOutputMode {
+    // Show output from all tests (default).
+    ALL = 0;
+    // Only show output from failed tests.
+    ERRORS = 1;
+    // Show no test output, only the summary.
+    NONE = 2;
+  }
+
+  // Controls how much test output is displayed.
+  TestOutputMode test_output_mode = 17;
 }
 
 message BxlRequest {
