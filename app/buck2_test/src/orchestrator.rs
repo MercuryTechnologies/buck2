@@ -57,6 +57,7 @@ use buck2_build_api::materialize::invocation_re_use_case;
 use buck2_build_signals::env::NodeDuration;
 use buck2_build_signals::env::WaitingCategory;
 use buck2_build_signals::env::WaitingData;
+use buck2_cli_proto::test_request::TestOutputMode;
 use buck2_common::dice::cells::HasCellResolver;
 use buck2_common::events::HasEvents;
 use buck2_common::file_ops::metadata::TrackedFileDigest;
@@ -172,6 +173,7 @@ use buck2_test_api::data::PrepareForLocalExecutionResult;
 use buck2_test_api::data::RequiredLocalResources;
 use buck2_test_api::data::TestResult;
 use buck2_test_api::data::TestStage;
+use buck2_test_api::data::TestStatus;
 use buck2_test_api::data::convert::host_sharing_requirements_to_grpc;
 use buck2_test_api::protocol::TestOrchestrator;
 use derive_more::From;
@@ -411,6 +413,7 @@ pub struct BuckTestOrchestrator<'a: 'static> {
     cancellations: &'a CancellationContext,
     re_client: Arc<remote_storage::ReClientWithCache>,
     internal_runner_config: InternalRunnerConfig,
+    test_output_mode: TestOutputMode,
 }
 
 /// Reads the root cell's full buckconfig, which follows `<file:...>` includes. The daemon's
@@ -452,6 +455,7 @@ impl<'a> BuckTestOrchestrator<'a> {
         results_channel: UnboundedSender<buck2_error::Result<ExecutorMessage>>,
         cancellations: &'a CancellationContext,
         internal_runner_config: InternalRunnerConfig,
+        test_output_mode: TestOutputMode,
     ) -> buck2_error::Result<BuckTestOrchestrator<'a>> {
         let events = dice.per_transaction_data().get_dispatcher().dupe();
         let re_client = Arc::new(remote_storage::ReClientWithCache::new(
@@ -466,6 +470,7 @@ impl<'a> BuckTestOrchestrator<'a> {
             cancellations,
             re_client,
             internal_runner_config,
+            test_output_mode,
         ))
     }
 
@@ -478,6 +483,7 @@ impl<'a> BuckTestOrchestrator<'a> {
         cancellations: &'a CancellationContext,
         re_client: Arc<remote_storage::ReClientWithCache>,
         internal_runner_config: InternalRunnerConfig,
+        test_output_mode: TestOutputMode,
     ) -> BuckTestOrchestrator<'a> {
         Self {
             dice,
@@ -488,6 +494,7 @@ impl<'a> BuckTestOrchestrator<'a> {
             cancellations,
             re_client,
             internal_runner_config,
+            test_output_mode,
         }
     }
 
@@ -1065,11 +1072,28 @@ impl TestOrchestrator for BuckTestOrchestrator<'_> {
     }
 
     async fn report_test_result(&self, r: TestResult) -> buck2_error::Result<()> {
-        let event = buck2_data::instant_event::Data::TestResult(translations::convert_test_result(
-            r.clone(),
-            &self.session,
-        )?);
-        self.events.instant_event(event);
+        // Only send test result events based on the output mode
+        let should_send_event = match self.test_output_mode {
+            TestOutputMode::All => true, // Show all test results
+            TestOutputMode::Errors => {
+                // Only show failed test results
+                matches!(
+                    r.status,
+                    TestStatus::FAIL
+                        | TestStatus::FATAL
+                        | TestStatus::TIMEOUT
+                        | TestStatus::LISTING_FAILED
+                )
+            }
+            TestOutputMode::None => false, // Don't show any test results
+        };
+
+        if should_send_event {
+            let event = buck2_data::instant_event::Data::TestResult(
+                translations::convert_test_result(r.clone(), &self.session)?,
+            );
+            self.events.instant_event(event);
+        }
         self.results_channel
             .unbounded_send(Ok(ExecutorMessage::TestResult(r)))
             .map_err(|_| {
@@ -3094,6 +3118,7 @@ mod tests {
                 CancellationContext::testing(),
                 re_client,
                 InternalRunnerConfig::parse(None),
+                TestOutputMode::All, // Default to showing all output in tests
             ),
             receiver,
         ))
