@@ -221,9 +221,9 @@ pub fn handle_soft_error(
     // @oss-disable: let is_open_source = false;
     let is_open_source = true; // @oss-enable
     if is_open_source {
-        // We don't log these, and we have no legacy users, and they might not upgrade that often,
-        // so lets just break open source things immediately.
-        return Err(err);
+        // Soft errors should not fail the build. Log at debug so there is some
+        // visibility without crashing the daemon.
+        tracing::debug!("Soft error (non-fatal) [{category}]: {:?}", err);
     }
 
     Ok(err)
