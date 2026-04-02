@@ -399,9 +399,10 @@ impl DaemonState {
             let disk_state_options = DiskStateOptions::new(root_config, materializations.dupe())?;
 
             let blocking_executor: Arc<dyn BlockingExecutor> =
-                if cfg!(any(target_os = "macos", target_os = "windows")) {
-                    Arc::new(DirectIoExecutor::new(fs.dupe())?)
-                } else {
+                //if cfg!(any(target_os = "macos", target_os = "windows")) {
+                //    Arc::new(DirectIoExecutor::new(fs.dupe())?)
+                //} else
+                {
                     Arc::new(BuckBlockingExecutor::default_concurrency(fs.dupe())?)
                 };
 
