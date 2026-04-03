@@ -374,6 +374,8 @@ impl BlockingExecutor for DirectIoExecutor {
 #[derive(Allocative)]
 enum BlockingExecutorFactoryKind {
     Pooled(Arc<BuckBlockingExecutorShared>),
+    // Unused while the https://github.com/facebook/buck2/issues/1282 workaround is in place.
+    #[allow(dead_code)]
     Direct,
 }
 
@@ -386,9 +388,13 @@ pub struct BlockingExecutorFactory {
 
 impl BlockingExecutorFactory {
     pub fn create() -> buck2_error::Result<Self> {
-        let kind = if cfg!(any(target_os = "macos", target_os = "windows")) {
-            BlockingExecutorFactoryKind::Direct
-        } else {
+        // NOTE: Due to this issue: https://github.com/facebook/buck2/issues/1282
+        // We need to revert DirectIoExecutor as a default to BuckBlockingExecutor on macOS.
+        //
+        //if cfg!(any(target_os = "macos", target_os = "windows")) {
+        //    BlockingExecutorFactoryKind::Direct
+        //} else
+        let kind = {
             BlockingExecutorFactoryKind::Pooled(Arc::new(
                 BuckBlockingExecutorShared::default_concurrency()?,
             ))
