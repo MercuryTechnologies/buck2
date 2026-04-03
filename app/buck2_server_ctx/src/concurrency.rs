@@ -544,12 +544,10 @@ impl ConcurrencyHandler {
                         }
 
                         let is_same_state = transaction.equivalent(&active.version);
-                        println!("transaction.equality_token = {}", transaction.equality_token());
-                        println!("active.version = {}", active.version);
+
                         // If we have a different state, attempt to transition to cleanup. This will
                         // succeed only if the current state is not in use.
                         if !is_same_state {
-                            println!("I AM HERE");
                             // If the active commands are preemptible, preempt them.
                             self.cancel_preemptible_commands(&mut data, is_same_state);
 
