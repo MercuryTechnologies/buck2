@@ -213,7 +213,7 @@ http-body-util = "0.1.0"
 httparse = "1.7.1"
 httptest = "0.16"
 humantime = "2.1"
-hyper = { version = "1.8.1", features = ["client", "http1", "http2"] }
+hyper = { version = "1.9", features = ["client", "http1", "http2"] }
 hyper-http-proxy = "1.0"
 hyper-rustls = { version = "0.27.0", features = ["http2"] }
 hyper-timeout = "0.5"
@@ -271,10 +271,10 @@ postcard = { version = "1.0.8", features = ["use-crc", "use-std"] }
 pretty_assertions = "1.2.1"
 probminhash = { git = "https://github.com/krallin/probminhash", rev = "3d6b7a5315305c2893a7a04e0de9e23b305992c5", default-features = false } # WAITING_FOR_PR https://github.com/jean-pierreBoth/probminhash/pull/4
 proc-macro2 = "1.0.106"
-prost = "0.14.3"
-prost-build = "0.14.3"
-prost-derive = "0.14.3"
-prost-types = "0.14.3"
+prost = "0.14"
+prost-build = "0.14"
+prost-derive = "0.14"
+prost-types = "0.14"
 protoc-bin-vendored = "3.0.0"
 psutil = "3.2"
 quick-xml = { version = "0.37", features = ["overlapped-lists", "serialize"] }
@@ -510,3 +510,9 @@ incremental = true
 # Base on the comment in https://github.com/jimblandy/perf-event/pull/53, we will no long need this patch in future.
 perf-event = { git = "https://github.com/Nero5023/perf-event.git", rev = "6dae86b6d4807acec081e6dc0a53167f57f8c0f4", version = "0.4" }
 perf-event-open-sys = { git = "https://github.com/Nero5023/perf-event.git", rev = "6dae86b6d4807acec081e6dc0a53167f57f8c0f4", version = "5.0" }
+hyper = { git = "https://github.com/arianvp/hyper.git", branch = "push-ktssyytnyrru" }
+tonic = { git = "https://github.com/edef1c/tonic.git", branch = "push-rosuyzxnysvw" }
+tonic-health = { git = "https://github.com/edef1c/tonic.git", branch = "push-rosuyzxnysvw" }
+tonic-reflection = { git = "https://github.com/edef1c/tonic.git", branch = "push-rosuyzxnysvw" }
+tonic-prost = { git = "https://github.com/edef1c/tonic.git", branch = "push-rosuyzxnysvw" }
+tonic-prost-build = { git = "https://github.com/edef1c/tonic.git", branch = "push-rosuyzxnysvw" }
