@@ -73,8 +73,8 @@ use re_grpc_proto::google::bytestream::ReadResponse;
 use re_grpc_proto::google::bytestream::WriteRequest;
 use re_grpc_proto::google::bytestream::WriteResponse;
 use re_grpc_proto::google::bytestream::byte_stream_client::ByteStreamClient;
-use re_grpc_proto::google::longrunning::operation::Result as OpResult;
 use re_grpc_proto::google::longrunning::Operation;
+use re_grpc_proto::google::longrunning::operation::Result as OpResult;
 use re_grpc_proto::google::rpc::Code;
 use re_grpc_proto::google::rpc::Status;
 use regex::Regex;
@@ -318,7 +318,7 @@ impl REClientBuilder {
 
         let tls_config = &tls_config;
 
-        let create_channel = |address: Option<String>| async move {
+        let create_channel = |address: Option<String>, with_timeout: bool| async move {
             let address = address.as_ref().context("No address")?;
             let address = substitute_env_vars(address).context("Invalid address")?;
             let uri = address.parse().context("Invalid address")?;
@@ -349,7 +349,14 @@ impl REClientBuilder {
             http.set_keepalive(Some(Duration::from_secs(180)));
             let connector = CountingConnector::new(http);
 
-            endpoint = endpoint.timeout(Duration::from_secs(opts.grpc_timeout));
+            // Apply a per-RPC deadline to all channels except the execution channel.
+            // The Execute RPC is a long-lived stream that stays open for the entire
+            // duration of the remote action (queued + executing), so a fixed short
+            // timeout would spuriously cancel it. All other RPCs are short unary calls
+            // where a deadline is appropriate.
+            if with_timeout {
+                endpoint = endpoint.timeout(Duration::from_secs(opts.grpc_timeout));
+            }
 
             anyhow::Ok(
                 endpoint
@@ -360,11 +367,11 @@ impl REClientBuilder {
         };
 
         let (cas, execution, action_cache, bytestream, capabilities) = futures::future::join5(
-            create_channel(opts.cas_address.clone()),
-            create_channel(opts.engine_address.clone()),
-            create_channel(opts.action_cache_address.clone()),
-            create_channel(opts.cas_address.clone()),
-            create_channel(opts.engine_address.clone()),
+            create_channel(opts.cas_address.clone(), true),
+            create_channel(opts.engine_address.clone(), false), // Execute streams are long-lived; no channel timeout
+            create_channel(opts.action_cache_address.clone(), true),
+            create_channel(opts.cas_address.clone(), true),
+            create_channel(opts.engine_address.clone(), true),
         )
         .await;
 
@@ -688,14 +695,12 @@ fn process_operation_message(msg: Operation) -> anyhow::Result<ExecuteWithProgre
             .result
             .context("Missing `result` when message was `done`")?
         {
-            OpResult::Error(rpc_status) => {
-                Err(REClientError {
-                    code: TCode(rpc_status.code),
-                    message: rpc_status.message,
-                    group: TCodeReasonGroup::UNKNOWN,
-                }
-                .into())
+            OpResult::Error(rpc_status) => Err(REClientError {
+                code: TCode(rpc_status.code),
+                message: rpc_status.message,
+                group: TCodeReasonGroup::UNKNOWN,
             }
+            .into()),
             OpResult::Response(any) => {
                 let execute_response_grpc: GExecuteResponse =
                     GExecuteResponse::decode(&any.value[..])?;
@@ -731,8 +736,7 @@ fn process_operation_message(msg: Operation) -> anyhow::Result<ExecuteWithProgre
             }
         }
     } else {
-        let meta =
-            ExecuteOperationMetadata::decode(&msg.metadata.unwrap_or_default().value[..])?;
+        let meta = ExecuteOperationMetadata::decode(&msg.metadata.unwrap_or_default().value[..])?;
 
         let stage = match execution_stage::Value::try_from(meta.stage) {
             Ok(execution_stage::Value::Unknown) => Stage::UNKNOWN,
