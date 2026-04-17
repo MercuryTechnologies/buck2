@@ -340,6 +340,10 @@ impl REClientBuilder {
             max_connections,
             max_concurrency_per_connection: opts.max_concurrency_per_connection.unwrap_or(100),
         };
+        // Execute is a long-lived stream, so it gets a pool whose channels do not carry the
+        // per-RPC deadline (`grpc_timeout`).
+        let execution_pool =
+            ChannelPool::new(pool_config.clone(), channel_config.without_timeout());
         let pool = ChannelPool::new(pool_config, channel_config);
 
         Ok(REClient::new(
@@ -358,6 +362,7 @@ impl REClientBuilder {
             instance_name,
             bystream_compressor,
             pool,
+            execution_pool,
             max_decoding_msg_size,
             interceptor,
             cas_address,
@@ -500,6 +505,9 @@ impl FindMissingCache {
 pub struct REClient {
     runtime_opts: RERuntimeOpts,
     pool: Arc<ChannelPool>,
+    // Separate pool for the execution channel: Execute is a long-lived stream, so it must not
+    // carry the per-RPC deadline applied to channels in `pool`.
+    execution_pool: Arc<ChannelPool>,
     capabilities: RECapabilities,
     instance_name: InstanceName,
     // buck2 calls find_missing for same blobs
@@ -740,8 +748,11 @@ fn decode_execute_operation(
     msg: Operation,
     cas_ttl_secs: i64,
 ) -> anyhow::Result<ExecuteWithProgressResponse> {
+    tracing::debug!(?msg, "RE ACTION RESPONSE");
+
     if !msg.done {
         let meta = ExecuteOperationMetadata::decode(&msg.metadata.unwrap_or_default().value[..])?;
+        tracing::debug!(?meta, "RE ACTION RESPONSE METADATA");
 
         let stage = match execution_stage::Value::try_from(meta.stage) {
             Ok(execution_stage::Value::Unknown) => Stage::UNKNOWN,
@@ -777,6 +788,8 @@ fn decode_execute_operation(
             let action_result = execute_response_grpc
                 .result
                 .with_context(|| "The action result is not defined.")?;
+
+            tracing::debug!(?action_result, "BUCK2 ACTION RESULT");
 
             let action_result = convert_action_result(action_result, cas_ttl_secs)?;
 
@@ -1020,6 +1033,7 @@ impl REClient {
         instance_name: InstanceName,
         bystream_compressor: Option<Compressor>,
         pool: ChannelPool,
+        execution_pool: ChannelPool,
         max_decoding_msg_size: usize,
         interceptor: InjectHeadersInterceptor,
         cas_address: String,
@@ -1030,6 +1044,7 @@ impl REClient {
         REClient {
             runtime_opts,
             pool: Arc::new(pool),
+            execution_pool: Arc::new(execution_pool),
             capabilities,
             instance_name,
             find_missing_cache: Mutex::new(FindMissingCache {
@@ -1132,13 +1147,16 @@ impl REClient {
         // TODO(aloiscochard): Map those properly in the request
         // use crate::proto::build::bazel::remote::execution::v2::ExecutionPolicy;
 
+        tracing::debug!(?execute_request, "RE ACTION REQUEST");
+        tracing::debug!(?metadata, "RE ACTION REQUEST METADATA");
+
         let action_digest = tdigest_to(&execute_request.action_digest);
         let priority = execute_request
             .execution_policy
             .map(|ep| ep.priority)
             .unwrap_or_default();
 
-        let pool = self.pool.dupe();
+        let pool = self.execution_pool.dupe();
         let interceptor = self.interceptor.dupe();
         let engine_address = self.engine_address.clone();
         let use_fbcode_metadata = self.runtime_opts.use_fbcode_metadata;
