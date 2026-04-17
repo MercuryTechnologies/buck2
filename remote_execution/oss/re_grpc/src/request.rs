@@ -84,7 +84,7 @@ pub struct ExtendDigestsTtlRequest {
     pub _dot_dot: (),
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct ExecuteRequest {
     pub action_digest: TDigest,
     pub skip_cache_lookup: bool,
@@ -94,13 +94,13 @@ pub struct ExecuteRequest {
     pub _dot_dot: (),
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct GangSpecification {
     pub workers_spec: GangWorkersSpec,
     pub _dot_dot: (),
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub enum GangWorkersSpec {
     EnumeratedSpec(EnumeratedGangSpec),
 }
@@ -111,26 +111,26 @@ impl GangWorkersSpec {
     }
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct EnumeratedGangSpec {
     pub workers: Vec<GangMember>,
     pub _dot_dot: (),
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct GangMember {
     pub host_runtime_requirements: THostRuntimeRequirements,
     pub _dot_dot: (),
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct TDependency {
     pub smc_tier: String,
     pub id: String,
     pub _dot_dot: (),
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct TExecutionPolicy {
     pub priority: i32,
     pub affinity_keys: Vec<String>,
@@ -139,7 +139,7 @@ pub struct TExecutionPolicy {
     pub _dot_dot: (),
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct THostResourceRequirements {
     pub mem_bytes: i64,
     pub cpu_units: i64,
@@ -148,7 +148,7 @@ pub struct THostResourceRequirements {
     pub _dot_dot: (),
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct THostRuntimeRequirements {
     pub platform: TPlatform,
     pub host_resource_requirements: THostResourceRequirements,

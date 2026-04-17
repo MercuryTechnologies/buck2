@@ -57,7 +57,10 @@ pub struct ChannelConfig {
     grpc_keepalive_time_secs: Option<u64>,
     grpc_keepalive_timeout_secs: Option<u64>,
     grpc_keepalive_while_idle: Option<bool>,
-    grpc_timeout: u64,
+    /// Per-RPC deadline applied to channels created from this config. `None`
+    /// for channels carrying long-lived streams (e.g. Execute), where a fixed
+    /// deadline would spuriously cancel an in-flight action.
+    grpc_timeout: Option<u64>,
 }
 
 fn substitute_env_vars(s: &str) -> anyhow::Result<String> {
@@ -102,8 +105,17 @@ impl ChannelConfig {
             grpc_keepalive_time_secs: opts.grpc_keepalive_time_secs,
             grpc_keepalive_timeout_secs: opts.grpc_keepalive_timeout_secs,
             grpc_keepalive_while_idle: opts.grpc_keepalive_while_idle,
-            grpc_timeout: opts.grpc_timeout,
+            grpc_timeout: Some(opts.grpc_timeout),
         })
+    }
+
+    /// Returns a copy of this config with the per-RPC deadline disabled, for
+    /// channels carrying long-lived streams (e.g. Execute).
+    pub fn without_timeout(&self) -> Self {
+        Self {
+            grpc_timeout: None,
+            ..self.clone()
+        }
     }
 
     async fn create_tls_config(opts: &Buck2OssReConfiguration) -> anyhow::Result<ClientTlsConfig> {
@@ -199,8 +211,10 @@ fn create_endpoint(
         .keep_alive_timeout(Duration::from_secs(
             config.grpc_keepalive_timeout_secs.unwrap_or(10),
         ))
-        .keep_alive_while_idle(config.grpc_keepalive_while_idle.unwrap_or(true))
-        .timeout(Duration::from_secs(config.grpc_timeout));
+        .keep_alive_while_idle(config.grpc_keepalive_while_idle.unwrap_or(true));
+    if let Some(grpc_timeout) = config.grpc_timeout {
+        endpoint = endpoint.timeout(Duration::from_secs(grpc_timeout));
+    }
 
     Ok(endpoint)
 }
@@ -433,8 +447,9 @@ impl HostPool {
 /// All channels in the pool share a single `ChannelConfig`. The address-keyed
 /// cache assumes this: if per-call config variation is ever needed, the cache
 /// key must include config identity, not just the address.
+#[derive(Clone)]
 pub struct ChannelPool {
-    pools: Mutex<HashMap<String, Arc<HostPool>>>,
+    pools: Arc<Mutex<HashMap<String, Arc<HostPool>>>>,
     config: PoolConfig,
     channel_config: ChannelConfig,
 }
@@ -442,7 +457,7 @@ pub struct ChannelPool {
 impl ChannelPool {
     pub fn new(config: PoolConfig, channel_config: ChannelConfig) -> Self {
         Self {
-            pools: Mutex::new(HashMap::new()),
+            pools: Arc::new(Mutex::new(HashMap::new())),
             config,
             channel_config,
         }
