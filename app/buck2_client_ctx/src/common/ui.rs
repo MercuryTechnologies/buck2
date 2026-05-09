@@ -58,30 +58,39 @@ pub fn get_console_with_root(
     command_name: &str,
     config: SuperConsoleConfig,
     health_check_display_reports_receiver: Option<Receiver<Vec<DisplayReport>>>,
-) -> Box<dyn EventSubscriber> {
-    let result: buck2_error::Result<Box<dyn EventSubscriber>> = match console_type {
-        ConsoleType::Simple => Ok(Box::new(
-            SimpleConsole::<NoopEventObserverExtra>::autodetect(
+    bes_results_url: Option<String>,
+) -> (Box<dyn EventSubscriber>, bool) {
+    let result: buck2_error::Result<(Box<dyn EventSubscriber>, bool)> = match console_type {
+        ConsoleType::Simple => Ok((
+            Box::new(SimpleConsole::<NoopEventObserverExtra>::autodetect(
                 trace_id.dupe(),
                 verbosity,
                 expect_spans,
                 health_check_display_reports_receiver,
-            ),
+                bes_results_url,
+            )),
+            false,
         )),
-        ConsoleType::SimpleNoTty => Ok(Box::new(
-            SimpleConsole::<NoopEventObserverExtra>::without_tty(
+        ConsoleType::SimpleNoTty => Ok((
+            Box::new(SimpleConsole::<NoopEventObserverExtra>::without_tty(
                 trace_id.dupe(),
                 verbosity,
                 expect_spans,
                 health_check_display_reports_receiver,
-            ),
+                bes_results_url,
+            )),
+            false,
         )),
-        ConsoleType::SimpleTty => Ok(Box::new(SimpleConsole::<NoopEventObserverExtra>::with_tty(
-            trace_id.dupe(),
-            verbosity,
-            expect_spans,
-            health_check_display_reports_receiver,
-        ))),
+        ConsoleType::SimpleTty => Ok((
+            Box::new(SimpleConsole::<NoopEventObserverExtra>::with_tty(
+                trace_id.dupe(),
+                verbosity,
+                expect_spans,
+                health_check_display_reports_receiver,
+                bes_results_url,
+            )),
+            false,
+        )),
         ConsoleType::Super => StatefulSuperConsole::new_with_root_forced(
             trace_id.dupe(),
             command_name,
@@ -91,8 +100,9 @@ pub fn get_console_with_root(
             None,
             config,
             health_check_display_reports_receiver,
+            bes_results_url,
         )
-        .map(|c| Box::new(c) as Box<dyn EventSubscriber>),
+        .map(|c| (Box::new(c) as Box<dyn EventSubscriber>, true)),
         ConsoleType::Auto => match StatefulSuperConsole::console_builder().build() {
             Ok(Some(sc)) => StatefulSuperConsole::new(
                 command_name,
@@ -103,32 +113,39 @@ pub fn get_console_with_root(
                 timekeeper,
                 config,
                 health_check_display_reports_receiver,
+                bes_results_url.clone(),
             )
-            .map(|c| Box::new(c) as Box<dyn EventSubscriber>),
-            _ => Ok(Box::new(
-                SimpleConsole::<NoopEventObserverExtra>::autodetect(
+            .map(|c| (Box::new(c) as Box<dyn EventSubscriber>, true)),
+            _ => Ok((
+                Box::new(SimpleConsole::<NoopEventObserverExtra>::autodetect(
                     trace_id.dupe(),
                     verbosity,
                     expect_spans,
                     health_check_display_reports_receiver,
-                ),
+                    bes_results_url,
+                )),
+                false,
             )),
         },
-        ConsoleType::None => Ok(Box::new(ErrorConsole)),
+        ConsoleType::None => Ok((Box::new(ErrorConsole), false)),
     };
 
     match result {
-        Ok(result) => result,
+        Ok(pair) => pair,
         Err(e) => {
             eprintln!("Falling back to simple console, super console initialization failed: {e}");
             let _unused = soft_error!("console_init_failed", e);
-            Box::new(SimpleConsole::<NoopEventObserverExtra>::autodetect(
-                trace_id,
-                verbosity,
-                expect_spans,
-                // Maybe refactor and set this.
-                None,
-            ))
+            (
+                Box::new(SimpleConsole::<NoopEventObserverExtra>::autodetect(
+                    trace_id,
+                    verbosity,
+                    expect_spans,
+                    // Maybe refactor and set this.
+                    None,
+                    None,
+                )),
+                false,
+            )
         }
     }
 }

@@ -111,7 +111,7 @@ impl BuckSubcommand for ReplayCommand {
         let work = async {
             let (event_stream, invocation, timekeeper) =
                 make_replayer(event_log.get(&ctx).await?, speed, seek, preload).await?;
-            let console = get_console_with_root(
+            let (console, _used_superconsole) = get_console_with_root(
                 invocation.trace_id,
                 console_opts.console_type,
                 ctx.verbosity,
@@ -119,6 +119,7 @@ impl BuckSubcommand for ReplayCommand {
                 timekeeper,
                 "(replay)", // Could be better
                 console_opts.superconsole_config(),
+                None,
                 None,
             );
 

@@ -268,6 +268,7 @@ impl StatefulSuperConsole {
         stream: Option<Box<dyn Write + Send + 'static + Sync>>,
         config: SuperConsoleConfig,
         health_check_reports_receiver: Option<Receiver<Vec<DisplayReport>>>,
+        bes_results_url: Option<String>,
     ) -> buck2_error::Result<Self> {
         let mut builder = Self::console_builder();
         if let Some(stream) = stream {
@@ -282,6 +283,7 @@ impl StatefulSuperConsole {
             timekeeper,
             config,
             health_check_reports_receiver,
+            bes_results_url,
         )
     }
 
@@ -294,6 +296,7 @@ impl StatefulSuperConsole {
         timekeeper: Timekeeper,
         config: SuperConsoleConfig,
         health_check_reports_receiver: Option<Receiver<Vec<DisplayReport>>>,
+        bes_results_url: Option<String>,
     ) -> buck2_error::Result<Self> {
         let header = format!("Command: {command_name}.");
         Ok(Self::Running(StatefulSuperConsoleImpl {
@@ -305,6 +308,7 @@ impl StatefulSuperConsole {
                 expect_spans,
                 config,
                 health_check_reports_receiver,
+                bes_results_url,
             )?,
             super_console,
             verbosity,
@@ -375,6 +379,7 @@ impl SuperConsoleState {
         expect_spans: bool,
         config: SuperConsoleConfig,
         health_check_reports_receiver: Option<Receiver<Vec<DisplayReport>>>,
+        bes_results_url: Option<String>,
     ) -> buck2_error::Result<SuperConsoleState> {
         Ok(SuperConsoleState {
             timekeeper,
@@ -383,6 +388,7 @@ impl SuperConsoleState {
                 verbosity,
                 expect_spans,
                 health_check_reports_receiver,
+                bes_results_url,
             ),
             config,
             active_warnings: None,
@@ -1047,6 +1053,7 @@ mod tests {
             None,
             Default::default(),
             None,
+            None,
         )
         .unwrap();
 
@@ -1119,6 +1126,7 @@ mod tests {
                 EventTimestamp(SystemTime::now().into()),
             ),
             Default::default(),
+            None,
             None,
         )?;
 
@@ -1214,6 +1222,7 @@ mod tests {
     fn test_session_info() -> buck2_error::Result<()> {
         let info = SessionInfo {
             trace_id: TraceId::null(),
+            bes_results_url: None,
             test_session: Some(buck2_data::TestSessionInfo {
                 info: (0..100).map(|_| "a").collect(),
             }),
@@ -1280,6 +1289,7 @@ mod tests {
                 EventTimestamp(SystemTime::now().into()),
             ),
             Default::default(),
+            None,
             None,
         )?;
 

@@ -418,6 +418,11 @@ pub struct EventsCtx {
     pub command_report_path: Option<AbsPathBuf>,
     // Internal commands triggered by other commands should not log an invocation record.
     pub log_invocation_record: bool,
+    /// Whether a superconsole was actually constructed for this command.
+    /// Set by `streaming.rs` from the authoritative answer returned by
+    /// `get_console_with_root`. Defaults to `false` for non-streaming entry
+    /// points (e.g. log replay) that don't go through that path.
+    pub used_superconsole: bool,
 }
 
 impl EventsCtx {
@@ -432,6 +437,7 @@ impl EventsCtx {
             buck_log_dir: None,
             command_report_path: None,
             log_invocation_record: true,
+            used_superconsole: false,
         }
     }
 
