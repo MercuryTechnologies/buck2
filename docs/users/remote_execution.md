@@ -46,6 +46,11 @@ Keys supported include:
   interpolation syntax ($VAR). They will be substituted before reading the file.
 - `instance_name` - an instance name to pass on execution, action cache, and CAS
   requests.
+- `capabilities` - whether Buck2 should query the RE capabilities service. This
+  defaults to enabled.
+- `max_total_batch_size` - optional client-side cap for cumulative blob size in
+  batch CAS requests. Buck2 also honors a smaller server-advertised
+  `max_batch_total_size_bytes`.
 
 Buck2 uses `SHA256` for all its hashing by default. If your RE engine requires
 something else, this can be configured in `.buckconfig` as follows:
@@ -55,6 +60,17 @@ something else, this can be configured in `.buckconfig` as follows:
 # Accepts BLAKE3, SHA1, or SHA256
 digest_algorithms = BLAKE3
 ```
+
+When capabilities are enabled, Buck2 records the advertised digest functions,
+compressed ByteStream support, action-cache update support, SplitBlob/SpliceBlob
+support, execution priority ranges, and CAS upload limits in the daemon logs.
+Buck2 also validates the server's advertised RE API version range and fails
+connection setup if there is no compatible version overlap. If the server
+advertises `max_cas_blob_size_bytes`, Buck2 rejects larger CAS uploads locally
+instead of waiting for the server to return an upload error.
+When the server does not advertise enabled remote execution, or when a nonzero
+execution priority is outside the advertised supported ranges, Buck2 rejects the
+`Execute` request locally.
 
 ## RE platform configuration
 
@@ -78,3 +94,9 @@ as follows:
 - `remote_execution_properties` - other additional properties.
   - If the RE engine requires a container image, this can be done by setting
     `container-image` to an image URL, as is done in the example above.
+
+If the server capabilities do not advertise enabled action-cache updates, Buck2
+skips local-result cache uploads instead of issuing an unsupported
+`UpdateActionResult` RPC. Buck2 also rejects malformed `BatchUpdateBlobs` replies
+where the returned digests do not match the uploaded batch, so cache upload
+success requires a successful response for every requested digest.
