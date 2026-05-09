@@ -1607,6 +1607,8 @@ fn lower_hex(bytes: &[u8]) -> String {
 trait VecIntoMap<T> {
     fn into_map<B>(self, f: impl FnMut(T) -> B) -> Vec<B>;
     fn into_try_map<B, E>(self, f: impl FnMut(T) -> Result<B, E>) -> Result<Vec<B>, E>;
+    #[allow(dead_code)]
+    fn map<B>(&self, f: impl FnMut(&T) -> B) -> Vec<B>;
 }
 
 impl<T> VecIntoMap<T> for Vec<T> {
@@ -1616,6 +1618,10 @@ impl<T> VecIntoMap<T> for Vec<T> {
 
     fn into_try_map<B, E>(self, f: impl FnMut(T) -> Result<B, E>) -> Result<Vec<B>, E> {
         self.into_iter().map(f).collect()
+    }
+
+    fn map<B>(&self, f: impl FnMut(&T) -> B) -> Vec<B> {
+        self.iter().map(f).collect()
     }
 }
 
@@ -6466,21 +6472,49 @@ fn with_re_metadata<T>(
             .insert_bin("re-metadata-bin", MetadataValue::from_bytes(&encoded));
     } else {
         let mut encoded = Vec::new();
+        let RemoteExecutionMetadata {
+            correlated_invocations_id,
+            buck_info,
+            action_id,
+            action_mnemonic,
+            target_id,
+            configuration_id,
+            ..
+        } = metadata.clone();
+
+        let correlated_invocations_id = correlated_invocations_id
+            .filter(|id| !id.is_empty())
+            .or_else(|| {
+                buck_info
+                    .as_ref()
+                    .map(|b| b.build_id.clone())
+                    .filter(|id| !id.is_empty())
+            })
+            .unwrap_or_else(|| Uuid::new_v4().to_string());
+
+        let (tool_invocation_id, tool_version) = match buck_info {
+            Some(buck_info) => {
+                let tool_version = if buck_info.version.is_empty() {
+                    "dev".to_owned()
+                } else {
+                    buck_info.version
+                };
+                (buck_info.build_id, tool_version)
+            }
+            None => (String::new(), "dev".to_owned()),
+        };
+
         RequestMetadata {
             tool_details: Some(ToolDetails {
                 tool_name: request_metadata_tool_name.to_owned(),
-                // TODO(#503): Pull the BuckVersion::get_unique_id() from BuckDaemon
-                tool_version: "0.1.0".to_owned(),
+                tool_version,
             }),
-            action_id: "".to_owned(),
-            tool_invocation_id: metadata
-                .buck_info
-                .as_ref()
-                .map_or(String::new(), |buck_info| buck_info.build_id.clone()),
-            correlated_invocations_id: "".to_owned(),
-            action_mnemonic: "".to_owned(),
-            target_id: "".to_owned(),
-            configuration_id: "".to_owned(),
+            action_id: action_id.unwrap_or_default(),
+            tool_invocation_id,
+            correlated_invocations_id,
+            action_mnemonic: action_mnemonic.unwrap_or_default(),
+            target_id: target_id.unwrap_or_default(),
+            configuration_id: configuration_id.unwrap_or_default(),
         }
         .encode(&mut encoded)
         .expect("Encoding into a Vec cannot not fail");
@@ -6718,7 +6752,7 @@ mod tests {
     fn with_re_metadata_sets_request_metadata_tool_name() {
         let request = with_re_metadata(
             (),
-            RemoteExecutionMetadata {
+            &RemoteExecutionMetadata {
                 buck_info: Some(BuckInfo {
                     build_id: "build-id".to_owned(),
                     version: "version".to_owned(),
@@ -7070,7 +7104,7 @@ mod tests {
     fn test_download_validation_selects_digest_function_by_hash() -> anyhow::Result<()> {
         let data = b"mixed digest validation";
         let sha1_digest = TDigest {
-            hash: format!("{:x}", Sha1::digest(data)),
+            hash: lower_hex(&Sha1::digest(data)),
             size_in_bytes: data.len() as i64,
             ..Default::default()
         };
@@ -7823,14 +7857,14 @@ mod tests {
         let t_action_result = TActionResult2 {
             stdout_raw: Some(b"inline stdout".to_vec()),
             stderr_raw: Some(b"inline stderr".to_vec()),
-            execution_metadata: TExecutedActionMetadata {
+            execution_metadata: Box::new(TExecutedActionMetadata {
                 auxiliary_metadata: vec![TAny {
                     type_url: "type.googleapis.com/buck2.RemoteDepFile".to_owned(),
                     value: b"dep-file-metadata".to_vec(),
                     ..Default::default()
                 }],
                 ..Default::default()
-            },
+            }),
             ..Default::default()
         };
 
@@ -8232,7 +8266,7 @@ mod tests {
 
     fn digest_for_test_data(data: &[u8]) -> TDigest {
         TDigest {
-            hash: format!("{:x}", Sha256::digest(data)),
+            hash: lower_hex(&Sha256::digest(data)),
             size_in_bytes: data.len() as i64,
             ..Default::default()
         }
@@ -10207,7 +10241,7 @@ async fn test_download_compressed() -> anyhow::Result<()> {
         &InstanceName(None),
         DownloadRequest {
             inlined_digests: Some(vec![TDigest {
-                hash: format!("{:x}", Sha256::digest(&blob_data)),
+                hash: lower_hex(&Sha256::digest(&blob_data)),
                 size_in_bytes: blob_data.len() as i64,
                 ..Default::default()
             }]),

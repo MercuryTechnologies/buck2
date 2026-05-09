@@ -396,12 +396,17 @@ impl Uploader {
 
         // Upload
         if !upload_files.is_empty() || !upload_blobs.is_empty() {
+            let mut metadata = use_case.metadata(identity);
+            if let Some(id) = identity.and_then(|id| id.action_id.clone()) {
+                metadata.action_id = Some(id);
+            }
             with_error_handler(
                 "upload",
                 client.get_session_id(),
-                client.get_raw_re_client()
+                client
+                    .get_raw_re_client()
                     .upload(
-                        use_case.metadata(identity),
+                        metadata,
                         UploadRequest {
                             files_with_digest: Some(upload_files),
                             inlined_blobs_with_digest: Some(upload_blobs),
