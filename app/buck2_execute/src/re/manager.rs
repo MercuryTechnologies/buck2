@@ -363,12 +363,13 @@ impl ManagedRemoteExecutionClient {
         &self,
         action_digest: ActionDigest,
         platform: &RE::Platform,
+        identity: Option<&ReActionIdentity<'_>>,
     ) -> buck2_error::Result<Option<ActionResultResponse>> {
         Ok(self
             .lock()?
             .get()
             .await?
-            .action_cache(action_digest, self.use_case, platform)
+            .action_cache(action_digest, self.use_case, platform, identity)
             .await
             .ok()
             .flatten())
@@ -407,6 +408,7 @@ impl ManagedRemoteExecutionClient {
         files_with_digest: Vec<NamedDigest>,
         directories: Vec<remote_execution::Path>,
         inlined_blobs_with_digest: Vec<InlinedBlobWithDigest>,
+        identity: Option<&ReActionIdentity<'_>>,
     ) -> buck2_error::Result<()> {
         self.lock()?
             .get()
@@ -416,6 +418,7 @@ impl ManagedRemoteExecutionClient {
                 directories,
                 inlined_blobs_with_digest,
                 self.use_case,
+                identity,
             )
             .await
     }
@@ -527,6 +530,7 @@ impl ManagedRemoteExecutionClient {
         &self,
         digest: ActionDigest,
         result: TActionResult2,
+        identity: Option<&ReActionIdentity<'_>>,
         platform: &RE::Platform,
         write_type: ActionCacheWriteType,
     ) -> buck2_error::Result<WriteActionResultResponse> {
@@ -543,7 +547,14 @@ impl ManagedRemoteExecutionClient {
             self.lock()?
                 .get()
                 .await?
-                .write_action_result(digest, result, self.use_case, platform, write_type)
+                .write_action_result(
+                    digest,
+                    result,
+                    self.use_case,
+                    identity,
+                    platform,
+                    write_type,
+                )
                 .await
         }
     }
