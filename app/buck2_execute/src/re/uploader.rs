@@ -232,10 +232,10 @@ impl Uploader {
                         if let DirectoryEntry::Leaf(ActionDirectoryMember::File(file)) =
                             entry.as_ref()
                         {
-                            // NOTE: find_missing has negative caching, so when we query to know if an
-                            // artifact was uploaded, if it was the result of an action we just ran, it
-                            // won't be here. On the flip side, if a digest has been in the CAS for
-                            // a very long time, it might have expired.
+                            // NOTE: FindMissingBlobs can report an artifact missing even when Buck
+                            // can still materialize it locally from the deferred materializer.
+                            // On the flip side, if a digest has been in the CAS for a very long
+                            // time, it might have expired.
                             if file.digest.to_re() == digest {
                                 if should_error_for_missing_digest(info) {
                                     soft_error!(

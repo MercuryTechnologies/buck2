@@ -382,7 +382,7 @@ impl TenantState {
             }
         });
 
-        let digest_algorithms = init_ctx
+        let digest_algorithm_families = init_ctx
             .daemon_startup_config
             .startup_options
             .digest_algorithms
@@ -395,7 +395,12 @@ impl TenantState {
             })
             .transpose()
             .buck_error_context("Invalid digest_algorithms")?
-            .unwrap_or_else(|| vec![default_digest_algorithm])
+            .unwrap_or_else(|| vec![default_digest_algorithm]);
+        let digest_algorithm_names = digest_algorithm_families
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>();
+        let digest_algorithms = digest_algorithm_families
             .into_iter()
             .map(convert_algorithm_kind)
             .collect::<Result<Vec<_>, _>>()?;
@@ -416,6 +421,7 @@ impl TenantState {
         // TODO(rafaelc): merge configs from all cells once they are consistent
         let static_metadata = Arc::new(RemoteExecutionStaticMetadata::from_legacy_config(
             root_config,
+            digest_algorithm_names,
         )?);
 
         let mut ignore_specs = Vec::new();

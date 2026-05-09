@@ -495,6 +495,17 @@ class ErrorCategorizationTest(BuckTestCase):
         assert error["category_key"] == "RE_FAILED_PRECONDITION:UNKNOWN"
 
     @buck_test(write_invocation_record=True)
+    async def test_re_execute_missing_inputs_retries(self, buck: Buck) -> None:
+        # Upload action if necessary
+        await buck.build("//:run_action", "--remote-only")
+        await buck.clean()
+        await buck.build(
+            "//:run_action",
+            "--no-remote-cache",
+            env={"BUCK2_TEST_FAIL_RE_EXECUTE_MISSING_INPUTS_ONCE": "true"},
+        )
+
+    @buck_test(write_invocation_record=True)
     async def test_local_incompatible(self, buck: Buck) -> None:
         res = await expect_failure(
             buck.build(
