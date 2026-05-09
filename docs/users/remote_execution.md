@@ -56,18 +56,13 @@ digest_algorithms = BLAKE3
 When capabilities are enabled, Buck2 records the advertised digest functions,
 compressed ByteStream support, action-cache update support, SplitBlob/SpliceBlob
 support, execution priority ranges, and CAS upload limits in the daemon logs.
-Buck2 also validates the server's advertised RE API version range and fails
-connection setup if there is no compatible version overlap. If the server
-advertises `max_cas_blob_size_bytes`, Buck2 rejects larger CAS uploads locally
-instead of waiting for the server to return an upload error. Buck2 also checks
-that the remote cache and enabled remote execution capabilities advertise the
-effective `[buck2] digest_algorithms` used by the daemon.
+If the server advertises `max_cas_blob_size_bytes`, Buck2 rejects larger CAS
+uploads locally instead of waiting for the server to return an upload error.
+Buck2 also checks that the remote cache and enabled remote execution
+capabilities advertise the effective `[buck2] digest_algorithms` used by the
+daemon, and logs a warning if they don't.
 Older servers may omit the remote cache digest function list; in that case
 Buck2 warns and assumes SHA256 for remote cache compatibility.
-When the server does not advertise enabled remote execution, or when a nonzero
-execution priority is outside the advertised supported ranges, Buck2 rejects the
-`Execute` request locally.
-
 ## RE platform configuration
 
 Next, your build will need an
@@ -95,6 +90,10 @@ If the server capabilities do not advertise enabled action-cache updates, Buck2
 skips local-result cache uploads instead of issuing an unsupported
 `UpdateActionResult` RPC. When an upload path asks to upload only missing blobs,
 Buck2 checks CAS first and skips blobs that the server already has. Buck2 also
+validates uploaded bytes against the digest advertised for local cache uploads
+where the RE protocol path exposes the uploaded content to Buck2 before sending
+it. Buck2 rejects size or digest mismatches locally rather than writing a
+corrupt CAS blob or action-cache result. Buck2 also
 rejects malformed `BatchUpdateBlobs` replies and `BatchReadBlobs` replies where
 the returned digests do not match the requested batch, so batch cache operations
 require a successful response for every requested digest. `FindMissingBlobs`
