@@ -921,6 +921,33 @@ impl FinalArtifactMaterialization {
     }
 }
 
+#[cfg(test)]
+mod materialization_method_tests {
+    use super::*;
+
+    #[test]
+    fn accepts_all_policy_spelling() {
+        assert!(matches!(
+            MaterializationMethod::try_new_from_config_value(Some("all")).unwrap(),
+            MaterializationMethod::Deferred
+        ));
+    }
+
+    #[test]
+    fn accepts_skip_final_artifacts_policy_spelling() {
+        assert!(matches!(
+            MaterializationMethod::try_new_from_config_value(Some("deferred_skip_final_artifacts"))
+                .unwrap(),
+            MaterializationMethod::DeferredSkipFinalArtifacts
+        ));
+    }
+
+    #[test]
+    fn rejects_unknown_policy_spelling() {
+        assert!(MaterializationMethod::try_new_from_config_value(Some("minimal")).is_err());
+    }
+}
+
 /// This trait provides a level of indirection since the concrete implementation of
 /// `MaterializerEntry` lives in a crate that depends on this one.
 pub trait MaterializerEntry: Send + Sync + std::fmt::Display {}
