@@ -211,13 +211,14 @@ where
         verbosity: Verbosity,
         expect_spans: bool,
         health_check_reports_receiver: Option<Receiver<Vec<DisplayReport>>>,
+        bes_results_url: Option<String>,
     ) -> Self {
         let now = Instant::now();
         SimpleConsole {
             tty_mode: TtyMode::Enabled,
             verbosity,
             expect_spans,
-            observer: EventObserver::new(trace_id),
+            observer: EventObserver::new(trace_id, bes_results_url),
             action_errors: Vec::new(),
             last_print_time: now,
             waiting_line: WaitingLineThrottle::new(is_agent_invocation(), now),
@@ -233,13 +234,14 @@ where
         verbosity: Verbosity,
         expect_spans: bool,
         health_check_reports_receiver: Option<Receiver<Vec<DisplayReport>>>,
+        bes_results_url: Option<String>,
     ) -> Self {
         let now = Instant::now();
         SimpleConsole {
             tty_mode: TtyMode::Disabled,
             verbosity,
             expect_spans,
-            observer: EventObserver::new(trace_id),
+            observer: EventObserver::new(trace_id, bes_results_url),
             action_errors: Vec::new(),
             last_print_time: now,
             waiting_line: WaitingLineThrottle::new(is_agent_invocation(), now),
@@ -256,6 +258,7 @@ where
         verbosity: Verbosity,
         expect_spans: bool,
         health_check_reports_receiver: Option<Receiver<Vec<DisplayReport>>>,
+        bes_results_url: Option<String>,
     ) -> Self {
         match SuperConsole::compatible() {
             true => Self::with_tty(
@@ -263,12 +266,14 @@ where
                 verbosity,
                 expect_spans,
                 health_check_reports_receiver,
+                bes_results_url,
             ),
             false => Self::without_tty(
                 trace_id,
                 verbosity,
                 expect_spans,
                 health_check_reports_receiver,
+                bes_results_url,
             ),
         }
     }
@@ -497,6 +502,9 @@ where
                 event.trace_id()?
             )?;
         } else {
+            if let Some(build_url) = self.observer().session_info().invocation_url() {
+                echo!("Build URL: {}", build_url)?;
+            }
             echo!("Build ID: {}", event.trace_id()?)?;
         }
         self.notify_printed();
