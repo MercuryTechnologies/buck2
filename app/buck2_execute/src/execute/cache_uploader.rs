@@ -21,6 +21,7 @@ use tracing::warn;
 use crate::digest_config::DigestConfig;
 use crate::execute::action_digest_and_blobs::ActionDigestAndBlobs;
 use crate::execute::dep_file_digest::DepFileDigest;
+use crate::execute::request::CommandExecutionPaths;
 use crate::execute::result::CommandExecutionResult;
 use crate::execute::target::CommandExecutionTarget;
 use crate::materialize::materializer::Materializer;
@@ -34,6 +35,7 @@ pub struct CacheUploadInfo<'a> {
     /// Whether locally produced results may be published. Results that came from RE
     /// (remote executions and action-cache hits) are already published.
     pub allow_cache_upload: bool,
+    pub paths: &'a CommandExecutionPaths,
 }
 
 #[async_trait]

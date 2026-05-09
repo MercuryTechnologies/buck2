@@ -1134,23 +1134,25 @@ mod materialization_method_tests {
     #[test]
     fn accepts_all_policy_spelling() {
         assert!(matches!(
-            MaterializationMethod::try_new_from_config_value(Some("all")).unwrap(),
-            MaterializationMethod::Deferred
+            FinalArtifactMaterialization::try_new_from_config_value(Some("all")).unwrap(),
+            FinalArtifactMaterialization::Enabled
         ));
     }
 
     #[test]
     fn accepts_skip_final_artifacts_policy_spelling() {
         assert!(matches!(
-            MaterializationMethod::try_new_from_config_value(Some("deferred_skip_final_artifacts"))
-                .unwrap(),
-            MaterializationMethod::DeferredSkipFinalArtifacts
+            FinalArtifactMaterialization::try_new_from_config_value(Some(
+                "deferred_skip_final_artifacts"
+            ))
+            .unwrap(),
+            FinalArtifactMaterialization::Skipped
         ));
     }
 
     #[test]
     fn rejects_unknown_policy_spelling() {
-        assert!(MaterializationMethod::try_new_from_config_value(Some("minimal")).is_err());
+        assert!(FinalArtifactMaterialization::try_new_from_config_value(Some("minimal")).is_err());
     }
 }
 

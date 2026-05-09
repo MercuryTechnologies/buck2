@@ -421,6 +421,7 @@ impl CasArtifactAction {
                     }],
                     vec![],
                     vec![],
+                    None,
                 )
                 .await?;
             buck2_error::Ok(())
