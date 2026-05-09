@@ -16,6 +16,7 @@ use buck2_common::legacy_configs::key::BuckconfigKeyRef;
 use buck2_core::rollout_percentage::RolloutPercentage;
 
 static BUCK2_RE_CLIENT_CFG_SECTION: &str = "buck2_re_client";
+static BUCK2_CFG_SECTION: &str = "buck2";
 
 /// We put functions here that both things need to implement for code that isn't gated behind a
 /// fbcode_build or not(fbcode_build)
@@ -527,6 +528,10 @@ pub struct Buck2OssReConfiguration {
     pub max_connections: Option<usize>,
     /// Maximum concurrent streams per connection.
     pub max_concurrency_per_connection: Option<usize>,
+    /// Preferred digest algorithms configured under `[buck2] digest_algorithms`.
+    /// This is used by OSS RE clients to disambiguate hash validation when
+    /// multiple algorithms share the same digest length (for example, SHA256 and BLAKE3).
+    pub digest_algorithms: Vec<String>,
 }
 
 #[derive(Clone, Debug, Default, Allocative)]
@@ -672,6 +677,12 @@ impl Buck2OssReConfiguration {
                 section: BUCK2_RE_CLIENT_CFG_SECTION,
                 property: "max_concurrency_per_connection",
             })?,
+            digest_algorithms: legacy_config
+                .parse_list(BuckconfigKeyRef {
+                    section: BUCK2_CFG_SECTION,
+                    property: "digest_algorithms",
+                })?
+                .unwrap_or_default(),
         })
     }
 }
