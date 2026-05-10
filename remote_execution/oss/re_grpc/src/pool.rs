@@ -361,6 +361,7 @@ impl HostPoolInner {
 struct HostPool {
     inner: Mutex<HostPoolInner>,
     endpoint: tonic::transport::Endpoint,
+    min_connections: usize,
     max_connections: usize,
     max_concurrency_per_connection: usize,
 }
@@ -372,12 +373,8 @@ impl HostPool {
         max_connections: usize,
         max_concurrency_per_connection: usize,
     ) -> Self {
-        let channel_states: Vec<_> = (0..min_connections)
-            .map(|_| {
-                let channel = channel_from_endpoint(&endpoint);
-                PooledChannelState::new(channel, max_concurrency_per_connection)
-            })
-            .collect();
+        let channel_states =
+            new_channels(&endpoint, min_connections, max_concurrency_per_connection);
 
         Self {
             inner: Mutex::new(HostPoolInner {
@@ -385,6 +382,7 @@ impl HostPool {
                 next_index: 0,
             }),
             endpoint,
+            min_connections,
             max_connections,
             max_concurrency_per_connection,
         }
@@ -422,6 +420,33 @@ impl HostPool {
         let state = inner.next_channel();
         PooledChannel::new(state.channel.clone(), state.semaphore.clone())
     }
+
+    /// Replaces this host's connections with new ones. Calls already running
+    /// keep the connections they have.
+    async fn reset(&self) {
+        let mut inner = self.inner.lock().await;
+        inner.channels = new_channels(
+            &self.endpoint,
+            self.min_connections,
+            self.max_concurrency_per_connection,
+        );
+        inner.next_index = 0;
+    }
+}
+
+fn new_channels(
+    endpoint: &tonic::transport::Endpoint,
+    count: usize,
+    max_concurrency_per_connection: usize,
+) -> Vec<PooledChannelState> {
+    (0..count)
+        .map(|_| {
+            PooledChannelState::new(
+                channel_from_endpoint(endpoint),
+                max_concurrency_per_connection,
+            )
+        })
+        .collect()
 }
 
 /// A pool of gRPC channels by host/address.
@@ -469,6 +494,15 @@ impl ChannelPool {
 
         Ok(host_pool.get().await)
     }
+
+    /// Drops the connections to `address`, so that later calls open new ones.
+    /// Calls already running keep the connections they have.
+    pub async fn reset(&self, address: &str) {
+        let host_pool = self.pools.lock().await.get(address).cloned();
+        if let Some(host_pool) = host_pool {
+            host_pool.reset().await;
+        }
+    }
 }
 
 #[cfg(test)]
@@ -487,5 +521,18 @@ mod tests {
         let uri = prepare_uri(uri, false).unwrap();
 
         assert_eq!(uri.to_string(), "http://example.com:1234/");
+    }
+
+    #[tokio::test]
+    async fn reset_replaces_connections() {
+        let endpoint = tonic::transport::Endpoint::from_static("http://127.0.0.1:1");
+        let pool = super::HostPool::new(endpoint, 2, 4, 100);
+        pool.get().await;
+
+        pool.reset().await;
+
+        let inner = pool.inner.lock().await;
+        assert_eq!(inner.channels.len(), 2);
+        assert_eq!(inner.next_index, 0);
     }
 }

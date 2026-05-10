@@ -13,6 +13,7 @@ use std::collections::HashSet;
 use std::env::VarError;
 use std::io;
 use std::io::Cursor;
+use std::io::SeekFrom;
 use std::num::NonZeroUsize;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -93,6 +94,7 @@ use tokio::fs::OpenOptions;
 use tokio::io::AsyncBufRead;
 use tokio::io::AsyncRead;
 use tokio::io::AsyncReadExt;
+use tokio::io::AsyncSeekExt;
 use tokio::io::AsyncWriteExt;
 use tokio::io::BufReader;
 use tokio_util::io::StreamReader;
@@ -119,6 +121,8 @@ const DEFAULT_RETRIES: usize = 5;
 const GRPC_RETRY_INITIAL_DELAY_MILLIS: u64 = 100;
 const DEFAULT_RETRY_MAX_DELAY_MILLIS: u64 = 5000;
 const GRPC_RETRY_JITTER: f64 = 0.1;
+const DEFAULT_GRPC_REQUEST_TIMEOUT_SECS: u64 = 60;
+const DEFAULT_BYTESTREAM_PROGRESS_TIMEOUT_SECS: u64 = 60;
 
 fn tdigest_to(tdigest: &TDigest) -> Digest {
     Digest {
@@ -316,16 +320,128 @@ fn validate_upload_blob(
     Ok(())
 }
 
+#[derive(Clone, PartialEq, ::prost::Message)]
+struct RetryInfoDetail {
+    #[prost(message, optional, tag = "1")]
+    retry_delay: Option<::prost_types::Duration>,
+}
+
+#[derive(Clone, PartialEq, ::prost::Message)]
+struct PreconditionFailureDetail {
+    #[prost(message, repeated, tag = "1")]
+    violations: Vec<PreconditionFailureViolation>,
+}
+
+#[derive(Clone, PartialEq, ::prost::Message)]
+struct PreconditionFailureViolation {
+    #[prost(string, tag = "1")]
+    r#type: String,
+    #[prost(string, tag = "2")]
+    subject: String,
+    #[prost(string, tag = "3")]
+    description: String,
+}
+
+const RETRY_INFO_TYPE_URL: &str = "type.googleapis.com/google.rpc.RetryInfo";
+const PRECONDITION_FAILURE_TYPE_URL: &str = "type.googleapis.com/google.rpc.PreconditionFailure";
+
 fn check_status(status: Status) -> Result<(), REClientError> {
     if status.code == 0 {
         return Ok(());
     }
 
-    Err(REClientError {
-        code: TCode(status.code),
-        message: status.message,
-        group: TCodeReasonGroup::UNKNOWN,
+    Err(re_client_error_from_rpc_status(&status))
+}
+
+fn grpc_duration_to_duration(duration: &::prost_types::Duration) -> Option<Duration> {
+    if duration.seconds < 0 || duration.nanos < 0 {
+        return None;
+    }
+
+    Some(Duration::new(
+        u64::try_from(duration.seconds).ok()?,
+        u32::try_from(duration.nanos).ok()?,
+    ))
+}
+
+fn retry_delay_from_rpc_status(status: &Status) -> Option<Duration> {
+    status.details.iter().find_map(|detail| {
+        if detail.type_url != RETRY_INFO_TYPE_URL {
+            return None;
+        }
+
+        let retry_info = RetryInfoDetail::decode(detail.value.as_slice()).ok()?;
+        retry_info
+            .retry_delay
+            .as_ref()
+            .and_then(grpc_duration_to_duration)
     })
+}
+
+fn precondition_failures(status: &Status) -> impl Iterator<Item = PreconditionFailureDetail> + '_ {
+    status.details.iter().filter_map(|detail| {
+        if detail.type_url != PRECONDITION_FAILURE_TYPE_URL {
+            return None;
+        }
+
+        PreconditionFailureDetail::decode(detail.value.as_slice()).ok()
+    })
+}
+
+fn message_indicates_quota(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    message.contains("quota") || message.contains("rate limit")
+}
+
+fn group_for_rpc_status(status: &Status) -> TCodeReasonGroup {
+    if status.code == Code::ResourceExhausted as i32 && message_indicates_quota(&status.message) {
+        TCodeReasonGroup::USER_QUOTA
+    } else {
+        TCodeReasonGroup::UNKNOWN
+    }
+}
+
+fn format_rpc_status_message(status: &Status) -> String {
+    let mut details = Vec::new();
+    if let Some(retry_delay) = retry_delay_from_rpc_status(status) {
+        details.push(format!(
+            "RetryInfo(retry_delay_ms={})",
+            retry_delay.as_millis()
+        ));
+    }
+
+    for failure in precondition_failures(status) {
+        for violation in failure.violations {
+            details.push(format!(
+                "PreconditionFailure(type={}, subject={}, description={})",
+                violation.r#type, violation.subject, violation.description
+            ));
+        }
+    }
+
+    for detail in &status.details {
+        if detail.type_url != RETRY_INFO_TYPE_URL
+            && detail.type_url != PRECONDITION_FAILURE_TYPE_URL
+        {
+            details.push(format!("detail_type={}", detail.type_url));
+        }
+    }
+
+    if details.is_empty() {
+        status.message.clone()
+    } else if status.message.is_empty() {
+        details.join("; ")
+    } else {
+        format!("{} ({})", status.message, details.join("; "))
+    }
+}
+
+fn re_client_error_from_rpc_status(status: &Status) -> REClientError {
+    REClientError {
+        code: TCode(status.code),
+        message: format_rpc_status_message(status),
+        group: group_for_rpc_status(status),
+    }
 }
 
 fn tcode_is_retryable(code: TCode) -> bool {
@@ -363,12 +479,80 @@ fn tcode_from_grpc_code(code: tonic::Code) -> TCode {
     }
 }
 
+fn tonic_status_rpc_status(status: &tonic::Status) -> Option<Status> {
+    if status.details().is_empty() {
+        return None;
+    }
+
+    Status::decode(status.details()).ok()
+}
+
+fn tonic_status_indicates_broken_connection(status: &tonic::Status) -> bool {
+    if !matches!(
+        status.code(),
+        tonic::Code::Unavailable
+            | tonic::Code::Unknown
+            | tonic::Code::Internal
+            | tonic::Code::DeadlineExceeded
+    ) {
+        return false;
+    }
+
+    let message = status.message().to_ascii_lowercase();
+    message.contains("transport error")
+        || message.contains("connection reset")
+        || message.contains("connection refused")
+        || message.contains("connection closed")
+        || message.contains("connection error")
+        || message.contains("broken pipe")
+        || message.contains("goaway")
+        || message.contains("http2")
+        || message.contains("io error")
+}
+
 fn re_client_error_from_tonic_status(status: &tonic::Status) -> REClientError {
+    let rpc_status = tonic_status_rpc_status(status);
+    let mut message = status.message().to_owned();
+    let mut group = if tonic_status_indicates_broken_connection(status) {
+        TCodeReasonGroup::RE_CONNECTION
+    } else {
+        TCodeReasonGroup::UNKNOWN
+    };
+
+    if let Some(rpc_status) = &rpc_status {
+        let rpc_group = group_for_rpc_status(rpc_status);
+        if group == TCodeReasonGroup::UNKNOWN {
+            group = rpc_group;
+        }
+        let rpc_message = format_rpc_status_message(rpc_status);
+        if !rpc_message.is_empty() {
+            message = rpc_message;
+        }
+    } else if status.code() == tonic::Code::ResourceExhausted && message_indicates_quota(&message) {
+        group = TCodeReasonGroup::USER_QUOTA;
+    }
+
     REClientError {
         code: tcode_from_grpc_code(status.code()),
-        message: status.message().to_owned(),
-        group: TCodeReasonGroup::UNKNOWN,
+        message,
+        group,
     }
+}
+
+fn tonic_status_from_io_error(error: &io::Error) -> Option<&tonic::Status> {
+    let source = error.get_ref()?;
+    if let Some(status) = source.downcast_ref::<tonic::Status>() {
+        return Some(status);
+    }
+
+    let mut current = source.source();
+    while let Some(source) = current {
+        if let Some(status) = source.downcast_ref::<tonic::Status>() {
+            return Some(status);
+        }
+        current = source.source();
+    }
+    None
 }
 
 fn normalize_grpc_error(err: anyhow::Error) -> anyhow::Error {
@@ -378,7 +562,12 @@ fn normalize_grpc_error(err: anyhow::Error) -> anyhow::Error {
 
     let re_client_error = err
         .downcast_ref::<tonic::Status>()
-        .map(re_client_error_from_tonic_status);
+        .map(re_client_error_from_tonic_status)
+        .or_else(|| {
+            err.downcast_ref::<io::Error>()
+                .and_then(tonic_status_from_io_error)
+                .map(re_client_error_from_tonic_status)
+        });
     match re_client_error {
         Some(re_client_error) => anyhow::Error::from(re_client_error),
         None => err,
@@ -392,10 +581,69 @@ fn error_tcode(err: &anyhow::Error) -> Option<TCode> {
             err.downcast_ref::<tonic::Status>()
                 .map(|status| tcode_from_grpc_code(status.code()))
         })
+        .or_else(|| {
+            err.downcast_ref::<io::Error>()
+                .and_then(tonic_status_from_io_error)
+                .map(|status| tcode_from_grpc_code(status.code()))
+        })
+}
+
+fn grpc_error_retry_delay(err: &anyhow::Error) -> Option<Duration> {
+    err.downcast_ref::<tonic::Status>()
+        .and_then(tonic_status_rpc_status)
+        .and_then(|status| retry_delay_from_rpc_status(&status))
+        .or_else(|| {
+            err.downcast_ref::<io::Error>()
+                .and_then(tonic_status_from_io_error)
+                .and_then(tonic_status_rpc_status)
+                .and_then(|status| retry_delay_from_rpc_status(&status))
+        })
+}
+
+fn is_broken_connection_error(err: &anyhow::Error) -> bool {
+    if err
+        .downcast_ref::<REClientError>()
+        .is_some_and(|error| error.group == TCodeReasonGroup::RE_CONNECTION)
+    {
+        return true;
+    }
+
+    if err
+        .downcast_ref::<tonic::Status>()
+        .is_some_and(tonic_status_indicates_broken_connection)
+    {
+        return true;
+    }
+
+    if let Some(io_error) = err.downcast_ref::<io::Error>() {
+        if matches!(
+            io_error.kind(),
+            io::ErrorKind::ConnectionReset
+                | io::ErrorKind::ConnectionAborted
+                | io::ErrorKind::BrokenPipe
+                | io::ErrorKind::UnexpectedEof
+                | io::ErrorKind::TimedOut
+        ) {
+            return true;
+        }
+
+        if tonic_status_from_io_error(io_error)
+            .is_some_and(tonic_status_indicates_broken_connection)
+        {
+            return true;
+        }
+    }
+
+    let message = format!("{err:#}").to_ascii_lowercase();
+    message.contains("connection reset")
+        || message.contains("connection refused")
+        || message.contains("connection closed")
+        || message.contains("broken pipe")
+        || message.contains("transport error")
 }
 
 fn is_retryable_grpc_error(err: &anyhow::Error) -> bool {
-    error_tcode(err).is_some_and(tcode_is_retryable)
+    grpc_error_retry_delay(err).is_some() || error_tcode(err).is_some_and(tcode_is_retryable)
 }
 
 fn jittered_retry_delay(base_delay: Duration) -> Duration {
@@ -409,11 +657,26 @@ fn jittered_retry_delay(base_delay: Duration) -> Duration {
 async fn retry_grpc_request<T, Fut, F>(
     retries: usize,
     retry_max_delay: Duration,
-    mut request: F,
+    request: F,
 ) -> anyhow::Result<T>
 where
     Fut: Future<Output = anyhow::Result<T>>,
     F: FnMut() -> Fut,
+{
+    retry_grpc_request_with_reconnect(retries, retry_max_delay, request, || async {}).await
+}
+
+async fn retry_grpc_request_with_reconnect<T, Fut, F, RFut, R>(
+    retries: usize,
+    retry_max_delay: Duration,
+    mut request: F,
+    mut reconnect: R,
+) -> anyhow::Result<T>
+where
+    Fut: Future<Output = anyhow::Result<T>>,
+    F: FnMut() -> Fut,
+    RFut: Future<Output = ()>,
+    R: FnMut() -> RFut,
 {
     let mut retry_attempt = 0usize;
     let mut next_delay = Duration::from_millis(GRPC_RETRY_INITIAL_DELAY_MILLIS);
@@ -426,7 +689,13 @@ where
                     return Err(normalize_grpc_error(err));
                 }
 
-                let delay = jittered_retry_delay(next_delay);
+                if is_broken_connection_error(&err) {
+                    reconnect().await;
+                }
+
+                let delay = grpc_error_retry_delay(&err)
+                    .map(|delay| std::cmp::min(delay, retry_max_delay))
+                    .unwrap_or_else(|| jittered_retry_delay(next_delay));
                 tracing::debug!(
                     retry_attempt = retry_attempt + 1,
                     retries,
@@ -439,6 +708,26 @@ where
             }
         }
     }
+}
+
+async fn retry_grpc_request_with_client_reconnect<T, Fut, F>(
+    grpc_clients: Arc<GRPCClients>,
+    kind: GrpcClientKind,
+    retries: usize,
+    retry_max_delay: Duration,
+    request: F,
+) -> anyhow::Result<T>
+where
+    Fut: Future<Output = anyhow::Result<T>>,
+    F: FnMut() -> Fut,
+{
+    retry_grpc_request_with_reconnect(retries, retry_max_delay, request, || {
+        let grpc_clients = grpc_clients.clone();
+        async move {
+            grpc_clients.reconnect_after_broken_connection(kind).await;
+        }
+    })
+    .await
 }
 
 enum BystreamWritePlan {
@@ -561,6 +850,10 @@ pub struct RERuntimeOpts {
     retries: usize,
     /// Maximum delay between retry attempts.
     retry_max_delay_ms: u64,
+    /// Per-attempt timeout for unary gRPC requests.
+    grpc_request_timeout: Duration,
+    /// Maximum idle time for a ByteStream download before the stream is retried.
+    bytestream_progress_timeout: Duration,
     /// Digest function selected from user config and capabilities for download hash validation.
     download_hash_digest_function: Option<digest_function::Value>,
     /// Digest functions selected from daemon config for RE request fields.
@@ -1002,6 +1295,14 @@ impl REClientBuilder {
         let retry_max_delay_ms = opts
             .retry_max_delay_ms
             .unwrap_or(DEFAULT_RETRY_MAX_DELAY_MILLIS);
+        let grpc_request_timeout = Duration::from_secs(
+            opts.grpc_request_timeout_secs
+                .unwrap_or(DEFAULT_GRPC_REQUEST_TIMEOUT_SECS),
+        );
+        let bytestream_progress_timeout = Duration::from_secs(
+            opts.bytestream_progress_timeout_secs
+                .unwrap_or(DEFAULT_BYTESTREAM_PROGRESS_TIMEOUT_SECS),
+        );
 
         let capabilities = if opts.capabilities.unwrap_or(true) {
             Self::fetch_rbe_capabilities(
@@ -1010,6 +1311,7 @@ impl REClientBuilder {
                 opts.max_total_batch_size,
                 retries,
                 retry_max_delay_ms,
+                grpc_request_timeout,
             )
             .await?
         } else {
@@ -1108,6 +1410,15 @@ impl REClientBuilder {
         };
         let pool = ChannelPool::new(pool_config, channel_config);
 
+        let grpc_clients = GRPCClients {
+            pool: Arc::new(pool),
+            cas_address,
+            engine_address: engine_address.clone(),
+            action_cache_address,
+            interceptor,
+            max_decoding_message_size: max_decoding_msg_size,
+        };
+
         Ok(REClient::new(
             RERuntimeOpts {
                 use_fbcode_metadata: opts.use_fbcode_metadata,
@@ -1121,18 +1432,15 @@ impl REClientBuilder {
                     .contains(&Compressor::Zstd),
                 retries,
                 retry_max_delay_ms,
+                grpc_request_timeout,
+                bytestream_progress_timeout,
                 download_hash_digest_function,
                 request_digest_function_config,
             },
+            grpc_clients,
             capabilities,
             instance_name,
             bystream_compressor,
-            pool,
-            max_decoding_msg_size,
-            interceptor,
-            cas_address,
-            engine_address.clone(),
-            action_cache_address,
         ))
     }
 
@@ -1142,14 +1450,16 @@ impl REClientBuilder {
         max_total_batch_size: Option<usize>,
         retries: usize,
         retry_max_delay_ms: u64,
+        grpc_request_timeout: Duration,
     ) -> anyhow::Result<RECapabilities> {
         // TODO use more of the capabilities of the remote build executor
 
         let resp = retry_grpc_request(retries, Duration::from_millis(retry_max_delay_ms), || {
             let mut client = client.clone();
-            let request = GetCapabilitiesRequest {
+            let mut request = tonic::Request::new(GetCapabilitiesRequest {
                 instance_name: instance_name.as_str().to_owned(),
-            };
+            });
+            request.set_timeout(grpc_request_timeout);
             async move { Ok(client.get_capabilities(request).await?.into_inner()) }
         })
         .await
@@ -1301,6 +1611,93 @@ impl Interceptor for InjectHeadersInterceptor {
 
 type GrpcService = InterceptedService<PooledChannel, InjectHeadersInterceptor>;
 
+fn build_cas_client(
+    channel: PooledChannel,
+    interceptor: InjectHeadersInterceptor,
+    max_decoding_message_size: usize,
+) -> ContentAddressableStorageClient<GrpcService> {
+    ContentAddressableStorageClient::with_interceptor(channel, interceptor)
+        .max_decoding_message_size(max_decoding_message_size)
+}
+
+fn build_action_cache_client(
+    channel: PooledChannel,
+    interceptor: InjectHeadersInterceptor,
+    max_decoding_message_size: usize,
+) -> ActionCacheClient<GrpcService> {
+    ActionCacheClient::with_interceptor(channel, interceptor)
+        .max_decoding_message_size(max_decoding_message_size)
+}
+
+fn build_bytestream_client(
+    channel: PooledChannel,
+    interceptor: InjectHeadersInterceptor,
+    max_decoding_message_size: usize,
+) -> ByteStreamClient<GrpcService> {
+    ByteStreamClient::with_interceptor(channel, interceptor)
+        .max_decoding_message_size(max_decoding_message_size)
+}
+
+#[derive(Debug, Copy, Clone)]
+enum GrpcClientKind {
+    Cas,
+    ActionCache,
+    ByteStream,
+}
+
+pub struct GRPCClients {
+    pool: Arc<ChannelPool>,
+    cas_address: String,
+    engine_address: String,
+    action_cache_address: String,
+    interceptor: InjectHeadersInterceptor,
+    max_decoding_message_size: usize,
+}
+
+impl GRPCClients {
+    fn address(&self, kind: GrpcClientKind) -> &str {
+        match kind {
+            GrpcClientKind::Cas | GrpcClientKind::ByteStream => &self.cas_address,
+            GrpcClientKind::ActionCache => &self.action_cache_address,
+        }
+    }
+
+    async fn channel(&self, kind: GrpcClientKind) -> anyhow::Result<PooledChannel> {
+        self.pool.get(self.address(kind)).await
+    }
+
+    async fn cas_client(&self) -> anyhow::Result<ContentAddressableStorageClient<GrpcService>> {
+        Ok(build_cas_client(
+            self.channel(GrpcClientKind::Cas).await?,
+            self.interceptor.dupe(),
+            self.max_decoding_message_size,
+        ))
+    }
+
+    async fn action_cache_client(&self) -> anyhow::Result<ActionCacheClient<GrpcService>> {
+        Ok(build_action_cache_client(
+            self.channel(GrpcClientKind::ActionCache).await?,
+            self.interceptor.dupe(),
+            self.max_decoding_message_size,
+        ))
+    }
+
+    async fn bytestream_client(&self) -> anyhow::Result<ByteStreamClient<GrpcService>> {
+        Ok(build_bytestream_client(
+            self.channel(GrpcClientKind::ByteStream).await?,
+            self.interceptor.dupe(),
+            self.max_decoding_message_size,
+        ))
+    }
+
+    /// Replaces the pool's connections to the address `kind` uses. Calls
+    /// already running keep theirs.
+    async fn reconnect_after_broken_connection(&self, kind: GrpcClientKind) {
+        self.pool.reset(self.address(kind)).await;
+        tracing::debug!(?kind, "Reconnected gRPC client after transport failure");
+    }
+}
+
 #[derive(Debug, Copy, Clone)]
 enum DigestRemoteState {
     ExistsOnRemote,
@@ -1336,17 +1733,12 @@ impl FindMissingCache {
 
 pub struct REClient {
     runtime_opts: RERuntimeOpts,
-    pool: Arc<ChannelPool>,
+    grpc_clients: Arc<GRPCClients>,
     capabilities: RECapabilities,
     instance_name: InstanceName,
     // buck2 calls find_missing for same blobs
     find_missing_cache: Mutex<FindMissingCache>,
     bystream_compressor: Option<Compressor>,
-    max_decoding_msg_size: usize,
-    interceptor: InjectHeadersInterceptor,
-    cas_address: String,
-    engine_address: String,
-    action_cache_address: String,
     query_write_status_supported: AtomicBool,
 }
 
@@ -1866,20 +2258,15 @@ impl<F> ExecutionStreamState<F> {
 impl REClient {
     fn new(
         runtime_opts: RERuntimeOpts,
+        grpc_clients: GRPCClients,
         capabilities: RECapabilities,
         instance_name: InstanceName,
         bystream_compressor: Option<Compressor>,
-        pool: ChannelPool,
-        max_decoding_msg_size: usize,
-        interceptor: InjectHeadersInterceptor,
-        cas_address: String,
-        engine_address: String,
-        action_cache_address: String,
     ) -> Self {
         let cas_ttl_secs = runtime_opts.cas_ttl_secs;
         REClient {
             runtime_opts,
-            pool: Arc::new(pool),
+            grpc_clients: Arc::new(grpc_clients),
             capabilities,
             instance_name,
             find_missing_cache: Mutex::new(FindMissingCache {
@@ -1888,11 +2275,6 @@ impl REClient {
                 last_check: Instant::now(),
             }),
             bystream_compressor,
-            max_decoding_msg_size,
-            interceptor,
-            cas_address,
-            engine_address,
-            action_cache_address,
             query_write_status_supported: AtomicBool::new(true),
         }
     }
@@ -1915,12 +2297,13 @@ impl REClient {
         let total_size = total_bystream_write_size(&segments);
 
         match bytestream_client
-            .query_write_status(with_re_metadata(
+            .query_write_status(with_re_metadata_timeout(
                 QueryWriteStatusRequest {
                     resource_name: resource_name.clone(),
                 },
-                &metadata,
+                metadata,
                 self.runtime_opts.use_fbcode_metadata,
+                self.runtime_opts.grpc_request_timeout,
             ))
             .await
         {
@@ -1968,24 +2351,28 @@ impl REClient {
         let digest_function = digest_function_to_grpc(digest_function);
         let metadata = metadata.clone();
         async move {
-            let res = retry_grpc_request(
+            let res = retry_grpc_request_with_client_reconnect(
+                self.grpc_clients.clone(),
+                GrpcClientKind::ActionCache,
                 self.runtime_opts.retries,
                 Duration::from_millis(self.runtime_opts.retry_max_delay_ms),
                 || {
+                    let grpc_clients = self.grpc_clients.clone();
                     let metadata = metadata.clone();
                     let action_digest = action_digest.clone();
                     async move {
-                        let mut client = self.action_cache_client().await?;
+                        let mut client = grpc_clients.action_cache_client().await?;
                         client
-                            .get_action_result(with_re_metadata(
+                            .get_action_result(with_re_metadata_timeout(
                                 GetActionResultRequest {
                                     instance_name: self.instance_name.as_str().to_owned(),
                                     action_digest: Some(action_digest),
                                     digest_function,
                                     ..Default::default()
                                 },
-                                &metadata,
+                                metadata,
                                 self.runtime_opts.use_fbcode_metadata,
+                                self.runtime_opts.grpc_request_timeout,
                             ))
                             .await
                             .map_err(anyhow::Error::from)
@@ -2019,17 +2406,20 @@ impl REClient {
         let metadata = metadata.clone();
         async move {
             let action_result = action_result?;
-            let res = retry_grpc_request(
+            let res = retry_grpc_request_with_client_reconnect(
+                self.grpc_clients.clone(),
+                GrpcClientKind::ActionCache,
                 self.runtime_opts.retries,
                 Duration::from_millis(self.runtime_opts.retry_max_delay_ms),
                 || {
+                    let grpc_clients = self.grpc_clients.clone();
                     let metadata = metadata.clone();
                     let action_digest = action_digest.clone();
                     let action_result = action_result.clone();
                     async move {
-                        let mut client = self.action_cache_client().await?;
+                        let mut client = grpc_clients.action_cache_client().await?;
                         client
-                            .update_action_result(with_re_metadata(
+                            .update_action_result(with_re_metadata_timeout(
                                 UpdateActionResultRequest {
                                     instance_name: self.instance_name.as_str().to_owned(),
                                     action_digest: Some(action_digest),
@@ -2037,8 +2427,9 @@ impl REClient {
                                     results_cache_policy: None,
                                     digest_function,
                                 },
-                                &metadata,
+                                metadata,
                                 self.runtime_opts.use_fbcode_metadata,
+                                self.runtime_opts.grpc_request_timeout,
                             ))
                             .await
                             .map_err(anyhow::Error::from)
@@ -2076,9 +2467,10 @@ impl REClient {
             .as_ref()
             .map(|ep| ep.priority)
             .unwrap_or_default();
-        let pool = self.pool.dupe();
-        let interceptor = self.interceptor.dupe();
-        let engine_address = self.engine_address.clone();
+
+        let pool = self.grpc_clients.pool.dupe();
+        let interceptor = self.grpc_clients.interceptor.dupe();
+        let engine_address = self.grpc_clients.engine_address.clone();
         let use_fbcode_metadata = self.runtime_opts.use_fbcode_metadata;
         let request = GExecuteRequest {
             instance_name: self.instance_name.as_str().to_owned(),
@@ -2164,19 +2556,23 @@ impl REClient {
                 |re_request| {
                     let metadata = metadata.clone();
                     async move {
-                        retry_grpc_request(
+                        retry_grpc_request_with_client_reconnect(
+                            self.grpc_clients.clone(),
+                            GrpcClientKind::Cas,
                             self.runtime_opts.retries,
                             Duration::from_millis(self.runtime_opts.retry_max_delay_ms),
                             || {
+                                let grpc_clients = self.grpc_clients.clone();
                                 let metadata = metadata.clone();
                                 let re_request = re_request.clone();
                                 async move {
-                                    let mut cas_client = self.cas_client().await?;
+                                    let mut cas_client = grpc_clients.cas_client().await?;
                                     Ok(cas_client
-                                        .batch_update_blobs(with_re_metadata(
+                                        .batch_update_blobs(with_re_metadata_timeout(
                                             re_request,
-                                            &metadata,
+                                            metadata,
                                             self.runtime_opts.use_fbcode_metadata,
+                                            self.runtime_opts.grpc_request_timeout,
                                         ))
                                         .await?
                                         .into_inner())
@@ -2189,14 +2585,18 @@ impl REClient {
                 |segments| {
                     let metadata = metadata.clone();
                     async move {
-                        retry_grpc_request(
+                        retry_grpc_request_with_client_reconnect(
+                            self.grpc_clients.clone(),
+                            GrpcClientKind::ByteStream,
                             self.runtime_opts.retries,
                             Duration::from_millis(self.runtime_opts.retry_max_delay_ms),
                             || {
+                                let grpc_clients = self.grpc_clients.clone();
                                 let metadata = metadata.clone();
                                 let segments = segments.clone();
                                 async move {
-                                    let mut bytestream_client = self.bytestream_client().await?;
+                                    let mut bytestream_client =
+                                        grpc_clients.bytestream_client().await?;
                                     let segments = match self
                                         .bystream_write_plan(
                                             &mut bytestream_client,
@@ -2286,19 +2686,23 @@ impl REClient {
                 |re_request| {
                     let metadata = metadata.clone();
                     async move {
-                        retry_grpc_request(
+                        retry_grpc_request_with_client_reconnect(
+                            self.grpc_clients.clone(),
+                            GrpcClientKind::Cas,
                             self.runtime_opts.retries,
                             Duration::from_millis(self.runtime_opts.retry_max_delay_ms),
                             || {
+                                let grpc_clients = self.grpc_clients.clone();
                                 let metadata = metadata.clone();
                                 let re_request = re_request.clone();
                                 async move {
-                                    let mut client = self.cas_client().await?;
+                                    let mut client = grpc_clients.cas_client().await?;
                                     Ok(client
-                                        .batch_read_blobs(with_re_metadata(
+                                        .batch_read_blobs(with_re_metadata_timeout(
                                             re_request,
-                                            &metadata,
+                                            metadata,
                                             self.runtime_opts.use_fbcode_metadata,
+                                            self.runtime_opts.grpc_request_timeout,
                                         ))
                                         .await?
                                         .into_inner())
@@ -2311,14 +2715,17 @@ impl REClient {
                 |read_request| {
                     let metadata = metadata.clone();
                     async move {
-                        let response = retry_grpc_request(
+                        let response = retry_grpc_request_with_client_reconnect(
+                            self.grpc_clients.clone(),
+                            GrpcClientKind::ByteStream,
                             self.runtime_opts.retries,
                             Duration::from_millis(self.runtime_opts.retry_max_delay_ms),
                             || {
+                                let grpc_clients = self.grpc_clients.clone();
                                 let metadata = metadata.clone();
                                 let read_request = read_request.clone();
                                 async move {
-                                    let mut client = self.bytestream_client().await?;
+                                    let mut client = grpc_clients.bytestream_client().await?;
                                     Ok(client
                                         .read(with_re_metadata(
                                             read_request,
@@ -2332,6 +2739,14 @@ impl REClient {
                         )
                         .await?;
                         Ok(Box::pin(response.into_stream()))
+                    }
+                },
+                || {
+                    let grpc_clients = self.grpc_clients.clone();
+                    async move {
+                        grpc_clients
+                            .reconnect_after_broken_connection(GrpcClientKind::ByteStream)
+                            .await;
                     }
                 },
             )
@@ -2376,23 +2791,27 @@ impl REClient {
                     .request_digest_function_config
                     .for_common_digest_function(&requested_digests);
                 let request_digest_function = digest_function_to_grpc(request_digest_function);
-                let missing_blobs = retry_grpc_request(
+                let missing_blobs = retry_grpc_request_with_client_reconnect(
+                    self.grpc_clients.clone(),
+                    GrpcClientKind::Cas,
                     self.runtime_opts.retries,
                     Duration::from_millis(self.runtime_opts.retry_max_delay_ms),
                     || {
                         let metadata = metadata.clone();
                         let requested_digests = requested_digests.clone();
+                        let grpc_clients = self.grpc_clients.clone();
                         async move {
-                            let mut cas_client = self.cas_client().await?;
+                            let mut cas_client = grpc_clients.cas_client().await?;
                             cas_client
-                                .find_missing_blobs(with_re_metadata(
+                                .find_missing_blobs(with_re_metadata_timeout(
                                     FindMissingBlobsRequest {
                                         instance_name: self.instance_name.as_str().to_owned(),
                                         blob_digests: requested_digests,
                                         digest_function: request_digest_function,
                                     },
-                                    &metadata,
+                                    metadata,
                                     self.runtime_opts.use_fbcode_metadata,
+                                    self.runtime_opts.grpc_request_timeout,
                                 ))
                                 .await
                                 .map_err(anyhow::Error::from)
@@ -2467,33 +2886,6 @@ impl REClient {
 
     pub fn get_action_cache_client(&self) -> &Self {
         self
-    }
-
-    async fn cas_client(&self) -> anyhow::Result<ContentAddressableStorageClient<GrpcService>> {
-        let channel = self.pool.get(&self.cas_address).await?;
-        Ok(
-            ContentAddressableStorageClient::new(InterceptedService::new(
-                channel,
-                self.interceptor.dupe(),
-            ))
-            .max_decoding_message_size(self.max_decoding_msg_size),
-        )
-    }
-
-    async fn bytestream_client(&self) -> anyhow::Result<ByteStreamClient<GrpcService>> {
-        let channel = self.pool.get(&self.cas_address).await?;
-        Ok(
-            ByteStreamClient::new(InterceptedService::new(channel, self.interceptor.dupe()))
-                .max_decoding_message_size(self.max_decoding_msg_size),
-        )
-    }
-
-    async fn action_cache_client(&self) -> anyhow::Result<ActionCacheClient<GrpcService>> {
-        let channel = self.pool.get(&self.action_cache_address).await?;
-        Ok(ActionCacheClient::new(InterceptedService::new(
-            channel,
-            self.interceptor.dupe(),
-        )))
     }
 
     pub fn get_metrics_client(&self) -> &Self {
@@ -2900,7 +3292,26 @@ fn convert_t_action_result2(t_action_result: &TActionResult2) -> anyhow::Result<
     Ok(action_result)
 }
 
-async fn download_impl<Byt, BytRet, Cas>(
+async fn read_with_progress_timeout(
+    reader: &mut Pin<Box<dyn AsyncRead + Unpin + Send>>,
+    buffer: &mut [u8],
+    timeout: Duration,
+) -> anyhow::Result<usize> {
+    match tokio::time::timeout(timeout, reader.read(buffer)).await {
+        Ok(result) => result.map_err(anyhow::Error::from),
+        Err(_) => Err(REClientError {
+            code: TCode::DEADLINE_EXCEEDED,
+            message: format!(
+                "ByteStream read made no progress for {}s",
+                timeout.as_secs()
+            ),
+            group: TCodeReasonGroup::RE_CONNECTION,
+        }
+        .into()),
+    }
+}
+
+async fn download_impl<Byt, BytRet, Cas, RetryFut>(
     opts: &RERuntimeOpts,
     instance_name: &InstanceName,
     request: DownloadRequest,
@@ -2910,12 +3321,18 @@ async fn download_impl<Byt, BytRet, Cas>(
     request_digest_function_config: DigestFunctionConfig,
     cas_f: impl Fn(BatchReadBlobsRequest) -> Cas,
     bystream_fut: impl Fn(ReadRequest) -> Byt + Sync + Send + Copy,
+    bystream_retry_hook: impl Fn() -> RetryFut + Sync + Send + Copy,
 ) -> anyhow::Result<DownloadResponse>
 where
     Byt: Future<Output = anyhow::Result<Pin<Box<BytRet>>>>,
-    BytRet: Stream<Item = Result<ReadResponse, tonic::Status>> + Send,
+    BytRet: Stream<Item = Result<ReadResponse, tonic::Status>> + Send + 'static,
     Cas: Future<Output = anyhow::Result<BatchReadBlobsResponse>>,
+    RetryFut: Future<Output = ()>,
 {
+    let retries = opts.retries;
+    let retry_max_delay = Duration::from_millis(opts.retry_max_delay_ms);
+    let bystream_progress_timeout = opts.bytestream_progress_timeout;
+
     fn resource_name(
         instance_name: &InstanceName,
         compressor: Option<Compressor>,
@@ -2961,7 +3378,7 @@ where
         }
     }
 
-    let bystream_fut = |digest: TDigest| async move {
+    let bystream_reader = |digest: TDigest, read_offset: i64| async move {
         let resource_name = resource_name(
             instance_name,
             bystream_compressor,
@@ -2971,7 +3388,7 @@ where
 
         bystream_fut(ReadRequest {
             resource_name: resource_name.clone(),
-            read_offset: 0,
+            read_offset,
             read_limit: 0,
         })
         .await
@@ -3120,14 +3537,75 @@ where
     for digest in inlined_digests {
         let data = if digest.size_in_bytes as usize >= max_total_batch_size {
             let mut accum = vec![];
-            let mut reader = bystream_fut(digest.clone()).await?;
-            tokio::io::copy(&mut reader, &mut accum).await?;
-            validate_downloaded_blob(
-                &digest,
-                &accum,
-                download_hash_digest_function_for_hash(&digest.hash),
-            )?;
-            accum
+            let restart_from_zero = bystream_compressor.is_some();
+            let mut retry_attempt = 0usize;
+            let mut next_delay = Duration::from_millis(GRPC_RETRY_INITIAL_DELAY_MILLIS);
+            loop {
+                if restart_from_zero {
+                    accum.clear();
+                }
+                let read_offset = if restart_from_zero {
+                    0
+                } else {
+                    i64::try_from(accum.len()).with_context(|| {
+                        format!("Downloaded blob is too large to resume on this platform: {digest}")
+                    })?
+                };
+
+                let read_result: anyhow::Result<()> = async {
+                    let mut reader = bystream_reader(digest.clone(), read_offset).await?;
+                    let mut buffer = vec![0u8; 64 * 1024];
+                    loop {
+                        let read_bytes = read_with_progress_timeout(
+                            &mut reader,
+                            &mut buffer,
+                            bystream_progress_timeout,
+                        )
+                        .await
+                        .with_context(|| format!("Error reading chunk of: {digest}"))?;
+                        if read_bytes == 0 {
+                            break;
+                        }
+                        accum.extend_from_slice(&buffer[..read_bytes]);
+                    }
+                    anyhow::Ok(())
+                }
+                .await;
+
+                match read_result {
+                    Ok(()) => {
+                        validate_downloaded_blob(
+                            &digest,
+                            &accum,
+                            download_hash_digest_function_for_hash(&digest.hash),
+                        )?;
+                        break accum;
+                    }
+                    Err(err) if retry_attempt < retries && is_retryable_grpc_error(&err) => {
+                        if is_broken_connection_error(&err) {
+                            bystream_retry_hook().await;
+                        }
+                        let delay = grpc_error_retry_delay(&err)
+                            .map(|delay| std::cmp::min(delay, retry_max_delay))
+                            .unwrap_or_else(|| jittered_retry_delay(next_delay));
+                        tracing::debug!(
+                            digest = %digest,
+                            retry_attempt = retry_attempt + 1,
+                            retries,
+                            read_offset,
+                            delay_ms = delay.as_millis(),
+                            "Retrying ByteStream read"
+                        );
+                        tokio::time::sleep(delay).await;
+                        retry_attempt += 1;
+                        next_delay = std::cmp::min(next_delay.saturating_mul(2), retry_max_delay);
+                    }
+                    Err(err) => {
+                        return Err(normalize_grpc_error(err)
+                            .context(format!("Error downloading digest `{digest}`")));
+                    }
+                }
+            }
         } else {
             get(&digest)?
         };
@@ -3165,32 +3643,104 @@ where
                     .await
                     .with_context(|| format!("Error writing: {}", req.named_digest.digest))?;
             } else {
-                let mut reader = bystream_fut(req.named_digest.digest.clone()).await?;
+                let restart_from_zero = bystream_compressor.is_some();
                 let mut hash_validators = BlobHashValidators::new(
                     &req.named_digest.digest.hash,
                     download_hash_digest_function_for_hash(&req.named_digest.digest.hash),
                 )?;
                 let mut copied_bytes = 0usize;
-                let mut buffer = vec![0u8; 64 * 1024];
+                let mut retry_attempt = 0usize;
+                let mut next_delay = Duration::from_millis(GRPC_RETRY_INITIAL_DELAY_MILLIS);
                 loop {
-                    let read_bytes = reader.read(&mut buffer).await.with_context(|| {
-                        format!("Error reading chunk of: {}", req.named_digest.digest)
-                    })?;
-                    if read_bytes == 0 {
-                        break;
-                    }
-                    copied_bytes = copied_bytes.checked_add(read_bytes).with_context(|| {
-                        format!(
-                            "Downloaded blob is too large to validate on this platform: {}",
-                            req.named_digest.digest
-                        )
-                    })?;
-                    hash_validators.update(&buffer[..read_bytes]);
-                    file.write_all(&buffer[..read_bytes])
-                        .await
-                        .with_context(|| {
-                            format!("Error writing chunk of: {}", req.named_digest.digest)
+                    if restart_from_zero {
+                        copied_bytes = 0;
+                        hash_validators = BlobHashValidators::new(
+                            &req.named_digest.digest.hash,
+                            download_hash_digest_function_for_hash(&req.named_digest.digest.hash),
+                        )?;
+                        file.set_len(0).await.with_context(|| {
+                            format!("Error truncating: {}", req.named_digest.digest)
                         })?;
+                        file.seek(SeekFrom::Start(0)).await.with_context(|| {
+                            format!("Error seeking: {}", req.named_digest.digest)
+                        })?;
+                    }
+
+                    let read_offset = if restart_from_zero {
+                        0
+                    } else {
+                        i64::try_from(copied_bytes).with_context(|| {
+                            format!(
+                                "Downloaded blob is too large to resume on this platform: {}",
+                                req.named_digest.digest
+                            )
+                        })?
+                    };
+
+                    let read_result: anyhow::Result<()> = async {
+                        let mut reader =
+                            bystream_reader(req.named_digest.digest.clone(), read_offset).await?;
+                        let mut buffer = vec![0u8; 64 * 1024];
+                        loop {
+                            let read_bytes = read_with_progress_timeout(
+                                &mut reader,
+                                &mut buffer,
+                                bystream_progress_timeout,
+                            )
+                            .await
+                            .with_context(|| {
+                                format!("Error reading chunk of: {}", req.named_digest.digest)
+                            })?;
+                            if read_bytes == 0 {
+                                break;
+                            }
+                            copied_bytes = copied_bytes.checked_add(read_bytes).with_context(
+                                || {
+                                    format!(
+                                        "Downloaded blob is too large to validate on this platform: {}",
+                                        req.named_digest.digest
+                                    )
+                                },
+                            )?;
+                            hash_validators.update(&buffer[..read_bytes]);
+                            file.write_all(&buffer[..read_bytes])
+                                .await
+                                .with_context(|| {
+                                    format!("Error writing chunk of: {}", req.named_digest.digest)
+                                })?;
+                        }
+                        anyhow::Ok(())
+                    }
+                    .await;
+
+                    match read_result {
+                        Ok(()) => break,
+                        Err(err)
+                            if retry_attempt < retries && is_retryable_grpc_error(&err) =>
+                        {
+                            if is_broken_connection_error(&err) {
+                                bystream_retry_hook().await;
+                            }
+                            let delay = grpc_error_retry_delay(&err)
+                                .map(|delay| std::cmp::min(delay, retry_max_delay))
+                                .unwrap_or_else(|| jittered_retry_delay(next_delay));
+                            tracing::debug!(
+                                digest = %req.named_digest.digest,
+                                retry_attempt = retry_attempt + 1,
+                                retries,
+                                read_offset,
+                                delay_ms = delay.as_millis(),
+                                "Retrying ByteStream file download"
+                            );
+                            tokio::time::sleep(delay).await;
+                            retry_attempt += 1;
+                            next_delay =
+                                std::cmp::min(next_delay.saturating_mul(2), retry_max_delay);
+                        }
+                        Err(err) => {
+                            return Err(normalize_grpc_error(err));
+                        }
+                    }
                 }
                 validate_downloaded_blob_size(&req.named_digest.digest, copied_bytes)?;
                 hash_validators.finish(&req.named_digest.digest)?;
@@ -3584,6 +4134,17 @@ fn with_re_metadata<T>(
     msg
 }
 
+fn with_re_metadata_timeout<T>(
+    t: T,
+    metadata: RemoteExecutionMetadata,
+    use_fbcode_metadata: bool,
+    timeout: Duration,
+) -> tonic::Request<T> {
+    let mut request = with_re_metadata(t, &metadata, use_fbcode_metadata);
+    request.set_timeout(timeout);
+    request
+}
+
 /// Replace occurrences of $FOO in a string with the value of the env var $FOO.
 fn substitute_env_vars(s: &str) -> anyhow::Result<String> {
     substitute_env_vars_impl(s, |v| std::env::var(v))
@@ -3629,6 +4190,37 @@ mod tests {
     use re_grpc_proto::build::bazel::remote::execution::v2::batch_update_blobs_response;
 
     use super::*;
+
+    async fn test_download_impl<Byt, BytRet, Cas>(
+        opts: &RERuntimeOpts,
+        instance_name: &InstanceName,
+        request: DownloadRequest,
+        bystream_compressor: Option<Compressor>,
+        max_total_batch_size: usize,
+        download_hash_digest_function: Option<digest_function::Value>,
+        request_digest_function_config: DigestFunctionConfig,
+        cas_f: impl Fn(BatchReadBlobsRequest) -> Cas,
+        bystream_fut: impl Fn(ReadRequest) -> Byt + Sync + Send + Copy,
+    ) -> anyhow::Result<DownloadResponse>
+    where
+        Byt: std::future::Future<Output = anyhow::Result<Pin<Box<BytRet>>>>,
+        BytRet: futures::Stream<Item = Result<ReadResponse, tonic::Status>> + Send + 'static,
+        Cas: std::future::Future<Output = anyhow::Result<BatchReadBlobsResponse>>,
+    {
+        download_impl(
+            opts,
+            instance_name,
+            request,
+            bystream_compressor,
+            max_total_batch_size,
+            download_hash_digest_function,
+            request_digest_function_config,
+            cas_f,
+            bystream_fut,
+            || async {},
+        )
+        .await
+    }
 
     const OP: &str = "operations/action-1";
 
@@ -4188,6 +4780,10 @@ mod tests {
             batch_read_zstd: false,
             retries: DEFAULT_RETRIES,
             retry_max_delay_ms: DEFAULT_RETRY_MAX_DELAY_MILLIS,
+            grpc_request_timeout: Duration::from_secs(DEFAULT_GRPC_REQUEST_TIMEOUT_SECS),
+            bytestream_progress_timeout: Duration::from_secs(
+                DEFAULT_BYTESTREAM_PROGRESS_TIMEOUT_SECS,
+            ),
             download_hash_digest_function: None,
             request_digest_function_config: DigestFunctionConfig::default(),
         }
@@ -4433,6 +5029,10 @@ mod tests {
             batch_read_zstd: false,
             retries: 0,
             retry_max_delay_ms: 0,
+            grpc_request_timeout: Duration::from_secs(DEFAULT_GRPC_REQUEST_TIMEOUT_SECS),
+            bytestream_progress_timeout: Duration::from_secs(
+                DEFAULT_BYTESTREAM_PROGRESS_TIMEOUT_SECS,
+            ),
             download_hash_digest_function: Some(digest_function::Value::Sha256),
             request_digest_function_config: digest_function_config,
         };
@@ -4682,6 +5282,51 @@ mod tests {
         let err = result.unwrap_err();
         let err = err.downcast_ref::<REClientError>().expect("REClientError");
         assert_eq!(err.code, TCode::UNAVAILABLE);
+    }
+
+    fn retry_info_tonic_status(code: tonic::Code, retry_delay: Duration) -> tonic::Status {
+        let mut retry_info = Vec::new();
+        RetryInfoDetail {
+            retry_delay: Some(prost_types::Duration {
+                seconds: retry_delay.as_secs() as i64,
+                nanos: retry_delay.subsec_nanos() as i32,
+            }),
+        }
+        .encode(&mut retry_info)
+        .unwrap();
+
+        let mut details = Vec::new();
+        Status {
+            code: tcode_from_grpc_code(code).0,
+            message: "retry later".to_owned(),
+            details: vec![prost_types::Any {
+                type_url: RETRY_INFO_TYPE_URL.to_owned(),
+                value: retry_info,
+            }],
+        }
+        .encode(&mut details)
+        .unwrap();
+
+        tonic::Status::with_details(code, "retry later", details.into())
+    }
+
+    #[tokio::test]
+    async fn retry_grpc_request_retries_retry_info_status() {
+        let attempts = AtomicU16::new(0);
+        retry_grpc_request(1, Duration::from_millis(1), || async {
+            if attempts.fetch_add(1, Ordering::Relaxed) == 0 {
+                Err(anyhow::Error::from(retry_info_tonic_status(
+                    tonic::Code::FailedPrecondition,
+                    Duration::from_millis(1),
+                )))
+            } else {
+                Ok(())
+            }
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(attempts.load(Ordering::Relaxed), 2);
     }
 
     #[test]
@@ -4934,7 +5579,7 @@ mod tests {
             ],
         };
 
-        download_impl(
+        test_download_impl(
             &test_re_runtime_opts(),
             &InstanceName(None),
             req,
@@ -5037,7 +5682,7 @@ mod tests {
             data: blob_data[10..].to_vec(),
         };
 
-        download_impl(
+        test_download_impl(
             &test_re_runtime_opts(),
             &InstanceName(None),
             req,
@@ -5116,7 +5761,7 @@ mod tests {
             ],
         };
 
-        let res = download_impl(
+        let res = test_download_impl(
             &test_re_runtime_opts(),
             &InstanceName(None),
             req,
@@ -5178,7 +5823,7 @@ mod tests {
 
         let counter = AtomicU16::new(0);
 
-        let res = download_impl(
+        let res = test_download_impl(
             &test_re_runtime_opts(),
             &InstanceName(None),
             req,
@@ -5245,7 +5890,7 @@ mod tests {
             data: blob_data[10..].to_vec(),
         };
 
-        let res = download_impl(
+        let res = test_download_impl(
             &test_re_runtime_opts(),
             &InstanceName(None),
             req,
@@ -5291,6 +5936,72 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_download_large_inlined_resumes_bystream_after_error() -> anyhow::Result<()> {
+        let blob_data = vec![
+            1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18,
+        ];
+        let digest = &digest_for_test_data(&blob_data);
+
+        let req = DownloadRequest {
+            inlined_digests: Some(vec![digest.clone()]),
+            ..Default::default()
+        };
+
+        let mut opts = test_re_runtime_opts();
+        opts.retries = 1;
+        opts.retry_max_delay_ms = 1;
+        let attempts = AtomicU16::new(0);
+        let reconnects = AtomicU16::new(0);
+        let res = download_impl(
+            &opts,
+            &InstanceName(None),
+            req,
+            None,
+            10,
+            None,
+            DigestFunctionConfig::default(),
+            |_req| async { Ok(BatchReadBlobsResponse { responses: vec![] }) },
+            |req| {
+                let attempt = attempts.fetch_add(1, Ordering::Relaxed);
+                let digest = digest.clone();
+                let blob_data = blob_data.clone();
+                async move {
+                    assert_eq!(req.resource_name, format!("blobs/{}/18", digest.hash));
+                    let responses = if attempt == 0 {
+                        assert_eq!(req.read_offset, 0);
+                        vec![
+                            Ok(ReadResponse {
+                                data: blob_data[..10].to_vec(),
+                            }),
+                            Err(tonic::Status::unavailable(
+                                "transport error: connection reset",
+                            )),
+                        ]
+                    } else {
+                        assert_eq!(req.read_offset, 10);
+                        vec![Ok(ReadResponse {
+                            data: blob_data[10..].to_vec(),
+                        })]
+                    };
+                    anyhow::Ok(Box::pin(futures::stream::iter(responses)))
+                }
+            },
+            || {
+                reconnects.fetch_add(1, Ordering::Relaxed);
+                async {}
+            },
+        )
+        .await?;
+
+        let inlined_blobs = res.inlined_blobs.unwrap();
+        assert_eq!(inlined_blobs[0].blob, blob_data);
+        assert_eq!(attempts.load(Ordering::Relaxed), 2);
+        assert_eq!(reconnects.load(Ordering::Relaxed), 1);
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn test_download_empty() -> anyhow::Result<()> {
         let digest1 = &digest_for_test_data(&[]);
 
@@ -5301,7 +6012,7 @@ mod tests {
 
         let res = BatchReadBlobsResponse { responses: vec![] };
 
-        let res = download_impl(
+        let res = test_download_impl(
             &test_re_runtime_opts(),
             &InstanceName(None),
             req,
@@ -5347,7 +6058,7 @@ mod tests {
             }],
         };
 
-        let err = match download_impl(
+        let err = match test_download_impl(
             &test_re_runtime_opts(),
             &InstanceName(None),
             req,
@@ -5396,7 +6107,7 @@ mod tests {
         };
 
         let read_response = ReadResponse { data: vec![1; 17] };
-        let err = match download_impl(
+        let err = match test_download_impl(
             &test_re_runtime_opts(),
             &InstanceName(None),
             req,
@@ -5443,7 +6154,7 @@ mod tests {
             }],
         };
 
-        let err = match download_impl(
+        let err = match test_download_impl(
             &test_re_runtime_opts(),
             &InstanceName(None),
             req,
@@ -5496,7 +6207,7 @@ mod tests {
         let read_response = ReadResponse {
             data: actual_data.clone(),
         };
-        let err = match download_impl(
+        let err = match test_download_impl(
             &test_re_runtime_opts(),
             &InstanceName(None),
             req,
@@ -5536,7 +6247,7 @@ mod tests {
             ..Default::default()
         };
 
-        download_impl(
+        test_download_impl(
             &test_re_runtime_opts(),
             &InstanceName(Some("instance".to_owned())),
             req,
@@ -5569,7 +6280,7 @@ mod tests {
             ..Default::default()
         };
 
-        download_impl(
+        test_download_impl(
             &test_re_runtime_opts(),
             &InstanceName(None),
             batch_req,
@@ -5600,7 +6311,7 @@ mod tests {
             ..Default::default()
         };
 
-        download_impl(
+        test_download_impl(
             &test_re_runtime_opts(),
             &InstanceName(None),
             stream_req,
@@ -5736,7 +6447,7 @@ mod tests {
         opts.batch_read_zstd = true;
 
         let expected = blob.clone();
-        let d_resp = download_impl(
+        let d_resp = test_download_impl(
             &opts,
             &InstanceName(None),
             req,
@@ -6411,8 +7122,6 @@ async fn test_download_compressed() -> anyhow::Result<()> {
         .read_to_end(&mut compressed_data)
         .await
         .unwrap();
-    let compressed_data_ref = &compressed_data;
-
     let d_resp = download_impl(
         &tests::test_re_runtime_opts(),
         &InstanceName(None),
@@ -6430,13 +7139,17 @@ async fn test_download_compressed() -> anyhow::Result<()> {
         None,
         DigestFunctionConfig::default(),
         |_req| async { panic!("not called") },
-        |_req| async move {
-            Ok(Box::pin(futures::stream::iter(
-                compressed_data_ref
+        |_req| {
+            let compressed_data = compressed_data.clone();
+            async move {
+                let responses = compressed_data
                     .chunks(10)
-                    .map(|d| Result::Ok(ReadResponse { data: d.to_vec() })),
-            )))
+                    .map(|d| Result::Ok(ReadResponse { data: d.to_vec() }))
+                    .collect::<Vec<_>>();
+                Ok(Box::pin(futures::stream::iter(responses)))
+            }
         },
+        || async {},
     )
     .await?;
 
