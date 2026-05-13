@@ -108,6 +108,8 @@ use crate::stats::CountingConnector;
 const DEFAULT_MAX_TOTAL_BATCH_SIZE: usize = 4 * 1000 * 1000;
 const INITIAL_DELAY: Duration = Duration::from_millis(100);
 const MAX_DELAY: Duration = Duration::from_secs(10);
+const DEFAULT_REQUEST_METADATA_TOOL_NAME: &str = "buck2";
+const REQUEST_METADATA_HEADER: &str = "build.bazel.remote.execution.v2.requestmetadata-bin";
 
 fn tdigest_to(tdigest: TDigest) -> Digest {
     Digest {
@@ -228,7 +230,7 @@ fn prepare_uri(uri: Uri, tls: bool) -> anyhow::Result<Uri> {
     // Is this API actually designed to be unusable? If you've got a scheme, you must
     // have a path_and_query. I'm sure there's a good reason, so we abide:
     if parts.path_and_query.is_none() {
-        parts.path_and_query = Some(http::uri::PathAndQuery::from_static(""));
+        parts.path_and_query = Some(http::uri::PathAndQuery::from_static("/"));
     }
 
     Ok(Uri::from_parts(parts)?)
@@ -309,9 +311,24 @@ impl Compressor {
 
 pub struct REClientBuilder;
 
+fn request_metadata_tool_name_from_options(
+    opts: &Buck2OssReConfiguration,
+) -> anyhow::Result<String> {
+    let request_metadata_tool_name = opts
+        .request_metadata_tool_name
+        .clone()
+        .unwrap_or_else(|| DEFAULT_REQUEST_METADATA_TOOL_NAME.to_owned());
+    anyhow::ensure!(
+        !request_metadata_tool_name.is_empty(),
+        "`request_metadata_tool_name` must not be empty"
+    );
+    Ok(request_metadata_tool_name)
+}
+
 impl REClientBuilder {
     pub async fn build_and_connect(opts: &Buck2OssReConfiguration) -> anyhow::Result<REClient> {
         // We just always create this just in case, so that we implicitly validate it if set.
+        let request_metadata_tool_name = request_metadata_tool_name_from_options(opts)?;
         let tls_config = create_tls_config(opts)
             .await
             .context("Invalid TLS config")?;
@@ -464,6 +481,7 @@ impl REClientBuilder {
                 max_retries: opts.max_retries,
                 rpc_timeout: Duration::from_secs(opts.grpc_timeout),
             },
+            request_metadata_tool_name,
             grpc_clients,
             capabilities,
             instance_name,
@@ -610,6 +628,8 @@ impl FindMissingCache {
 
 pub struct REClient {
     runtime_opts: RERuntimeOpts,
+    /// Tool name to report in RequestMetadata.tool_details.
+    request_metadata_tool_name: String,
     grpc_clients: GRPCClients,
     capabilities: RECapabilities,
     instance_name: InstanceName,
@@ -758,6 +778,7 @@ fn process_operation_message(msg: Operation) -> anyhow::Result<ExecuteWithProgre
 impl REClient {
     fn new(
         runtime_opts: RERuntimeOpts,
+        request_metadata_tool_name: String,
         grpc_clients: GRPCClients,
         capabilities: RECapabilities,
         instance_name: InstanceName,
@@ -765,6 +786,7 @@ impl REClient {
     ) -> Self {
         REClient {
             runtime_opts,
+            request_metadata_tool_name,
             grpc_clients,
             capabilities,
             instance_name,
@@ -797,7 +819,8 @@ impl REClient {
                             ..Default::default()
                         },
                         metadata,
-                        self.runtime_opts,
+                        self.runtime_opts.use_fbcode_metadata,
+                        self.request_metadata_tool_name.as_str(),
                     ))
                     .await?;
 
@@ -836,7 +859,8 @@ impl REClient {
                             ..Default::default()
                         },
                         metadata,
-                        self.runtime_opts,
+                        self.runtime_opts.use_fbcode_metadata,
+                        self.request_metadata_tool_name.as_str(),
                     ))
                     .await?;
 
@@ -877,6 +901,7 @@ impl REClient {
 
         let execution_client = self.grpc_clients.execution_client.clone();
         let runtime_opts = self.runtime_opts;
+        let request_metadata_tool_name = self.request_metadata_tool_name.clone();
 
         // retrying_stream covers both stream establishment and stream reading, so errors like
         // h2 GOAWAY (ENHANCE_YOUR_CALM / "too_many_internal_resets") that surface during
@@ -887,9 +912,15 @@ impl REClient {
                 let mut client = execution_client.clone();
                 let request = request.clone();
                 let metadata = metadata.clone();
+                let request_metadata_tool_name = request_metadata_tool_name.clone();
                 async move {
                     Ok(client
-                        .execute(with_re_metadata(request, metadata, runtime_opts))
+                        .execute(with_re_metadata(
+                            request,
+                            metadata,
+                            runtime_opts.use_fbcode_metadata,
+                            request_metadata_tool_name.as_str(),
+                        ))
                         .await?
                         .into_inner())
                 }
@@ -937,6 +968,7 @@ impl REClient {
                 let metadata = metadata.clone();
                 let cas_client = self.grpc_clients.cas_client.clone();
                 let runtime_opts = self.runtime_opts;
+                let request_metadata_tool_name = self.request_metadata_tool_name.clone();
 
                 retry(
                     "BatchUpdateBlobs",
@@ -944,12 +976,14 @@ impl REClient {
                         let metadata = metadata.clone();
                         let mut cas_client = cas_client.clone();
                         let re_request = re_request.clone();
+                        let request_metadata_tool_name = request_metadata_tool_name.clone();
                         async move {
                             let resp = cas_client
                                 .batch_update_blobs(with_re_metadata(
                                     re_request,
                                     metadata,
-                                    runtime_opts,
+                                    runtime_opts.use_fbcode_metadata,
+                                    request_metadata_tool_name.as_str(),
                                 ))
                                 .await?;
                             Ok(resp.into_inner())
@@ -966,6 +1000,7 @@ impl REClient {
                 let metadata = metadata.clone();
                 let bytestream_client = self.grpc_clients.bytestream_client.clone();
                 let runtime_opts = self.runtime_opts;
+                let request_metadata_tool_name = self.request_metadata_tool_name.clone();
 
                 retry(
                     "BS.write",
@@ -973,9 +1008,15 @@ impl REClient {
                         let metadata = metadata.clone();
                         let mut bytestream_client = bytestream_client.clone();
                         let requests = futures::stream::iter(segments.clone());
+                        let request_metadata_tool_name = request_metadata_tool_name.clone();
                         async move {
                             let resp = bytestream_client
-                                .write(with_re_metadata(requests, metadata, runtime_opts))
+                                .write(with_re_metadata(
+                                    requests,
+                                    metadata,
+                                    runtime_opts.use_fbcode_metadata,
+                                    request_metadata_tool_name.as_str(),
+                                ))
                                 .await?;
 
                             Ok(resp.into_inner())
@@ -1032,6 +1073,7 @@ impl REClient {
                 let metadata = metadata.clone();
                 let client = self.grpc_clients.cas_client.clone();
                 let runtime_opts = self.runtime_opts;
+                let request_metadata_tool_name = self.request_metadata_tool_name.clone();
 
                 retry(
                     "BatchReadBlobs",
@@ -1039,12 +1081,14 @@ impl REClient {
                         let metadata = metadata.clone();
                         let mut client = client.clone();
                         let re_request = re_request.clone();
+                        let request_metadata_tool_name = request_metadata_tool_name.clone();
                         async move {
                             Ok(client
                                 .batch_read_blobs(with_re_metadata(
                                     re_request,
                                     metadata,
-                                    runtime_opts,
+                                    runtime_opts.use_fbcode_metadata,
+                                    request_metadata_tool_name.as_str(),
                                 ))
                                 .await?
                                 .into_inner())
@@ -1060,6 +1104,7 @@ impl REClient {
             |read_request| {
                 let metadata = metadata.clone();
                 let runtime_opts = self.runtime_opts;
+                let request_metadata_tool_name = self.request_metadata_tool_name.clone();
                 async move {
                     let client = self.grpc_clients.bytestream_client.clone();
                     retry(
@@ -1068,12 +1113,14 @@ impl REClient {
                             let metadata = metadata.clone();
                             let mut client = client.clone();
                             let read_request = read_request.clone();
+                            let request_metadata_tool_name = request_metadata_tool_name.clone();
                             async move {
                                 let response = client
                                     .read(with_re_metadata(
                                         read_request,
                                         metadata,
-                                        runtime_opts,
+                                        runtime_opts.use_fbcode_metadata,
+                                        request_metadata_tool_name.as_str(),
                                     ))
                                     .await?
                                     .into_inner();
@@ -1141,6 +1188,7 @@ impl REClient {
                         let metadata = metadata.clone();
                         let digests_to_check = digests_to_check.clone();
                         let instance_name = self.instance_name.as_str().to_owned();
+                        let request_metadata_tool_name = self.request_metadata_tool_name.clone();
 
                         async move {
                             cas_client
@@ -1152,7 +1200,8 @@ impl REClient {
                                         ..Default::default()
                                     },
                                     metadata,
-                                    runtime_opts,
+                                    runtime_opts.use_fbcode_metadata,
+                                    request_metadata_tool_name.as_str(),
                                 ))
                                 .await
                                 .context("Failed to request what blobs are not present on remote")
@@ -1875,7 +1924,8 @@ where
 fn with_re_metadata<T>(
     t: T,
     metadata: RemoteExecutionMetadata,
-    runtime_opts: RERuntimeOpts,
+    use_fbcode_metadata: bool,
+    request_metadata_tool_name: &str,
 ) -> tonic::Request<T> {
     // This creates a new Tonic request with attached metadata for the RE
     // backend. There are two cases here we need to support:
@@ -1898,7 +1948,7 @@ fn with_re_metadata<T>(
 
     let mut msg = tonic::Request::new(t);
 
-    if runtime_opts.use_fbcode_metadata {
+    if use_fbcode_metadata {
         // This is pretty ugly, but the protobuf spec that defines this is
         // internal, so considering field numbers need to be stable anyway (=
         // low risk), and this is not used in prod (= low impact if this goes
@@ -1960,7 +2010,7 @@ fn with_re_metadata<T>(
 
         RequestMetadata {
             tool_details: Some(ToolDetails {
-                tool_name: "buck2".to_owned(),
+                tool_name: request_metadata_tool_name.to_owned(),
                 tool_version,
             }),
             action_id: action_id.unwrap_or_default(),
@@ -1973,10 +2023,8 @@ fn with_re_metadata<T>(
         .encode(&mut encoded)
         .expect("Encoding into a Vec cannot not fail");
 
-        msg.metadata_mut().insert_bin(
-            "build.bazel.remote.execution.v2.requestmetadata-bin",
-            MetadataValue::from_bytes(&encoded),
-        );
+        msg.metadata_mut()
+            .insert_bin(REQUEST_METADATA_HEADER, MetadataValue::from_bytes(&encoded));
     };
     msg
 }
@@ -2028,6 +2076,70 @@ mod tests {
             max_retries: 0,
             rpc_timeout: Duration::from_secs(60),
         }
+    }
+
+    fn decode_request_metadata<T>(request: &tonic::Request<T>) -> RequestMetadata {
+        let metadata = request
+            .metadata()
+            .get_bin(REQUEST_METADATA_HEADER)
+            .expect("request metadata header should be present");
+        RequestMetadata::decode(metadata.to_bytes().unwrap()).unwrap()
+    }
+
+    #[test]
+    fn request_metadata_tool_name_from_options_defaults_to_buck2() -> anyhow::Result<()> {
+        let opts = Buck2OssReConfiguration::default();
+        assert_eq!(
+            request_metadata_tool_name_from_options(&opts)?,
+            DEFAULT_REQUEST_METADATA_TOOL_NAME
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn request_metadata_tool_name_from_options_uses_configured_value() -> anyhow::Result<()> {
+        let opts = Buck2OssReConfiguration {
+            request_metadata_tool_name: Some("bazel".to_owned()),
+            ..Default::default()
+        };
+        assert_eq!(request_metadata_tool_name_from_options(&opts)?, "bazel");
+        Ok(())
+    }
+
+    #[test]
+    fn request_metadata_tool_name_from_options_rejects_empty_value() {
+        let opts = Buck2OssReConfiguration {
+            request_metadata_tool_name: Some(String::new()),
+            ..Default::default()
+        };
+        let err = request_metadata_tool_name_from_options(&opts)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("request_metadata_tool_name"));
+    }
+
+    #[test]
+    fn with_re_metadata_sets_request_metadata_tool_name() {
+        use re_grpc_proto::build::bazel::remote::execution::v2::BuckInfo;
+        let request = with_re_metadata(
+            (),
+            RemoteExecutionMetadata {
+                buck_info: Some(BuckInfo {
+                    build_id: "build-id".to_owned(),
+                    version: "version".to_owned(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            false,
+            "bazel",
+        );
+        let request_metadata = decode_request_metadata(&request);
+        let tool_details = request_metadata
+            .tool_details
+            .expect("tool details should be set");
+        assert_eq!(tool_details.tool_name, "bazel");
+        assert_eq!(tool_details.tool_version, "version");
     }
 
     #[tokio::test]

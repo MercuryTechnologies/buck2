@@ -38,6 +38,21 @@ Keys supported include:
   interpolation syntax ($VAR). They will be substituted before reading the file.
 - `instance_name` - an instance name to pass on execution, action cache, and CAS
   requests.
+- `request_metadata_tool_name` - optional override for
+  `RequestMetadata.tool_details.tool_name` in the Bazel remote execution request
+  metadata. This defaults to `buck2`.
+- `capabilities` - whether Buck2 should query the RE capabilities service. This
+  defaults to enabled.
+- `max_total_batch_size` - optional client-side cap for cumulative blob size in
+  batch CAS requests. Buck2 also honors a smaller server-advertised
+  `max_batch_total_size_bytes`.
+- `remote_cache_chunking` - enables FastCDC 2020 chunked uploads and downloads
+  for large CAS blobs. This requires `capabilities` to be enabled and the server
+  to advertise SplitBlob, SpliceBlob, and FastCDC 2020 parameters.
+- `remote_cache_chunk_cache_dir` - optional local directory for FastCDC chunk
+  blobs. When set with `remote_cache_chunking`, Buck2 checks this directory
+  before downloading chunks from remote CAS and writes validated chunks after
+  chunked uploads or downloads. The directory is managed by the user.
 
 Buck2 uses `SHA256` for all its hashing by default. If your RE engine requires
 something else, this can be configured in `.buckconfig` as follows:
