@@ -143,6 +143,7 @@ pub struct Message {
 
 struct SendNowRequest {
     messages: Vec<Message>,
+    wait_for_acks: bool,
     done: oneshot::Sender<buck2_error::Result<()>>,
 }
 
@@ -683,10 +684,11 @@ impl BesClient {
         }
     }
 
-    // Send through a dedicated priority lane on the background worker and wait
-    // for completion. This keeps emergency delivery semantics while reusing the
-    // worker's existing per-invocation stream state.
-    pub async fn send_messages_now(&self, messages: Vec<Message>) -> buck2_error::Result<()> {
+    async fn send_messages_with_priority(
+        &self,
+        messages: Vec<Message>,
+        wait_for_acks: bool,
+    ) -> buck2_error::Result<()> {
         if messages.is_empty() {
             return Ok(());
         }
@@ -695,6 +697,7 @@ impl BesClient {
         self.send_now_tx
             .send(SendNowRequest {
                 messages,
+                wait_for_acks,
                 done: done_tx,
             })
             .map_err(|_| {
@@ -710,6 +713,20 @@ impl BesClient {
                 "BES worker dropped priority send response channel"
             )
         })?
+    }
+
+    // Send through a dedicated priority lane on the background worker and wait
+    // for completion. This keeps emergency delivery semantics while reusing the
+    // worker's existing per-invocation stream state.
+    pub async fn send_messages_now(&self, messages: Vec<Message>) -> buck2_error::Result<()> {
+        self.send_messages_with_priority(messages, true).await
+    }
+
+    pub async fn send_messages_without_waiting_for_acks(
+        &self,
+        messages: Vec<Message>,
+    ) -> buck2_error::Result<()> {
+        self.send_messages_with_priority(messages, false).await
     }
 
     pub fn export_counters(&self) -> Counters {
@@ -731,7 +748,8 @@ fn process_send_now_request(
     worker: &mut WorkerState,
     request: SendNowRequest,
 ) {
-    // Desired behavior (mirroring Bazel's BES uploader semantics):
+    // Desired behavior for the ACK-waiting path (mirroring Bazel's BES
+    // uploader semantics):
     //
     // 1) `send_messages_now()` is an emergency path. Returning `Ok(())` means all events from this
     //    request were ACKed by BES.
@@ -762,7 +780,7 @@ fn process_send_now_request(
             }
         }
     }
-    if result.is_ok() && !ack_targets.is_empty() {
+    if request.wait_for_acks && result.is_ok() && !ack_targets.is_empty() {
         if let Err(status) = runtime.block_on(worker.wait_for_acks(&ack_targets)) {
             worker.record_status_failure(&status);
             result = Err(buck2_error::buck2_error!(
