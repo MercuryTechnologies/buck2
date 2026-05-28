@@ -789,6 +789,7 @@ impl TestOrchestrator for BuckTestOrchestrator<'_> {
                 suite_name: suite,
                 test_names: names,
                 target_label: Some(test_target.target().as_proto()),
+                labels: Vec::new(),
             })),
         });
 
@@ -1046,6 +1047,7 @@ impl BuckTestOrchestrator<'_> {
                 let start = TestDiscoveryStart {
                     target_label: Some(test_target.target.as_proto()),
                     suite_name: suite.clone(),
+                    labels: Vec::new(),
                 };
                 let (result, cached) = events
                     .span_async(start, async move {
@@ -1082,6 +1084,7 @@ impl BuckTestOrchestrator<'_> {
                             )
                             .ok(),
                             re_cache_enabled: *cacheable && re_cache_enabled,
+                            labels: Vec::new(),
                         };
                         ((result, cached), end)
                     })
@@ -1117,6 +1120,7 @@ impl BuckTestOrchestrator<'_> {
                     suite_name: suite.clone(),
                     test_names: testcases.clone(),
                     target_label: Some(test_target.target.as_proto()),
+                    labels: Vec::new(),
                 });
                 let start = TestRunStart {
                     suite: test_suite.clone(),
@@ -1154,6 +1158,7 @@ impl BuckTestOrchestrator<'_> {
                                 prepared_command.request.host_sharing_requirements().clone(),
                             )
                             .ok(),
+                            timeout: None,
                         };
                         ((result, cached), end)
                     })

@@ -547,7 +547,13 @@ async fn process_build_result(
                 Ok(n) => *n,
                 Err(..) => 0,
             };
-            (res, buck2_data::CreateOutputSymlinksEnd { created })
+            (
+                res,
+                buck2_data::CreateOutputSymlinksEnd {
+                    created,
+                    symlinks: Vec::new(),
+                },
+            )
         })
         .await?;
     }

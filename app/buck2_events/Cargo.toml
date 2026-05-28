@@ -9,6 +9,7 @@ version = "0.1.0"
 async-trait = { workspace = true }
 bazel_bep_proto = { workspace = true }
 bes_grpc_proto = { workspace = true }
+chrono = { workspace = true }
 console = { workspace = true }
 crossbeam-channel = { workspace = true }
 derive_more = { workspace = true }
