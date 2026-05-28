@@ -17,6 +17,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use buck2_data::CommandExecutionDetails;
 use buck2_error::BuckErrorContext;
+use buck2_error::internal_error;
 use buck2_event_observer::action_sub_error_display::ActionSubErrorDisplay;
 use buck2_event_observer::display;
 use buck2_event_observer::display::TargetDisplayOptions;
