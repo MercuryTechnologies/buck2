@@ -1797,6 +1797,8 @@ fn truncate(contents: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    use buck2_error::internal_error;
+
     use std::time::SystemTime;
 
     use buck2_cli_proto::CommandResult;
