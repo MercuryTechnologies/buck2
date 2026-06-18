@@ -66,9 +66,12 @@ load(":toolchain.bzl", "evaluate_cgo_enabled")
 def go_exported_library_impl(ctx: AnalysisContext) -> list[Provider]:
     pkg_import_path = go_attr_pkg_name(ctx)
     cgo_enabled = evaluate_cgo_enabled(ctx.attrs._cgo_enabled)
-    cgo_build_context = get_cgo_build_context(ctx)
+    native_deps = ctx.attrs.deps + ctx.attrs.cdeps
+    cgo_build_context = get_cgo_build_context(ctx, native_deps)
 
-    lib, pkg_info, _ = declare_package_build(
+    header_namespace = cgo_build_context.header_namespace if cgo_build_context != None else (ctx.attrs.header_namespace if ctx.attrs.header_namespace != None else ctx.label.package)
+
+    lib, pkg_info, _, _ = declare_package_build(
         ctx = ctx,
         pkg_import_path = pkg_import_path,
         main = True,
@@ -92,6 +95,7 @@ def go_exported_library_impl(ctx: AnalysisContext) -> list[Provider]:
             lib,
             cgo_enabled = cgo_enabled,
             deps = ctx.attrs.deps,
+            native_deps = ctx.attrs.cdeps,
             build_mode = build_mode,
             link_style = value_or(map_val(LinkStyle, ctx.attrs.link_style), LinkStyle("static_pic")),
             linker_flags = ctx.attrs.linker_flags,
@@ -159,22 +163,24 @@ def go_exported_library_impl(ctx: AnalysisContext) -> list[Provider]:
         ),
         GoTestInfo(
             deps = ctx.attrs.deps,
-            srcs = ctx.attrs.srcs,
+            cdeps = ctx.attrs.cdeps,
+            srcs = ctx.attrs.srcs + ctx.attrs.headers,
             pkg_import_path = pkg_import_path,
+            header_namespace = header_namespace,
             coverage_enabled = ctx.attrs.coverage_enabled,
         ),
         create_merged_link_info(
             ctx,
             cxx_toolchain.pic_behavior,
             link_infos = link_infos,
-            deps = filter(None, map_idx(MergedLinkInfo, ctx.attrs.deps)),
+            deps = filter(None, map_idx(MergedLinkInfo, native_deps)),
         ),
         merge_shared_libraries(
             ctx.actions,
             node = shared_libs,
-            deps = filter(None, map_idx(SharedLibraryInfo, ctx.attrs.deps)),
+            deps = filter(None, map_idx(SharedLibraryInfo, native_deps)),
         ),
-        merge_link_group_lib_info(deps = ctx.attrs.deps),
+        merge_link_group_lib_info(deps = native_deps),
         create_linkable_graph(
             ctx,
             node = create_linkable_graph_node(
@@ -182,14 +188,14 @@ def go_exported_library_impl(ctx: AnalysisContext) -> list[Provider]:
                 linkable_node = create_linkable_node(
                     ctx,
                     default_soname = soname,
-                    deps = ctx.attrs.deps,
+                    deps = native_deps,
                     link_infos = link_infos,
                     shared_libs = shared_libs,
                 ),
             ),
-            deps = ctx.attrs.deps,
+            deps = native_deps,
         ),
-        cxx_merge_cpreprocessors(ctx.actions, own_exported_preprocessors, cxx_inherited_preprocessor_infos(ctx.attrs.deps)),
+        cxx_merge_cpreprocessors(ctx.actions, own_exported_preprocessors, cxx_inherited_preprocessor_infos(native_deps)),
         pkg_info,
     ]
 
@@ -245,6 +251,7 @@ go_exported_library = prelude_rule(
         | go_common.import_path_arg()
         | go_common.srcs_arg()
         | go_common.deps_arg()
+        | go_common.cdeps_arg()
         | {
             "build_mode": attrs.option(
                 attrs.enum(BuildMode),
