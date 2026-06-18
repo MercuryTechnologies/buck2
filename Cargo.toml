@@ -251,6 +251,9 @@ num_cpus = "1.11"
 num_enum = "0.7"
 object = "0.36.7"
 once_cell = "1.8"
+opentelemetry = "0.32.0"
+opentelemetry-otlp = { version = "0.32.0", default-features = false, features = ["trace", "http-proto", "reqwest-blocking-client"] }
+opentelemetry_sdk = "0.32.1"
 os_str_bytes = { version = "6.6.0", features = ["conversions"] }
 parking_lot = { version = "0.11.2", features = ["send_guard"] }
 paste = "1.0"
@@ -330,6 +333,7 @@ tower = { version = "0.4", features = ["util"] }
 tower-layer = "0.3.1"
 tower-service = "0.3.3"
 tracing = "0.1.22"
+tracing-opentelemetry = "0.33.0"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 triomphe = "0.1.11"
 trybuild = "1.0.56"

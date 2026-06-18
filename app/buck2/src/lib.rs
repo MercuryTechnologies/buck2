@@ -489,6 +489,22 @@ impl CommandKind {
             recorder.update_for_client_ctx(&command_ctx, self.command_name());
         }
 
+        // Start client-side telemetry. Almost all spans are emitted by the client, so this is where
+        // the bulk of the trace comes from. Unlike the daemon, the client never `fork()`s without an
+        // immediate `exec()`, so it is safe to spawn the exporter's threads now. The daemon is
+        // handled separately (it activates after daemonizing -- see `CommandKind::exec`), and we
+        // skip the forking helpers, which fork+exec constantly and emit nothing useful.
+        #[cfg(not(client_only))]
+        let skip_telemetry = matches!(
+            self,
+            CommandKind::Forkserver(..) | CommandKind::InternalTestRunner(..)
+        );
+        #[cfg(client_only)]
+        let skip_telemetry = false;
+        if !skip_telemetry {
+            buck2_core::logging::otel::activate();
+        }
+
         match self {
             #[cfg(not(client_only))]
             CommandKind::Daemon(..) => unreachable!("Checked earlier"),

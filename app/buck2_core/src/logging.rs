@@ -22,6 +22,7 @@ use tracing_subscriber::reload::Handle;
 use crate::buck2_env;
 
 pub mod log_file;
+pub mod otel;
 
 pub trait LogConfigurationReloadHandle: Send + Sync + 'static {
     fn update_log_filter(&self, format: &str) -> buck2_error::Result<()>;
@@ -83,7 +84,13 @@ where
 
     let (layer, handle) = reload::Layer::new(layer);
 
-    tracing_subscriber::registry().with(layer).init();
+    // Install an empty, reloadable OTLP telemetry slot. This spawns no threads -- the exporter is
+    // built later by `otel::activate()`, once the process has finished any `fork()`-without-`exec()`
+    // (i.e. after the daemon daemonizes). See `otel` module docs for why this can't happen here.
+    tracing_subscriber::registry()
+        .with(layer)
+        .with(otel::deferred_layer())
+        .init();
 
     Ok(Arc::new(handle) as _)
 }
