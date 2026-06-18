@@ -30,12 +30,13 @@ use serde::Deserialize;
 use serde::Serialize;
 use tokio::fs::File;
 use tokio::io::AsyncRead;
+use tracing::instrument;
 
 use crate::chunk_reader::ChunkReader;
 use crate::legacy_configs::configs::LegacyBuckConfig;
 use crate::legacy_configs::key::BuckconfigKeyRef;
 
-#[derive(Copy, Clone, Dupe)]
+#[derive(Copy, Clone, Dupe, Debug)]
 pub struct Ttl {
     duration: Duration,
 }
@@ -138,7 +139,7 @@ impl From<io::Error> for UploadError {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub struct Bucket {
     pub name: &'static str,
     key: &'static str,
@@ -266,6 +267,7 @@ impl ManifoldClient {
         self.config.is_some()
     }
 
+    #[instrument(skip(self, buf), fields(len = buf.len()), err)]
     pub async fn write(
         &self,
         bucket: Bucket,
@@ -311,6 +313,7 @@ impl ManifoldClient {
         Ok(())
     }
 
+    #[instrument(skip(self, buf), fields(len = buf.len()), err)]
     pub async fn append(
         &self,
         bucket: Bucket,
@@ -344,6 +347,7 @@ impl ManifoldClient {
         Ok(())
     }
 
+    #[instrument(skip(self, read), err)]
     pub async fn read_and_upload<R>(
         &self,
         bucket: Bucket,
@@ -383,6 +387,7 @@ impl ManifoldClient {
         }
     }
 
+    #[instrument(skip(self), err)]
     pub async fn upload_file(
         &self,
         local_path: &AbsPath,
