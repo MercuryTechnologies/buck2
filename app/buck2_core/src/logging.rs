@@ -22,6 +22,7 @@ use tracing_subscriber::reload::Handle;
 use crate::buck2_env;
 
 pub mod log_file;
+pub mod otel;
 
 pub trait LogConfigurationReloadHandle: Send + Sync + 'static {
     fn update_log_filter(&self, format: &str) -> buck2_error::Result<()>;
