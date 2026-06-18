@@ -60,6 +60,7 @@ use crate::key::DiceKey;
 use crate::key::ParentKey;
 use crate::opaque::OpaqueValue;
 use crate::updater::ActiveTransactionGuard;
+use crate::updater::TransactionUpdater;
 use crate::value::MaybeResidentComputedValue;
 use crate::value::TrackedInvalidationPaths;
 use crate::versions::VersionNumber;
@@ -110,6 +111,15 @@ impl TransactionCtx {
 
     pub(crate) fn get_version(&self) -> VersionNumber {
         self.ctx.get_version()
+    }
+
+    /// An updater for this transaction's branch, carrying its user data.
+    pub(crate) fn into_updater_for_latest(self) -> TransactionUpdater {
+        TransactionUpdater::new(
+            self.ctx.transaction_data.dice.dupe(),
+            self.get_version().branch(),
+            self.ctx.transaction_data.user_data.dupe(),
+        )
     }
 
     pub(crate) fn compute<'a, K>(

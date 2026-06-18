@@ -8,11 +8,14 @@
  * above-listed licenses.
  */
 
+use std::sync::LazyLock;
 use std::collections::BTreeMap;
+use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::OnceLock;
 use std::sync::Mutex;
 use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 use std::time::Instant;
 
@@ -760,6 +763,8 @@ pub fn is_induced_cache_miss(action_digest: &ActionDigest) -> bool {
 }
 
 static TEST_FAIL_RE_EXECUTE_MISSING_INPUTS_ONCE: AtomicBool = AtomicBool::new(false);
+static TEST_FAIL_RE_DOWNLOAD_DIGESTS_ONCE: LazyLock<Mutex<BuckMutSet<String>>> =
+    LazyLock::new(|| Mutex::new(BuckMutSet::default()));
 
 impl RemoteExecutionClientImpl {
     async fn new(re_config: &RemoteExecutionConfig) -> buck2_error::Result<Self> {
@@ -1849,8 +1854,7 @@ impl RemoteExecutionClientImpl {
             "BUCK2_TEST_FAIL_RE_EXECUTE_MISSING_INPUTS_ONCE",
             bool,
             applicability = testing
-        )? && !TEST_FAIL_RE_EXECUTE_MISSING_INPUTS_ONCE
-            .swap(true, std::sync::atomic::Ordering::Relaxed)
+        )? && !TEST_FAIL_RE_EXECUTE_MISSING_INPUTS_ONCE.swap(true, Ordering::Relaxed)
         {
             return Ok(ExecuteResponseOrCancelled::Response(
                 ExecuteResponseWithQueueStats {
@@ -1885,7 +1889,7 @@ impl RemoteExecutionClientImpl {
         );
 
         if let Some(induced_cache_miss) = induced_cache_miss {
-            induced_cache_miss.store(true, std::sync::atomic::Ordering::Relaxed);
+            induced_cache_miss.store(true, Ordering::Relaxed);
         }
 
         let trace = match &res {
@@ -2072,6 +2076,13 @@ impl RemoteExecutionClientImpl {
                 .await
                 .buck_error_context("Failed to acquire download_files_semapore")?;
 
+            if let Some(digest) = should_fail_re_download(&chunk)? {
+                return Err(test_re_error(
+                    &format!("Injected missing CAS download for {digest}"),
+                    TCode::NOT_FOUND,
+                ));
+            }
+
             let download = self.client().get_cas_client().download(
                 metadata,
                 DownloadRequest {
@@ -2218,6 +2229,64 @@ buck2_util::size_assert::words_of_async_fn_future!(
     (_, _, _, _),
     ~38
 );
+
+fn should_fail_re_download(
+    files: &[NamedDigestWithPermissions],
+) -> buck2_error::Result<Option<TDigest>> {
+    fn convert_digests(val: &str) -> buck2_error::Result<Vec<TDigest>> {
+        val.split_whitespace()
+            .map(|digest| {
+                TDigest::from_str(digest)
+                    .map_err(|e| from_any_with_tag(e, buck2_error::ErrorTag::InvalidDigest))
+                    .with_buck_error_context(|| format!("Invalid digest: {digest}"))
+            })
+            .collect()
+    }
+
+    let injected_digests_file = buck2_env!(
+        "BUCK2_TEST_FAIL_RE_DOWNLOAD_DIGESTS_ONCE_FILE",
+        applicability = testing
+    )?;
+    if let Some(path) = injected_digests_file {
+        let injected_digests = std::fs::read_to_string(path)
+            .with_buck_error_context(|| format!("Failed to read `{path}`"))?;
+        for injected_digest in convert_digests(&injected_digests)? {
+            if should_fail_digest_once(files, &injected_digest) {
+                return Ok(Some(injected_digest));
+            }
+        }
+    }
+
+    let injected_digests = buck2_env!(
+        "BUCK2_TEST_FAIL_RE_DOWNLOAD_DIGESTS_ONCE",
+        type=Vec<TDigest>,
+        converter=convert_digests,
+        applicability=testing
+    )?;
+
+    let Some(injected_digests) = injected_digests else {
+        return Ok(None);
+    };
+
+    for injected_digest in injected_digests {
+        if should_fail_digest_once(files, &injected_digest) {
+            return Ok(Some(injected_digest.clone()));
+        }
+    }
+
+    Ok(None)
+}
+
+fn should_fail_digest_once(files: &[NamedDigestWithPermissions], digest: &TDigest) -> bool {
+    if !files.iter().any(|file| file.named_digest.digest == *digest) {
+        return false;
+    }
+
+    TEST_FAIL_RE_DOWNLOAD_DIGESTS_ONCE
+        .lock()
+        .expect("Poisoned lock")
+        .insert(digest.to_string())
+}
 
 /// Drop the REClient on a blocking thread. The REClient destructor does a blocking wait on async
 /// calls (it tells the server to cancel its calls, but it waits for an ack), so we shouldn't drop

@@ -20,6 +20,7 @@ use buck2_cli_proto::build_request::Uploads;
 use buck2_core::execution_types::executor_config::RemoteExecutorUseCase;
 use buck2_core::fs::project_rel_path::ProjectRelativePath;
 use buck2_error::BuckErrorContext;
+use buck2_error::ErrorTag;
 use buck2_execute::artifact_utils::ArtifactValueBuilder;
 use buck2_execute::artifact_value::ArtifactValue;
 use buck2_execute::digest_config::HasDigestConfig;
@@ -34,6 +35,7 @@ use dice_futures::spawn::spawn_dropcancel;
 use dupe::Dupe;
 use futures::FutureExt;
 
+use crate::actions::rewind::ActionRewindRequest;
 use crate::actions::artifact::get_artifact_fs::GetArtifactFs;
 use crate::actions::artifact::materializer::ArtifactMaterializer;
 use crate::actions::execute::dice_data::GetReClient;
@@ -172,10 +174,58 @@ async fn materialize_artifact_group(
             }
         }
 
-        buck2_util::future::try_join_all(materialize_futs).await?;
+        match buck2_util::future::try_join_all(materialize_futs).await {
+            Ok(_) => {}
+            // A forced materialization whose blob the remote CAS no longer has asks for the actions
+            // that produced it to be rewound, and forgets that it queued these artifacts.
+            Err(error) if force && error.tags().contains(&ErrorTag::ReNotFound) => {
+                remove_materialization_queue_entries(&values, queue_tracker);
+                return Err(match materialization_rewind_request(&values) {
+                    Some(request) => error.context(request),
+                    None => error,
+                });
+            }
+            Err(error) => return Err(error),
+        }
     }
 
     Ok(values)
+}
+
+fn materialization_rewind_request(values: &ArtifactGroupValues) -> Option<ActionRewindRequest> {
+    let mut producers = Vec::new();
+
+    for (artifact, _) in values.iter() {
+        if let BaseArtifactKind::Build(artifact) = artifact.as_parts().0 {
+            if !producers.iter().any(|key| key == artifact.key()) {
+                producers.push(artifact.key().dupe());
+            }
+        }
+    }
+
+    if producers.is_empty() {
+        return None;
+    }
+
+    for producer in &producers {
+        tracing::info!(
+            producer_action = %producer,
+            "Requesting DICE graph rewind after a requested output disappeared from remote CAS"
+        );
+    }
+
+    Some(ActionRewindRequest::new(producers))
+}
+
+fn remove_materialization_queue_entries(
+    values: &ArtifactGroupValues,
+    queue_tracker: &Arc<BuckDashSet<BuildArtifact>>,
+) {
+    for (artifact, _) in values.iter() {
+        if let BaseArtifactKind::Build(artifact) = artifact.as_parts().0 {
+            queue_tracker.remove(artifact);
+        }
+    }
 }
 
 async fn ensure_uploaded(
