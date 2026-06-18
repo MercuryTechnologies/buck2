@@ -80,7 +80,7 @@ where
     }
 }
 
-#[derive(Eq, PartialEq, Copy, Clone)]
+#[derive(Eq, PartialEq, Copy, Clone, Debug)]
 pub(crate) enum EventLogType {
     System,
     User,

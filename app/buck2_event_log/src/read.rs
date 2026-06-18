@@ -116,7 +116,7 @@ where
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct EventLogPathBuf {
     pub(crate) path: AbsPathBuf,
     pub(crate) encoding: Encoding,
