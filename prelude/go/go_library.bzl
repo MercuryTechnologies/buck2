@@ -182,6 +182,7 @@ go_library = prelude_rule(
         # @unsorted-dict-items
         go_common.srcs_arg()
         | go_common.package_name_arg()
+        | go_common.import_path_arg()
         | go_common.deps_arg()
         | go_common.compiler_flags_arg()
         | go_common.assembler_flags_arg()

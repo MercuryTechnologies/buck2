@@ -277,6 +277,14 @@ go_test = prelude_rule(
                  parameter instead of setting `package_name` to include the tested source files.
             """,
             ),
+            "import_path": attrs.option(
+                attrs.string(),
+                default = None,
+                doc = """
+                Sets the Go import path of the test package being compiled. Prefer this over
+                 package_name for new targets. If both are set, they must be equal.
+            """,
+            ),
             "target_under_test": attrs.option(
                 attrs.dep(),
                 default = None,
