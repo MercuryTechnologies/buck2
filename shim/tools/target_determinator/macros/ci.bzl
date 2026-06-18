@@ -21,6 +21,9 @@ def _package(
 def _labels(*args):
     return []
 
+def _modifiers(*_args):
+    return []
+
 def _remove_labels(*_args):
     return []
 
@@ -35,5 +38,6 @@ ci = struct(
     opt = _lbl,
     remove = _lbl,
     labels = _labels,
+    modifiers = _modifiers,
     remove_labels = _remove_labels,
 )
