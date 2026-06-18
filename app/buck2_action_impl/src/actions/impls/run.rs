@@ -1237,9 +1237,14 @@ impl RunAction {
         // First, check in the local dep file cache if an identical action can be found there.
         // Do this before checking the action cache as we can avoid a potentially large download.
         // Once the action cache lookup misses, we will do the full dep file cache look up.
-        let (identical_action, should_fully_check_dep_file_cache) = dep_file_bundle
-            .check_local_dep_file_cache_for_identical_action(ctx, self.outputs.as_slice())
-            .await?;
+        let should_bypass_action_cache = ctx.should_bypass_action_cache();
+        let (identical_action, should_fully_check_dep_file_cache) = if should_bypass_action_cache {
+            (None, false)
+        } else {
+            dep_file_bundle
+                .check_local_dep_file_cache_for_identical_action(ctx, self.outputs.as_slice())
+                .await?
+        };
         // We can avoid preparing the action for a local cache hit as long as we're not forcing certain digests to cache-miss.
         let forced_misses = induced_cache_misses_configured();
         if !forced_misses && let Some((outputs, metadata)) = identical_action {
@@ -1732,7 +1737,8 @@ impl Action for RunAction {
         waiting_data: WaitingData,
     ) -> Result<(ActionOutputs, ActionExecutionMetadata), ExecuteError> {
         // Check offline cache first if parameter enabled
-        if self.inner.allow_offline_output_cache
+        if !ctx.should_bypass_action_cache()
+            && self.inner.allow_offline_output_cache
             && ctx.run_action_knobs().use_network_action_output_cache
         {
             if let Some((outputs, metadata)) = self.execute_for_offline(ctx).await? {
