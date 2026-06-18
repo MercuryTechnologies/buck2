@@ -147,6 +147,7 @@ go_binary = prelude_rule(
     attrs = (
         # @unsorted-dict-items
         go_common.package_name_arg()
+        | go_common.import_path_arg()
         | go_common.srcs_arg()
         | go_common.deps_arg()
         | go_common.link_style_arg()
