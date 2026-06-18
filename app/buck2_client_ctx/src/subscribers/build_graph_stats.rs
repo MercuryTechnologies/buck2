@@ -69,6 +69,8 @@ impl BuildGraphStats {
                 bazel_artifact_uri_authority: None,
                 #[cfg(not(fbcode_build))]
                 bazel_artifact_upload_max_bytes: 10 * 1024 * 1024,
+                #[cfg(not(fbcode_build))]
+                build_metadata: Vec::new(),
             },
         );
 

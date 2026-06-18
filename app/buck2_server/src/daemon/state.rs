@@ -479,6 +479,8 @@ impl DaemonState {
                     bazel_artifact_uri_authority,
                     #[cfg(not(fbcode_build))]
                     bazel_artifact_upload_max_bytes,
+                    #[cfg(not(fbcode_build))]
+                    build_metadata: Vec::new(),
                 },
             )
             .buck_error_context("failed to init scribe sink")?;
