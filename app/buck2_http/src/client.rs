@@ -30,6 +30,8 @@ use hyper_util::client::legacy::connect::Connect;
 use tokio::io::AsyncReadExt;
 use tokio::sync::Semaphore;
 use tokio_util::io::StreamReader;
+use tracing::Span;
+use tracing::instrument;
 
 use crate::HttpError;
 use crate::redirect::PendingRequest;
@@ -163,15 +165,15 @@ impl HttpClient {
     }
 
     /// Send a generic request.
+    #[instrument(skip_all, err, fields(method = %request.method(), uri = %request.uri(), version = ?request.version(), headers = ?request.headers(), body_bytes = request.body().len(), status))]
     pub async fn request(
         &self,
         request: Request<Bytes>,
     ) -> Result<Response<BoxStream<'_, hyper::Result<Bytes>>>, HttpError> {
         let pending_request = PendingRequest::from_request(&request);
         let uri = request.uri().clone();
-        tracing::debug!("http: request: {:?}", request);
         let resp = self.send_request_impl(request).await?;
-        tracing::debug!("http: response: {:?}", resp.status());
+        Span::current().record("status", resp.status().to_string());
 
         // Handle redirects up to self.max_redirects times.
         let resp = if let Some(max_redirects) = self.max_redirects {
