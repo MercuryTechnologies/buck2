@@ -22,6 +22,7 @@ use buck2_directory::directory::directory_iterator::DirectoryIterator;
 use buck2_directory::directory::entry::DirectoryEntry;
 use buck2_directory::directory::walk::ordered_entry_walk;
 use buck2_error::ErrorTag;
+use buck2_error::TypedContext;
 use buck2_events::dispatch::EventDispatcher;
 use derive_more::Display;
 use dice::UserComputationData;
@@ -102,6 +103,22 @@ pub struct CasNotFoundError {
     pub directory: ActionDirectoryEntry<ActionSharedDirectory>,
     #[source]
     pub error: Arc<buck2_error::Error>,
+}
+
+#[derive(Allocative, Clone, Debug, Eq, PartialEq)]
+pub struct ReLostInput {
+    pub path: ProjectRelativePathBuf,
+    pub digest: FileDigest,
+}
+
+impl TypedContext for ReLostInput {
+    fn eq(&self, other: &dyn TypedContext) -> bool {
+        (other as &dyn Any).downcast_ref::<Self>() == Some(self)
+    }
+
+    fn display(&self) -> Option<String> {
+        Some(format!("{self:?}"))
+    }
 }
 
 #[derive(buck2_error::Error, Debug)]
