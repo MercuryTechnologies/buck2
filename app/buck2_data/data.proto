@@ -92,6 +92,7 @@ message SpanStartEvent {
     ComputeDetailedAggregatedMetricsStart compute_detailed_aggregated_metrics =
         89;
     ReSubmitStart re_submit = 91;
+    RemoteRequestStart remote_request = 92;
     // Used in Buck unit tests.
     FakeStart fake = 999;
   }
@@ -146,6 +147,7 @@ message SpanEndEvent {
     ComputeDetailedAggregatedMetricsEnd compute_detailed_aggregated_metrics =
         89;
     ReSubmitEnd re_submit = 91;
+    RemoteRequestEnd remote_request = 92;
     // Used in Buck unit tests.
     FakeEnd fake = 999;
   }
@@ -2247,6 +2249,22 @@ message CommandExecutionMetadata {
   /// is always this attempt's own and on the client's clock. Whole
   /// milliseconds. Unset when there was no real attempt interval.
   google.protobuf.Timestamp client_start_time = 12;
+
+  /// Worker-side timing metadata reported by remote execution.
+  RemoteExecutionTiming remote_execution_timing = 13;
+}
+
+message RemoteExecutionTiming {
+  string worker = 1;
+  google.protobuf.Timestamp queued_timestamp = 2;
+  google.protobuf.Timestamp worker_start_timestamp = 3;
+  google.protobuf.Timestamp worker_completed_timestamp = 4;
+  google.protobuf.Timestamp input_fetch_start_timestamp = 5;
+  google.protobuf.Timestamp input_fetch_completed_timestamp = 6;
+  google.protobuf.Timestamp execution_start_timestamp = 7;
+  google.protobuf.Timestamp execution_completed_timestamp = 8;
+  google.protobuf.Timestamp output_upload_start_timestamp = 9;
+  google.protobuf.Timestamp output_upload_completed_timestamp = 10;
 }
 
 /// What the RE worker reported about running a command for this build. Times
@@ -4241,6 +4259,32 @@ message ReSubmitEnd {
   // taken. A hint of contention, not an exact count: other actions change it
   // concurrently.
   uint64 free_slots_hint = 4;
+}
+
+message RemoteRequestStart {
+  string service = 1;
+  string method = 2;
+  optional string action_digest = 3;
+  optional string action_id = 4;
+  optional string target = 5;
+  optional string action_mnemonic = 6;
+  string use_case = 7;
+  optional uint64 digest_count = 8;
+  optional uint64 bytes = 9;
+  optional bool upload_only_missing = 10;
+  optional bool skip_cache_lookup = 11;
+  map<string, string> details = 12;
+}
+
+message RemoteRequestEnd {
+  bool success = 1;
+  optional string error = 2;
+  optional string re_error_code = 3;
+  optional uint64 digest_count = 4;
+  optional uint64 bytes = 5;
+  optional bool cache_hit = 6;
+  optional uint64 ttl_seconds = 7;
+  map<string, string> details = 8;
 }
 
 message ConnectToInstallerStart {
