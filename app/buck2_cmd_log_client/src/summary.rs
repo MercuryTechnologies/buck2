@@ -54,6 +54,7 @@ struct Stats {
     re_max_download_speeds: Vec<SlidingWindow>,
     re_max_upload_speeds: Vec<SlidingWindow>,
     hg_revision: Option<String>,
+    git_revision: Option<String>,
     has_local_changes: Option<bool>,
 }
 
@@ -123,6 +124,12 @@ impl Stats {
                             }
                             None => {}
                         }
+                        match vcs.git_revision {
+                            Some(ref revision) => {
+                                self.git_revision = Some(revision.clone());
+                            }
+                            None => {}
+                        }
                         match vcs.has_local_changes {
                             Some(ref has_local_changes) => {
                                 self.has_local_changes = Some(*has_local_changes);
@@ -158,6 +165,10 @@ impl Display for Stats {
 
         if let Some(hg_revision) = &self.hg_revision {
             writeln!(f, "- HG Revision: {hg_revision}")?;
+        }
+
+        if let Some(git_revision) = &self.git_revision {
+            writeln!(f, "- Git Revision: {git_revision}")?;
         }
 
         if let Some(has_local_changes) = self.has_local_changes {
