@@ -231,6 +231,7 @@ pub struct InvocationRecorder {
     active_networks_kinds: HashSet<i32>,
     target_cfg: Option<TargetCfg>,
     hg_revision: Option<String>,
+    git_revision: Option<String>,
     has_local_changes: Option<bool>,
     version_control_errors: Vec<String>,
     concurrent_commands: bool,
@@ -442,6 +443,7 @@ impl InvocationRecorder {
             active_networks_kinds: HashSet::new(),
             target_cfg: None,
             hg_revision: None,
+            git_revision: None,
             has_local_changes: None,
             version_control_errors: Vec::new(),
             concurrent_commands: false,
@@ -1066,6 +1068,7 @@ impl InvocationRecorder {
                 .collect(),
             target_cfg: self.target_cfg.take(),
             hg_revision: self.hg_revision.take(),
+            git_revision: self.git_revision.take(),
             has_local_changes: self.has_local_changes.take(),
             version_control_errors: self.version_control_errors.drain(..).collect(),
             version_control_revision: None,
@@ -2080,6 +2083,7 @@ impl InvocationRecorder {
         revision: &buck2_data::VersionControlRevision,
     ) -> buck2_error::Result<()> {
         self.hg_revision = revision.hg_revision.clone().or(self.hg_revision.clone());
+        self.git_revision = revision.git_revision.clone().or(self.git_revision.clone());
         self.has_local_changes = revision.has_local_changes.or(self.has_local_changes);
         self.version_control_errors
             .extend(revision.command_error.clone());
