@@ -26,6 +26,7 @@ use futures::future::Future;
 use prost::Message;
 use serde::Serialize;
 use tokio::fs::OpenOptions;
+use tracing::instrument;
 
 use crate::FutureChildOutput;
 use crate::file_names::get_logfile_name;
@@ -220,6 +221,7 @@ impl WriteEventLog {
         self.log_invocation(event.trace_id()?).await
     }
 
+    #[instrument(skip_all)]
     pub fn exit(&mut self) -> impl Future<Output = ()> + 'static + Send + Sync + use<> {
         // Shut down writers, flush all our files before exiting.
         let state = std::mem::replace(&mut self.state, LogWriterState::Closed);
@@ -251,6 +253,7 @@ impl WriteEventLog {
     }
 }
 
+#[instrument(err)]
 async fn start_persist_event_log_subprocess(
     path: EventLogPathBuf,
     trace_id: TraceId,
@@ -307,6 +310,7 @@ async fn start_persist_event_log_subprocess(
     ))
 }
 
+#[instrument(err)]
 async fn open_event_log_for_writing(
     path: EventLogPathBuf,
     bytes_written: Option<Arc<AtomicU64>>,
