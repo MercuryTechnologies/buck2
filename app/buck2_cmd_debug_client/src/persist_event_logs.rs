@@ -42,6 +42,7 @@ use tokio::sync::Mutex;
 use tokio::time::Duration;
 use tokio::time::Instant;
 use tokio::time::sleep;
+use tracing::instrument;
 
 const MAX_WAIT: Duration = Duration::from_mins(5);
 
@@ -141,12 +142,14 @@ impl PersistEventLogsCommand {
     }
 }
 
+#[instrument(skip_all, fields(bytes_written = tracing::field::Empty), err)]
 async fn write_task(
     file_mutex: &Mutex<File>,
     tx: tokio::sync::mpsc::UnboundedSender<u64>,
     mut stdin: impl io::AsyncBufRead + Unpin,
 ) -> buck2_error::Result<()> {
     let mut write_position = 0;
+    let mut warned_upload_gone = false;
     loop {
         let mut buf = vec![0; 64 * 1024]; // maximum pipe size in linux
         let bytes_read = stdin.read(&mut buf).await?;
@@ -157,12 +160,28 @@ async fn write_task(
         write_to_file(&mut file, write_position, &buf[..bytes_read]).await?;
         drop(file);
         write_position += bytes_read as u64;
-        let _ignored = tx.send(bytes_read as u64); // If this errors, that means the upload task died.
+        // If this send errors the upload task has died, so we keep writing to
+        // disk but nothing more gets uploaded -- a prime suspect for a truncated
+        // remote log. Warn once rather than on every 64KiB read.
+        if tx.send(bytes_read as u64).is_err() && !warned_upload_gone {
+            warned_upload_gone = true;
+            tracing::warn!(
+                error = format!(
+                    "Upload task is gone; continuing to write to disk only -- remote log will be truncated"
+                ),
+                bytes_written = write_position,
+            );
+        }
     }
 
+    // stdin closing is the only "done" signal we get; record the total on the
+    // span so a short local log (e.g. the parent buck2 dying mid-stream) stays
+    // visible after the fact without an explicit success event.
+    tracing::Span::current().record("bytes_written", write_position);
     Ok(())
 }
 
+#[instrument(skip_all, fields(%local_path), err)]
 async fn create_log_file(local_path: String) -> Result<tokio::fs::File, buck2_error::Error> {
     let local_path = AbsPathBuf::new(local_path)?;
 
@@ -182,6 +201,7 @@ async fn create_log_file(local_path: String) -> Result<tokio::fs::File, buck2_er
     Ok(file)
 }
 
+#[instrument(skip(file_mutex, rx, buckets_config), fields(%manifold_name, no_upload), err)]
 async fn upload_task(
     file_mutex: &Mutex<File>,
     mut rx: tokio::sync::mpsc::UnboundedReceiver<u64>,
@@ -190,6 +210,7 @@ async fn upload_task(
     no_upload: bool,
 ) -> buck2_error::Result<()> {
     if no_upload {
+        tracing::info!("Not uploading event log: --no-upload was set");
         return Ok(());
     }
 
@@ -197,6 +218,7 @@ async fn upload_task(
     // No need to do more work if we don't have an endpoint configured (default
     // in OSS)
     if !manifold_client.will_upload() {
+        tracing::info!("Not uploading event log: no Manifold/buckets endpoint configured");
         return Ok(());
     }
     let manifold_path = format!("flat/{manifold_name}");
@@ -235,6 +257,20 @@ async fn upload_task(
     // Last chunk to upload is smaller than &reader
     uploader.upload_chunk().await?;
 
+    // If we reached here without error, everything written should also have been
+    // uploaded; a mismatch is a silently-truncated remote log, so flag it (a
+    // clean success is already captured by the span).
+    let uploaded_bytes = uploader.manifold.position();
+    if uploaded_bytes != uploader.total_bytes {
+        tracing::warn!(
+            error = format!(
+                "Upload task finished but uploaded bytes != bytes written -- remote log may be truncated"
+            ),
+            uploaded_bytes,
+            total_bytes = uploader.total_bytes,
+        );
+    }
+
     Ok(())
 }
 
@@ -250,6 +286,7 @@ struct Uploader<'a> {
 }
 
 impl<'a> Uploader<'a> {
+    #[instrument(skip(file_mutex, manifold_client), fields(%manifold_path), err)]
     fn new(
         file_mutex: &'a Mutex<File>,
         manifold_path: &'a str,
@@ -271,14 +308,28 @@ impl<'a> Uploader<'a> {
     }
 
     /// Uploads at most 'chunk size' bytes to Manifold
+    #[instrument(
+        skip_all,
+        fields(
+            offset = self.manifold.position(),
+            total_bytes = self.total_bytes,
+            chunk_len = tracing::field::Empty
+        ),
+        err
+    )]
     async fn upload_chunk(&mut self) -> buck2_error::Result<()> {
+        let offset = self.manifold.position();
         let mut file = self.file_mutex.lock().await;
-        file.seek(io::SeekFrom::Start(self.manifold.position()))
+        file.seek(io::SeekFrom::Start(offset))
             .await
             .buck_error_context("Failed to seek log file")?;
         let buf = self.reader.read(&mut *file).await?;
         drop(file);
 
+        // A chunk_len short of chunk_size (other than the final chunk) means we
+        // read fewer bytes off disk than were written; recording it on the span
+        // lets a truncation be traced to the exact offset it began at.
+        tracing::Span::current().record("chunk_len", buf.len());
         self.manifold.write(buf.into()).await?;
         Ok(())
     }
