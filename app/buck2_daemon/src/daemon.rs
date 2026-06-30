@@ -281,6 +281,13 @@ impl DaemonCommand {
             (listener, process_info, endpoint)
         };
 
+        // Daemonization is complete, so it is now safe to spawn the OTLP exporter's background
+        // threads. Doing this before the `fork()` above (e.g. when the tracing subscriber was first
+        // installed) would leave those threads -- and any locks they held -- wedged in the forked
+        // child, deadlocking or aborting the daemon. We must also stay outside any tokio runtime
+        // here, as the exporter's blocking HTTP client cannot be constructed from within one.
+        buck2_core::logging::otel::activate();
+
         let daemon_id = DaemonId::parse_from_str(&self.daemon_id)?;
         set_daemon_id_for_panics(daemon_id.dupe());
 
