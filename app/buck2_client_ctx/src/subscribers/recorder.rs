@@ -54,6 +54,8 @@ use buck2_event_observer::last_command_execution_kind::LastCommandExecutionKind;
 use buck2_event_observer::last_command_execution_kind::get_last_command_execution_time;
 use buck2_events::BuckEvent;
 use buck2_events::daemon_id::DaemonId;
+#[cfg(not(fbcode_build))]
+use buck2_events::sink::otel::new_otel_event_sink_if_enabled;
 use buck2_events::sink::remote::RemoteEventConfig;
 #[cfg(fbcode_build)]
 use buck2_events::sink::remote::new_remote_event_sink_if_enabled;
@@ -2729,7 +2731,16 @@ impl EventSubscriber for InvocationRecorder {
 
         #[cfg(not(fbcode_build))]
         {
-            drop(event);
+            // The OTLP sink is independent of BES: it exports the invocation record as a wide
+            // span to an OpenTelemetry collector, if one is configured. Telemetry must never fail
+            // a command, so an OTLP failure is logged rather than propagated.
+            if let Some(otel_sink) = new_otel_event_sink_if_enabled() {
+                let span = tracing::info_span!("Recording invocation to OpenTelemetry");
+                let _guard = span.enter();
+                if let Err(e) = otel_sink.send_now(event).await {
+                    tracing::warn!("Failed to export invocation record via OTLP: {e:#}");
+                }
+            }
             // In OSS, daemon-side BES upload is the source of truth for the
             // invocation stream. Sending a second client-side stream with the
             // same invocation ID causes BuildBuddy to cancel/preempt attempts

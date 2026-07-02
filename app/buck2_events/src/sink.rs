@@ -17,6 +17,10 @@ mod bes_client;
 pub(crate) mod channel;
 pub mod error_on_event;
 pub mod null;
+#[cfg(not(fbcode_build))]
+pub mod otel;
+#[cfg(not(fbcode_build))]
+pub(crate) mod otel_record;
 pub mod remote;
 pub(crate) mod scribe;
 pub(crate) mod smart_truncate_event;
