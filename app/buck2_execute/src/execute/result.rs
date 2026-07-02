@@ -406,9 +406,11 @@ impl CommandExecutionReport {
     ) -> buck2_data::CommandExecutionDetails {
         // If the top-level command failed then we don't want to omit any details. If it succeeded and
         // so did this command (it could succeed while not having a success here if we have rejected
-        // executions), then we'll strip non-relevant stuff.
-        let omit_stdout =
-            omit_stdout && matches!(self.status, CommandExecutionStatus::Success { .. });
+        // executions), then we'll strip non-relevant stuff. This applies to both stdout and stderr:
+        // for a failing test, its stderr is exactly the output we need for debugging.
+        let is_success = matches!(self.status, CommandExecutionStatus::Success { .. });
+        let omit_stdout = omit_stdout && is_success;
+        let omit_stderr = omit_stderr && is_success;
 
         let signed_exit_code = self.exit_code;
 
@@ -627,6 +629,27 @@ mod tests {
         expected_proto.details.as_mut().unwrap().cmd_stderr = "".to_owned();
 
         assert_eq!(proto, expected_proto);
+    }
+
+    #[tokio::test]
+    async fn test_to_command_execution_proto_keeps_streams_on_failure() {
+        // A failing command's stdout/stderr must survive even when the caller asks to omit them
+        // (the test orchestrator always passes omit_stdout=omit_stderr=true). Failing-test output
+        // is exactly what we need for debugging, so the omit flags only take effect on success.
+        let mut report = make_simple_report();
+        report.status = CommandExecutionStatus::Failure {
+            execution_kind: CommandExecutionKind::Local {
+                digest: CasDigest::new_blake3([0].repeat(32).as_slice().try_into().unwrap(), 123),
+                command: vec!["fake_buck2".to_owned()],
+                env: SortedVectorMap::new(),
+            },
+        };
+
+        let proto = report.to_command_execution_proto(true, true, false).await;
+        let details = proto.details.unwrap();
+
+        assert_eq!(details.cmd_stdout, "ABC");
+        assert_eq!(details.cmd_stderr, "DEF");
     }
 
     #[tokio::test]
