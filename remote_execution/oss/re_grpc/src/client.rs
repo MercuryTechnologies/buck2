@@ -3280,6 +3280,13 @@ async fn test_download_compressed() -> anyhow::Result<()> {
     let compressed_data_ref = &compressed_data;
 
     let d_resp = download_impl(
+        &RERuntimeOpts {
+            use_fbcode_metadata: false,
+            max_concurrent_uploads_per_action: None,
+            cas_ttl_secs: 0,
+            max_retries: 0,
+            rpc_timeout: Duration::from_secs(60),
+        },
         &InstanceName(None),
         DownloadRequest {
             inlined_digests: Some(vec![TDigest {
