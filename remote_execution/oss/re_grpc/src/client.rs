@@ -2120,7 +2120,7 @@ mod tests {
 
     #[test]
     fn with_re_metadata_sets_request_metadata_tool_name() {
-        use re_grpc_proto::build::bazel::remote::execution::v2::BuckInfo;
+        use crate::BuckInfo;
         let request = with_re_metadata(
             (),
             RemoteExecutionMetadata {
