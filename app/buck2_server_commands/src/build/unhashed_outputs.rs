@@ -25,16 +25,36 @@ use buck2_query::__derive_refs::indexmap::IndexMap;
 use itertools::Itertools;
 use tracing::info;
 
+pub(crate) struct CreateUnhashedOutputsResult {
+    pub(crate) links: Vec<CreatedUnhashedOutputLink>,
+}
+
+impl CreateUnhashedOutputsResult {
+    pub(crate) fn created(&self) -> u64 {
+        self.links.len() as u64
+    }
+}
+
+pub(crate) struct CreatedUnhashedOutputLink {
+    pub(crate) path: String,
+    pub(crate) target: String,
+}
+
+struct UnhashedOutputCandidate {
+    path: String,
+    hashed_paths: HashSet<AbsNormPathBuf>,
+}
+
 pub(crate) fn create_unhashed_outputs(
     provider_artifacts: Vec<ProviderArtifacts>,
     artifact_fs: &ArtifactFs,
     fs: &ProjectRoot,
-) -> buck2_error::Result<u64> {
+) -> buck2_error::Result<CreateUnhashedOutputsResult> {
     let buck_out_root = fs.resolve(artifact_fs.buck_out_path_resolver().root());
 
     let start = std::time::Instant::now();
     // The following IndexMap will contain a key of the unhashed/symlink path and values of all the hashed locations that map to the unhashed location.
-    let mut unhashed_to_hashed: IndexMap<AbsNormPathBuf, HashSet<AbsNormPathBuf>> = IndexMap::new();
+    let mut unhashed_to_hashed: IndexMap<AbsNormPathBuf, UnhashedOutputCandidate> = IndexMap::new();
     for provider_artifact in provider_artifacts {
         if !matches!(provider_artifact.provider_type, BuildProviderType::Default) {
             continue;
@@ -58,8 +78,11 @@ pub(crate) fn create_unhashed_outputs(
                         let abs_unhashed_path = fs.resolve(&unhashed_path);
                         let entry = unhashed_to_hashed
                             .entry(abs_unhashed_path)
-                            .or_insert_with(HashSet::new);
-                        entry.insert(fs.resolve(&path));
+                            .or_insert_with(|| UnhashedOutputCandidate {
+                                path: unhashed_path.to_string(),
+                                hashed_paths: HashSet::new(),
+                            });
+                        entry.hashed_paths.insert(fs.resolve(&path));
                     }
                 }
                 _ => {}
@@ -69,25 +92,36 @@ pub(crate) fn create_unhashed_outputs(
     }
     // The IndexMap is used now to determine if and what conflicts exist where multiple hashed artifact locations
     // all want a symlink to the same unhashed artifact location and deal with them accordingly.
-    let mut num_unhashed_links_made = 0;
-    for (unhashed, hashed_set) in unhashed_to_hashed {
-        if hashed_set.len() == 1 {
-            create_unhashed_link(&unhashed, hashed_set.iter().next().unwrap(), &buck_out_root)?;
-            num_unhashed_links_made += 1;
+    let mut links = Vec::new();
+    for (unhashed, candidate) in unhashed_to_hashed {
+        if candidate.hashed_paths.len() == 1 {
+            let original = candidate.hashed_paths.iter().next().unwrap();
+            create_unhashed_link(&unhashed, original, &buck_out_root)?;
+            links.push(CreatedUnhashedOutputLink {
+                path: candidate.path,
+                target: output_base_relative_path(original, &buck_out_root)?,
+            });
         } else {
             info!(
                 "The following outputs have a conflicting unhashed path at {}: {:?}",
-                unhashed, hashed_set
+                unhashed, candidate.hashed_paths
             );
         }
     }
     let duration = Instant::now() - start;
     info!(
         "Creating {} output compatibility symlinks in {:3}s",
-        num_unhashed_links_made,
+        links.len(),
         duration.as_secs_f64()
     );
-    Ok(num_unhashed_links_made)
+    Ok(CreateUnhashedOutputsResult { links })
+}
+
+fn output_base_relative_path(
+    path: &AbsNormPathBuf,
+    buck_out_root: &AbsNormPathBuf,
+) -> buck2_error::Result<String> {
+    Ok(path.strip_prefix(buck_out_root)?.to_string())
 }
 
 fn create_unhashed_link(
@@ -187,5 +221,16 @@ mod tests {
             &format!("{prefix}/repo/buck-out/v2/foo/bar/some"),
         );
         assert_eq!(iter.next(), None);
+    }
+
+    #[test]
+    fn output_base_relative_path_strips_buck_out_root() -> buck2_error::Result<()> {
+        let prefix = if cfg!(windows) { "C:" } else { "" };
+        let root = AbsNormPathBuf::try_from(format!("{prefix}/repo/buck-out/v2")).unwrap();
+        let path = AbsNormPathBuf::try_from(format!("{prefix}/repo/buck-out/v2/gen/root/pkg/out"))
+            .unwrap();
+
+        assert_eq!(output_base_relative_path(&path, &root)?, "gen/root/pkg/out");
+        Ok(())
     }
 }
