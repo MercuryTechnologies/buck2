@@ -77,7 +77,7 @@ pub async fn main(
 
     if let Some(p) = manifold_path {
         // TODO iguridi: write and upload concurrently
-        let manifold = ManifoldClient::new().await?;
+        let manifold = ManifoldClient::new_with_config(None).await?;
 
         manifold
             .read_and_upload(Bucket::EVENT_LOGS, p, Default::default(), &mut cursor)
