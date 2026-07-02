@@ -334,15 +334,18 @@ impl BxlAqueryFunctions for BxlAqueryFunctionsImpl {
         dice: &mut DiceComputations<'_>,
         action_keys: Vec<ActionKey>,
     ) -> buck2_error::Result<TargetSet<ActionQueryNode>> {
-        dice.with_linear_recompute(|dice| async move {
-            let delegate = self.aquery_delegate(&dice).await?;
-            let mut result = TargetSet::new();
-            let nodes = buck2_util::future::try_join_all(
-                action_keys.iter().map(|key| delegate.get_action_node(&key)),
-            )
-            .await?;
-            result.extend(nodes);
-            Ok(result)
+        dice.with_linear_recompute(|dice| {
+            async move {
+                let delegate = self.aquery_delegate(dice).await?;
+                let mut result = TargetSet::new();
+                let nodes = buck2_util::future::try_join_all(
+                    action_keys.iter().map(|key| delegate.get_action_node(&key)),
+                )
+                .await?;
+                result.extend(nodes);
+                Ok(result)
+            }
+            .boxed()
         })
         .await
     }
