@@ -49,7 +49,7 @@ const STRUCT_TYPE_URL: &str = "type.googleapis.com/google.protobuf.Struct";
 const BUILDBUDDY_VISIBILITY_KEY: &str = "VISIBILITY";
 const BUILDBUDDY_PUBLIC_VISIBILITY: &str = "PUBLIC";
 const COMMAND_PROFILE_NAME: &str = "command.profile.gz";
-const MAX_PROFILE_SPANS: usize = 50_000;
+const MAX_PROFILE_SPANS: usize = 150_000;
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 struct TargetKey {
@@ -2631,6 +2631,14 @@ impl CommandProfileBuilder {
         let Some(data) = span_start.data.as_ref() else {
             return;
         };
+        // ExecutorStage is the highest-volume span type (frequently >50% of all
+        // spans) -- fine-grained per-action sub-stages that flood the timeline
+        // and exhaust the span budget, dropping the tail of the build. Exclude
+        // them from the command profile; action-level and synthesized RE-phase
+        // spans carry the useful timing. Remove this guard to re-enable them.
+        if matches!(data, buck2_data::span_start_event::Data::ExecutorStage(_)) {
+            return;
+        }
         if let buck2_data::span_start_event::Data::Command(command) = data {
             self.command_name = Some(command_name(command));
             self.command_started_at_us = timestamp_micros(event.timestamp.as_ref());
@@ -2663,6 +2671,10 @@ impl CommandProfileBuilder {
         let Some(data) = span_end.data.as_ref() else {
             return;
         };
+        // See record_span_start: ExecutorStage spans are excluded from the profile.
+        if matches!(data, buck2_data::span_end_event::Data::ExecutorStage(_)) {
+            return;
+        }
         let duration_us = span_end
             .duration
             .as_ref()
@@ -12046,25 +12058,14 @@ mod tests {
         );
         assert_eq!(action_profile_event["args"]["remote_queue_time_ms"], 2);
 
-        let remote_stage_profile_event = trace_events
-            .iter()
-            .find(|event| event["name"] == "remote execute")
-            .expect("remote execute profile event");
-        assert_eq!(
-            remote_stage_profile_event["args"]["action_digest"],
-            "action-digest"
-        );
-        assert_eq!(
-            remote_stage_profile_event["args"]["remote_use_case"],
-            "buck2-default"
-        );
-        assert_eq!(
-            remote_stage_profile_event["args"]["action_key"],
-            "action-key"
-        );
-        assert_eq!(
-            remote_stage_profile_event["args"]["remote_platform"],
-            "container-image=linux"
+        // ExecutorStage spans (e.g. "remote execute") are intentionally excluded
+        // from the command profile to keep its size and clutter manageable; RE
+        // timing is still surfaced via the synthesized "RE *" phase spans checked
+        // below.
+        assert!(
+            !trace_events
+                .iter()
+                .any(|event| event["name"] == "remote execute")
         );
 
         let remote_request_profile_event = trace_events
