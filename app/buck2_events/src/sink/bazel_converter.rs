@@ -82,6 +82,7 @@ struct FinishedEventSignature {
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 enum ProfileLane {
     Command,
+    Phases,
     Loading,
     Analysis,
     Actions,
@@ -97,6 +98,7 @@ impl ProfileLane {
     fn label(self) -> &'static str {
         match self {
             Self::Command => "Buck2 command",
+            Self::Phases => "Build phases",
             Self::Loading => "Buck2 loading",
             Self::Analysis => "Buck2 analysis",
             Self::Actions => "Buck2 actions",
@@ -112,6 +114,7 @@ impl ProfileLane {
     fn track_base(self) -> u64 {
         match self {
             Self::Command => 1,
+            Self::Phases => 500,
             Self::Loading => 1_000,
             Self::Analysis => 2_000,
             Self::Actions => 3_000,
@@ -2880,6 +2883,7 @@ impl CommandProfileBuilder {
                 args: fallback.args,
             });
         }
+        append_phase_marker_spans(&mut spans, self.command_started_at_us);
         let base_us = self
             .command_started_at_us
             .or_else(|| spans.iter().map(|span| span.start_us).min())
@@ -6062,6 +6066,77 @@ fn extend_json_map(
     for (key, value) in more {
         args.insert(key, value);
     }
+}
+
+/// Synthesize Bazel-style "build phase marker" spans so BuildBuddy's Timing
+/// Breakdown -- which is hardcoded to look up the event names `buildTargets`,
+/// `runAnalysisPhase`, and `evaluateTargetPatterns` -- can render a phase
+/// breakdown for buck2 profiles.
+///
+/// buck2's phases interleave (analysis and execution overlap via DICE), unlike
+/// Bazel's sequential phases, so these are an approximation: loading is the
+/// time before the first analysis, analysis is from the first analysis to the
+/// first action, and BuildBuddy derives execution as
+/// `buildTargets - runAnalysisPhase - evaluateTargetPatterns`.
+fn append_phase_marker_spans(spans: &mut Vec<ProfileCompletedSpan>, command_started_at_us: Option<i64>) {
+    let Some(command_start) =
+        command_started_at_us.or_else(|| spans.iter().map(|span| span.start_us).min())
+    else {
+        return;
+    };
+    let Some(command_end) = spans
+        .iter()
+        .map(|span| span.start_us.saturating_add(span.duration_us))
+        .max()
+    else {
+        return;
+    };
+    let total_dur = command_end.saturating_sub(command_start);
+    if total_dur <= 0 {
+        return;
+    }
+
+    let analysis_start = spans
+        .iter()
+        .filter(|span| span.lane == ProfileLane::Analysis)
+        .map(|span| span.start_us)
+        .min();
+    let action_start = spans
+        .iter()
+        .filter(|span| span.lane == ProfileLane::Actions)
+        .map(|span| span.start_us)
+        .min();
+
+    let mut push = |name: &'static str, start_us: i64, duration_us: i64| {
+        if duration_us > 0 {
+            spans.push(ProfileCompletedSpan {
+                span_id: 0,
+                parent_id: 0,
+                name: name.to_owned(),
+                lane: ProfileLane::Phases,
+                category: "build phase marker",
+                start_us,
+                duration_us,
+                args: serde_json::Map::new(),
+            });
+        }
+    };
+
+    if let Some(analysis_start) = analysis_start {
+        push(
+            "evaluateTargetPatterns",
+            command_start,
+            analysis_start.saturating_sub(command_start),
+        );
+        let analysis_end = action_start.unwrap_or(command_end);
+        push(
+            "runAnalysisPhase",
+            analysis_start,
+            analysis_end.saturating_sub(analysis_start),
+        );
+    }
+
+    push("buildTargets", command_start, total_dur);
 }
 
 fn serialize_trace_events(events: &[serde_json::Value]) -> serde_json::Result<String> {
@@ -12109,6 +12184,49 @@ mod tests {
                 .iter()
                 .any(|event| event["name"] == "RE output upload")
         );
+    }
+
+    #[test]
+    fn phase_marker_spans_synthesize_bazel_phase_names() {
+        let span = |name: &str, lane, start_us, duration_us| ProfileCompletedSpan {
+            span_id: 0,
+            parent_id: 0,
+            name: name.to_owned(),
+            lane,
+            category: "x",
+            start_us,
+            duration_us,
+            args: serde_json::Map::new(),
+        };
+        // Analysis runs [100, 150); an action runs [200, 500). Command starts at 0.
+        let mut spans = vec![
+            span("analyze //:a", ProfileLane::Analysis, 100, 50),
+            span("write //:a", ProfileLane::Actions, 200, 300),
+        ];
+        append_phase_marker_spans(&mut spans, Some(0));
+
+        let by_name = |name: &str| {
+            spans
+                .iter()
+                .find(|s| s.name == name)
+                .unwrap_or_else(|| panic!("missing {name}"))
+        };
+
+        let targets = by_name("evaluateTargetPatterns");
+        assert_eq!(targets.category, "build phase marker");
+        assert_eq!(targets.lane, ProfileLane::Phases);
+        assert_eq!(targets.start_us, 0);
+        assert_eq!(targets.duration_us, 100); // command_start(0)..analysis_start(100)
+
+        let analysis = by_name("runAnalysisPhase");
+        assert_eq!(analysis.start_us, 100);
+        assert_eq!(analysis.duration_us, 100); // analysis_start(100)..action_start(200)
+
+        let total = by_name("buildTargets");
+        assert_eq!(total.start_us, 0);
+        assert_eq!(total.duration_us, 500); // command_start(0)..command_end(500)
+
+        // BuildBuddy derives execution = 500 - 100 - 100 = 300 (the action's duration).
     }
 
     #[test]
