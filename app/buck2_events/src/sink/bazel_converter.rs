@@ -82,6 +82,7 @@ struct FinishedEventSignature {
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 enum ProfileLane {
     Command,
+    CriticalPath,
     Phases,
     Loading,
     Analysis,
@@ -98,6 +99,7 @@ impl ProfileLane {
     fn label(self) -> &'static str {
         match self {
             Self::Command => "Buck2 command",
+            Self::CriticalPath => "Critical Path",
             Self::Phases => "Build phases",
             Self::Loading => "Buck2 loading",
             Self::Analysis => "Buck2 analysis",
@@ -114,6 +116,7 @@ impl ProfileLane {
     fn track_base(self) -> u64 {
         match self {
             Self::Command => 1,
+            Self::CriticalPath => 400,
             Self::Phases => 500,
             Self::Loading => 1_000,
             Self::Analysis => 2_000,
@@ -180,6 +183,7 @@ struct CommandProfileBuilder {
     completed_spans: Vec<ProfileCompletedSpan>,
     next_synthetic_span_id: u64,
     dropped_spans: usize,
+    critical_path: Vec<buck2_data::CriticalPathEntry2>,
 }
 
 #[derive(Debug, Default)]
@@ -1612,6 +1616,7 @@ impl BazelEventConverter {
                 }
             }
             Some(buck2_data::instant_event::Data::BuildGraphInfo(info)) => {
+                self.command_profile.record_critical_path(info);
                 let mut metadata = BTreeMap::new();
                 if info.num_nodes > 0 {
                     metadata.insert(
@@ -2626,6 +2631,12 @@ impl BazelEventConverter {
 }
 
 impl CommandProfileBuilder {
+    fn record_critical_path(&mut self, info: &buck2_data::BuildGraphExecutionInfo) {
+        if !info.critical_path2.is_empty() {
+            self.critical_path = info.critical_path2.clone();
+        }
+    }
+
     fn record_span_start(
         &mut self,
         event: &buck2_data::BuckEvent,
@@ -2892,6 +2903,7 @@ impl CommandProfileBuilder {
             });
         }
         append_phase_marker_spans(&mut spans, self.command_started_at_us);
+        append_critical_path_spans(&mut spans, self.command_started_at_us, &self.critical_path);
         let base_us = self
             .command_started_at_us
             .or_else(|| spans.iter().map(|span| span.start_us).min())
@@ -6164,6 +6176,88 @@ fn local_action_execution_category(
         Ok(buck2_data::ActionExecutionKind::Local)
         | Ok(buck2_data::ActionExecutionKind::LocalWorker) => Some("local action execution"),
         _ => None,
+    }
+}
+
+/// Synthesize a "Critical Path" thread from buck2's BuildGraphExecutionInfo
+/// (`critical_path2`), matching Bazel's convention of a dedicated Critical Path
+/// thread in the profile. Each entry is placed at its `start_offset_ns` from the
+/// command start (falling back to sequential placement when offsets are absent).
+fn append_critical_path_spans(
+    spans: &mut Vec<ProfileCompletedSpan>,
+    command_started_at_us: Option<i64>,
+    critical_path: &[buck2_data::CriticalPathEntry2],
+) {
+    if critical_path.is_empty() {
+        return;
+    }
+    let command_start = command_started_at_us
+        .or_else(|| spans.iter().map(|span| span.start_us).min())
+        .unwrap_or_default();
+
+    let mut cursor = command_start;
+    for entry in critical_path {
+        let duration_us = entry
+            .duration
+            .as_ref()
+            .map(duration_micros)
+            .unwrap_or_default()
+            .max(1);
+        let start_us = match entry.start_offset_ns {
+            Some(offset_ns) => command_start.saturating_add((offset_ns / 1_000) as i64),
+            None => cursor,
+        };
+        cursor = start_us.saturating_add(duration_us);
+
+        let mut args = serde_json::Map::new();
+        if let Some(total) = entry.total_duration.as_ref() {
+            json_arg_i64(&mut args, "total_duration_us", duration_micros(total));
+        }
+        if let Some(improvement) = entry.potential_improvement_duration.as_ref() {
+            json_arg_i64(
+                &mut args,
+                "potential_improvement_us",
+                duration_micros(improvement),
+            );
+        }
+
+        spans.push(ProfileCompletedSpan {
+            span_id: 0,
+            parent_id: 0,
+            name: critical_path_entry_name(entry),
+            lane: ProfileLane::CriticalPath,
+            category: "critical path",
+            start_us,
+            duration_us,
+            args,
+        });
+    }
+}
+
+fn critical_path_entry_name(entry: &buck2_data::CriticalPathEntry2) -> String {
+    use buck2_data::critical_path_entry2::Entry;
+    match entry.entry.as_ref() {
+        Some(Entry::ActionExecution(action)) => action
+            .name
+            .as_ref()
+            .map(|name| format!("{} {}", name.category, name.identifier).trim().to_owned())
+            .filter(|name| !name.is_empty())
+            .unwrap_or_else(|| "action".to_owned()),
+        Some(Entry::Analysis(_)) => "analysis".to_owned(),
+        Some(Entry::DynamicAnalysis(_)) => "dynamic analysis".to_owned(),
+        Some(Entry::Load(load)) => format!("load {}", load.package),
+        Some(Entry::Listing(listing)) => format!("listing {}", listing.package),
+        Some(Entry::TestExecution(test)) => format!("test {}", test.suite),
+        Some(Entry::TestListing(test)) => format!("test listing {}", test.suite),
+        Some(Entry::FinalMaterialization(_)) => "final materialization".to_owned(),
+        Some(Entry::ComputeCriticalPath(_)) => "compute critical path".to_owned(),
+        Some(Entry::GenericEntry(generic)) => generic.kind.clone(),
+        Some(Entry::Waiting(waiting)) => waiting
+            .category
+            .as_ref()
+            .map(|category| format!("waiting ({category})"))
+            .unwrap_or_else(|| "waiting".to_owned()),
+        None => "critical path entry".to_owned(),
     }
 }
 
@@ -12285,6 +12379,55 @@ mod tests {
             ..Default::default()
         });
         assert_eq!(write.category, "remote_request");
+    }
+
+    #[test]
+    fn critical_path_spans_synthesized_on_critical_path_thread() {
+        use buck2_data::critical_path_entry2::Entry;
+        let entry = |offset_ns: u64, dur_us: i32, e: Entry| buck2_data::CriticalPathEntry2 {
+            start_offset_ns: Some(offset_ns),
+            duration: Some(prost_types::Duration {
+                seconds: 0,
+                nanos: dur_us * 1_000,
+            }),
+            entry: Some(e),
+            ..Default::default()
+        };
+        let critical_path = vec![
+            entry(
+                0,
+                100,
+                Entry::Load(buck2_data::critical_path_entry2::Load {
+                    package: "//pkg".to_owned(),
+                }),
+            ),
+            entry(
+                100_000,
+                200,
+                Entry::ActionExecution(buck2_data::critical_path_entry2::ActionExecution {
+                    name: Some(buck2_data::ActionName {
+                        category: "cxx_compile".to_owned(),
+                        identifier: "main.o".to_owned(),
+                    }),
+                    ..Default::default()
+                }),
+            ),
+        ];
+        let mut spans = Vec::new();
+        append_critical_path_spans(&mut spans, Some(1_000), &critical_path);
+
+        assert_eq!(spans.len(), 2);
+        assert!(
+            spans
+                .iter()
+                .all(|s| s.lane == ProfileLane::CriticalPath && s.category == "critical path")
+        );
+        assert_eq!(spans[0].name, "load //pkg");
+        assert_eq!(spans[0].start_us, 1_000); // command_start(1000) + offset 0ns
+        assert_eq!(spans[0].duration_us, 100);
+        assert_eq!(spans[1].name, "cxx_compile main.o");
+        assert_eq!(spans[1].start_us, 1_100); // command_start(1000) + 100_000ns/1000
+        assert_eq!(spans[1].duration_us, 200);
     }
 
     #[test]
