@@ -2686,6 +2686,14 @@ impl CommandProfileBuilder {
             .max(1);
         if let Some(mut open) = self.open_spans.remove(&event.span_id) {
             extend_json_map(&mut open.args, profile_span_end_args(data));
+            // Bazel's Timing Breakdown sums the "local action execution" category
+            // for its "Executing locally" slice; retag locally-executed actions
+            // so buck2 profiles populate it.
+            if let buck2_data::span_end_event::Data::ActionExecution(action) = data
+                && let Some(category) = local_action_execution_category(action)
+            {
+                open.category = category;
+            }
             let parent_id = open.span_id;
             let parent_start_us = open.start_us;
             let parent_end_us = open.start_us.saturating_add(duration_us);
@@ -5517,6 +5525,11 @@ fn profile_remote_request_details(request: &buck2_data::RemoteRequestStart) -> P
         ),
         "remote_request",
     );
+    // Bazel's Timing Breakdown totals the "remote output download" category into
+    // its "Downloading outputs" slice; tag CAS/ByteStream reads accordingly.
+    if matches!(request.method.as_str(), "BatchReadBlobs" | "Read") {
+        details.category = "remote output download";
+    }
     json_arg_non_empty(&mut details.args, "service", &request.service);
     json_arg_non_empty(&mut details.args, "method", &request.method);
     if let Some(action_digest) = request.action_digest.as_ref() {
@@ -5576,7 +5589,9 @@ fn remote_execution_phase_profile_spans(
             timing.input_fetch_completed_timestamp.as_ref(),
         ),
         (
-            "RE execution",
+            // "execute remotely" matches Bazel's profiler event name so
+            // BuildBuddy's Timing Breakdown totals it into "Executing remotely".
+            "execute remotely",
             "execution",
             timing.execution_start_timestamp.as_ref(),
             timing.execution_completed_timestamp.as_ref(),
@@ -6137,6 +6152,19 @@ fn append_phase_marker_spans(spans: &mut Vec<ProfileCompletedSpan>, command_star
     }
 
     push("buildTargets", command_start, total_dur);
+}
+
+/// Bazel category used by BuildBuddy's Timing Breakdown to total local
+/// execution. Returns Some for locally-executed run actions so we can retag
+/// their profile span category to match.
+fn local_action_execution_category(
+    action: &buck2_data::ActionExecutionEnd,
+) -> Option<&'static str> {
+    match buck2_data::ActionExecutionKind::try_from(action.execution_kind) {
+        Ok(buck2_data::ActionExecutionKind::Local)
+        | Ok(buck2_data::ActionExecutionKind::LocalWorker) => Some("local action execution"),
+        _ => None,
+    }
 }
 
 fn serialize_trace_events(events: &[serde_json::Value]) -> serde_json::Result<String> {
@@ -12166,7 +12194,7 @@ mod tests {
 
         let re_execution_phase = trace_events
             .iter()
-            .find(|event| event["name"] == "RE execution")
+            .find(|event| event["name"] == "execute remotely")
             .expect("remote execution phase profile event");
         assert_eq!(re_execution_phase["cat"], "remote_execution");
         assert_eq!(re_execution_phase["dur"], 8_000);
@@ -12227,6 +12255,36 @@ mod tests {
         assert_eq!(total.duration_us, 500); // command_start(0)..command_end(500)
 
         // BuildBuddy derives execution = 500 - 100 - 100 = 300 (the action's duration).
+    }
+
+    #[test]
+    fn execution_breakdown_taxonomy_matches_bazel() {
+        let local = buck2_data::ActionExecutionEnd {
+            execution_kind: buck2_data::ActionExecutionKind::Local as i32,
+            ..Default::default()
+        };
+        assert_eq!(
+            local_action_execution_category(&local),
+            Some("local action execution")
+        );
+        let remote = buck2_data::ActionExecutionEnd {
+            execution_kind: buck2_data::ActionExecutionKind::Remote as i32,
+            ..Default::default()
+        };
+        assert_eq!(local_action_execution_category(&remote), None);
+
+        let read = profile_remote_request_details(&buck2_data::RemoteRequestStart {
+            service: "ByteStream".to_owned(),
+            method: "Read".to_owned(),
+            ..Default::default()
+        });
+        assert_eq!(read.category, "remote output download");
+        let write = profile_remote_request_details(&buck2_data::RemoteRequestStart {
+            service: "ByteStream".to_owned(),
+            method: "Write".to_owned(),
+            ..Default::default()
+        });
+        assert_eq!(write.category, "remote_request");
     }
 
     #[test]
