@@ -136,6 +136,68 @@ impl Display for CommandExecutionStatus {
     }
 }
 
+#[derive(Debug, Copy, Clone, Dupe, Allocative)]
+pub struct RemoteExecutionTimestamp {
+    pub seconds: i64,
+    pub nanos: i32,
+}
+
+impl RemoteExecutionTimestamp {
+    pub fn to_system_time(self) -> SystemTime {
+        let seconds = u64::try_from(self.seconds).unwrap_or_default();
+        let nanos = u32::try_from(self.nanos).unwrap_or_default();
+        SystemTime::UNIX_EPOCH + Duration::new(seconds, nanos)
+    }
+}
+
+#[derive(Debug, Copy, Clone, Dupe, Allocative)]
+pub struct RemoteExecutionTiming {
+    pub queued_timestamp: Option<RemoteExecutionTimestamp>,
+    pub worker_start_timestamp: Option<RemoteExecutionTimestamp>,
+    pub worker_completed_timestamp: Option<RemoteExecutionTimestamp>,
+    pub input_fetch_start_timestamp: Option<RemoteExecutionTimestamp>,
+    pub input_fetch_completed_timestamp: Option<RemoteExecutionTimestamp>,
+    pub execution_start_timestamp: Option<RemoteExecutionTimestamp>,
+    pub execution_completed_timestamp: Option<RemoteExecutionTimestamp>,
+    pub output_upload_start_timestamp: Option<RemoteExecutionTimestamp>,
+    pub output_upload_completed_timestamp: Option<RemoteExecutionTimestamp>,
+}
+
+impl RemoteExecutionTiming {
+    pub fn to_proto(self) -> buck2_data::RemoteExecutionTiming {
+        buck2_data::RemoteExecutionTiming {
+            worker: String::new(),
+            queued_timestamp: self
+                .queued_timestamp
+                .map(|timestamp| timestamp.to_system_time().into()),
+            worker_start_timestamp: self
+                .worker_start_timestamp
+                .map(|timestamp| timestamp.to_system_time().into()),
+            worker_completed_timestamp: self
+                .worker_completed_timestamp
+                .map(|timestamp| timestamp.to_system_time().into()),
+            input_fetch_start_timestamp: self
+                .input_fetch_start_timestamp
+                .map(|timestamp| timestamp.to_system_time().into()),
+            input_fetch_completed_timestamp: self
+                .input_fetch_completed_timestamp
+                .map(|timestamp| timestamp.to_system_time().into()),
+            execution_start_timestamp: self
+                .execution_start_timestamp
+                .map(|timestamp| timestamp.to_system_time().into()),
+            execution_completed_timestamp: self
+                .execution_completed_timestamp
+                .map(|timestamp| timestamp.to_system_time().into()),
+            output_upload_start_timestamp: self
+                .output_upload_start_timestamp
+                .map(|timestamp| timestamp.to_system_time().into()),
+            output_upload_completed_timestamp: self
+                .output_upload_completed_timestamp
+                .map(|timestamp| timestamp.to_system_time().into()),
+        }
+    }
+}
+
 /// Unlike action where we only really have just 1 time, commands can have slightly richer timing
 /// data.
 #[derive(Debug, Copy, Clone, Dupe, Allocative)]
@@ -166,6 +228,8 @@ pub struct CommandExecutionMetadata {
     /// How long this command spent waiting to run
     pub queue_duration: Option<Duration>,
 
+    pub remote_execution_timing: Option<RemoteExecutionTiming>,
+
     pub suspend_duration: Option<Duration>,
 
     pub suspend_count: Option<u64>,
@@ -182,6 +246,7 @@ impl CommandExecutionMetadata {
             hashing_duration: Duration::default(),
             hashed_artifacts_count: 0,
             queue_duration: None,
+            remote_execution_timing: None,
             suspend_count: None,
             suspend_duration: None,
         }
@@ -195,6 +260,7 @@ impl CommandExecutionMetadata {
             execution_stats: re_timing.execution_stats,
             input_materialization_duration: re_timing.input_materialization_duration,
             queue_duration: re_timing.queue_duration,
+            remote_execution_timing: re_timing.remote_execution_timing,
             hashing_duration: Default::default(),
             hashed_artifacts_count: 0,
             suspend_duration: None,
@@ -217,6 +283,9 @@ impl CommandExecutionMetadata {
             hashing_duration: metadata.hashing_duration.try_into().ok(),
             hashed_artifacts_count: metadata.hashed_artifacts_count.try_into().ok().unwrap_or(0),
             queue_duration: metadata.queue_duration.and_then(|d| d.try_into().ok()),
+            remote_execution_timing: metadata
+                .remote_execution_timing
+                .map(RemoteExecutionTiming::to_proto),
             suspend_duration: metadata.suspend_duration.and_then(|d| d.try_into().ok()),
             suspend_count: metadata.suspend_count,
         }
@@ -406,9 +475,11 @@ impl CommandExecutionReport {
     ) -> buck2_data::CommandExecutionDetails {
         // If the top-level command failed then we don't want to omit any details. If it succeeded and
         // so did this command (it could succeed while not having a success here if we have rejected
-        // executions), then we'll strip non-relevant stuff.
-        let omit_stdout =
-            omit_stdout && matches!(self.status, CommandExecutionStatus::Success { .. });
+        // executions), then we'll strip non-relevant stuff. This applies to both stdout and stderr:
+        // for a failing test, its stderr is exactly the output we need for debugging.
+        let is_success = matches!(self.status, CommandExecutionStatus::Success { .. });
+        let omit_stdout = omit_stdout && is_success;
+        let omit_stderr = omit_stderr && is_success;
 
         let signed_exit_code = self.exit_code;
 
@@ -496,6 +567,7 @@ mod tests {
             hashing_duration: Duration::from_secs(7),
             hashed_artifacts_count: 8,
             queue_duration: Some(Duration::from_secs(9)),
+            remote_execution_timing: None,
             suspend_duration: None,
             suspend_count: None,
         };
@@ -573,6 +645,7 @@ mod tests {
                 seconds: 9,
                 nanos: 0,
             }),
+            remote_execution_timing: None,
             suspend_duration: None,
             suspend_count: None,
         };
@@ -627,6 +700,27 @@ mod tests {
         expected_proto.details.as_mut().unwrap().cmd_stderr = "".to_owned();
 
         assert_eq!(proto, expected_proto);
+    }
+
+    #[tokio::test]
+    async fn test_to_command_execution_proto_keeps_streams_on_failure() {
+        // A failing command's stdout/stderr must survive even when the caller asks to omit them
+        // (the test orchestrator always passes omit_stdout=omit_stderr=true). Failing-test output
+        // is exactly what we need for debugging, so the omit flags only take effect on success.
+        let mut report = make_simple_report();
+        report.status = CommandExecutionStatus::Failure {
+            execution_kind: CommandExecutionKind::Local {
+                digest: CasDigest::new_blake3([0].repeat(32).as_slice().try_into().unwrap(), 123),
+                command: vec!["fake_buck2".to_owned()],
+                env: SortedVectorMap::new(),
+            },
+        };
+
+        let proto = report.to_command_execution_proto(true, true, false).await;
+        let details = proto.details.unwrap();
+
+        assert_eq!(details.cmd_stdout, "ABC");
+        assert_eq!(details.cmd_stderr, "DEF");
     }
 
     #[tokio::test]

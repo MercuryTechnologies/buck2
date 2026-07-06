@@ -17,6 +17,7 @@ fxhash = { workspace = true }
 indexmap = { workspace = true }
 itertools = { workspace = true }
 once_cell = { workspace = true }
+prost-types = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }

@@ -55,9 +55,8 @@ use buck2_event_observer::last_command_execution_kind::LastCommandExecutionKind;
 use buck2_event_observer::last_command_execution_kind::get_last_command_execution_time;
 use buck2_events::BuckEvent;
 use buck2_events::daemon_id::DaemonId;
-#[cfg(not(fbcode_build))]
-use buck2_events::sink::otel::new_otel_event_sink_if_enabled;
-use buck2_events::sink::remote::ScribeConfig;
+use buck2_events::sink::remote::RemoteEventConfig;
+#[cfg(fbcode_build)]
 use buck2_events::sink::remote::new_remote_event_sink_if_enabled;
 use buck2_fs::fs_util;
 use buck2_fs::paths::abs_path::AbsPathBuf;
@@ -80,6 +79,7 @@ use crate::common::CommonEventLogOptions;
 use crate::common::PreemptibleWhen;
 use crate::console_interaction_stream::SuperConsoleToggle;
 use crate::exit_result::ExitResult;
+use crate::remote_sink_config;
 use crate::subscribers::classify_server_stderr::classify_server_stderr;
 use crate::subscribers::observer::ErrorObserver;
 use crate::subscribers::subscriber::EventSubscriber;
@@ -186,6 +186,7 @@ pub struct InvocationRecorder {
     has_command_result: bool,
     has_end_of_stream: bool,
     compressed_event_log_size_bytes: Option<Arc<AtomicU64>>,
+    remote_sink_config: RemoteEventConfig,
     critical_path_backend: Option<String>,
     bxl_ensure_artifacts_duration: Option<prost_types::Duration>,
     install_duration: Option<prost_types::Duration>,
@@ -392,6 +393,40 @@ impl InvocationRecorder {
             has_command_result: false,
             has_end_of_stream: false,
             compressed_event_log_size_bytes: None,
+            remote_sink_config: RemoteEventConfig {
+                buffer_size: 1,
+                retry_backoff: Duration::from_millis(500),
+                retry_attempts: 5,
+                message_batch_size: None,
+                #[cfg(fbcode_build)]
+                thrift_timeout: Duration::from_secs(2),
+                #[cfg(not(fbcode_build))]
+                grpc_timeout: Duration::from_secs(10),
+                #[cfg(not(fbcode_build))]
+                bes_backend: None,
+                #[cfg(not(fbcode_build))]
+                bes_headers: Vec::new(),
+                #[cfg(not(fbcode_build))]
+                event_format: Default::default(),
+                #[cfg(not(fbcode_build))]
+                bazel_artifact_upload: true,
+                #[cfg(not(fbcode_build))]
+                upload_successful_action_events: true,
+                #[cfg(not(fbcode_build))]
+                bazel_artifact_upload_backend: None,
+                #[cfg(not(fbcode_build))]
+                re_client_cas_address: None,
+                #[cfg(not(fbcode_build))]
+                bazel_artifact_upload_instance_name: None,
+                #[cfg(not(fbcode_build))]
+                re_client_instance_name: None,
+                #[cfg(not(fbcode_build))]
+                bazel_artifact_uri_authority: None,
+                #[cfg(not(fbcode_build))]
+                bazel_artifact_upload_max_bytes: 10 * 1024 * 1024,
+                #[cfg(not(fbcode_build))]
+                build_metadata: Vec::new(),
+            },
             critical_path_backend: None,
             bxl_ensure_artifacts_duration: None,
             install_duration: None,
@@ -572,6 +607,43 @@ impl InvocationRecorder {
         self.build_count_manager = build_count;
         self.filesystem = Some(filesystem);
         self.compressed_event_log_size_bytes = log_size_counter_bytes;
+        self.remote_sink_config = remote_sink_config::with_buckconfig_overrides(
+            paths,
+            RemoteEventConfig {
+                buffer_size: 1,
+                retry_backoff: Duration::from_millis(500),
+                retry_attempts: 5,
+                message_batch_size: None,
+                #[cfg(fbcode_build)]
+                thrift_timeout: Duration::from_secs(2),
+                #[cfg(not(fbcode_build))]
+                grpc_timeout: Duration::from_secs(10),
+                #[cfg(not(fbcode_build))]
+                bes_backend: None,
+                #[cfg(not(fbcode_build))]
+                bes_headers: Vec::new(),
+                #[cfg(not(fbcode_build))]
+                event_format: Default::default(),
+                #[cfg(not(fbcode_build))]
+                bazel_artifact_upload: true,
+                #[cfg(not(fbcode_build))]
+                upload_successful_action_events: true,
+                #[cfg(not(fbcode_build))]
+                bazel_artifact_upload_backend: None,
+                #[cfg(not(fbcode_build))]
+                re_client_cas_address: None,
+                #[cfg(not(fbcode_build))]
+                bazel_artifact_upload_instance_name: None,
+                #[cfg(not(fbcode_build))]
+                re_client_instance_name: None,
+                #[cfg(not(fbcode_build))]
+                bazel_artifact_uri_authority: None,
+                #[cfg(not(fbcode_build))]
+                bazel_artifact_upload_max_bytes: 10 * 1024 * 1024,
+                #[cfg(not(fbcode_build))]
+                build_metadata: Vec::new(),
+            },
+        );
         self.health_check_tags_receiver = health_check_tags_receiver;
         self.preemptible = build_config_opts.and_then(|opts| opts.preemptible);
     }
@@ -2399,39 +2471,32 @@ impl EventSubscriber for InvocationRecorder {
     }
 
     async fn finalize(&mut self) -> buck2_error::Result<()> {
-        // Can't set this before the daemon forks.
-        // Typically initialized already unless the command failed early.
-        let fb = buck2_common::fbinit::get_or_init_fbcode_globals();
         let event = self.create_record_event();
 
-        // Send the record to every enabled remote sink. The OTLP sink has the same interface as the
-        // Scribe sink and is not Meta-specific, so it is the export path in OSS builds where the
-        // Scribe sink is a compile-time no-op. Telemetry must never fail a command, so an OTLP
-        // failure is logged rather than propagated.
         #[cfg(not(fbcode_build))]
-        if let Some(otel_sink) = new_otel_event_sink_if_enabled() {
-            let span = tracing::info_span!("Recording invocation to OpenTelemetry");
-            let _guard = span.enter();
-            if let Err(e) = otel_sink.send_now(event.clone()).await {
-                tracing::warn!("Failed to export invocation record via OTLP: {e:#}");
-            }
+        {
+            let _ = event;
+            // In OSS, daemon-side BES upload is the source of truth for the
+            // invocation stream. Sending a second client-side stream with the
+            // same invocation ID causes BuildBuddy to cancel/preempt attempts
+            // and can downgrade a successful invocation to disconnected.
+            return Ok(());
         }
 
-        if let Some(scribe_sink) = new_remote_event_sink_if_enabled(
-            fb,
-            ScribeConfig {
-                buffer_size: 1,
-                retry_backoff: Duration::from_millis(500),
-                retry_attempts: 5,
-                message_batch_size: None,
-                thrift_timeout: Duration::from_secs(2),
-            },
-        )? {
-            tracing::info!("Recording invocation to Scribe: {:?}", &event);
-            scribe_sink.send_now(event).await
-        } else {
-            tracing::info!("Invocation record is not sent to Scribe: {:?}", &event);
-            Ok(())
+        #[cfg(fbcode_build)]
+        {
+            // Can't set this before the daemon forks.
+            // Typically initialized already unless the command failed early.
+            let fb = buck2_common::fbinit::get_or_init_fbcode_globals();
+            let remote_sink_config =
+                std::mem::replace(&mut self.remote_sink_config, RemoteEventConfig::default());
+            if let Some(scribe_sink) = new_remote_event_sink_if_enabled(fb, remote_sink_config)? {
+                tracing::info!("Recording invocation to Scribe: {:?}", &event);
+                scribe_sink.send_now(event).await
+            } else {
+                tracing::info!("Invocation record is not sent to Scribe: {:?}", &event);
+                Ok(())
+            }
         }
     }
 

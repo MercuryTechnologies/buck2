@@ -6,20 +6,31 @@ repository = { workspace = true }
 version = "0.1.0"
 
 [dependencies]
+async-trait = { workspace = true }
+bazel_bep_proto = { workspace = true }
+bes_grpc_proto = { workspace = true }
+chrono = { workspace = true }
 console = { workspace = true }
 crossbeam-channel = { workspace = true }
 derive_more = { workspace = true }
+flate2 = { workspace = true }
 futures = { workspace = true }
+google_grpc_proto = { workspace = true }
 hostname = { workspace = true }
 is_proc_translated = { workspace = true }
 opentelemetry = { workspace = true }
 opentelemetry-semantic-conventions = { workspace = true }
 pin-project = { workspace = true }
 prost-types = { workspace = true }
+prost = { workspace = true }
 serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
 smallvec = { workspace = true }
 sys-info = { workspace = true }
 tokio = { workspace = true }
+tokio-stream = { workspace = true }
+tonic = { workspace = true }
 uuid = { workspace = true }
 
 allocative = { workspace = true }

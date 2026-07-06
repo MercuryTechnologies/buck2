@@ -268,6 +268,7 @@ impl StatefulSuperConsole {
         stream: Option<Box<dyn Write + Send + 'static + Sync>>,
         config: SuperConsoleConfig,
         health_check_reports_receiver: Option<Receiver<Vec<DisplayReport>>>,
+        bes_results_url: Option<String>,
     ) -> buck2_error::Result<Self> {
         let mut builder = Self::console_builder();
         if let Some(stream) = stream {
@@ -282,6 +283,7 @@ impl StatefulSuperConsole {
             timekeeper,
             config,
             health_check_reports_receiver,
+            bes_results_url,
         )
     }
 
@@ -294,6 +296,7 @@ impl StatefulSuperConsole {
         timekeeper: Timekeeper,
         config: SuperConsoleConfig,
         health_check_reports_receiver: Option<Receiver<Vec<DisplayReport>>>,
+        bes_results_url: Option<String>,
     ) -> buck2_error::Result<Self> {
         let header = format!("Command: {command_name}.");
         Ok(Self::Running(StatefulSuperConsoleImpl {
@@ -305,6 +308,7 @@ impl StatefulSuperConsole {
                 expect_spans,
                 config,
                 health_check_reports_receiver,
+                bes_results_url,
             )?,
             super_console,
             verbosity,
@@ -375,6 +379,7 @@ impl SuperConsoleState {
         expect_spans: bool,
         config: SuperConsoleConfig,
         health_check_reports_receiver: Option<Receiver<Vec<DisplayReport>>>,
+        bes_results_url: Option<String>,
     ) -> buck2_error::Result<SuperConsoleState> {
         Ok(SuperConsoleState {
             timekeeper,
@@ -383,6 +388,7 @@ impl SuperConsoleState {
                 verbosity,
                 expect_spans,
                 health_check_reports_receiver,
+                bes_results_url,
             ),
             config,
             active_warnings: None,
@@ -442,11 +448,63 @@ impl StatefulSuperConsoleImpl {
         Ok(())
     }
 
+    async fn handle_command_start(&mut self) -> buck2_error::Result<()> {
+        self.emit_streaming_results_start_line()
+    }
+
+    async fn handle_command_end(&mut self) -> buck2_error::Result<()> {
+        self.emit_streaming_results_end_line()
+    }
+
+    fn emit_streaming_results_start_line(&mut self) -> buck2_error::Result<()> {
+        let Some(streaming_results_line) = self
+            .state
+            .simple_console
+            .command_start_streaming_results_line()
+        else {
+            return Ok(());
+        };
+        self.emit_streaming_results_line(&streaming_results_line)
+    }
+
+    fn emit_streaming_results_end_line(&mut self) -> buck2_error::Result<()> {
+        let Some(streaming_results_line) = self
+            .state
+            .simple_console
+            .command_end_streaming_results_line()
+        else {
+            return Ok(());
+        };
+        self.emit_streaming_results_line(&streaming_results_line)
+    }
+
+    fn emit_streaming_results_line(
+        &mut self,
+        streaming_results_line: &str,
+    ) -> buck2_error::Result<()> {
+        self.super_console.emit_now(
+            Lines(vec![Line::sanitized(streaming_results_line)]),
+            &BuckRootComponent {
+                header: &self.header,
+                state: &self.state,
+            },
+        )?;
+        Ok(())
+    }
+
     async fn handle_inner_event(&mut self, event: &BuckEvent) -> buck2_error::Result<()> {
         match unpack_event(event)? {
-            buck2_event_observer::unpack_event::UnpackedBuckEvent::SpanStart(_, _, _) => Ok(()),
+            buck2_event_observer::unpack_event::UnpackedBuckEvent::SpanStart(_, _, data) => {
+                match data {
+                    buck2_data::span_start_event::Data::Command(_) => {
+                        self.handle_command_start().await
+                    }
+                    _ => Ok(()),
+                }
+            }
             buck2_event_observer::unpack_event::UnpackedBuckEvent::SpanEnd(_, _, data) => {
                 match data {
+                    buck2_data::span_end_event::Data::Command(_) => self.handle_command_end().await,
                     buck2_data::span_end_event::Data::ActionExecution(action) => {
                         self.handle_action_execution_end(action).await
                     }
@@ -1047,6 +1105,7 @@ mod tests {
             None,
             Default::default(),
             None,
+            None,
         )
         .unwrap();
 
@@ -1119,6 +1178,7 @@ mod tests {
                 EventTimestamp(SystemTime::now().into()),
             ),
             Default::default(),
+            None,
             None,
         )?;
 
@@ -1214,6 +1274,7 @@ mod tests {
     fn test_session_info() -> buck2_error::Result<()> {
         let info = SessionInfo {
             trace_id: TraceId::null(),
+            bes_results_url: None,
             test_session: Some(buck2_data::TestSessionInfo {
                 info: (0..100).map(|_| "a").collect(),
             }),
@@ -1281,6 +1342,7 @@ mod tests {
             ),
             Default::default(),
             None,
+            None,
         )?;
 
         console.handle_tailer_stderr("some stderr output").await?;
@@ -1299,6 +1361,93 @@ mod tests {
         };
 
         assert_frame_contains(&frame, "some stderr output");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_streaming_results_line_emitted_for_command_lifecycle() -> buck2_error::Result<()>
+    {
+        let trace_id = TraceId::new();
+        let now = SystemTime::now();
+        let expected = format!(
+            "Streaming build results to: https://buildbuddy.example.com/invocation/{}",
+            trace_id
+        );
+
+        let mut console = StatefulSuperConsole::new(
+            "build",
+            trace_id.dupe(),
+            test_console(),
+            Verbosity::default(),
+            true,
+            Timekeeper::new(
+                Box::new(RealtimeClock),
+                EventTimestamp(SystemTime::now().into()),
+            ),
+            Default::default(),
+            None,
+            Some("https://buildbuddy.example.com/invocation/".to_owned()),
+        )?;
+
+        let command_span_id = SpanId::next();
+        console
+            .handle_event(&Arc::new(BuckEvent::new(
+                now,
+                trace_id.dupe(),
+                Some(command_span_id),
+                None,
+                buck2_data::buck_event::Data::SpanStart(SpanStartEvent {
+                    data: Some(
+                        buck2_data::CommandStart {
+                            data: Some(buck2_data::BuildCommandStart {}.into()),
+                            ..Default::default()
+                        }
+                        .into(),
+                    ),
+                }),
+            )))
+            .await?;
+
+        let frame = match &mut console {
+            StatefulSuperConsole::Running(c) => c
+                .super_console
+                .test_output_mut()
+                .frames
+                .pop()
+                .buck_error_context("No frame was emitted")?,
+            StatefulSuperConsole::Finalized(_) => {
+                panic!("Console was downgraded");
+            }
+        };
+        assert_frame_contains(&frame, &expected);
+
+        console
+            .handle_event(&Arc::new(BuckEvent::new(
+                now,
+                trace_id.dupe(),
+                Some(command_span_id),
+                None,
+                buck2_data::buck_event::Data::SpanEnd(SpanEndEvent {
+                    data: Some(buck2_data::CommandEnd::default().into()),
+                    stats: None,
+                    duration: None,
+                }),
+            )))
+            .await?;
+
+        let frame = match &mut console {
+            StatefulSuperConsole::Running(c) => c
+                .super_console
+                .test_output_mut()
+                .frames
+                .pop()
+                .buck_error_context("No frame was emitted")?,
+            StatefulSuperConsole::Finalized(_) => {
+                panic!("Console was downgraded");
+            }
+        };
+        assert_frame_contains(&frame, &expected);
+
         Ok(())
     }
 }

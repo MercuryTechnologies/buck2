@@ -406,6 +406,10 @@ impl IoHandler for DefaultIoHandler {
             }
             _ => None,
         };
+        let url = match method.as_ref() {
+            ArtifactMaterializationMethod::HttpDownload { info } => Some(info.url.to_string()),
+            _ => None,
+        };
         let materialization_start = buck2_data::MaterializationStart {
             action_digest: action_digest.clone(),
         };
@@ -431,6 +435,7 @@ impl IoHandler for DefaultIoHandler {
                         success: error.is_none(),
                         error,
                         method: Some(method.to_proto() as i32),
+                        url,
                     },
                 )
             })

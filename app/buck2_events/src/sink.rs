@@ -10,6 +10,10 @@
 
 //! Implementations of `[crate::EventSink]` that are useful in different situations. Buck2 primarily uses the `channel`
 //! sink during normal operation.
+#[cfg(not(fbcode_build))]
+mod bazel_converter;
+#[cfg(not(fbcode_build))]
+mod bes_client;
 pub(crate) mod channel;
 pub mod null;
 #[cfg(not(fbcode_build))]
@@ -17,7 +21,6 @@ pub mod otel;
 #[cfg(not(fbcode_build))]
 pub(crate) mod otel_record;
 pub mod remote;
-#[cfg(fbcode_build)]
 pub(crate) mod scribe;
 pub(crate) mod smart_truncate_event;
 pub mod tee;

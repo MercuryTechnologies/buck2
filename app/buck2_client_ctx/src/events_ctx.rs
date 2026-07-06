@@ -418,6 +418,11 @@ pub struct EventsCtx {
     pub command_report_path: Option<AbsPathBuf>,
     // Internal commands triggered by other commands should not log an invocation record.
     pub log_invocation_record: bool,
+    /// Whether a superconsole was actually constructed for this command.
+    /// Set by `streaming.rs` from the authoritative answer returned by
+    /// `get_console_with_root`. Defaults to `false` for non-streaming entry
+    /// points (e.g. log replay) that don't go through that path.
+    pub used_superconsole: bool,
 }
 
 impl EventsCtx {
@@ -432,6 +437,7 @@ impl EventsCtx {
             buck_log_dir: None,
             command_report_path: None,
             log_invocation_record: true,
+            used_superconsole: false,
         }
     }
 
@@ -483,6 +489,21 @@ impl EventsCtx {
         });
         self.try_for_each_subscriber(|subscriber| subscriber.handle_events(&events))
             .await
+    }
+
+    pub async fn handle_client_instant_event(
+        &mut self,
+        trace_id: TraceId,
+        data: buck2_data::instant_event::Data,
+    ) -> buck2_error::Result<()> {
+        let event = BuckEvent::new(
+            SystemTime::now(),
+            trace_id,
+            None,
+            None,
+            buck2_data::buck_event::Data::Instant(buck2_data::InstantEvent { data: Some(data) }),
+        );
+        self.handle_events(vec![event], &mut None).await
     }
 
     async fn handle_command_result(
