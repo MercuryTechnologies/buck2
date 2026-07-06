@@ -119,7 +119,7 @@ impl ChannelConfig {
     }
 
     async fn create_tls_config(opts: &Buck2OssReConfiguration) -> anyhow::Result<ClientTlsConfig> {
-        let config = ClientTlsConfig::new().with_enabled_roots();
+        let config = ClientTlsConfig::new().with_enabled_roots().use_key_log();
 
         let config = match opts.tls_ca_certs.as_ref() {
             Some(tls_ca_certs) => {
