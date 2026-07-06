@@ -26,6 +26,7 @@ use async_compression::tokio::bufread::DeflateDecoder;
 use async_compression::tokio::bufread::DeflateEncoder;
 use async_compression::tokio::bufread::ZstdDecoder;
 use async_compression::tokio::bufread::ZstdEncoder;
+use buck2_events::dispatch::span_async;
 use buck2_re_configuration::Buck2OssReConfiguration;
 use buck2_re_configuration::HttpHeader;
 use dupe::Dupe;
@@ -775,6 +776,72 @@ fn process_operation_message(msg: Operation) -> anyhow::Result<ExecuteWithProgre
     }
 }
 
+fn grpc_digest_size_bytes(digest: &Digest) -> u64 {
+    u64::try_from(digest.size_bytes).unwrap_or_default()
+}
+
+fn grpc_digest_string(digest: &Digest) -> String {
+    format!("{}/{}", digest.hash, digest.size_bytes)
+}
+
+fn remote_request_start(
+    service: &str,
+    method: &str,
+    metadata: &RemoteExecutionMetadata,
+    action_digest: Option<String>,
+) -> buck2_data::RemoteRequestStart {
+    buck2_data::RemoteRequestStart {
+        service: service.to_owned(),
+        method: method.to_owned(),
+        action_digest,
+        action_id: metadata.action_id.clone(),
+        target: metadata.target_id.clone(),
+        action_mnemonic: metadata.action_mnemonic.clone(),
+        use_case: metadata.use_case_id.clone(),
+        ..Default::default()
+    }
+}
+
+fn remote_request_end<T>(result: &anyhow::Result<T>) -> buck2_data::RemoteRequestEnd {
+    match result {
+        Ok(_) => buck2_data::RemoteRequestEnd {
+            success: true,
+            ..Default::default()
+        },
+        Err(error) => buck2_data::RemoteRequestEnd {
+            success: false,
+            error: Some(error.to_string()),
+            re_error_code: error
+                .downcast_ref::<tonic::Status>()
+                .map(|status| format!("{:?}", status.code())),
+            ..Default::default()
+        },
+    }
+}
+
+async fn remote_request_span<T>(
+    start: buck2_data::RemoteRequestStart,
+    fut: impl Future<Output = anyhow::Result<T>>,
+) -> anyhow::Result<T> {
+    span_async(start, async move {
+        let result = fut.await;
+        let end = remote_request_end(&result);
+        (result, end)
+    })
+    .await
+}
+
+fn request_stats_for_grpc_digests<'a>(digests: impl IntoIterator<Item = &'a Digest>) -> (u64, u64) {
+    digests
+        .into_iter()
+        .fold((0u64, 0u64), |(count, bytes), digest| {
+            (
+                count.saturating_add(1),
+                bytes.saturating_add(grpc_digest_size_bytes(digest)),
+            )
+        })
+}
+
 impl REClient {
     fn new(
         runtime_opts: RERuntimeOpts,
@@ -804,35 +871,44 @@ impl REClient {
         metadata: RemoteExecutionMetadata,
         request: ActionResultRequest,
     ) -> anyhow::Result<ActionResultResponse> {
-        retry(
-            "GetActionResultRequest",
-            || async {
-                let mut client = self.grpc_clients.action_cache_client.clone();
-                let request = request.clone();
-                let metadata = metadata.clone();
+        let start = remote_request_start(
+            "ActionCache",
+            "GetActionResult",
+            &metadata,
+            Some(grpc_digest_string(&tdigest_to(request.digest.clone()))),
+        );
+        remote_request_span(
+            start,
+            retry(
+                "GetActionResultRequest",
+                || async {
+                    let mut client = self.grpc_clients.action_cache_client.clone();
+                    let request = request.clone();
+                    let metadata = metadata.clone();
 
-                let res = client
-                    .get_action_result(with_re_metadata(
-                        GetActionResultRequest {
-                            instance_name: self.instance_name.as_str().to_owned(),
-                            action_digest: Some(tdigest_to(request.digest)),
-                            ..Default::default()
-                        },
-                        metadata,
-                        self.runtime_opts.use_fbcode_metadata,
-                        self.request_metadata_tool_name.as_str(),
-                    ))
-                    .await?;
+                    let res = client
+                        .get_action_result(with_re_metadata(
+                            GetActionResultRequest {
+                                instance_name: self.instance_name.as_str().to_owned(),
+                                action_digest: Some(tdigest_to(request.digest)),
+                                ..Default::default()
+                            },
+                            metadata,
+                            self.runtime_opts.use_fbcode_metadata,
+                            self.request_metadata_tool_name.as_str(),
+                        ))
+                        .await?;
 
-                Ok(ActionResultResponse {
-                    action_result: convert_action_result(res.into_inner())?,
-                    ttl: 0,
-                })
-            },
-            self.runtime_opts.max_retries,
-            INITIAL_DELAY,
-            MAX_DELAY,
-            false,
+                    Ok(ActionResultResponse {
+                        action_result: convert_action_result(res.into_inner())?,
+                        ttl: 0,
+                    })
+                },
+                self.runtime_opts.max_retries,
+                INITIAL_DELAY,
+                MAX_DELAY,
+                false,
+            ),
         )
         .await
     }
@@ -842,37 +918,48 @@ impl REClient {
         metadata: RemoteExecutionMetadata,
         request: WriteActionResultRequest,
     ) -> anyhow::Result<WriteActionResultResponse> {
-        retry(
+        let start = remote_request_start(
+            "ActionCache",
             "UpdateActionResult",
-            || async {
-                let mut client = self.grpc_clients.action_cache_client.clone();
-                let request = request.clone();
-                let metadata = metadata.clone();
+            &metadata,
+            Some(grpc_digest_string(&tdigest_to(request.action_digest.clone()))),
+        );
+        remote_request_span(
+            start,
+            retry(
+                "UpdateActionResult",
+                || async {
+                    let mut client = self.grpc_clients.action_cache_client.clone();
+                    let request = request.clone();
+                    let metadata = metadata.clone();
 
-                let res = client
-                    .update_action_result(with_re_metadata(
-                        UpdateActionResultRequest {
-                            instance_name: self.instance_name.as_str().to_owned(),
-                            action_digest: Some(tdigest_to(request.action_digest)),
-                            action_result: Some(convert_t_action_result2(request.action_result)?),
-                            results_cache_policy: None,
-                            ..Default::default()
-                        },
-                        metadata,
-                        self.runtime_opts.use_fbcode_metadata,
-                        self.request_metadata_tool_name.as_str(),
-                    ))
-                    .await?;
+                    let res = client
+                        .update_action_result(with_re_metadata(
+                            UpdateActionResultRequest {
+                                instance_name: self.instance_name.as_str().to_owned(),
+                                action_digest: Some(tdigest_to(request.action_digest)),
+                                action_result: Some(convert_t_action_result2(
+                                    request.action_result,
+                                )?),
+                                results_cache_policy: None,
+                                ..Default::default()
+                            },
+                            metadata,
+                            self.runtime_opts.use_fbcode_metadata,
+                            self.request_metadata_tool_name.as_str(),
+                        ))
+                        .await?;
 
-                Ok(WriteActionResultResponse {
-                    actual_action_result: convert_action_result(res.into_inner())?,
-                    ttl_seconds: 0,
-                })
-            },
-            self.runtime_opts.max_retries,
-            INITIAL_DELAY,
-            MAX_DELAY,
-            false,
+                    Ok(WriteActionResultResponse {
+                        actual_action_result: convert_action_result(res.into_inner())?,
+                        ttl_seconds: 0,
+                    })
+                },
+                self.runtime_opts.max_retries,
+                INITIAL_DELAY,
+                MAX_DELAY,
+                false,
+            ),
         )
         .await
     }
@@ -970,29 +1057,41 @@ impl REClient {
                 let runtime_opts = self.runtime_opts;
                 let request_metadata_tool_name = self.request_metadata_tool_name.clone();
 
-                retry(
-                    "BatchUpdateBlobs",
-                    move || {
-                        let metadata = metadata.clone();
-                        let mut cas_client = cas_client.clone();
-                        let re_request = re_request.clone();
-                        let request_metadata_tool_name = request_metadata_tool_name.clone();
-                        async move {
-                            let resp = cas_client
-                                .batch_update_blobs(with_re_metadata(
-                                    re_request,
-                                    metadata,
-                                    runtime_opts.use_fbcode_metadata,
-                                    request_metadata_tool_name.as_str(),
-                                ))
-                                .await?;
-                            Ok(resp.into_inner())
-                        }
-                    },
-                    self.runtime_opts.max_retries,
-                    INITIAL_DELAY,
-                    MAX_DELAY,
-                    false,
+                let mut start = remote_request_start("CAS", "BatchUpdateBlobs", &metadata, None);
+                start.digest_count = Some(re_request.requests.len() as u64);
+                start.bytes = Some(
+                    re_request
+                        .requests
+                        .iter()
+                        .map(|request| request.data.len() as u64)
+                        .sum(),
+                );
+                remote_request_span(
+                    start,
+                    retry(
+                        "BatchUpdateBlobs",
+                        move || {
+                            let metadata = metadata.clone();
+                            let mut cas_client = cas_client.clone();
+                            let re_request = re_request.clone();
+                            let request_metadata_tool_name = request_metadata_tool_name.clone();
+                            async move {
+                                let resp = cas_client
+                                    .batch_update_blobs(with_re_metadata(
+                                        re_request,
+                                        metadata,
+                                        runtime_opts.use_fbcode_metadata,
+                                        request_metadata_tool_name.as_str(),
+                                    ))
+                                    .await?;
+                                Ok(resp.into_inner())
+                            }
+                        },
+                        self.runtime_opts.max_retries,
+                        INITIAL_DELAY,
+                        MAX_DELAY,
+                        false,
+                    ),
                 )
                 .await
             },
@@ -1002,30 +1101,34 @@ impl REClient {
                 let runtime_opts = self.runtime_opts;
                 let request_metadata_tool_name = self.request_metadata_tool_name.clone();
 
-                retry(
-                    "BS.write",
-                    move || {
-                        let metadata = metadata.clone();
-                        let mut bytestream_client = bytestream_client.clone();
-                        let requests = futures::stream::iter(segments.clone());
-                        let request_metadata_tool_name = request_metadata_tool_name.clone();
-                        async move {
-                            let resp = bytestream_client
-                                .write(with_re_metadata(
-                                    requests,
-                                    metadata,
-                                    runtime_opts.use_fbcode_metadata,
-                                    request_metadata_tool_name.as_str(),
-                                ))
-                                .await?;
+                let start = remote_request_start("ByteStream", "Write", &metadata, None);
+                remote_request_span(
+                    start,
+                    retry(
+                        "BS.write",
+                        move || {
+                            let metadata = metadata.clone();
+                            let mut bytestream_client = bytestream_client.clone();
+                            let requests = futures::stream::iter(segments.clone());
+                            let request_metadata_tool_name = request_metadata_tool_name.clone();
+                            async move {
+                                let resp = bytestream_client
+                                    .write(with_re_metadata(
+                                        requests,
+                                        metadata,
+                                        runtime_opts.use_fbcode_metadata,
+                                        request_metadata_tool_name.as_str(),
+                                    ))
+                                    .await?;
 
-                            Ok(resp.into_inner())
-                        }
-                    },
-                    self.runtime_opts.max_retries,
-                    INITIAL_DELAY,
-                    MAX_DELAY,
-                    false,
+                                Ok(resp.into_inner())
+                            }
+                        },
+                        self.runtime_opts.max_retries,
+                        INITIAL_DELAY,
+                        MAX_DELAY,
+                        false,
+                    ),
                 )
                 .await
             },
@@ -1075,29 +1178,36 @@ impl REClient {
                 let runtime_opts = self.runtime_opts;
                 let request_metadata_tool_name = self.request_metadata_tool_name.clone();
 
-                retry(
-                    "BatchReadBlobs",
-                    move || {
-                        let metadata = metadata.clone();
-                        let mut client = client.clone();
-                        let re_request = re_request.clone();
-                        let request_metadata_tool_name = request_metadata_tool_name.clone();
-                        async move {
-                            Ok(client
-                                .batch_read_blobs(with_re_metadata(
-                                    re_request,
-                                    metadata,
-                                    runtime_opts.use_fbcode_metadata,
-                                    request_metadata_tool_name.as_str(),
-                                ))
-                                .await?
-                                .into_inner())
-                        }
-                    },
-                    self.runtime_opts.max_retries,
-                    INITIAL_DELAY,
-                    MAX_DELAY,
-                    false,
+                let mut start = remote_request_start("CAS", "BatchReadBlobs", &metadata, None);
+                let (digest_count, bytes) = request_stats_for_grpc_digests(&re_request.digests);
+                start.digest_count = Some(digest_count);
+                start.bytes = Some(bytes);
+                remote_request_span(
+                    start,
+                    retry(
+                        "BatchReadBlobs",
+                        move || {
+                            let metadata = metadata.clone();
+                            let mut client = client.clone();
+                            let re_request = re_request.clone();
+                            let request_metadata_tool_name = request_metadata_tool_name.clone();
+                            async move {
+                                Ok(client
+                                    .batch_read_blobs(with_re_metadata(
+                                        re_request,
+                                        metadata,
+                                        runtime_opts.use_fbcode_metadata,
+                                        request_metadata_tool_name.as_str(),
+                                    ))
+                                    .await?
+                                    .into_inner())
+                            }
+                        },
+                        self.runtime_opts.max_retries,
+                        INITIAL_DELAY,
+                        MAX_DELAY,
+                        false,
+                    ),
                 )
                 .await
             },
@@ -1107,6 +1217,9 @@ impl REClient {
                 let request_metadata_tool_name = self.request_metadata_tool_name.clone();
                 async move {
                     let client = self.grpc_clients.bytestream_client.clone();
+                    let start = remote_request_start("ByteStream", "Read", &metadata, None);
+                    remote_request_span(
+                    start,
                     retry(
                         "Read",
                         move || {
@@ -1141,6 +1254,7 @@ impl REClient {
                         INITIAL_DELAY,
                         MAX_DELAY,
                         false,
+                    ),
                     )
                     .await
                 }
@@ -1181,36 +1295,45 @@ impl REClient {
             if !digests_to_check.is_empty() {
                 tracing::debug!(num_digests = digests_to_check.len(), "FindMissingBlobs");
                 let runtime_opts = self.runtime_opts;
-                let missing_blobs = retry(
-                    "FindMissingBlobs",
-                    || {
-                        let mut cas_client = cas_client.clone();
-                        let metadata = metadata.clone();
-                        let digests_to_check = digests_to_check.clone();
-                        let instance_name = self.instance_name.as_str().to_owned();
-                        let request_metadata_tool_name = self.request_metadata_tool_name.clone();
+                let mut start =
+                    remote_request_start("CAS", "FindMissingBlobs", &metadata, None);
+                start.digest_count = Some(digests_to_check.len() as u64);
+                let missing_blobs = remote_request_span(
+                    start,
+                    retry(
+                        "FindMissingBlobs",
+                        || {
+                            let mut cas_client = cas_client.clone();
+                            let metadata = metadata.clone();
+                            let digests_to_check = digests_to_check.clone();
+                            let instance_name = self.instance_name.as_str().to_owned();
+                            let request_metadata_tool_name =
+                                self.request_metadata_tool_name.clone();
 
-                        async move {
-                            cas_client
-                                .find_missing_blobs(with_re_metadata(
-                                    FindMissingBlobsRequest {
-                                        instance_name,
-                                        blob_digests: digests_to_check
-                                            .map(|b| tdigest_to(b.clone())),
-                                        ..Default::default()
-                                    },
-                                    metadata,
-                                    runtime_opts.use_fbcode_metadata,
-                                    request_metadata_tool_name.as_str(),
-                                ))
-                                .await
-                                .context("Failed to request what blobs are not present on remote")
-                        }
-                    },
-                    self.runtime_opts.max_retries,
-                    INITIAL_DELAY,
-                    MAX_DELAY,
-                    false,
+                            async move {
+                                cas_client
+                                    .find_missing_blobs(with_re_metadata(
+                                        FindMissingBlobsRequest {
+                                            instance_name,
+                                            blob_digests: digests_to_check
+                                                .map(|b| tdigest_to(b.clone())),
+                                            ..Default::default()
+                                        },
+                                        metadata,
+                                        runtime_opts.use_fbcode_metadata,
+                                        request_metadata_tool_name.as_str(),
+                                    ))
+                                    .await
+                                    .context(
+                                        "Failed to request what blobs are not present on remote",
+                                    )
+                            }
+                        },
+                        self.runtime_opts.max_retries,
+                        INITIAL_DELAY,
+                        MAX_DELAY,
+                        false,
+                    ),
                 )
                 .await?;
                 let resp: FindMissingBlobsResponse = missing_blobs.into_inner();
