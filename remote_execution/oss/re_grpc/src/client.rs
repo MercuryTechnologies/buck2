@@ -255,6 +255,7 @@ pub struct RERuntimeOpts {
     /// Maximum retries for network requests.
     max_retries: usize,
     /// Timeout for RPC requests.
+    #[expect(unused)]
     rpc_timeout: Duration,
 }
 
@@ -3078,94 +3079,95 @@ mod tests {
         assert_eq!(substitute_env_vars_impl("FOO", getter).unwrap(), "FOO");
         assert!(substitute_env_vars_impl("$FOO$BAZ", getter).is_err());
     }
-}
 
-#[tokio::test]
-async fn test_upload_compressed() -> anyhow::Result<()> {
-    let blob_data = vec![1; 10 * 1024 * 1024];
-    let digest1 = TDigest {
-        hash: "aa".to_owned(),
-        size_in_bytes: blob_data.len() as i64,
-        ..Default::default()
-    };
-
-    let req = UploadRequest {
-        inlined_blobs_with_digest: Some(vec![InlinedBlobWithDigest {
-            digest: digest1.clone(),
-            blob: blob_data.clone(),
+    #[tokio::test]
+    async fn test_upload_compressed() -> anyhow::Result<()> {
+        let blob_data = vec![1; 10 * 1024 * 1024];
+        let digest1 = TDigest {
+            hash: "aa".to_owned(),
+            size_in_bytes: blob_data.len() as i64,
             ..Default::default()
-        }]),
-        ..Default::default()
-    };
+        };
 
-    let blob_data_ref = &blob_data;
-    upload_impl(
-        &InstanceName(Some("instance".to_owned())),
-        req,
-        Some(Compressor::Zstd),
-        1,
-        None,
-        |_req| async move {
-            panic!("Not called");
-        },
-        {
-            |write_reqs| async move {
-                let compressed_data: Vec<u8> =
-                    write_reqs.iter().flat_map(|wr| wr.data.clone()).collect();
-                let mut data = vec![];
-                ZstdDecoder::new(Cursor::new(compressed_data))
-                    .read_to_end(&mut data)
-                    .await
-                    .unwrap();
-                assert_eq!(&data, blob_data_ref);
-                anyhow::Ok(WriteResponse { committed_size: -1 })
-            }
-        },
-    )
-    .await?;
-
-    Ok(())
-}
-
-#[tokio::test]
-async fn test_download_compressed() -> anyhow::Result<()> {
-    let blob_data = vec![1; 1024];
-
-    let mut compressed_data = vec![];
-    ZstdEncoder::new(Cursor::new(blob_data.clone()))
-        .read_to_end(&mut compressed_data)
-        .await
-        .unwrap();
-    let compressed_data_ref = &compressed_data;
-
-    let d_resp = download_impl(
-        &InstanceName(None),
-        DownloadRequest {
-            inlined_digests: Some(vec![TDigest {
-                hash: "aa".to_owned(),
-                size_in_bytes: blob_data.len() as i64,
+        let req = UploadRequest {
+            inlined_blobs_with_digest: Some(vec![InlinedBlobWithDigest {
+                digest: digest1.clone(),
+                blob: blob_data.clone(),
                 ..Default::default()
             }]),
-            file_digests: None,
             ..Default::default()
-        },
-        Some(Compressor::Zstd),
-        10,
-        |_req| async { panic!("not called") },
-        |_req| async move {
-            Ok(Box::pin(futures::stream::iter(
-                compressed_data_ref
-                    .chunks(10)
-                    .map(|d| Result::Ok(ReadResponse { data: d.to_vec() })),
-            )))
-        },
-    )
-    .await?;
+        };
 
-    assert_eq!(
-        d_resp.inlined_blobs.as_ref().unwrap()[0].blob.len(),
-        blob_data.len()
-    );
-    assert_eq!(d_resp.inlined_blobs.unwrap()[0].blob, blob_data);
-    Ok(())
+        let blob_data_ref = &blob_data;
+        upload_impl(
+            &InstanceName(Some("instance".to_owned())),
+            req,
+            Some(Compressor::Zstd),
+            1,
+            None,
+            |_req| async move {
+                panic!("Not called");
+            },
+            {
+                |write_reqs| async move {
+                    let compressed_data: Vec<u8> =
+                        write_reqs.iter().flat_map(|wr| wr.data.clone()).collect();
+                    let mut data = vec![];
+                    ZstdDecoder::new(Cursor::new(compressed_data))
+                        .read_to_end(&mut data)
+                        .await
+                        .unwrap();
+                    assert_eq!(&data, blob_data_ref);
+                    anyhow::Ok(WriteResponse { committed_size: -1 })
+                }
+            },
+        )
+        .await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_download_compressed() -> anyhow::Result<()> {
+        let blob_data = vec![1; 1024];
+
+        let mut compressed_data = vec![];
+        ZstdEncoder::new(Cursor::new(blob_data.clone()))
+            .read_to_end(&mut compressed_data)
+            .await
+            .unwrap();
+        let compressed_data_ref = &compressed_data;
+
+        let d_resp = download_impl(
+            &test_re_runtime_opts(),
+            &InstanceName(None),
+            DownloadRequest {
+                inlined_digests: Some(vec![TDigest {
+                    hash: "aa".to_owned(),
+                    size_in_bytes: blob_data.len() as i64,
+                    ..Default::default()
+                }]),
+                file_digests: None,
+                ..Default::default()
+            },
+            Some(Compressor::Zstd),
+            10,
+            |_req| async { panic!("not called") },
+            |_req| async move {
+                Ok(Box::pin(futures::stream::iter(
+                    compressed_data_ref
+                        .chunks(10)
+                        .map(|d| Result::Ok(ReadResponse { data: d.to_vec() })),
+                )))
+            },
+        )
+        .await?;
+
+        assert_eq!(
+            d_resp.inlined_blobs.as_ref().unwrap()[0].blob.len(),
+            blob_data.len()
+        );
+        assert_eq!(d_resp.inlined_blobs.unwrap()[0].blob, blob_data);
+        Ok(())
+    }
 }
