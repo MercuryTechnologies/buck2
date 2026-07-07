@@ -54,7 +54,6 @@ use buck2_execute::dep_file_state::DEP_FILE_STORE;
 use buck2_execute::digest_config::DigestConfig;
 use buck2_execute::execute::blocking::BlockingExecutor;
 use buck2_execute::execute::blocking::BuckBlockingExecutor;
-use buck2_execute::execute::blocking::DirectIoExecutor;
 use buck2_execute::materialize::materializer::MaterializationMethod;
 use buck2_execute::materialize::materializer::Materializer;
 use buck2_execute::re::manager::ReConnectionManager;
