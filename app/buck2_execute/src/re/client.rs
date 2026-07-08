@@ -1078,7 +1078,7 @@ impl RemoteExecutionClientImpl {
         /// Wait for either the ExecuteResponse to show up, or a stage change, within a span
         /// on the CommandExecutionManager.
         async fn wait_for_response_or_stage_change(
-            receiver: &mut BoxStream<'static, anyhow::Result<ExecuteWithProgressResponse>>,
+            receiver: &mut BoxStream<'_, anyhow::Result<ExecuteWithProgressResponse>>,
             previous_stage: Stage,
             previous_metadata: &Option<OperationMetadata>,
             report_stage: re_stage::Stage,

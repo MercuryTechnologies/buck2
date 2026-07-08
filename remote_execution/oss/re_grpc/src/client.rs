@@ -244,7 +244,7 @@ pub struct RECapabilities {
 }
 
 /// Contains runtime options for the remote execution client as set under `buck2_re_client`
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct RERuntimeOpts {
     /// Use the Meta version of the request metadata
     use_fbcode_metadata: bool,
@@ -798,7 +798,7 @@ impl REClient {
                             ..Default::default()
                         },
                         metadata,
-                        self.runtime_opts,
+                        &self.runtime_opts,
                     ))
                     .await?;
 
@@ -837,7 +837,7 @@ impl REClient {
                             ..Default::default()
                         },
                         metadata,
-                        self.runtime_opts,
+                        &self.runtime_opts,
                     ))
                     .await?;
 
@@ -858,7 +858,7 @@ impl REClient {
         &self,
         metadata: RemoteExecutionMetadata,
         mut execute_request: ExecuteRequest,
-    ) -> anyhow::Result<BoxStream<'static, anyhow::Result<ExecuteWithProgressResponse>>> {
+    ) -> anyhow::Result<BoxStream<'_, anyhow::Result<ExecuteWithProgressResponse>>> {
         // TODO(aloiscochard): Map those properly in the request
         // use crate::proto::build::bazel::remote::execution::v2::ExecutionPolicy;
 
@@ -877,7 +877,7 @@ impl REClient {
         debug!(?metadata, "RE ACTION REQUEST METADATA");
 
         let execution_client = self.grpc_clients.execution_client.clone();
-        let runtime_opts = self.runtime_opts;
+        let runtime_opts = &self.runtime_opts;
 
         // retrying_stream covers both stream establishment and stream reading, so errors like
         // h2 GOAWAY (ENHANCE_YOUR_CALM / "too_many_internal_resets") that surface during
@@ -937,7 +937,6 @@ impl REClient {
             |re_request| async {
                 let metadata = metadata.clone();
                 let cas_client = self.grpc_clients.cas_client.clone();
-                let runtime_opts = self.runtime_opts;
 
                 retry(
                     "BatchUpdateBlobs",
@@ -950,7 +949,7 @@ impl REClient {
                                 .batch_update_blobs(with_re_metadata(
                                     re_request,
                                     metadata,
-                                    runtime_opts,
+                                    &self.runtime_opts,
                                 ))
                                 .await?;
                             Ok(resp.into_inner())
@@ -966,7 +965,6 @@ impl REClient {
             |segments| async {
                 let metadata = metadata.clone();
                 let bytestream_client = self.grpc_clients.bytestream_client.clone();
-                let runtime_opts = self.runtime_opts;
 
                 retry(
                     "BS.write",
@@ -976,7 +974,7 @@ impl REClient {
                         let requests = futures::stream::iter(segments.clone());
                         async move {
                             let resp = bytestream_client
-                                .write(with_re_metadata(requests, metadata, runtime_opts))
+                                .write(with_re_metadata(requests, metadata, &self.runtime_opts))
                                 .await?;
 
                             Ok(resp.into_inner())
@@ -1032,7 +1030,6 @@ impl REClient {
             |re_request| async {
                 let metadata = metadata.clone();
                 let client = self.grpc_clients.cas_client.clone();
-                let runtime_opts = self.runtime_opts;
 
                 retry(
                     "BatchReadBlobs",
@@ -1045,7 +1042,7 @@ impl REClient {
                                 .batch_read_blobs(with_re_metadata(
                                     re_request,
                                     metadata,
-                                    runtime_opts,
+                                    &self.runtime_opts,
                                 ))
                                 .await?
                                 .into_inner())
@@ -1060,7 +1057,6 @@ impl REClient {
             },
             |read_request| {
                 let metadata = metadata.clone();
-                let runtime_opts = self.runtime_opts;
                 async move {
                     let client = self.grpc_clients.bytestream_client.clone();
                     retry(
@@ -1074,7 +1070,7 @@ impl REClient {
                                     .read(with_re_metadata(
                                         read_request,
                                         metadata,
-                                        runtime_opts,
+                                        &self.runtime_opts,
                                     ))
                                     .await?
                                     .into_inner();
@@ -1134,7 +1130,6 @@ impl REClient {
             // Send a request and notify others of the result
             if !digests_to_check.is_empty() {
                 tracing::debug!(num_digests = digests_to_check.len(), "FindMissingBlobs");
-                let runtime_opts = self.runtime_opts;
                 let missing_blobs = retry(
                     "FindMissingBlobs",
                     || {
@@ -1153,7 +1148,7 @@ impl REClient {
                                         ..Default::default()
                                     },
                                     metadata,
-                                    runtime_opts,
+                                    &self.runtime_opts,
                                 ))
                                 .await
                                 .context("Failed to request what blobs are not present on remote")
@@ -1876,7 +1871,7 @@ where
 fn with_re_metadata<T>(
     t: T,
     metadata: RemoteExecutionMetadata,
-    runtime_opts: RERuntimeOpts,
+    runtime_opts: &RERuntimeOpts,
 ) -> tonic::Request<T> {
     // This creates a new Tonic request with attached metadata for the RE
     // backend. There are two cases here we need to support:

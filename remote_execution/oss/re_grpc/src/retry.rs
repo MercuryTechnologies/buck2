@@ -127,19 +127,19 @@ fn is_retryable(err: &anyhow::Error, retry_not_found: bool) -> Retryable {
 ///
 /// Items from the stream are yielded progressively to the caller (preserving streaming progress
 /// updates), so this is a drop-in replacement for `retry(make_stream) + try_unfold(try_next)`.
-pub fn retrying_stream<F, Fut, S, T>(
+pub fn retrying_stream<'a, F, Fut, S, T>(
     method: &'static str,
     make_stream: F,
     max_retries: usize,
     initial_delay: Duration,
     max_delay: Duration,
     retry_not_found: bool,
-) -> impl Stream<Item = anyhow::Result<T>> + Send + 'static
+) -> impl Stream<Item = anyhow::Result<T>> + Send + 'a
 where
-    F: Fn() -> Fut + Send + Sync + 'static,
-    Fut: Future<Output = anyhow::Result<S>> + Send + 'static,
-    S: futures::TryStream<Ok = T, Error = tonic::Status> + Send + Unpin + 'static,
-    T: Send + 'static,
+    F: Fn() -> Fut + Send + Sync + 'a,
+    Fut: Future<Output = anyhow::Result<S>> + Send + 'a,
+    S: futures::TryStream<Ok = T, Error = tonic::Status> + Send + Unpin + 'a,
+    T: Send + 'a,
 {
     struct RetryState<F, S> {
         make_stream: Arc<F>,
