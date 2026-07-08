@@ -5,6 +5,10 @@ on:
       - mercury-head
   pull_request:
   workflow_dispatch: # allows manual triggering
+# Cancel superseded runs on force-push, but never cancel runs on mercury-head.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 jobs:
   linux-build-and-test:
     runs-on: ubuntu-latest
@@ -13,8 +17,10 @@ jobs:
     - uses: ./.github/actions/setup_linux_env
     - uses: ./.github/actions/build_debug
     - uses: ./.github/actions/run_test_py
+      with:
+        flags: --test-only
   macos-build-and-test:
-    runs-on: macos-latest
+    runs-on: macos-latest-xlarge
     steps:
     - uses: maxim-lobanov/setup-xcode@v1.6.0
       with:
@@ -23,6 +29,8 @@ jobs:
     - uses: ./.github/actions/setup_macos_env
     - uses: ./.github/actions/build_debug
     - uses: ./.github/actions/run_test_py
+      with:
+        flags: --test-only
   windows-build-and-test:
     runs-on: windows-latest
     steps:
@@ -30,3 +38,54 @@ jobs:
     - uses: ./.github/actions/setup_windows_env
     - uses: ./.github/actions/build_debug
     - uses: ./.github/actions/run_test_py
+      with:
+        flags: --test-only
+  linux-lint:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v6
+    - uses: ./.github/actions/setup_linux_env
+    - uses: Swatinem/rust-cache@v2
+      with:
+        prefix-key: buck2-lint
+    - uses: ./.github/actions/run_test_py
+      with:
+        flags: --lint-rust-only
+  macos-lint:
+    runs-on: macos-latest-xlarge
+    steps:
+    - uses: maxim-lobanov/setup-xcode@v1.6.0
+      with:
+        xcode-version: latest-stable
+    - uses: actions/checkout@v6
+    - uses: ./.github/actions/setup_macos_env
+    - uses: Swatinem/rust-cache@v2
+      with:
+        prefix-key: buck2-lint
+    - uses: ./.github/actions/run_test_py
+      with:
+        flags: --lint-rust-only
+  windows-lint:
+    runs-on: windows-latest
+    steps:
+    - uses: actions/checkout@v6
+    - uses: ./.github/actions/setup_windows_env
+    - uses: Swatinem/rust-cache@v2
+      with:
+        prefix-key: buck2-lint
+    - uses: ./.github/actions/run_test_py
+      with:
+        flags: --lint-rust-only
+  # rustdoc output is platform-independent enough that Linux-only coverage
+  # is sufficient; running it on all three platforms buys nothing.
+  linux-rustdoc:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v6
+    - uses: ./.github/actions/setup_linux_env
+    - uses: Swatinem/rust-cache@v2
+      with:
+        prefix-key: buck2-rustdoc
+    - uses: ./.github/actions/run_test_py
+      with:
+        flags: --rustdoc-only

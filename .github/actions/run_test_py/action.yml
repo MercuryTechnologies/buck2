@@ -1,7 +1,16 @@
 name: run_test_py
+inputs:
+  flags:
+    description: 'Extra flags passed to test.py (e.g. --test-only)'
+    required: false
+    default: ''
 runs:
   using: composite
   steps:
+  - name: Install cargo-nextest
+    uses: taiki-e/install-action@v2
+    with:
+      tool: nextest
   - name: Run test.py
-    run: python3 test.py --ci --git --buck2=$RUNNER_TEMP/artifacts/buck2
+    run: python3 test.py --ci --git --buck2=$RUNNER_TEMP/artifacts/buck2 ${{ inputs.flags }}
     shell: bash
