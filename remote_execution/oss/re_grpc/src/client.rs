@@ -106,6 +106,8 @@ use crate::retry::retry;
 use crate::retry::retrying_stream;
 
 const DEFAULT_MAX_TOTAL_BATCH_SIZE: usize = 4 * 1000 * 1000;
+/// Default minimum `data` size before a batched blob is zstd-compressed.
+const DEFAULT_BATCH_COMPRESSION_THRESHOLD: usize = 100;
 const INITIAL_DELAY: Duration = Duration::from_millis(100);
 const MAX_DELAY: Duration = Duration::from_secs(10);
 
@@ -185,6 +187,8 @@ pub struct RECapabilities {
     /// Compressors supported by the "compressed-blobs" bytestream resources. Also used to decide
     /// whether we can request zstd-compressed `BatchReadBlobs` responses.
     supported_compressors: Vec<Compressor>,
+    /// Compressors the server accepts for `BatchUpdateBlobs` request `data`.
+    supported_batch_update_compressors: Vec<Compressor>,
 }
 
 /// Contains runtime options for the remote execution client as set under `buck2_re_client`
@@ -200,6 +204,8 @@ pub struct RERuntimeOpts {
     find_missing_blobs_batch_size: usize,
     /// Maximum retries for RPC requests. Defaults to 5.
     max_retries: usize,
+    /// Minimum `data` size before a batched blob is zstd-compressed in `BatchUpdateBlobs` uploads.
+    batch_compression_threshold: usize,
     /// Whether to request zstd-compressed `BatchReadBlobs` responses (server supports zstd).
     batch_read_zstd: bool,
 }
@@ -253,6 +259,14 @@ impl Compressor {
     }
 }
 
+/// zstd-compress an in-memory blob for a `BatchUpdateBlobs` request.
+async fn zstd_compress_blob(data: &[u8]) -> anyhow::Result<Vec<u8>> {
+    let mut encoder = ZstdEncoder::new(Cursor::new(data));
+    let mut out = Vec::new();
+    encoder.read_to_end(&mut out).await?;
+    Ok(out)
+}
+
 /// Decompress a zstd-compressed blob returned in a `BatchReadBlobs` response.
 async fn zstd_decompress_blob(data: &[u8]) -> anyhow::Result<Vec<u8>> {
     let mut decoder = ZstdDecoder::new(Cursor::new(data));
@@ -300,6 +314,7 @@ impl REClientBuilder {
             RECapabilities {
                 max_total_batch_size: DEFAULT_MAX_TOTAL_BATCH_SIZE,
                 supported_compressors: Vec::new(),
+                supported_batch_update_compressors: Vec::new(),
             }
         };
 
@@ -360,6 +375,9 @@ impl REClientBuilder {
                 cas_ttl_secs: opts.cas_ttl_secs.unwrap_or(3 * 60 * 60),
                 find_missing_blobs_batch_size: opts.find_missing_blobs_batch_size.unwrap_or(100),
                 max_retries: opts.max_retries,
+                batch_compression_threshold: opts
+                    .batch_compression_threshold_bytes
+                    .unwrap_or(DEFAULT_BATCH_COMPRESSION_THRESHOLD),
                 batch_read_zstd: capabilities
                     .supported_compressors
                     .contains(&Compressor::Zstd),
@@ -403,6 +421,17 @@ impl REClientBuilder {
             Vec::new()
         };
 
+        let supported_batch_update_compressors = if let Some(cache_cap) = &resp.cache_capabilities {
+            cache_cap
+                .supported_batch_update_compressors
+                .iter()
+                .cloned()
+                .filter_map(Compressor::from_grpc)
+                .collect()
+        } else {
+            Vec::new()
+        };
+
         let max_total_batch_size_from_capabilities: Option<usize> =
             if let Some(cache_cap) = resp.cache_capabilities {
                 let size = cache_cap.max_batch_total_size_bytes as usize;
@@ -423,6 +452,7 @@ impl REClientBuilder {
         Ok(RECapabilities {
             max_total_batch_size,
             supported_compressors,
+            supported_batch_update_compressors,
         })
     }
 }
@@ -862,6 +892,13 @@ impl REClient {
         metadata: &RemoteExecutionMetadata,
         request: UploadRequest,
     ) -> anyhow::Result<UploadResponse> {
+        // Only compress batched blobs if the server advertised zstd support for BatchUpdateBlobs.
+        let batch_zstd_threshold = self
+            .capabilities
+            .supported_batch_update_compressors
+            .contains(&Compressor::Zstd)
+            .then_some(self.runtime_opts.batch_compression_threshold);
+
         upload_impl(
             &self.runtime_opts,
             &self.instance_name,
@@ -869,6 +906,7 @@ impl REClient {
             self.bystream_compressor,
             self.capabilities.max_total_batch_size,
             self.runtime_opts.max_concurrent_uploads_per_action,
+            batch_zstd_threshold,
             |re_request| async move {
                 retry(
                     "BatchUpdateBlobs",
@@ -1611,6 +1649,9 @@ async fn upload_impl<Byt, Cas>(
     bystream_compressor: Option<Compressor>,
     max_total_batch_size: usize,
     max_concurrent_uploads: Option<usize>,
+    // Minimum blob `data` size before zstd-compressing it in a `BatchUpdateBlobs` request.
+    // `None` disables batch compression (e.g. server doesn't advertise zstd support).
+    batch_zstd_threshold: Option<usize>,
     cas_f: impl Fn(BatchUpdateBlobsRequest) -> Cas + Sync + Send + Copy,
     bystream_fut: impl Fn(Vec<WriteRequest>) -> Byt + Sync + Send + Copy,
 ) -> anyhow::Result<UploadResponse>
@@ -1780,14 +1821,8 @@ where
                 ..Default::default()
             };
             for blob in batch {
-                match blob {
-                    BatchUploadRequest::Blob(blob) => {
-                        re_request.requests.push(Request {
-                            digest: Some(tdigest_to(blob.digest.clone())),
-                            data: blob.blob.clone(),
-                            compressor: compressor::Value::Identity as i32,
-                        });
-                    }
+                let (digest, data) = match blob {
+                    BatchUploadRequest::Blob(blob) => (blob.digest.clone(), blob.blob.clone()),
                     BatchUploadRequest::File(file) => {
                         // These should be small files, so no need to use a buffered reader.
                         let mut fin = tokio::fs::File::open(&file.name)
@@ -1795,14 +1830,24 @@ where
                             .with_context(|| format!("Opening {} for reading failed", file.name))?;
                         let mut data = vec![];
                         fin.read_to_end(&mut data).await?;
-
-                        re_request.requests.push(Request {
-                            digest: Some(tdigest_to(file.digest.clone())),
-                            data,
-                            compressor: compressor::Value::Identity as i32,
-                        });
+                        (file.digest.clone(), data)
                     }
-                }
+                };
+
+                // The digest always refers to the *uncompressed* content; only the transmitted
+                // `data` is compressed. Skip small blobs where compression isn't worth it.
+                let (data, compressor) = match batch_zstd_threshold {
+                    Some(threshold) if data.len() > threshold => {
+                        (zstd_compress_blob(&data).await?, compressor::Value::Zstd)
+                    }
+                    _ => (data, compressor::Value::Identity),
+                };
+
+                re_request.requests.push(Request {
+                    digest: Some(tdigest_to(digest)),
+                    data,
+                    compressor: compressor as i32,
+                });
             }
             let blob_hashes = re_request
                 .requests
@@ -1979,8 +2024,60 @@ mod tests {
             cas_ttl_secs: 0,
             find_missing_blobs_batch_size: 100,
             max_retries: 0,
+            batch_compression_threshold: DEFAULT_BATCH_COMPRESSION_THRESHOLD,
             batch_read_zstd: false,
         }
+    }
+
+    /// The all-OK response a server would send for a `BatchUpdateBlobs` of these digests.
+    fn batch_update_ok(digests: &[&TDigest]) -> BatchUpdateBlobsResponse {
+        BatchUpdateBlobsResponse {
+            responses: digests
+                .iter()
+                .map(|digest| batch_update_blobs_response::Response {
+                    digest: Some(tdigest_to((*digest).clone())),
+                    status: Some(Status::default()),
+                })
+                .collect(),
+        }
+    }
+
+    /// An upload request inlining the given (hash, blob) pairs, plus the all-OK
+    /// `BatchUpdateBlobs` response the server would send for it.
+    fn inlined_upload(blobs: &[(&str, &[u8])]) -> (UploadRequest, BatchUpdateBlobsResponse) {
+        let digests: Vec<TDigest> = blobs
+            .iter()
+            .map(|&(hash, blob)| TDigest {
+                hash: hash.to_owned(),
+                size_in_bytes: blob.len() as i64,
+                ..Default::default()
+            })
+            .collect();
+        let req = UploadRequest {
+            inlined_blobs_with_digest: Some(
+                digests
+                    .iter()
+                    .zip(blobs)
+                    .map(|(digest, &(_, blob))| InlinedBlobWithDigest {
+                        digest: digest.clone(),
+                        blob: blob.to_vec(),
+                        ..Default::default()
+                    })
+                    .collect(),
+            ),
+            ..Default::default()
+        };
+        let res = batch_update_ok(&digests.iter().collect::<Vec<_>>());
+        (req, res)
+    }
+
+    async fn zstd_decompress(data: &[u8]) -> Vec<u8> {
+        let mut out = vec![];
+        ZstdDecoder::new(Cursor::new(data.to_vec()))
+            .read_to_end(&mut out)
+            .await
+            .unwrap();
+        out
     }
 
     #[tokio::test]
@@ -2569,6 +2666,7 @@ mod tests {
             None,
             10000,
             None,
+            None,
             |req| {
                 let res = res.clone();
                 let digest1 = digest1.clone();
@@ -2579,6 +2677,86 @@ mod tests {
                     assert_eq!(req.requests[0].data, b"aaa");
                     assert_eq!(req.requests[1].digest, Some(tdigest_to(digest2)));
                     assert_eq!(req.requests[1].data, b"bbb");
+                    Ok(res)
+                }
+            },
+            |_req| async { panic!("A Bytestream upload should not be triggered") },
+        )
+        .await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_batch_upload_zstd_threshold() -> anyhow::Result<()> {
+        // A blob larger than the threshold is zstd-compressed; a small one is left uncompressed.
+        let big = vec![7u8; 1000];
+        let (req, res) = inlined_upload(&[("big", &big), ("small", b"hi")]);
+
+        let expected_big = big.clone();
+        upload_impl(
+            &test_re_runtime_opts(),
+            &InstanceName(None),
+            req,
+            None,
+            10000,
+            None,
+            Some(100), // batch zstd threshold
+            |req| {
+                let res = res.clone();
+                let expected_big = expected_big.clone();
+                async move {
+                    let by_hash = |h: &str| {
+                        req.requests
+                            .iter()
+                            .find(|r| r.digest.as_ref().unwrap().hash == h)
+                            .unwrap()
+                            .clone()
+                    };
+
+                    let big_req = by_hash("big");
+                    assert_eq!(big_req.compressor, compressor::Value::Zstd as i32);
+                    // The digest still refers to the uncompressed content...
+                    assert_eq!(big_req.digest.as_ref().unwrap().size_bytes, 1000);
+                    // ...but the transmitted data is the zstd-compressed form.
+                    assert_eq!(zstd_decompress(&big_req.data).await, expected_big);
+
+                    let small_req = by_hash("small");
+                    assert_eq!(small_req.compressor, compressor::Value::Identity as i32);
+                    assert_eq!(small_req.data, b"hi");
+
+                    Ok(res)
+                }
+            },
+            |_req| async { panic!("A Bytestream upload should not be triggered") },
+        )
+        .await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_batch_upload_zstd_disabled() -> anyhow::Result<()> {
+        // With no threshold (batch compression disabled), everything stays Identity.
+        let big = vec![7u8; 1000];
+        let (req, res) = inlined_upload(&[("big", &big)]);
+
+        upload_impl(
+            &test_re_runtime_opts(),
+            &InstanceName(None),
+            req,
+            None,
+            10000,
+            None,
+            None, // batch compression disabled
+            |req| {
+                let res = res.clone();
+                async move {
+                    assert_eq!(
+                        req.requests[0].compressor,
+                        compressor::Value::Identity as i32
+                    );
+                    assert_eq!(req.requests[0].data.len(), 1000);
                     Ok(res)
                 }
             },
@@ -2713,6 +2891,7 @@ mod tests {
             None,
             10, // kept small to simulate a large file upload
             None,
+            None,
             |req| {
                 let res = res.clone();
                 let digest1 = digest1.clone();
@@ -2789,6 +2968,7 @@ mod tests {
             None,
             10, // kept small to simulate a large inlined upload
             None,
+            None,
             |req| {
                 let res = res.clone();
                 let digest1 = digest1.clone();
@@ -2851,6 +3031,7 @@ mod tests {
             req,
             None,
             10,
+            None,
             None,
             |_req| async move {
                 panic!("This should not be called as there are no blobs to upload in batch");
@@ -2915,6 +3096,7 @@ mod tests {
             None,
             3,
             None,
+            None,
             |_req| async move {
                 panic!("Not called");
             },
@@ -2963,6 +3145,7 @@ mod tests {
                     compressor,
                     0, // max_total_batch_size=0 forces bytestream API
                     None,
+                    None,
                     |_req| async move {
                         panic!("Not called");
                     },
@@ -2988,6 +3171,7 @@ mod tests {
                     },
                     compressor,
                     1024, // forces the batch API
+                    None,
                     None,
                     |_req| async move {
                         panic!("Not called");
@@ -3037,6 +3221,7 @@ mod tests {
             None,
             1,
             None,
+            None,
             |_req| async move {
                 panic!("Not called");
             },
@@ -3084,6 +3269,7 @@ mod tests {
             req,
             Some(Compressor::Zstd),
             1,
+            None,
             None,
             |_req| async move {
                 panic!("Not called");
@@ -3154,6 +3340,7 @@ mod tests {
             req,
             Some(Compressor::Zstd),
             1,
+            None,
             None,
             |_req| async move {
                 panic!("Not called");
