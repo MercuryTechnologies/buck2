@@ -102,6 +102,7 @@ members = [
   "app/buck2_node",
   "app/buck2_node_tests",
   "app/buck2_offline_archive",
+  "app/buck2_perfetto",
   "app/buck2_profile",
   "app/buck2_protoc_dev",
   "app/buck2_query",
