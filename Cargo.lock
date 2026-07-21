@@ -2544,6 +2544,7 @@ dependencies = [
  "futures 0.3.32",
  "gazebo",
  "glob",
+ "globset",
  "hashbrown 0.17.1",
  "hex",
  "indoc",
