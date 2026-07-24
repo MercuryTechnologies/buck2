@@ -1,0 +1,39 @@
+# Hermetic upstream Rust toolchain, used to reproduce the aarch64
+# `__stack_chk_guard` link failure (see shim/hermetic_rust.bzl for the "why").
+#
+# Pinned to nightly-2026-04-11 == rustc 1.96.0-nightly (02c7f9bec 2026-04-10),
+# matching rust-toolchain.toml and the toolchain the nix repro uses.
+http_file(
+    name = "rustc-nightly",
+    out = "rustc-nightly-aarch64-unknown-linux-gnu.tar.xz",
+    urls = ["https://static.rust-lang.org/dist/2026-04-11/rustc-nightly-aarch64-unknown-linux-gnu.tar.xz"],
+    sha256 = "cc7328b044c18c6e82c185b95f0c5e670fafa6c121a35d70788b91235fdca8e7",
+)
+#
+http_file(
+    name = "rust-std-nightly",
+    out = "rust-std-nightly-aarch64-unknown-linux-gnu.tar.xz",
+    urls = ["https://static.rust-lang.org/dist/2026-04-11/rust-std-nightly-aarch64-unknown-linux-gnu.tar.xz"],
+    sha256 = "b525badb4029a775d8d2f3b3dfe17fdba0636081d130b8eaa4913526b37bd30d",
+)
+
+# Assemble a normal rustc sysroot: extract the `rustc` component, then overlay
+# the target std rlibs from the `rust-std` component into
+# `lib/rustlib/<triple>/lib/`.
+genrule(
+    name = "sysroot",
+    srcs = [
+        ":rustc-nightly",
+        ":rust-std-nightly",
+    ],
+    out = "sysroot",
+    cmd = " && ".join([
+        'mkdir -p "$OUT"',
+        'tar xJf "$SRCDIR/rustc-nightly-aarch64-unknown-linux-gnu.tar.xz" -C "$TMP"',
+        'cp -a "$TMP/rustc-nightly-aarch64-unknown-linux-gnu/rustc/." "$OUT/"',
+        'mkdir -p "$OUT/lib/rustlib/aarch64-unknown-linux-gnu/lib"',
+        'tar xJf "$SRCDIR/rust-std-nightly-aarch64-unknown-linux-gnu.tar.xz" -C "$TMP"',
+        'cp -a "$TMP/rust-std-nightly-aarch64-unknown-linux-gnu/rust-std-aarch64-unknown-linux-gnu/lib/rustlib/aarch64-unknown-linux-gnu/lib/." "$OUT/lib/rustlib/aarch64-unknown-linux-gnu/lib/"',
+    ]),
+    visibility = ["PUBLIC"],
+)

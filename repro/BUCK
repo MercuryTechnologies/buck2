@@ -1,0 +1,265 @@
+load("@prelude//rust:cargo_package.bzl", "cargo")
+
+http_archive(
+    name = "cfg-if-1.0.4.crate",
+    sha256 = "9330f8b2ff13f34540b44e946ef35111825727b38d33286ef986142615121801",
+    strip_prefix = "cfg-if-1.0.4",
+    urls = ["https://static.crates.io/crates/cfg-if/1.0.4/download"],
+)
+
+cargo.rust_library(
+    name = "cfg-if-1",
+    srcs = [":cfg-if-1.0.4.crate"],
+    crate = "cfg_if",
+    crate_root = "cfg-if-1.0.4.crate/src/lib.rs",
+    edition = "2018",
+)
+
+http_archive(
+    name = "libc-0.2.186.crate",
+    sha256 = "68ab91017fe16c622486840e4c83c9a37afeff978bd239b5293d61ece587de66",
+    strip_prefix = "libc-0.2.186",
+    urls = ["https://static.crates.io/crates/libc/0.2.186/download"],
+)
+
+cargo.rust_library(
+    name = "libc-0.2",
+    srcs = [":libc-0.2.186.crate"],
+    crate = "libc",
+    crate_root = "libc-0.2.186.crate/src/lib.rs",
+    edition = "2021",
+    features = [
+        "default",
+        "extra_traits",
+        "std",
+    ],
+)
+
+http_archive(
+    name = "untrusted-0.9.0.crate",
+    sha256 = "8ecb6da28b8a351d773b68d5825ac39017e680750f980f3a1a85cd8dd28a47c1",
+    strip_prefix = "untrusted-0.9.0",
+    urls = ["https://static.crates.io/crates/untrusted/0.9.0/download"],
+)
+
+cargo.rust_library(
+    name = "untrusted-0.9",
+    srcs = [":untrusted-0.9.0.crate"],
+    crate = "untrusted",
+    crate_root = "untrusted-0.9.0.crate/src/lib.rs",
+    edition = "2018",
+)
+
+http_archive(
+    name = "getrandom-0.2.17.crate",
+    sha256 = "ff2abc00be7fca6ebc474524697ae276ad847ad0a6b3faa4bcb027e9a4614ad0",
+    strip_prefix = "getrandom-0.2.17",
+    urls = ["https://static.crates.io/crates/getrandom/0.2.17/download"],
+)
+
+cargo.rust_library(
+    name = "getrandom-0.2",
+    srcs = [":getrandom-0.2.17.crate"],
+    crate = "getrandom",
+    crate_root = "getrandom-0.2.17.crate/src/lib.rs",
+    edition = "2018",
+    features = ["std"],
+    platform = {
+        "linux-arm64": dict(
+            deps = [":libc-0.2"],
+        ),
+    },
+    deps = [":cfg-if-1"],
+)
+
+http_archive(
+    name = "ring-0.17.14.crate",
+    sha256 = "a4689e6c2294d81e88dc6261c768b63bc4fcdb852be6d1352498b114f61383b7",
+    strip_prefix = "ring-0.17.14",
+    sub_targets = [
+        "crypto/constant_time_test.c",
+        "crypto/cpu_intel.c",
+        "crypto/crypto.c",
+        "crypto/curve25519/curve25519.c",
+        "crypto/curve25519/curve25519_64_adx.c",
+        "crypto/curve25519/curve25519_tables.h",
+        "crypto/curve25519/internal.h",
+        "crypto/fipsmodule/aes/aes_nohw.c",
+        "crypto/fipsmodule/bn/internal.h",
+        "crypto/fipsmodule/bn/montgomery.c",
+        "crypto/fipsmodule/bn/montgomery_inv.c",
+        "crypto/fipsmodule/ec/ecp_nistz.c",
+        "crypto/fipsmodule/ec/ecp_nistz.h",
+        "crypto/fipsmodule/ec/ecp_nistz384.h",
+        "crypto/fipsmodule/ec/ecp_nistz384.inl",
+        "crypto/fipsmodule/ec/gfp_p256.c",
+        "crypto/fipsmodule/ec/gfp_p384.c",
+        "crypto/fipsmodule/ec/p256.c",
+        "crypto/fipsmodule/ec/p256-nistz.c",
+        "crypto/fipsmodule/ec/p256-nistz.h",
+        "crypto/fipsmodule/ec/p256-nistz-table.h",
+        "crypto/fipsmodule/ec/p256_shared.h",
+        "crypto/fipsmodule/ec/p256_table.h",
+        "crypto/fipsmodule/ec/util.h",
+        "crypto/internal.h",
+        "crypto/limbs/limbs.c",
+        "crypto/limbs/limbs.h",
+        "crypto/limbs/limbs.inl",
+        "crypto/mem.c",
+        "crypto/poly1305/poly1305.c",
+        "crypto/poly1305/poly1305_arm.c",
+        "include/ring-core/aes.h",
+        "include/ring-core/asm_base.h",
+        "include/ring-core/base.h",
+        "include/ring-core/check.h",
+        "include/ring-core/mem.h",
+        "include/ring-core/target.h",
+        "include/ring-core/type_check.h",
+        "pregenerated/aesv8-armx-linux64.S",
+        "pregenerated/aesv8-gcm-armv8-linux64.S",
+        "pregenerated/armv8-mont-linux64.S",
+        "pregenerated/chacha-armv8-linux64.S",
+        "pregenerated/chacha20_poly1305_armv8-linux64.S",
+        "pregenerated/ghash-neon-armv8-linux64.S",
+        "pregenerated/ghashv8-armx-linux64.S",
+        "pregenerated/p256-armv8-asm-linux64.S",
+        "pregenerated/sha256-armv8-linux64.S",
+        "pregenerated/sha512-armv8-linux64.S",
+        "pregenerated/vpaes-armv8-linux64.S",
+        "third_party/fiat/asm/fiat_curve25519_adx_mul.S",
+        "third_party/fiat/asm/fiat_curve25519_adx_square.S",
+        "third_party/fiat/curve25519_32.h",
+        "third_party/fiat/curve25519_64.h",
+        "third_party/fiat/curve25519_64_adx.h",
+        "third_party/fiat/curve25519_64_msvc.h",
+        "third_party/fiat/p256_32.h",
+        "third_party/fiat/p256_64.h",
+        "third_party/fiat/p256_64_msvc.h",
+    ],
+    urls = ["https://static.crates.io/crates/ring/0.17.14/download"],
+)
+
+cargo.rust_library(
+    name = "ring-0.17",
+    srcs = [":ring-0.17.14.crate"],
+    crate = "ring",
+    crate_root = "ring-0.17.14.crate/src/lib.rs",
+    edition = "2021",
+    env = {
+        "CARGO_PKG_NAME": "ring",
+        "CARGO_PKG_VERSION_MAJOR": "0",
+        "CARGO_PKG_VERSION_MINOR": "17",
+        "CARGO_PKG_VERSION_PATCH": "14",
+        "CARGO_PKG_VERSION_PRE": "",
+        "RING_CORE_PREFIX": "ring_core_0_17_14",
+    },
+    features = [
+        "alloc",
+        "default",
+        "dev_urandom_fallback",
+    ],
+    platform = {
+        "linux-arm64": dict(
+            deps = [
+                ":libc-0.2",
+                ":ring-0.17-ring-c-asm-elf-aarch64",
+            ],
+        ),
+    },
+    deps = [
+        ":cfg-if-1",
+        ":getrandom-0.2",
+        ":untrusted-0.9",
+    ],
+)
+
+cxx_library(
+    name = "ring-0.17-ring-c-asm-elf-aarch64",
+    srcs = [
+        ":ring-0.17.14.crate[crypto/constant_time_test.c]",
+        ":ring-0.17.14.crate[crypto/cpu_intel.c]",
+        ":ring-0.17.14.crate[crypto/crypto.c]",
+        ":ring-0.17.14.crate[crypto/curve25519/curve25519.c]",
+        ":ring-0.17.14.crate[crypto/curve25519/curve25519_64_adx.c]",
+        ":ring-0.17.14.crate[crypto/fipsmodule/aes/aes_nohw.c]",
+        ":ring-0.17.14.crate[crypto/fipsmodule/bn/montgomery.c]",
+        ":ring-0.17.14.crate[crypto/fipsmodule/bn/montgomery_inv.c]",
+        ":ring-0.17.14.crate[crypto/fipsmodule/ec/ecp_nistz.c]",
+        ":ring-0.17.14.crate[crypto/fipsmodule/ec/gfp_p256.c]",
+        ":ring-0.17.14.crate[crypto/fipsmodule/ec/gfp_p384.c]",
+        ":ring-0.17.14.crate[crypto/fipsmodule/ec/p256.c]",
+        ":ring-0.17.14.crate[crypto/fipsmodule/ec/p256-nistz.c]",
+        ":ring-0.17.14.crate[crypto/limbs/limbs.c]",
+        ":ring-0.17.14.crate[crypto/mem.c]",
+        ":ring-0.17.14.crate[crypto/poly1305/poly1305.c]",
+        ":ring-0.17.14.crate[crypto/poly1305/poly1305_arm.c]",
+        ":ring-0.17.14.crate[pregenerated/aesv8-armx-linux64.S]",
+        ":ring-0.17.14.crate[pregenerated/aesv8-gcm-armv8-linux64.S]",
+        ":ring-0.17.14.crate[pregenerated/armv8-mont-linux64.S]",
+        ":ring-0.17.14.crate[pregenerated/chacha-armv8-linux64.S]",
+        ":ring-0.17.14.crate[pregenerated/chacha20_poly1305_armv8-linux64.S]",
+        ":ring-0.17.14.crate[pregenerated/ghash-neon-armv8-linux64.S]",
+        ":ring-0.17.14.crate[pregenerated/ghashv8-armx-linux64.S]",
+        ":ring-0.17.14.crate[pregenerated/p256-armv8-asm-linux64.S]",
+        ":ring-0.17.14.crate[pregenerated/sha256-armv8-linux64.S]",
+        ":ring-0.17.14.crate[pregenerated/sha512-armv8-linux64.S]",
+        ":ring-0.17.14.crate[pregenerated/vpaes-armv8-linux64.S]",
+        ":ring-0.17.14.crate[third_party/fiat/asm/fiat_curve25519_adx_mul.S]",
+        ":ring-0.17.14.crate[third_party/fiat/asm/fiat_curve25519_adx_square.S]",
+    ],
+    headers = [
+        ":ring-0.17.14.crate[crypto/curve25519/curve25519_tables.h]",
+        ":ring-0.17.14.crate[crypto/curve25519/internal.h]",
+        ":ring-0.17.14.crate[crypto/fipsmodule/bn/internal.h]",
+        ":ring-0.17.14.crate[crypto/fipsmodule/ec/ecp_nistz.h]",
+        ":ring-0.17.14.crate[crypto/fipsmodule/ec/ecp_nistz384.h]",
+        ":ring-0.17.14.crate[crypto/fipsmodule/ec/ecp_nistz384.inl]",
+        ":ring-0.17.14.crate[crypto/fipsmodule/ec/p256-nistz.h]",
+        ":ring-0.17.14.crate[crypto/fipsmodule/ec/p256-nistz-table.h]",
+        ":ring-0.17.14.crate[crypto/fipsmodule/ec/p256_shared.h]",
+        ":ring-0.17.14.crate[crypto/fipsmodule/ec/p256_table.h]",
+        ":ring-0.17.14.crate[crypto/fipsmodule/ec/util.h]",
+        ":ring-0.17.14.crate[crypto/internal.h]",
+        ":ring-0.17.14.crate[crypto/limbs/limbs.h]",
+        ":ring-0.17.14.crate[crypto/limbs/limbs.inl]",
+        ":ring-0.17.14.crate[include/ring-core/aes.h]",
+        ":ring-0.17.14.crate[include/ring-core/asm_base.h]",
+        ":ring-0.17.14.crate[include/ring-core/base.h]",
+        ":ring-0.17.14.crate[include/ring-core/check.h]",
+        ":ring-0.17.14.crate[include/ring-core/mem.h]",
+        ":ring-0.17.14.crate[include/ring-core/target.h]",
+        ":ring-0.17.14.crate[include/ring-core/type_check.h]",
+        ":ring-0.17.14.crate[third_party/fiat/curve25519_32.h]",
+        ":ring-0.17.14.crate[third_party/fiat/curve25519_64.h]",
+        ":ring-0.17.14.crate[third_party/fiat/curve25519_64_adx.h]",
+        ":ring-0.17.14.crate[third_party/fiat/curve25519_64_msvc.h]",
+        ":ring-0.17.14.crate[third_party/fiat/p256_32.h]",
+        ":ring-0.17.14.crate[third_party/fiat/p256_64.h]",
+        ":ring-0.17.14.crate[third_party/fiat/p256_64_msvc.h]",
+        "fixups/ring/include/ring_core_generated/prefix_symbols.h",
+        "fixups/ring/include/ring_core_generated/prefix_symbols_asm.h",
+    ],
+    compiler_flags = ["-Wno-error"],
+    include_directories = ["fixups/ring/include"],
+    preferred_linkage = "static",
+    preprocessor_flags = ["-I$(location :ring-0.17.14.crate)/include"],
+)
+
+rust_binary(
+    name = "ring_hello",
+    srcs = ["main.rs"],
+    deps = [
+        ":ring-0.17",
+    ],
+)
+
+# Negative control: a plain rust binary with no `-fstack-protector-strong` C
+# code links fine under the same hermetic toolchain. Only `ring_hello` (whose
+# ring C archive is appended after `-lc` under `--as-needed`) fails. This
+# confirms the toolchain isn't universally broken — the failure is specific to
+# a native lib needing an ld-linux-only symbol from a post-`-lc` position.
+rust_binary(
+    name = "plain_hello",
+    srcs = ["plain.rs"],
+    crate_root = "plain.rs",
+)

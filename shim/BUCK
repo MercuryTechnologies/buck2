@@ -14,12 +14,35 @@ load("@prelude//toolchains:ocaml.bzl", "system_ocaml_toolchain")
 load("@prelude//toolchains:python.bzl", "system_python_bootstrap_toolchain", "system_python_toolchain")
 load("@prelude//toolchains:remote_test_execution.bzl", "remote_test_execution_toolchain")
 load("@prelude//toolchains:rust.bzl", "system_rust_toolchain")
+load(":hermetic_rust.bzl", "hermetic_rust_toolchain")
 
 oncall("open_source")
+
+fs = [
+        "-fPIC",
+        "-fstack-clash-protection",
+        "-O2",
+        "-U_FORTIFY_SOURCE",
+        "-D_FORTIFY_SOURCE=3",
+        "-D_LIBCPP_HARDENING_MODE=_LIBCPP_HARDENING_MODE_FAST",
+        "-Wformat",
+        "-Wformat-security",
+        "-Werror=format-security",
+        "-fzero-call-used-regs=used-gpr",
+        "-fstrict-flex-arrays=1",
+        "-fstack-protector-strong",
+        "--param",
+        "ssp-buffer-size=4",
+        "-fno-strict-overflow",
+        "-fno-omit-frame-pointer",
+        "-mno-omit-leaf-frame-pointer",
+]
 
 system_cxx_toolchain(
     name = "cxx",
     compiler = "gcc",
+    c_flags = fs,
+    link_flags = fs,
     # `compiler_type = "gcc"` is required in addition to the compiler
     # binary names. The prelude gates many flags on `compiler_type`
     # rather than the binary name (e.g. `prelude/cxx/compiler.bzl` adds
@@ -28,7 +51,8 @@ system_cxx_toolchain(
     # with clang-only flags and rejects them.
     compiler_type = "gcc",
     cxx_compiler = "g++",
-    cxx_flags = ["-std=c++20"],
+    cxx_flags = ["-std=c++20",
+    ],
     # The sandcastle OSS-bootstrap environment has `gcc`/`g++` on PATH but
     # not `clang`/`clang++` or `lld`, which are the defaults pulled in by
     # `prelude//toolchains/cxx/clang:path_clang_tools`. Using `g++` as the
@@ -74,11 +98,22 @@ system_python_bootstrap_toolchain(
     visibility = ["PUBLIC"],
 )
 
-system_rust_toolchain(
+# Hermetic upstream Rust toolchain (nightly-2026-04-11), used instead of the
+# system `rustc` so the aarch64 `__stack_chk_guard` bug reproduces. Fedora's
+# system rustc masks it (see shim/hermetic_rust.bzl). To go back to the system
+# toolchain, swap this for the `system_rust_toolchain` call below.
+hermetic_rust_toolchain(
     name = "rust",
     default_edition = "2024",
+    sysroot = "gh_facebook_buck2//rust_toolchain:sysroot",
     visibility = ["PUBLIC"],
 )
+
+# system_rust_toolchain(
+#     name = "rust",
+#     default_edition = "2024",
+#     visibility = ["PUBLIC"],
+# )
 
 remote_test_execution_toolchain(
     name = "remote_test_execution",
