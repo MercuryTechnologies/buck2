@@ -930,26 +930,20 @@ impl REClient {
                 .await
             },
             |segments| async move {
-                retry(
-                    "BS.write",
-                    || async {
-                        let resp = self
-                            .bytestream_client()
-                            .await?
-                            .write(with_re_metadata(
-                                futures::stream::iter(segments.clone()),
-                                metadata,
-                                self.runtime_opts,
-                            ))
-                            .await?;
-                        Ok(resp.into_inner())
-                    },
-                    self.runtime_opts.max_retries,
-                    INITIAL_DELAY,
-                    MAX_DELAY,
-                    false,
-                )
-                .await
+                // No retry here: this is only ever called from within upload_impl's own
+                // "BS.write" retry, which covers both rebuilding the segments (re-reading the
+                // file/blob) and sending them (a single retry layer around the whole unit,
+                // rather than nesting retry budgets).
+                let resp = self
+                    .bytestream_client()
+                    .await?
+                    .write(with_re_metadata(
+                        futures::stream::iter(segments),
+                        metadata,
+                        self.runtime_opts,
+                    ))
+                    .await?;
+                Ok(resp.into_inner())
             },
         )
         .await
@@ -1015,37 +1009,26 @@ impl REClient {
                 .await
             },
             |read_request| async move {
-                retry(
-                    "Read",
-                    || async {
-                        let response = self
-                            .bytestream_client()
-                            .await?
-                            .read(with_re_metadata(
-                                read_request.clone(),
-                                metadata,
-                                self.runtime_opts,
-                            ))
-                            .await?
-                            .into_inner();
-                        Ok(Box::pin(response.into_stream())
-                            as Pin<
-                                Box<
-                                    dyn Stream<
-                                            Item = Result<
-                                                re_grpc_proto::google::bytestream::ReadResponse,
-                                                tonic::Status,
-                                            >,
-                                        > + Send,
-                                >,
-                            >)
-                    },
-                    self.runtime_opts.max_retries,
-                    INITIAL_DELAY,
-                    MAX_DELAY,
-                    false,
-                )
-                .await
+                // No retry here: this is only ever called from within download_impl's own
+                // "BS.read" retry, which covers both establishing this stream and consuming it
+                // (a single retry layer around the whole unit, rather than nesting retry budgets).
+                let response = self
+                    .bytestream_client()
+                    .await?
+                    .read(with_re_metadata(read_request, metadata, self.runtime_opts))
+                    .await?
+                    .into_inner();
+                Ok(Box::pin(response.into_stream())
+                    as Pin<
+                        Box<
+                            dyn Stream<
+                                    Item = Result<
+                                        re_grpc_proto::google::bytestream::ReadResponse,
+                                        tonic::Status,
+                                    >,
+                                > + Send,
+                        >,
+                    >)
             },
         )
         .await
