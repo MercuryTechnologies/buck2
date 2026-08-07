@@ -2,7 +2,6 @@
 
 [patch.crates-io]
 backtrace = { git = "https://github.com/rust-lang/backtrace-rs", rev = "df979dcf80027eb047d7bb9e0874710c15009f31" }
-bindgen = { git = "https://github.com/jsgf/rust-bindgen", rev = "4d385d21c160e6ee1f443aeb7e00528a1dc7fd44" }
 darwin-libproc = { git = "https://github.com/fbsource/darwin-libproc", rev = "f73ddb1002d51ae74c1b41670fae56bd5896b7a3" }
 perf-event = { version = "0.4", git = "https://github.com/Nero5023/perf-event.git", rev = "6dae86b6d4807acec081e6dc0a53167f57f8c0f4" }
 perf-event-open-sys = { version = "5.0", git = "https://github.com/Nero5023/perf-event.git", rev = "6dae86b6d4807acec081e6dc0a53167f57f8c0f4" }
@@ -10,6 +9,13 @@ rustls-native-certs = { git = "https://github.com/rustls/rustls-native-certs", r
 wezterm-color-types = { git = "https://github.com/wezterm/wezterm.git", rev = "05343b387085842b434d267f91b6b0ec157e4331" }
 wezterm-dynamic = { git = "https://github.com/wezterm/wezterm.git", rev = "05343b387085842b434d267f91b6b0ec157e4331" }
 wezterm-input-types = { git = "https://github.com/wezterm/wezterm.git", rev = "05343b387085842b434d267f91b6b0ec157e4331" }
+hyper = { git = "https://github.com/MercuryTechnologies/hyper.git", branch = "mercury/goaway-1.11.0" }
+tonic = { git = "https://github.com/MercuryTechnologies/grpc-rust.git", branch = "mercury/goaway-0.14.9" }
+# unused packages
+# tonic-health = { git = "https://github.com/MercuryTechnologies/grpc-rust.git", branch = "mercury/goaway-0.14.9" }
+# tonic-reflection = { git = "https://github.com/MercuryTechnologies/grpc-rust.git", branch = "mercury/goaway-0.14.9" }
+tonic-prost = { git = "https://github.com/MercuryTechnologies/grpc-rust.git", branch = "mercury/goaway-0.14.9" }
+tonic-prost-build = { git = "https://github.com/MercuryTechnologies/grpc-rust.git", branch = "mercury/goaway-0.14.9" }
 
 [patch."https://github.com/wez/finl_unicode.git"]
 finl_unicode = { git = "https://github.com/dahosek/finl_unicode.git", rev = "a1892f26245529f2ef3877a9ebd610c96cec07a6" }

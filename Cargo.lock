@@ -6358,8 +6358,7 @@ dependencies = [
 [[package]]
 name = "hyper"
 version = "1.11.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d22053281f852e11534f5198498373cbb59295120a20771d90f7ed1897490a72"
+source = "git+https://github.com/MercuryTechnologies/hyper.git?branch=mercury%2Fgoaway-1.11.0#79f99dfb20b132337102b64d4836303d24aaa88f"
 dependencies = [
  "atomic-waker",
  "bytes",
@@ -11721,8 +11720,7 @@ checksum = "009dbb7700f11c55ef83aebbe4c0e9cf1f1ac0844bd8d6f00dc38f302026e13a"
 [[package]]
 name = "tonic"
 version = "0.14.9"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e2cdfc673aabd30fe8fee92e65837b644c37c5d47f0f97ae6d5e0f1237d15e1b"
+source = "git+https://github.com/MercuryTechnologies/grpc-rust.git?branch=mercury%2Fgoaway-0.14.9#9cbc072ad0a31fabc5bdac28145a70c19178d4b8"
 dependencies = [
  "async-trait",
  "axum",
@@ -11755,8 +11753,7 @@ dependencies = [
 [[package]]
 name = "tonic-build"
 version = "0.14.9"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ac6d916d206ed7bdda1778ddff9bda43303789c258877e7bc22fb44ee5c984b4"
+source = "git+https://github.com/MercuryTechnologies/grpc-rust.git?branch=mercury%2Fgoaway-0.14.9#9cbc072ad0a31fabc5bdac28145a70c19178d4b8"
 dependencies = [
  "prettyplease",
  "proc-macro2",
@@ -11767,8 +11764,7 @@ dependencies = [
 [[package]]
 name = "tonic-prost"
 version = "0.14.9"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "eba464054e2226f182a34489b8b079bf4c6e3e7ab5fd7fc30e024f24aa92a484"
+source = "git+https://github.com/MercuryTechnologies/grpc-rust.git?branch=mercury%2Fgoaway-0.14.9#9cbc072ad0a31fabc5bdac28145a70c19178d4b8"
 dependencies = [
  "bytes",
  "prost",
@@ -11778,8 +11774,7 @@ dependencies = [
 [[package]]
 name = "tonic-prost-build"
 version = "0.14.9"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2ea216ddc448e08e7839ab09e20e60b06b6a1c32745ccb212c0ebd161c199f1b"
+source = "git+https://github.com/MercuryTechnologies/grpc-rust.git?branch=mercury%2Fgoaway-0.14.9#9cbc072ad0a31fabc5bdac28145a70c19178d4b8"
 dependencies = [
  "prettyplease",
  "proc-macro2",
@@ -13732,8 +13727,3 @@ dependencies = [
  "syn 3.0.9",
  "winnow",
 ]
-
-[[patch.unused]]
-name = "bindgen"
-version = "0.72.1"
-source = "git+https://github.com/jsgf/rust-bindgen?rev=4d385d21c160e6ee1f443aeb7e00528a1dc7fd44#4d385d21c160e6ee1f443aeb7e00528a1dc7fd44"
