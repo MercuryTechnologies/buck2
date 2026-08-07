@@ -6,6 +6,9 @@ runs:
   - uses: Swatinem/rust-cache@v2
     with:
       prefix-key: buck2-release
+      # See the note in build_debug: without this the workspace crates are
+      # dropped from the cache and rebuilt from scratch every run.
+      cache-workspace-crates: true
   - name: Build buck2 binary (release)
     run: |-
       mkdir $RUNNER_TEMP/artifacts

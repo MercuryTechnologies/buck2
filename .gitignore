@@ -1,5 +1,6 @@
 /target/
-Cargo.lock
+# In our fork we check in Cargo.lock for build determinism.
+# Cargo.lock
 buck-out
 /.direnv
 .buckconfig.local

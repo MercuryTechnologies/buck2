@@ -9,6 +9,24 @@ on:
 permissions:
   contents: read
 
+# Cancel superseded PR runs. A force-push previously left the old run burning
+# runners for the better part of an hour. Pushes to mercury-head are keyed on
+# the ref and never cancelled.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  # A CI runner starts with no incremental state and rust-cache never restores
+  # any, so incremental compilation is built and then discarded. Cargo's
+  # `incremental` profile keys say otherwise; the env var overrides them.
+  CARGO_INCREMENTAL: 0
+  # Full debuginfo across 138 crates dominates object size, link time, and
+  # cache upload, and nothing in CI reads it. Set these to "line-tables-only"
+  # instead if you want readable backtraces out of a failing test.
+  CARGO_PROFILE_DEV_DEBUG: 0
+  CARGO_PROFILE_TEST_DEBUG: 0
+
 jobs:
   # Runner labels are repository (owner) specific, so the Meta larger runners
   # (4-core-ubuntu, windows-8-core) don't exist on forks and jobs requesting
@@ -21,11 +39,15 @@ jobs:
     - uses: ./.github/actions/setup_linux_env
     - uses: ./.github/actions/build_debug
     - uses: ./.github/actions/run_test_py
+      with:
+        flags: --test-only
   macos-build-and-test:
-    # Pinned to macos-14: on the macos-15 runner image `latest-stable` selects an
-    # Xcode/SDK that mis-targets the deployment SDK and breaks the `cargo build`
-    # step (actions/runner-images#12758). macos-14 resolves to a known-good Xcode 16.x.
-    runs-on: macos-14
+    # Upstream: pinned to macos-14 because on the macos-15 runner image
+    # `latest-stable` selects an Xcode/SDK that mis-targets the deployment SDK
+    # and breaks the `cargo build` step (actions/runner-images#12758).
+    # Fork: macos-14-xlarge is the same arm64 image with double the cores. The
+    # work here is compile-bound so it scales; it is billed per minute.
+    runs-on: ${{ github.repository_owner == 'facebook' && 'macos-14' || 'macos-14-xlarge' }}
     steps:
     - uses: maxim-lobanov/setup-xcode@v1.6.0
       with:
@@ -34,10 +56,77 @@ jobs:
     - uses: ./.github/actions/setup_macos_env
     - uses: ./.github/actions/build_debug
     - uses: ./.github/actions/run_test_py
+      with:
+        flags: --test-only
+  # Windows cost more wall clock than Linux and macOS combined (~100 min of a
+  # 103 min run), almost all of it Defender and NTFS metadata overhead on a
+  # build that creates hundreds of thousands of small files. We don't ship
+  # buck2 for Windows from this fork, so it only runs upstream.
   windows-build-and-test:
-    runs-on: ${{ github.repository_owner == 'facebook' && 'windows-8-core' || 'windows-latest' }}
+    if: github.repository_owner == 'facebook'
+    runs-on: windows-8-core
     steps:
     - uses: actions/checkout@v6
     - uses: ./.github/actions/setup_windows_env
     - uses: ./.github/actions/build_debug
     - uses: ./.github/actions/run_test_py
+      with:
+        flags: --test-only
+
+  # clippy and rustdoc used to run serially ahead of the test phase inside
+  # every build-and-test job. They are independent of it, so give them their
+  # own jobs and let them overlap with the tests instead.
+  linux-lint:
+    runs-on: ${{ github.repository_owner == 'facebook' && '4-core-ubuntu' || 'ubuntu-latest' }}
+    steps:
+    - uses: actions/checkout@v6
+    - uses: ./.github/actions/setup_linux_env
+    - uses: Swatinem/rust-cache@v2
+      with:
+        prefix-key: buck2-lint
+        cache-workspace-crates: true
+    - uses: ./.github/actions/run_test_py
+      with:
+        flags: --lint-rust-only
+  macos-lint:
+    runs-on: ${{ github.repository_owner == 'facebook' && 'macos-14' || 'macos-14-xlarge' }}
+    steps:
+    - uses: maxim-lobanov/setup-xcode@v1.6.0
+      with:
+        xcode-version: latest-stable
+    - uses: actions/checkout@v6
+    - uses: ./.github/actions/setup_macos_env
+    - uses: Swatinem/rust-cache@v2
+      with:
+        prefix-key: buck2-lint
+        cache-workspace-crates: true
+    - uses: ./.github/actions/run_test_py
+      with:
+        flags: --lint-rust-only
+  windows-lint:
+    if: github.repository_owner == 'facebook'
+    runs-on: windows-8-core
+    steps:
+    - uses: actions/checkout@v6
+    - uses: ./.github/actions/setup_windows_env
+    - uses: Swatinem/rust-cache@v2
+      with:
+        prefix-key: buck2-lint
+        cache-workspace-crates: true
+    - uses: ./.github/actions/run_test_py
+      with:
+        flags: --lint-rust-only
+  # rustdoc output is platform-independent enough that Linux-only coverage is
+  # sufficient; running it on all three platforms bought nothing.
+  linux-rustdoc:
+    runs-on: ${{ github.repository_owner == 'facebook' && '4-core-ubuntu' || 'ubuntu-latest' }}
+    steps:
+    - uses: actions/checkout@v6
+    - uses: ./.github/actions/setup_linux_env
+    - uses: Swatinem/rust-cache@v2
+      with:
+        prefix-key: buck2-rustdoc
+        cache-workspace-crates: true
+    - uses: ./.github/actions/run_test_py
+      with:
+        flags: --rustdoc-only
