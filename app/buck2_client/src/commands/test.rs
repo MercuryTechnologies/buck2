@@ -150,7 +150,7 @@ If include patterns are present, regardless of whether exclude patterns are pres
 
     /// Will run tests to on RE even if they are missing required settings (running from the root +
     /// relative paths). Those required settings just get overridden.
-    #[clap(long, group = "re_options", alias = "unstable-force-tests-on-re")]
+    #[clap(long, group = "re_options", alias = "unstable-force-tests-on-re", default_value_t = true)]
     unstable_allow_all_tests_on_re: bool,
 
     #[clap(name = "TARGET_PATTERNS", help = "Patterns to test", value_hint = clap::ValueHint::Other)]
