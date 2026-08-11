@@ -1083,7 +1083,10 @@ fn push_cgroup_memory_stats(a: &mut Attrs, prefix: &str, s: &buck2_data::UnixCgr
 }
 
 fn push_command_end(a: &mut Attrs, c: &buck2_data::CommandEnd) {
-    a.bool("command_end.is_success", c.is_success);
+    // `CommandEnd::is_success` is deliberately *not* exported. It is a deprecated proto3 scalar
+    // that nothing has written since mid-2025; the field survives only so
+    // that Meta's ingress can still read invocation records produced by old buck2 binaries.
+
     if let Some(build_result) = &c.build_result {
         a.bool(
             "command_end.build_result.build_completed",
@@ -1515,6 +1518,37 @@ mod tests {
         assert_eq!(boolean(&attrs, "buck2.has_local_changes"), Some(false));
         // Never set -- must be absent.
         assert!(find(&attrs, "buck2.new_configs_used").is_none());
+    }
+
+    /// The deprecated `CommandEnd::is_success` must not be exported: nothing sets it, and being a
+    /// proto3 scalar it reads `false` on every row, which is indistinguishable from a genuine
+    /// failure. `outcome` and `build_result.build_completed` are the real signals.
+    #[test]
+    fn does_not_export_deprecated_command_end_is_success() {
+        let record = buck2_data::InvocationRecord {
+            outcome: Some(buck2_data::InvocationOutcome::Success as i32),
+            command_end: Some(buck2_data::CommandEnd {
+                // A successful build, as the rest of the record reports it -- yet the deprecated
+                // flag is still `false`, which is exactly why it must not become a column.
+                is_success: false,
+                build_result: Some(buck2_data::BuildResult {
+                    build_completed: true,
+                }),
+                data: Some(buck2_data::command_end::Data::Build(
+                    buck2_data::BuildCommandEnd::default(),
+                )),
+            }),
+            ..Default::default()
+        };
+        let attrs = invocation_record_attributes(&record);
+
+        assert!(find(&attrs, "buck2.command_end.is_success").is_none());
+        // The signals that replaced it are present.
+        assert_eq!(string(&attrs, "buck2.outcome").as_deref(), Some("Success"));
+        assert_eq!(
+            boolean(&attrs, "buck2.command_end.build_result.build_completed"),
+            Some(true)
+        );
     }
 
     /// `client_metadata` / `install_device_metadata` are key-value maps: each entry's key becomes
