@@ -6,6 +6,10 @@ runs:
   - uses: Swatinem/rust-cache@v2
     with:
       prefix-key: buck2-debug
+      # By default rust-cache strips the workspace members' artifacts before
+      # saving, so all 138 buck2 crates recompile from zero on every run. They
+      # are by far the bulk of the build.
+      cache-workspace-crates: true
   - name: Build buck2 binary (debug)
     run: |-
       mkdir $RUNNER_TEMP/artifacts
