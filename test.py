@@ -16,6 +16,7 @@ import importlib.machinery
 import json
 import os
 import shlex
+import shutil
 import signal
 import subprocess
 import sys
@@ -389,18 +390,40 @@ def rustdoc(package_args: list[str], target_args: list[str]) -> None:
 
 
 def test(package_args: list[str], target_args: list[str]) -> None:
-    print_running("cargo test --lib")
-    extra_args = []
-    # Limit number of parallel jobs to prevent OOMs
-    if is_windows():
-        extra_args = ["--jobs", str(os.cpu_count() // 2)]
+    # Limit number of parallel build jobs to prevent OOMs
+    build_jobs = str((os.cpu_count() or 2) // 2) if is_windows() else None
     # Hour should be enough for all tests to run
     timeout_sec = 60 * 60
-    run(
-        ["cargo", "test", "--lib", *extra_args, *package_args, *target_args],
-        timeout=timeout_sec,
-    )
+
+    if shutil.which("cargo-nextest") is not None:
+        # `cargo test` runs one test binary at a time, which serializes badly
+        # across the ~138 crates in this workspace; nextest schedules tests
+        # from all binaries in parallel.
+        print_running("cargo nextest run --lib")
+        extra_args = ["--build-jobs", build_jobs] if build_jobs else []
+        run(
+            [
+                "cargo",
+                "nextest",
+                "run",
+                "--lib",
+                *extra_args,
+                *package_args,
+                *target_args,
+            ],
+            timeout=timeout_sec,
+        )
+    else:
+        print_running("cargo test --lib")
+        extra_args = ["--jobs", build_jobs] if build_jobs else []
+        run(
+            ["cargo", "test", "--lib", *extra_args, *package_args, *target_args],
+            timeout=timeout_sec,
+        )
+
+    # nextest does not support doctests; those still go through `cargo test`.
     print_running("cargo test --doc")
+    extra_args = ["--jobs", build_jobs] if build_jobs else []
     run(
         ["cargo", "test", "--doc", *extra_args, *package_args, *target_args],
         timeout=timeout_sec,
