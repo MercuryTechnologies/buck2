@@ -29,9 +29,10 @@
 //!   builder itself; we only check the two endpoint variables to decide *whether* to export.
 //! * `OTEL_SDK_DISABLED=true` -- the spec's global kill-switch. `opentelemetry-rust` does not honor
 //!   it on its own, so we check it here and skip building the exporter entirely.
-//! * `OTEL_SERVICE_NAME` / `OTEL_RESOURCE_ATTRIBUTES` -- extra/overriding resource attributes,
-//!   merged in by `resource`. Our own authoritative attributes (pid, arch, os, host) win on
-//!   conflict; `service.name` defaults to `buck2` but yields to a user-provided value.
+//! * `OTEL_RESOURCE_ATTRIBUTES` -- extra resource attributes, merged in by `resource`. Our own
+//!   attributes (`service.name`, pid, arch, os, host) win on conflict, per the Resource SDK spec.
+//! * `OTEL_SERVICE_NAME` -- deliberately *not* honored, unlike a typical OpenTelemetry app;
+//!   `service.name` is always `buck2`. See the `resource` function for why.
 //! * `TRACEPARENT` / `TRACESTATE` -- W3C Trace Context of the launching process (CI job, wrapper
 //!   script, ...). When present, our wide-event span is parented under that trace instead of being
 //!   a disconnected root. See [`export_span`].
@@ -85,6 +86,7 @@ use opentelemetry_semantic_conventions::resource::HOST_NAME;
 use opentelemetry_semantic_conventions::resource::OS_TYPE;
 use opentelemetry_semantic_conventions::resource::PROCESS_PID;
 use opentelemetry_semantic_conventions::resource::SERVICE_INSTANCE_ID;
+use opentelemetry_semantic_conventions::resource::SERVICE_NAME;
 use opentelemetry_semantic_conventions::resource::SERVICE_VERSION;
 use uuid::Uuid;
 
@@ -157,14 +159,21 @@ fn otel_host_arch(arch: &str) -> &str {
 /// Resource attributes identifying this build invocation, following OpenTelemetry semantic
 /// conventions (<https://opentelemetry.io/docs/specs/semconv/resource/>).
 ///
-/// Attributes are layered in ascending priority -- each step below overrides earlier ones on
-/// conflict -- so `service.name` falls back to `buck2` but yields to whatever the user configured,
-/// while the values buck2 measures itself always win. Expressing precedence by ordering lets the
-/// user's `service.name` simply override our default instead of us having to detect whether they set
-/// one. (We can't use the all-in-one `Resource::builder()`: it runs its detectors *first*, i.e. at
-/// the lowest priority, leaving no way to slip our `buck2` default underneath them.)
+/// The environment is merged in first, then the values buck2 knows for itself override it -- the
+/// precedence the Resource SDK spec prescribes for `OTEL_RESOURCE_ATTRIBUTES` (env is the "secondary
+/// resource"; user-provided wins).
+///
+/// `service.name` is one of those authoritative values, so we also ignore `OTEL_SERVICE_NAME`. It
+/// names the service the *environment* was provisioned for -- the app being built, injected by the
+/// OpenTelemetry k8s operator or a CI image -- and filing buck2's spans under that app would pollute
+/// its metrics. Honoring it is optional per spec (env config is MAY), but it is what an operator
+/// would expect, and the tradeoff is that a deliberate `OTEL_SERVICE_NAME=x buck2 build` is silently
+/// ignored; a buck2-owned flag would be the fix.
 fn resource(version: &'static str) -> Resource {
     let mut authoritative = vec![
+        // Always `buck2`, never the environment's idea of it -- see above. Also keeps us off the
+        // spec's `unknown_service:<exe>` fallback for this `Required` attribute.
+        KeyValue::new(SERVICE_NAME, "buck2"),
         // buck2 is not a deployed service, so `service.version` is just this binary's build version.
         // The caller passes it in (`BuckVersion::get_version()`, the same string `buck2 --version`
         // prints) because the richer version -- the source revision stamped at build time via
@@ -183,30 +192,19 @@ fn resource(version: &'static str) -> Resource {
         authoritative.push(KeyValue::new(HOST_NAME, hostname));
     }
 
-    let mut builder = Resource::builder_empty()
-        // Lowest priority: our default `service.name`, overridden by anything the user sets below.
-        .with_service_name("buck2")
-        // `telemetry.sdk.*`, plus any attributes from `OTEL_RESOURCE_ATTRIBUTES` (which may carry a
-        // `service.name` that then wins over our default, and other attributes like
-        // `deployment.environment` that flow through untouched). `EnvResourceDetector` percent-decodes
-        // the values per the Resource SDK spec -- but only in our Mercury fork of `opentelemetry-rust`
+    Resource::builder_empty()
+        // Lowest priority: `telemetry.sdk.*`, plus `OTEL_RESOURCE_ATTRIBUTES` (things like
+        // `deployment.environment` flow through untouched). `EnvResourceDetector` percent-decodes the
+        // values per the Resource SDK spec -- but only in our Mercury fork of `opentelemetry-rust`
         // (see the workspace `Cargo.toml`); upstream does not yet. See
         // <https://github.com/open-telemetry/opentelemetry-rust/issues/857>.
         .with_detectors(&[
             Box::new(TelemetryResourceDetector),
             Box::new(EnvResourceDetector::new()),
-        ]);
-    // `OTEL_SERVICE_NAME` is the dedicated variable and outranks a `service.name` in
-    // `OTEL_RESOURCE_ATTRIBUTES`; `EnvResourceDetector` only reads the latter, so apply it ourselves.
-    if let Some(name) = std::env::var_os("OTEL_SERVICE_NAME")
-        .and_then(|v| v.into_string().ok())
-        .filter(|v| !v.is_empty())
-    {
-        builder = builder.with_service_name(name);
-    }
-    // Highest priority: the attributes buck2 measures itself (pid, arch, os, host) win over anything
-    // the environment supplies.
-    builder.with_attributes(authoritative).build()
+        ])
+        // Highest priority: what buck2 knows for itself wins over the environment.
+        .with_attributes(authoritative)
+        .build()
 }
 
 /// Build the OTLP exporter and tracer provider (spawning the exporter's background threads) and store
@@ -396,6 +394,18 @@ mod tests {
                 .span()
                 .span_context()
                 .is_valid()
+        );
+    }
+
+    /// Only pins the value under the test runner's own environment: proving `OTEL_SERVICE_NAME`
+    /// loses would need `set_var`, which is unsound in a threaded test binary. Still catches the
+    /// attribute being dropped, misspelled, or falling back to `unknown_service:<exe>`.
+    #[test]
+    fn service_name_is_buck2() {
+        let resource = resource("test-version");
+        assert_eq!(
+            resource.get(&SERVICE_NAME.into()).map(|v| v.to_string()),
+            Some("buck2".to_owned())
         );
     }
 
