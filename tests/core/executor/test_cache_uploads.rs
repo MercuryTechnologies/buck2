@@ -94,3 +94,28 @@ async fn test_re_uploads_default(buck: &Buck) -> anyhow::Result<()> {
     .await?;
     assert_locally_executed_upload_attempted(buck, 1).await
 }
+
+#[buck_test(meta_only = "uses fbpython")]
+async fn test_missing_output_is_not_uploaded(buck: &Buck) -> anyhow::Result<()> {
+    // Give the action a fresh digest so an entry left by a buggy Buck2 cannot
+    // turn this into an action-cache hit.
+    let nonce = format!("write.nonce={}", random_string());
+    buck.build(&["root//:missing_output", "-c", &nonce])
+        .await
+        .expect_failure()
+        .assert_stderr_matches("Required outputs are missing");
+
+    // A successful command with an invalid output set must be rejected before
+    // Buck2 enters the cache-upload path. Check all CacheUpload events here,
+    // including rejected uploads that the other tests tolerate as CI infra
+    // limitations.
+    let log = buck.log(&["show"]).await?.stdout;
+    for line in log.trim().lines() {
+        let event: Value = serde_json::from_str(line)?;
+        assert!(
+            json_get(&event, &["Event", "data", "SpanEnd", "data", "CacheUpload"]).is_none(),
+            "unexpected cache upload: {line}"
+        );
+    }
+    Ok(())
+}
