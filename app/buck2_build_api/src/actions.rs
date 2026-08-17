@@ -291,6 +291,12 @@ pub trait ActionExecutionCtx: Send + Sync {
         allow_cache_upload: bool,
     ) -> buck2_error::Result<CacheUploadResults>;
 
+    /// Validate the executor's complete result against this action's declared outputs.
+    fn validate_command_execution_outputs(
+        &self,
+        result: &CommandExecutionResult,
+    ) -> Result<(), ExecuteError>;
+
     /// Executes a command
     /// TODO(bobyf) this seems like it deserves critical sections?
     async fn exec_cmd(
