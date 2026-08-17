@@ -1793,6 +1793,14 @@ impl Action for RunAction {
             (false, false) => buck2_data::IncrementalKind::NonIncremental,
         };
 
+        // We need to validate the outputs before uploading to cache, to avoid turning a buggy
+        // successful action into a cache corruption.
+        // There's a second check in BuckActionExecutor::execute for non-RunAction actions; this one
+        // just stops upload bugs.
+        if result.was_success() {
+            ctx.validate_command_execution_outputs(&result)?;
+        }
+
         let allow_cache_upload = allow_cache_upload || force_cache_upload()?;
         // If there is a dep file entry AND if dep file cache upload is enabled, upload it
         if result.was_success()
