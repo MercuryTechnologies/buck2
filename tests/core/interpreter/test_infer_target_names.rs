@@ -37,6 +37,26 @@ async fn test_eponymous_dep_in_build_file_inferred_when_enabled(buck: &Buck) -> 
 }
 
 #[buck_test]
+async fn test_eponymous_query_literal_inferred_when_enabled(buck: &Buck) -> anyhow::Result<()> {
+    // Query literals use a separate parser from attributes in build files. It must
+    // honor the same setting so tools can feed abbreviated labels back to Buck.
+    let res = buck
+        .uquery(&["deps(root//lib/greeting)", "-c", ENABLE])
+        .await?;
+    assert!(res.stdout.contains("root//lib/greeting:greeting"));
+    Ok(())
+}
+
+#[buck_test]
+async fn test_bxl_query_filter_infers_target_name_when_enabled(buck: &Buck) -> anyhow::Result<()> {
+    let res = buck
+        .bxl(&["//:infer_target_names.bxl:main", "-c", ENABLE])
+        .await?;
+    assert_eq!(res.stdout.trim(), "[root//foo:foo]");
+    Ok(())
+}
+
+#[buck_test]
 async fn test_eponymous_source_in_build_file_rejected_by_default(buck: &Buck) {
     // `attrs.source()` takes either a path or a label, so it coerces separately
     // from `attrs.dep()`. Without the buckconfig, `//lib/greeting` fails as both
