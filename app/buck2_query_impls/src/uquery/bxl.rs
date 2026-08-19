@@ -18,6 +18,7 @@ use buck2_common::target_aliases::HasTargetAliasResolver;
 use buck2_core::fs::project::ProjectRoot;
 use buck2_core::fs::project_rel_path::ProjectRelativePathBuf;
 use buck2_core::global_cfg_options::GlobalCfgOptions;
+use buck2_interpreter_for_build::interpreter::context::HasInterpreterContext;
 use buck2_node::nodes::unconfigured::TargetNode;
 use buck2_query::query::syntax::simple::eval::file_set::FileSet;
 use buck2_query::query::syntax::simple::eval::set::TargetSet;
@@ -56,6 +57,11 @@ impl BxlUqueryFunctionsImpl {
             .await?
             .dupe();
         let target_alias_resolver = dice.get().target_alias_resolver().await?.dupe();
+        let infer_target_names = dice
+            .get()
+            .get_interpreter_configuror()
+            .await?
+            .infer_target_names();
 
         let query_data = Arc::new(DiceQueryData::new(
             GlobalCfgOptions::default(),
@@ -64,6 +70,7 @@ impl BxlUqueryFunctionsImpl {
             &self.working_dir,
             self.project_root.dupe(),
             target_alias_resolver,
+            infer_target_names,
             self.allow_partial_graph,
         ));
         Ok(DiceQueryDelegate::new(dice, query_data))
