@@ -25,7 +25,13 @@ class WhatUploadedTest(BuckTestCase):
             "//:upload_rule", "--remote-only", "-c", "test.content=" + content
         )
         out = await buck.log("what-uploaded", "--format", "csv")
-        header = ["action", "digests_uploaded", "bytes_uploaded"]
+        header = [
+            "kind",
+            "action",
+            "action_digest",
+            "digests_uploaded",
+            "bytes_uploaded",
+        ]
         out = [
             dict(zip(header, record))
             for record in csv.reader(out.stdout.splitlines())
@@ -38,6 +44,7 @@ class WhatUploadedTest(BuckTestCase):
         assert int(out[1]["digests_uploaded"]) > 0, (
             "second entry should be upload digests"
         )
+        assert out[1]["kind"] == "re_inputs"
 
     @buck_test()
     async def test_what_uploaded_aggregated(self, buck: Buck) -> None:
