@@ -25,7 +25,13 @@ async fn test_what_uploaded_csv(buck: &Buck) -> anyhow::Result<()> {
     ])
     .await?;
     let out = buck.log(&["what-uploaded", "--format", "csv"]).await?;
-    let header = ["action", "digests_uploaded", "bytes_uploaded"];
+    let header = [
+        "kind",
+        "action",
+        "action_digest",
+        "digests_uploaded",
+        "bytes_uploaded",
+    ];
     let out = csv::ReaderBuilder::new()
         .has_headers(false)
         .flexible(true)
@@ -51,6 +57,7 @@ async fn test_what_uploaded_csv(buck: &Buck) -> anyhow::Result<()> {
         out[1]["digests_uploaded"].parse::<i64>()? > 0,
         "second entry should be upload digests"
     );
+    assert_eq!(out[1]["kind"], "re_inputs");
     Ok(())
 }
 
