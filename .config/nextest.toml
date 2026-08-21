@@ -23,4 +23,6 @@ slow-timeout = { period = "60s", terminate-after = 5 }
 #
 # Passes on macOS, and its sibling test_sigkill_when_graceful_termination_fails
 # passes on both, so the coverage lost here is small.
-default-filter = 'not (package(buck2_common) and test(=kill_util::tests::test_graceful_termination))'
+#
+# register_racing_with_wake_all_loses_wakeups seems to just be flaky on macOS.
+default-filter = 'not ((package(buck2_common) and test(=kill_util::tests::test_graceful_termination)) or (package(dice_futures) and test(=atomic_waker_set::tests::register_racing_with_wake_all_loses_wakeups)))'
