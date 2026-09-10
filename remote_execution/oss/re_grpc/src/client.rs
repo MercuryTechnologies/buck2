@@ -108,8 +108,6 @@ use crate::retry::retrying_stream;
 const DEFAULT_MAX_TOTAL_BATCH_SIZE: usize = 4 * 1000 * 1000;
 /// Default minimum `data` size before a batched blob is zstd-compressed.
 const DEFAULT_BATCH_COMPRESSION_THRESHOLD: usize = 100;
-const INITIAL_DELAY: Duration = Duration::from_millis(100);
-const MAX_DELAY: Duration = Duration::from_secs(10);
 
 fn tdigest_to(tdigest: TDigest) -> Digest {
     Digest {
@@ -189,6 +187,11 @@ pub struct RERuntimeOpts {
     find_missing_blobs_batch_size: usize,
     /// Maximum retries for RPC requests. Defaults to 5.
     max_retries: usize,
+    /// Delay before the first retry of an RPC request. Doubles after each subsequent retry, up to
+    /// `retry_max_delay`. Defaults to 100ms.
+    retry_initial_delay: Duration,
+    /// Upper bound on the delay between retries of an RPC request. Defaults to 10s.
+    retry_max_delay: Duration,
     /// Minimum `data` size before a batched blob is zstd-compressed in `BatchUpdateBlobs` uploads.
     batch_compression_threshold: usize,
     /// Whether to request zstd-compressed `BatchReadBlobs` responses (server supports zstd).
@@ -360,6 +363,8 @@ impl REClientBuilder {
                 cas_ttl_secs: opts.cas_ttl_secs.unwrap_or(3 * 60 * 60),
                 find_missing_blobs_batch_size: opts.find_missing_blobs_batch_size.unwrap_or(100),
                 max_retries: opts.max_retries,
+                retry_initial_delay: Duration::from_millis(opts.retry_initial_delay_ms),
+                retry_max_delay: Duration::from_millis(opts.retry_max_delay_ms),
                 batch_compression_threshold: opts
                     .batch_compression_threshold_bytes
                     .unwrap_or(DEFAULT_BATCH_COMPRESSION_THRESHOLD),
@@ -739,8 +744,8 @@ impl REClient {
                 })
             },
             self.runtime_opts.max_retries,
-            INITIAL_DELAY,
-            MAX_DELAY,
+            self.runtime_opts.retry_initial_delay,
+            self.runtime_opts.retry_max_delay,
             false,
         )
         .await
@@ -778,8 +783,8 @@ impl REClient {
                 })
             },
             self.runtime_opts.max_retries,
-            INITIAL_DELAY,
-            MAX_DELAY,
+            self.runtime_opts.retry_initial_delay,
+            self.runtime_opts.retry_max_delay,
             false,
         )
         .await
@@ -845,8 +850,8 @@ impl REClient {
                 }
             },
             self.runtime_opts.max_retries,
-            INITIAL_DELAY,
-            MAX_DELAY,
+            self.runtime_opts.retry_initial_delay,
+            self.runtime_opts.retry_max_delay,
             true,
         );
 
@@ -908,8 +913,8 @@ impl REClient {
                         Ok(resp.into_inner())
                     },
                     self.runtime_opts.max_retries,
-                    INITIAL_DELAY,
-                    MAX_DELAY,
+                    self.runtime_opts.retry_initial_delay,
+                    self.runtime_opts.retry_max_delay,
                     false,
                 )
                 .await
@@ -986,8 +991,8 @@ impl REClient {
                         Ok(resp.into_inner())
                     },
                     self.runtime_opts.max_retries,
-                    INITIAL_DELAY,
-                    MAX_DELAY,
+                    self.runtime_opts.retry_initial_delay,
+                    self.runtime_opts.retry_max_delay,
                     // Blobs can transiently 404 while propagating across a distributed CAS.
                     true,
                 )
@@ -1071,8 +1076,8 @@ impl REClient {
                         Ok(resp.into_inner())
                     },
                     self.runtime_opts.max_retries,
-                    INITIAL_DELAY,
-                    MAX_DELAY,
+                    self.runtime_opts.retry_initial_delay,
+                    self.runtime_opts.retry_max_delay,
                     false,
                 )
                 .await?;
@@ -1528,8 +1533,8 @@ where
                     Ok(accum)
                 },
                 opts.max_retries,
-                INITIAL_DELAY,
-                MAX_DELAY,
+                opts.retry_initial_delay,
+                opts.retry_max_delay,
                 false,
             )
             .await?
@@ -1587,8 +1592,8 @@ where
                 anyhow::Ok(())
             },
             opts.max_retries,
-            INITIAL_DELAY,
-            MAX_DELAY,
+            opts.retry_initial_delay,
+            opts.retry_max_delay,
             false,
         )
         .await
@@ -1730,8 +1735,8 @@ where
                     Ok(vec![hash.clone()])
                 },
                 opts.max_retries,
-                INITIAL_DELAY,
-                MAX_DELAY,
+                opts.retry_initial_delay,
+                opts.retry_max_delay,
                 false,
             )
             .await
@@ -1768,8 +1773,8 @@ where
                     Ok(vec![hash.clone()])
                 },
                 opts.max_retries,
-                INITIAL_DELAY,
-                MAX_DELAY,
+                opts.retry_initial_delay,
+                opts.retry_max_delay,
                 false,
             )
             .await
@@ -1991,6 +1996,8 @@ mod tests {
             cas_ttl_secs: 0,
             find_missing_blobs_batch_size: 100,
             max_retries: 0,
+            retry_initial_delay: Duration::from_millis(100),
+            retry_max_delay: Duration::from_secs(10),
             batch_compression_threshold: DEFAULT_BATCH_COMPRESSION_THRESHOLD,
             batch_read_zstd: false,
         }

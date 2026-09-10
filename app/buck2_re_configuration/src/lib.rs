@@ -18,6 +18,8 @@ use buck2_core::rollout_percentage::RolloutPercentage;
 static BUCK2_RE_CLIENT_CFG_SECTION: &str = "buck2_re_client";
 
 const DEFAULT_MAX_RETRIES: usize = 5;
+const DEFAULT_RETRY_INITIAL_DELAY_MS: u64 = 100;
+const DEFAULT_RETRY_MAX_DELAY_MS: u64 = 10_000;
 
 /// We put functions here that both things need to implement for code that isn't gated behind a
 /// fbcode_build or not(fbcode_build)
@@ -484,6 +486,12 @@ pub struct Buck2OssReConfiguration {
     pub max_concurrency_per_connection: Option<usize>,
     /// Maximum retries for RPC requests. Defaults to 5.
     pub max_retries: usize,
+    /// Delay in milliseconds before the first retry of an RPC request. The delay doubles after
+    /// each subsequent retry, up to `retry_max_delay_ms`. Defaults to 100ms.
+    pub retry_initial_delay_ms: u64,
+    /// Upper bound in milliseconds on the delay between retries of an RPC request. Defaults to
+    /// 10s.
+    pub retry_max_delay_ms: u64,
     /// Timeout for RPC requests in seconds. Defaults to 60s.
     pub grpc_timeout: u64,
 }
@@ -633,6 +641,18 @@ impl Buck2OssReConfiguration {
                     property: "max_retries",
                 })?
                 .unwrap_or(DEFAULT_MAX_RETRIES),
+            retry_initial_delay_ms: legacy_config
+                .parse(BuckconfigKeyRef {
+                    section: BUCK2_RE_CLIENT_CFG_SECTION,
+                    property: "retry_initial_delay_ms",
+                })?
+                .unwrap_or(DEFAULT_RETRY_INITIAL_DELAY_MS),
+            retry_max_delay_ms: legacy_config
+                .parse(BuckconfigKeyRef {
+                    section: BUCK2_RE_CLIENT_CFG_SECTION,
+                    property: "retry_max_delay_ms",
+                })?
+                .unwrap_or(DEFAULT_RETRY_MAX_DELAY_MS),
             grpc_timeout: legacy_config
                 .parse(BuckconfigKeyRef {
                     section: BUCK2_RE_CLIENT_CFG_SECTION,
