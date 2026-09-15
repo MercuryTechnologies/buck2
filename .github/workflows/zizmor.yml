@@ -1,0 +1,33 @@
+name: GitHub Actions Security Scan
+
+on:
+  pull_request:
+  merge_group:
+  push:
+    branches: [mercury-head]
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  zizmor:
+    name: Scan GitHub Actions
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read # Check out the repository and audit public action references
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+      - name: Scan GitHub Actions
+        uses: zizmorcore/zizmor-action@cc914d7f3750a2d13d75c7f184a1060aa0e9d482 # v0.6.4
+        with:
+          version: v1.25.2
+          persona: pedantic
+          advanced-security: false
+          annotations: true
