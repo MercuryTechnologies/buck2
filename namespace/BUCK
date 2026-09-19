@@ -1,0 +1,15 @@
+load("@root//buildbuddy:defs.bzl", "buildbuddy_remote_execution_platform")
+
+oncall("build_infra")
+
+# Namespace remote execution. Its workers are x86_64 Linux and it takes the
+# credentials from [buck2_re_client], which `nsc buck2 setup` writes; the
+# platform only has to say which OS the action wants. No local executor, so a
+# build with --remote-only proves every action ran remotely.
+buildbuddy_remote_execution_platform(
+    name = "rbe",
+    cpu_configuration = "prelude//cpu:x86_64",
+    os_configuration = "prelude//os:linux",
+    os_family = "Linux",
+    visibility = ["PUBLIC"],
+)
