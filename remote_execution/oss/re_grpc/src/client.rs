@@ -1065,7 +1065,7 @@ async fn create_tls_config(settings: &GrpcTlsSettings) -> anyhow::Result<ClientT
     Ok(config)
 }
 
-fn prepare_uri(uri: Uri) -> anyhow::Result<(Uri, bool)> {
+fn prepare_uri(uri: Uri, tls_override: Option<bool>) -> anyhow::Result<(Uri, bool)> {
     // Now do some awkward things with the protocol. Why do we do all this? The reason is
     // because we'd like our configuration to not be super confusing. We don't want to e.g.
     // allow setting the address to `https://foobar`; instead we infer TLS from the source
@@ -1089,6 +1089,10 @@ fn prepare_uri(uri: Uri) -> anyhow::Result<(Uri, bool)> {
             ));
         }
     };
+
+    // `[buck2_re_client] tls` wins over the scheme. Upstream buck2 reads TLS from that key
+    // alone, so the config nsc and others write for it says `grpc://host:port` and `tls = true`.
+    let tls = tls_override.unwrap_or(tls);
 
     // And now, let's put back a proper scheme for Tonic to be happy with. First, because
     // Tonic will blow up if we don't. Second, so we get port inference.
@@ -2657,6 +2661,8 @@ type GrpcService = InterceptedService<Channel, InjectHeadersInterceptor>;
 
 #[derive(Clone)]
 struct GrpcTlsSettings {
+    /// `[buck2_re_client] tls`; overrides what the address scheme implies.
+    tls: Option<bool>,
     tls_ca_certs: Option<String>,
     tls_client_cert: Option<String>,
 }
@@ -2674,6 +2680,7 @@ impl GrpcChannelSettings {
     fn from_options(opts: &Buck2OssReConfiguration) -> Self {
         Self {
             tls: GrpcTlsSettings {
+                tls: opts.tls,
                 tls_ca_certs: opts.tls_ca_certs.clone(),
                 tls_client_cert: opts.tls_client_cert.clone(),
             },
@@ -2715,7 +2722,7 @@ impl GrpcChannelConnector {
         let address = self.address.as_ref().context("No address")?;
         let address = substitute_env_vars(address).context("Invalid address")?;
         let uri = address.parse().context("Invalid address")?;
-        let (uri, tls) = prepare_uri(uri).context("Invalid URI")?;
+        let (uri, tls) = prepare_uri(uri, self.settings.tls.tls).context("Invalid URI")?;
 
         let mut endpoint = Channel::builder(uri);
         if tls {
@@ -6832,16 +6839,28 @@ mod tests {
     }
 
     #[test]
+    fn prepare_uri_lets_the_tls_key_override_the_scheme() -> anyhow::Result<()> {
+        let (uri, tls) = prepare_uri("grpc://reapi.example:444".parse()?, Some(true))?;
+        assert_eq!(uri.scheme_str(), Some("https"));
+        assert!(tls);
+
+        let (uri, tls) = prepare_uri("grpcs://reapi.example:444".parse()?, Some(false))?;
+        assert_eq!(uri.scheme_str(), Some("http"));
+        assert!(!tls);
+        Ok(())
+    }
+
+    #[test]
     fn prepare_uri_adds_root_path_to_bare_authority() -> anyhow::Result<()> {
-        let (uri, tls) = prepare_uri("remote.buildbuddy.io".parse()?)?;
+        let (uri, tls) = prepare_uri("remote.buildbuddy.io".parse()?, None)?;
         assert_eq!(uri.to_string(), "https://remote.buildbuddy.io/");
         assert!(tls);
 
-        let (uri, tls) = prepare_uri("grpc://localhost:8980".parse()?)?;
+        let (uri, tls) = prepare_uri("grpc://localhost:8980".parse()?, None)?;
         assert_eq!(uri.to_string(), "http://localhost:8980/");
         assert!(!tls);
 
-        let (uri, tls) = prepare_uri("grpcs://remote.buildbuddy.io/cache".parse()?)?;
+        let (uri, tls) = prepare_uri("grpcs://remote.buildbuddy.io/cache".parse()?, None)?;
         assert_eq!(uri.to_string(), "https://remote.buildbuddy.io/cache");
         assert!(tls);
 

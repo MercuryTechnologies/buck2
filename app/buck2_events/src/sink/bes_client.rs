@@ -52,9 +52,11 @@ use tokio_stream::wrappers::ReceiverStream;
 use tonic::Status;
 use tonic::metadata::MetadataKey;
 use tonic::metadata::MetadataValue;
+use tonic::transport::Certificate;
 use tonic::transport::Channel;
 use tonic::transport::ClientTlsConfig;
 use tonic::transport::Endpoint;
+use tonic::transport::Identity;
 
 use crate::sink::bazel_converter::BazelEventConverter;
 use crate::sink::bazel_converter::encode_bep_event;
@@ -76,6 +78,7 @@ pub struct BesConfig {
     pub grpc_timeout: Duration,
     pub bes_backend: Option<String>,
     pub bes_headers: Vec<(String, String)>,
+    pub bes_tls: BesTls,
     pub build_metadata: Vec<(String, String)>,
     pub event_format: BesEventFormat,
     pub bazel_artifact_upload: bool,
@@ -105,6 +108,7 @@ impl Default for BesConfig {
             grpc_timeout: Duration::from_secs(10),
             bes_backend: None,
             bes_headers: Vec::new(),
+            bes_tls: BesTls::default(),
             build_metadata: Vec::new(),
             event_format: BesEventFormat::Buck,
             bazel_artifact_upload: true,
@@ -256,16 +260,27 @@ impl CounterState {
     }
 }
 
+/// PEM files for the sink's TLS connections. Set by `[bes] connection = re_client`, which hands
+/// the remote execution client's identity to the sink. Paths may reference environment
+/// variables.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct BesTls {
+    pub client_cert: Option<String>,
+    pub ca_certs: Option<String>,
+}
+
 #[derive(Clone, Debug)]
 struct ConnectionConfig {
     endpoint: String,
     headers: Vec<(String, String)>,
+    tls: BesTls,
 }
 
 #[derive(Clone, Debug)]
 struct BazelArtifactUploadConfig {
     endpoint: String,
     headers: Vec<(String, String)>,
+    tls: BesTls,
     instance_name: String,
     uri_authority: String,
     max_bytes: usize,
@@ -306,6 +321,7 @@ impl BazelArtifactUploadConfig {
         Ok(Some(Self {
             endpoint,
             headers: connection.headers.clone(),
+            tls: connection.tls.clone(),
             instance_name: config
                 .bazel_artifact_upload_instance_name
                 .clone()
@@ -623,7 +639,7 @@ impl BazelArtifactUploader {
         }
 
         if self.client.is_none() {
-            let endpoint = endpoint_for(&self.config.endpoint, self.config.grpc_timeout)?;
+            let endpoint = endpoint_for(&self.config.endpoint, self.config.grpc_timeout, &self.config.tls)?;
             let channel = endpoint.connect().await.map_err(map_transport_error)?;
             self.client = Some(ByteStreamClient::new(channel));
         }
@@ -655,7 +671,7 @@ impl BazelArtifactUploader {
         }
 
         if self.client.is_none() {
-            let endpoint = endpoint_for(&self.config.endpoint, self.config.grpc_timeout)?;
+            let endpoint = endpoint_for(&self.config.endpoint, self.config.grpc_timeout, &self.config.tls)?;
             let channel = endpoint.connect().await.map_err(map_transport_error)?;
             self.client = Some(ByteStreamClient::new(channel));
         }
@@ -879,6 +895,7 @@ impl BesClient {
         let connection = ConnectionConfig {
             endpoint: bes_backend(config.bes_backend.as_deref())?,
             headers: config.bes_headers.clone(),
+            tls: config.bes_tls.clone(),
         };
         let queue_capacity = config.buffer_size.max(1);
         let (tx, rx) = crossbeam_channel::bounded(queue_capacity);
@@ -1345,7 +1362,7 @@ impl WorkerState {
     > {
         // Keep stream RPCs open for the duration of the build; use this value
         // only to bound connection establishment.
-        let endpoint = endpoint_for(&self.connection.endpoint, self.config.grpc_timeout)?;
+        let endpoint = endpoint_for(&self.connection.endpoint, self.config.grpc_timeout, &self.connection.tls)?;
         let channel = endpoint.connect().await.map_err(map_transport_error)?;
         let mut client = PublishBuildEventClient::new(channel);
         let (tx, rx) = mpsc::channel(self.config.buffer_size.max(1));
@@ -1893,7 +1910,7 @@ fn map_transport_error(err: tonic::transport::Error) -> Status {
     Status::unavailable(err.to_string())
 }
 
-fn endpoint_for(uri: &str, connect_timeout: Duration) -> Result<Endpoint, Status> {
+fn endpoint_for(uri: &str, connect_timeout: Duration, tls: &BesTls) -> Result<Endpoint, Status> {
     let mut endpoint = Endpoint::from_shared(uri.to_owned())
         .map_err(|e| Status::internal(e.to_string()))?
         .connect_timeout(connect_timeout);
@@ -1901,11 +1918,27 @@ fn endpoint_for(uri: &str, connect_timeout: Duration) -> Result<Endpoint, Status
         .split_once("://")
         .is_some_and(|(scheme, _)| scheme.eq_ignore_ascii_case("https"))
     {
+        let mut tls_config = match &tls.ca_certs {
+            Some(path) => ClientTlsConfig::new().ca_certificate(Certificate::from_pem(read_pem(path)?)),
+            None => ClientTlsConfig::new().with_enabled_roots(),
+        };
+        if let Some(path) = &tls.client_cert {
+            // One file holds the certificate chain and the key, as for the remote execution
+            // client's `tls_client_cert`.
+            let pem = read_pem(path)?;
+            tls_config = tls_config.identity(Identity::from_pem(&pem, &pem));
+        }
         endpoint = endpoint
-            .tls_config(ClientTlsConfig::new().with_enabled_roots())
+            .tls_config(tls_config)
             .map_err(|e| Status::internal(e.to_string()))?;
     }
     Ok(endpoint)
+}
+
+fn read_pem(path: &str) -> Result<Vec<u8>, Status> {
+    let mut env = |name: &str| std::env::var(name).ok();
+    let path = crate::sink::remote::expand_bes_config_env_vars_with(path, &mut env);
+    std::fs::read(&path).map_err(|e| Status::internal(format!("reading `{path}`: {e}")))
 }
 
 fn bes_backend(configured_endpoint: Option<&str>) -> buck2_error::Result<String> {
@@ -2107,6 +2140,7 @@ mod tests {
         let connection = ConnectionConfig {
             endpoint: "https://bes.example.com".to_owned(),
             headers: Vec::new(),
+            tls: BesTls::default(),
         };
         let upload = BazelArtifactUploadConfig::from_bes(&config, &connection)
             .unwrap()
@@ -2133,6 +2167,7 @@ mod tests {
         BazelArtifactUploadConfig {
             endpoint: "test://bytestream".to_owned(),
             headers: Vec::new(),
+            tls: BesTls::default(),
             instance_name: "remote/instance".to_owned(),
             uri_authority: "localhost:1985".to_owned(),
             max_bytes: 1024,
@@ -2503,6 +2538,7 @@ mod tests {
         let connection = ConnectionConfig {
             endpoint: "http://127.0.0.1:1".to_owned(),
             headers: Vec::new(),
+            tls: BesTls::default(),
         };
         let counters = Arc::new(CounterState::default());
         let mut worker = WorkerState::new(config, connection, counters);
@@ -2530,6 +2566,7 @@ mod tests {
         let connection = ConnectionConfig {
             endpoint: "http://127.0.0.1:1".to_owned(),
             headers: Vec::new(),
+            tls: BesTls::default(),
         };
         let counters = Arc::new(CounterState::default());
         let mut worker = WorkerState::new(config, connection, counters.clone());
@@ -2570,6 +2607,7 @@ mod tests {
         let connection = ConnectionConfig {
             endpoint: "http://127.0.0.1:1".to_owned(),
             headers: Vec::new(),
+            tls: BesTls::default(),
         };
         let counters = Arc::new(CounterState::default());
         let mut worker = WorkerState::new(config, connection, counters);

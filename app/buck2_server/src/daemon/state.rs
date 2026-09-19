@@ -397,6 +397,51 @@ impl DaemonState {
                     section: "bes",
                     property: "header",
                 })?)?;
+            // `[bes] connection = re_client` reuses the remote execution client's endpoint,
+            // headers and TLS identity. Explicit `backend` and `header` keys still win.
+            #[cfg(not(fbcode_build))]
+            let bes_connection = match root_config
+                .get(BuckconfigKeyRef {
+                    section: "bes",
+                    property: "connection",
+                })
+                .map(str::trim)
+            {
+                Some("re_client") => Some(
+                    buck2_re_configuration::BesConnection::from_re_client(&root_config)?,
+                ),
+                Some("") | None => None,
+                Some(other) => {
+                    return Err(buck2_error::buck2_error!(
+                        buck2_error::ErrorTag::Input,
+                        "Invalid `bes.connection` `{}` (expected `re_client`)",
+                        other
+                    ));
+                }
+            };
+            #[cfg(not(fbcode_build))]
+            let bes_backend = bes_backend.or_else(|| {
+                bes_connection
+                    .as_ref()
+                    .map(|connection| connection.backend.clone())
+            });
+            #[cfg(not(fbcode_build))]
+            let bes_headers = if bes_headers.is_empty() {
+                bes_connection
+                    .as_ref()
+                    .map(|connection| connection.headers.clone())
+                    .unwrap_or_default()
+            } else {
+                bes_headers
+            };
+            #[cfg(not(fbcode_build))]
+            let bes_tls = bes_connection
+                .as_ref()
+                .map(|connection| remote::BesTls {
+                    client_cert: connection.tls_client_cert.clone(),
+                    ca_certs: connection.tls_ca_certs.clone(),
+                })
+                .unwrap_or_default();
             #[cfg(not(fbcode_build))]
             let build_metadata = Self::parse_bes_build_metadata(
                 root_config.parse_list::<String>(BuckconfigKeyRef {
@@ -493,6 +538,8 @@ impl DaemonState {
                     bes_backend,
                     #[cfg(not(fbcode_build))]
                     bes_headers,
+                    #[cfg(not(fbcode_build))]
+                    bes_tls,
                     #[cfg(not(fbcode_build))]
                     build_metadata,
                     #[cfg(not(fbcode_build))]
