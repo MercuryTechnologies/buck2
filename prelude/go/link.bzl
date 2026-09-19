@@ -77,12 +77,22 @@ def _build_mode_param(mode: GoBuildMode) -> str:
 def get_inherited_link_pkgs(deps: list[Dependency]) -> dict[str, GoPkg]:
     return merge_pkgs([d[GoPkgLinkInfo].pkgs for d in deps if GoPkgLinkInfo in d])
 
+def dedupe_native_link_deps(deps: list[Dependency]) -> list[Dependency]:
+    # native_deps is a flat, transitive list. Concatenating each dep's list
+    # without deduplication makes it grow with the number of paths through the
+    # graph, exponential in depth; on a deep Go module graph that is tens of
+    # gigabytes of analysis. Keyed by configured label, first occurrence wins.
+    seen = {}
+    for dep in deps:
+        seen.setdefault(dep.label, dep)
+    return seen.values()
+
 def get_inherited_native_link_deps(deps: list[Dependency]) -> list[Dependency]:
     native_deps = []
     for dep in deps:
         if GoPkgLinkInfo in dep:
             native_deps += dep[GoPkgLinkInfo].native_deps or []
-    return native_deps
+    return dedupe_native_link_deps(native_deps)
 
 # TODO(cjhopman): Is link_style a LibOutputStyle or a LinkStrategy here? Based
 # on returning an empty thing for link_style != shared, it seems likely its
@@ -216,7 +226,7 @@ def link(
 
     go_stdlib = ctx.attrs._go_stdlib[GoStdlib]
 
-    all_native_deps = deps + native_deps + get_inherited_native_link_deps(deps)
+    all_native_deps = dedupe_native_link_deps(deps + native_deps + get_inherited_native_link_deps(deps))
     executable_args = _process_shared_dependencies(ctx, output, all_native_deps, link_style)
 
     if link_mode == None:

@@ -43,7 +43,7 @@ load(
 load(":cgo_builder.bzl", "get_cgo_build_context")
 load(":compile.bzl", "GoPkgCompileInfo", "GoTestInfo")
 load(":coverage.bzl", "GoCoverageMode")
-load(":link.bzl", "GoPkgLinkInfo", "get_inherited_link_pkgs", "get_inherited_native_link_deps")
+load(":link.bzl", "GoPkgLinkInfo", "dedupe_native_link_deps", "get_inherited_link_pkgs", "get_inherited_native_link_deps")
 load(":package_builder.bzl", "GoBuildConfig", "GoSourceInputs", "declare_package_build")
 load(":packages.bzl", "cgo_exported_preprocessor", "go_attr_pkg_name", "merge_pkgs")
 load(":toolchain.bzl", "GoToolchainInfo", "evaluate_cgo_enabled", "get_toolchain_env_vars")
@@ -83,7 +83,7 @@ def go_library_impl(ctx: AnalysisContext) -> list[Provider]:
 
     own_exported_preprocessors = [cgo_exported_preprocessor(ctx, pkg_info)] if ctx.attrs.generate_exported_header else []
     header_namespace = cgo_build_context.header_namespace if cgo_build_context != None else (ctx.attrs.header_namespace if ctx.attrs.header_namespace != None else ctx.label.package)
-    native_link_deps = native_deps + get_inherited_native_link_deps(ctx.attrs.deps)
+    native_link_deps = dedupe_native_link_deps(native_deps + get_inherited_native_link_deps(ctx.attrs.deps))
 
     return [
         DefaultInfo(default_output = default_output),
