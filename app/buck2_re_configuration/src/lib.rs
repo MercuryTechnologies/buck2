@@ -662,19 +662,19 @@ pub struct BesConnection {
 }
 
 impl BesConnection {
-    pub fn from_re_client(legacy_config: &LegacyBuckConfig) -> buck2_error::Result<Self> {
+    /// `Ok(None)` when no remote execution engine is configured: a checked-in
+    /// `[bes] connection = re_client` then means "report when there is somewhere to report to",
+    /// and a machine without `nsc reapi setup buck2` builds without a sink rather than failing.
+    pub fn from_re_client(legacy_config: &LegacyBuckConfig) -> buck2_error::Result<Option<Self>> {
         let config = Buck2OssReConfiguration::from_legacy_config(legacy_config)?;
-        let engine = config
+        let Some(engine) = config
             .engine_address
             .as_deref()
             .map(str::trim)
             .filter(|s| !s.is_empty())
-            .ok_or_else(|| {
-                buck2_error::buck2_error!(
-                    buck2_error::ErrorTag::Input,
-                    "`[bes] connection = re_client` needs `[buck2_re_client] engine_address`"
-                )
-            })?;
+        else {
+            return Ok(None);
+        };
         let (scheme, host) = match engine.split_once("://") {
             Some((scheme, host)) => (Some(scheme.to_ascii_lowercase()), host),
             None => (None, engine),
@@ -683,7 +683,7 @@ impl BesConnection {
         // address scheme says, so the sink does the same.
         let _ = scheme;
         let tls = config.tls;
-        Ok(Self {
+        Ok(Some(Self {
             backend: format!(
                 "{}://{}",
                 if tls { "grpcs" } else { "grpc" },
@@ -696,7 +696,7 @@ impl BesConnection {
                 .collect(),
             tls_client_cert: config.tls_client_cert.filter(|_| tls),
             tls_ca_certs: config.tls_ca_certs.filter(|_| tls),
-        })
+        }))
     }
 }
 
@@ -715,7 +715,7 @@ mod tests {
             )],
             "config",
         )?;
-        let connection = BesConnection::from_re_client(&legacy_config)?;
+        let connection = BesConnection::from_re_client(&legacy_config)?.expect("engine configured");
         assert_eq!(connection.backend, "grpcs://reapi.example:444");
         assert_eq!(connection.tls_client_cert.as_deref(), Some("/tmp/client.pem"));
         assert_eq!(
@@ -734,7 +734,10 @@ mod tests {
             &[("config", "[buck2_re_client]\nengine_address = reapi.example:443\n")],
             "config",
         )?;
-        assert_eq!(BesConnection::from_re_client(&bare)?.backend, "grpcs://reapi.example:443");
+        assert_eq!(
+            BesConnection::from_re_client(&bare)?.expect("engine configured").backend,
+            "grpcs://reapi.example:443"
+        );
 
         let plain = parse(
             &[(
@@ -743,16 +746,16 @@ mod tests {
             )],
             "config",
         )?;
-        let connection = BesConnection::from_re_client(&plain)?;
+        let connection = BesConnection::from_re_client(&plain)?.expect("engine configured");
         assert_eq!(connection.backend, "grpc://localhost:8980");
         assert_eq!(connection.tls_client_cert, None);
         Ok(())
     }
 
     #[test]
-    fn bes_connection_needs_an_engine_address() -> buck2_error::Result<()> {
+    fn bes_connection_is_none_without_an_engine_address() -> buck2_error::Result<()> {
         let legacy_config = parse(&[("config", "")], "config")?;
-        assert!(BesConnection::from_re_client(&legacy_config).is_err());
+        assert_eq!(BesConnection::from_re_client(&legacy_config)?, None);
         Ok(())
     }
 }
