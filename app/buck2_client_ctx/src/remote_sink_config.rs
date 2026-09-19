@@ -14,11 +14,14 @@ use buck2_error::ErrorTag;
 #[cfg(not(fbcode_build))]
 use buck2_events::sink::remote::BesEventFormat;
 use buck2_events::sink::remote::RemoteEventConfig;
+#[cfg(not(fbcode_build))]
+use buck2_events::sink::remote::BesTls;
 
 #[cfg(not(fbcode_build))]
 struct BuckconfigBesSettings {
     bes_backend: Option<String>,
     bes_headers: Vec<(String, String)>,
+    bes_tls: BesTls,
     build_metadata: Vec<(String, String)>,
     bes_event_format: Option<BesEventFormat>,
     bazel_artifact_upload: Option<bool>,
@@ -43,6 +46,7 @@ pub fn with_buckconfig_overrides(
                 config.bes_backend = Some(bes_backend);
             }
             config.bes_headers = settings.bes_headers;
+            config.bes_tls = settings.bes_tls;
             config.build_metadata = settings.build_metadata;
             if let Some(bes_event_format) = settings.bes_event_format {
                 config.event_format = bes_event_format;
@@ -122,6 +126,7 @@ fn read_buckconfig_bes_settings(
         return Ok(BuckconfigBesSettings {
             bes_backend: None,
             bes_headers: Vec::new(),
+            bes_tls: BesTls::default(),
             build_metadata: Vec::new(),
             bes_event_format: None,
             bazel_artifact_upload: None,
@@ -168,17 +173,54 @@ fn read_buckconfig_bes_settings(
         })?
         .or(re_client_default_address);
 
+    // `[bes] connection = re_client` reuses the remote execution client's endpoint, headers
+    // and TLS identity. Explicit `backend` and `header` keys still win.
+    let connection = match root_config
+        .get(BuckconfigKeyRef {
+            section: "bes",
+            property: "connection",
+        })
+        .map(str::trim)
+    {
+        Some("re_client") => Some(buck2_re_configuration::BesConnection::from_re_client(
+            &root_config,
+        )?),
+        Some("") | None => None,
+        Some(other) => {
+            return Err(buck2_error::buck2_error!(
+                ErrorTag::Input,
+                "Invalid `bes.connection` `{}` (expected `re_client`)",
+                other
+            ));
+        }
+    };
+    let mut bes_headers = parse_bes_headers(root_config.parse_list::<String>(BuckconfigKeyRef {
+            section: "bes",
+            property: "header",
+        })?)?;
+    if bes_headers.is_empty() {
+        if let Some(connection) = &connection {
+            bes_headers = connection.headers.clone();
+        }
+    }
+    let bes_tls = connection
+        .as_ref()
+        .map(|connection| BesTls {
+            client_cert: connection.tls_client_cert.clone(),
+            ca_certs: connection.tls_ca_certs.clone(),
+        })
+        .unwrap_or_default();
+
     Ok(BuckconfigBesSettings {
         bes_backend: root_config
             .get(BuckconfigKeyRef {
                 section: "bes",
                 property: "backend",
             })
-            .map(str::to_owned),
-        bes_headers: parse_bes_headers(root_config.parse_list::<String>(BuckconfigKeyRef {
-            section: "bes",
-            property: "header",
-        })?)?,
+            .map(str::to_owned)
+            .or_else(|| connection.as_ref().map(|connection| connection.backend.clone())),
+        bes_headers,
+        bes_tls,
         build_metadata: parse_bes_build_metadata(root_config.parse_list::<String>(
             BuckconfigKeyRef {
                 section: "bes",
