@@ -6780,6 +6780,15 @@ fn finished_event_from_command_end(
     )
 }
 
+/// The final event for a build the daemon abandons: shutdown reached the stream before
+/// CommandEnd did. Bazel's exit code for an interrupted build, and `last_message`, so the
+/// server closes the invocation instead of showing it running forever.
+pub fn interrupted_finish_event(timestamp: Option<Timestamp>) -> bep::BuildEvent {
+    let mut event = finished_event(timestamp, 8, "INTERRUPTED", Vec::new());
+    event.last_message = true;
+    event
+}
+
 fn finished_event(
     timestamp: Option<Timestamp>,
     exit_code: i32,
@@ -7772,6 +7781,24 @@ fn first_metadata(metadata: &HashMap<String, String>, keys: &[&str]) -> Option<S
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn interrupted_finish_event_is_a_final_interrupted_build_finished() {
+        let event = interrupted_finish_event(None);
+        assert!(event.last_message);
+        assert!(matches!(
+            event.id.as_ref().and_then(|id| id.id.as_ref()),
+            Some(build_event_id::Id::BuildFinished(_))
+        ));
+        match event.payload {
+            Some(build_event::Payload::Finished(finished)) => {
+                assert!(!finished.overall_success);
+                let exit = finished.exit_code.expect("exit code");
+                assert_eq!((exit.name.as_str(), exit.code), ("INTERRUPTED", 8));
+            }
+            other => panic!("unexpected payload {other:?}"),
+        }
+    }
     use std::io::Read;
 
     use flate2::read::GzDecoder;

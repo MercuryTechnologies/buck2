@@ -267,11 +267,18 @@ pub trait EventSink: Send + Sync {
     }
 }
 
+#[async_trait]
 pub trait EventSinkWithStats: Send + Sync {
     fn to_event_sync(self: Arc<Self>) -> Arc<dyn EventSink>;
 
     /// Collects stats on this sink (e.g. messages accepted, rejected).
     fn stats(&self) -> EventSinkStats;
+
+    /// Deliver what is queued and finish the remote streams. Called once, at daemon shutdown,
+    /// so an interrupted build ends on the remote side instead of staying open forever.
+    async fn shutdown(&self) -> buck2_error::Result<()> {
+        Ok(())
+    }
 }
 
 #[async_trait]

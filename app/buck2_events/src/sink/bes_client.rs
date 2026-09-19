@@ -60,6 +60,7 @@ use tonic::transport::Identity;
 
 use crate::sink::bazel_converter::BazelEventConverter;
 use crate::sink::bazel_converter::encode_bep_event;
+use crate::sink::bazel_converter::interrupted_finish_event;
 
 const BUCK2_EVENT_TYPE_URL: &str = "type.googleapis.com/buck.data.BuckEvent";
 const DEFAULT_BATCH_SIZE: usize = 1;
@@ -156,6 +157,8 @@ pub struct Message {
 struct SendNowRequest {
     messages: Vec<Message>,
     wait_for_acks: bool,
+    /// Close every stream after sending: the daemon is shutting down.
+    close_all: bool,
     done: oneshot::Sender<buck2_error::Result<()>>,
 }
 
@@ -1044,6 +1047,7 @@ impl BesClient {
             .send(SendNowRequest {
                 messages,
                 wait_for_acks,
+                close_all: false,
                 done: done_tx,
             })
             .map_err(|_| {
@@ -1078,6 +1082,29 @@ impl BesClient {
     pub fn export_counters(&self) -> Counters {
         self.counters.snapshot()
     }
+
+    /// Finish every open stream and wait for the acknowledgements. For the daemon's shutdown:
+    /// the worker would close streams when this client is dropped, but the process exits
+    /// first, and a stream left open shows as a build still running on the server.
+    pub async fn close_all_streams(&self) -> buck2_error::Result<()> {
+        let (done_tx, done_rx) = oneshot::channel();
+        self.send_now_tx
+            .send(SendNowRequest {
+                messages: Vec::new(),
+                wait_for_acks: true,
+                close_all: true,
+                done: done_tx,
+            })
+            .map_err(|_| {
+                buck2_error::buck2_error!(ErrorTag::Tier0, "Failed to enqueue BES close request")
+            })?;
+        done_rx.await.map_err(|_| {
+            buck2_error::buck2_error!(
+                ErrorTag::Tier0,
+                "BES worker dropped close response channel"
+            )
+        })?
+    }
 }
 
 fn bes_worker_runtime() -> std::io::Result<Runtime> {
@@ -1104,6 +1131,11 @@ fn process_send_now_request(
     worker: &mut WorkerState,
     request: SendNowRequest,
 ) {
+    if request.close_all {
+        runtime.block_on(worker.close_all_streams_for_shutdown());
+        drop(request.done.send(Ok(())));
+        return;
+    }
     // Desired behavior for the ACK-waiting path (mirroring Bazel's BES
     // uploader semantics):
     //
@@ -1155,6 +1187,10 @@ struct WorkerState {
     connection: ConnectionConfig,
     counters: Arc<CounterState>,
     streams: HashMap<String, StreamState>,
+    /// Set once the streams were finished for shutdown. Events that arrive afterwards, from
+    /// commands being cancelled, are dropped rather than opening a second stream for an
+    /// invocation the server already saw end.
+    closed: bool,
 }
 
 impl WorkerState {
@@ -1164,6 +1200,7 @@ impl WorkerState {
             connection,
             counters,
             streams: HashMap::new(),
+            closed: false,
         }
     }
 
@@ -1179,6 +1216,10 @@ impl WorkerState {
         message: &Message,
         fail_fast: bool,
     ) -> buck2_error::Result<Option<(String, i64)>> {
+        if self.closed {
+            self.counters.inc_dropped();
+            return Ok(None);
+        }
         // Route by each event's own invocation ID. Buck2 can process commands
         // concurrently, so a shared "active invocation" can misroute events
         // across streams and cause one command's end event to close another.
@@ -1490,6 +1531,28 @@ impl WorkerState {
             return;
         };
         stream.discard_transport();
+    }
+
+    /// Shutdown: a stream whose command never ended gets the final event the server keys on,
+    /// marked interrupted, before the stream is finished. Without it the server has no
+    /// `BuildFinished` and shows the build running forever.
+    async fn close_all_streams_for_shutdown(&mut self) {
+        if self.config.event_format == BesEventFormat::Bazel {
+            let now: Option<Timestamp> = Some(SystemTime::now().into());
+            for stream in self.streams.values_mut() {
+                if !stream.saw_command_end && !stream.stream_finished_enqueued {
+                    stream.enqueue_raw_event(BuildEvent {
+                        event_time: now.clone(),
+                        event: Some(build_event::Event::BazelEvent(encode_bep_event(
+                            &interrupted_finish_event(now.clone()),
+                        ))),
+                    });
+                    stream.saw_command_end = true;
+                }
+            }
+        }
+        self.close_all_streams().await;
+        self.closed = true;
     }
 
     async fn close_all_streams(&mut self) {

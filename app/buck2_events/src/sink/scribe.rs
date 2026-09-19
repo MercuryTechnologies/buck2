@@ -549,9 +549,21 @@ fn get_is_cache_hit(details: &buck2_data::CommandExecutionDetails) -> bool {
         .unwrap_or(false)
 }
 
+#[async_trait]
 impl EventSinkWithStats for RemoteEventSink {
     fn to_event_sync(self: Arc<Self>) -> Arc<dyn EventSink> {
         self as _
+    }
+
+    async fn shutdown(&self) -> buck2_error::Result<()> {
+        #[cfg(not(fbcode_build))]
+        {
+            self.client.close_all_streams().await
+        }
+        #[cfg(fbcode_build)]
+        {
+            Ok(())
+        }
     }
 
     fn stats(&self) -> EventSinkStats {
