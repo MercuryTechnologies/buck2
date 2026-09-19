@@ -430,6 +430,7 @@ impl InvocationRecorder {
                 bes_backend: None,
                 #[cfg(not(fbcode_build))]
                 bes_headers: Vec::new(),
+                bes_tls: Default::default(),
                 #[cfg(not(fbcode_build))]
                 build_metadata: Vec::new(),
                 #[cfg(not(fbcode_build))]
@@ -661,6 +662,7 @@ impl InvocationRecorder {
                 bes_backend: None,
                 #[cfg(not(fbcode_build))]
                 bes_headers: Vec::new(),
+                bes_tls: Default::default(),
                 #[cfg(not(fbcode_build))]
                 build_metadata: Vec::new(),
                 #[cfg(not(fbcode_build))]

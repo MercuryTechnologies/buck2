@@ -17,6 +17,8 @@ use fbinit::FacebookInit;
 #[cfg(not(fbcode_build))]
 pub use crate::sink::scribe::BesEventFormat;
 pub use crate::sink::scribe::RemoteEventConfig;
+#[cfg(not(fbcode_build))]
+pub use crate::sink::bes_client::BesTls;
 pub use crate::sink::scribe::RemoteEventSink;
 pub(crate) use crate::sink::scribe::scribe_category;
 
