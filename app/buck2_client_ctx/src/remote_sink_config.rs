@@ -182,9 +182,7 @@ fn read_buckconfig_bes_settings(
         })
         .map(str::trim)
     {
-        Some("re_client") => Some(buck2_re_configuration::BesConnection::from_re_client(
-            &root_config,
-        )?),
+        Some("re_client") => buck2_re_configuration::BesConnection::from_re_client(&root_config)?,
         Some("") | None => None,
         Some(other) => {
             return Err(buck2_error::buck2_error!(
@@ -211,14 +209,18 @@ fn read_buckconfig_bes_settings(
         })
         .unwrap_or_default();
 
+    let bes_backend = root_config
+        .get(BuckconfigKeyRef {
+            section: "bes",
+            property: "backend",
+        })
+        .map(str::to_owned)
+        .or_else(|| connection.as_ref().map(|connection| connection.backend.clone()));
+    // No backend, no sink: a results URL would name a page that never gets written.
+    let bes_results_url = bes_results_url.filter(|_| bes_backend.is_some());
+
     Ok(BuckconfigBesSettings {
-        bes_backend: root_config
-            .get(BuckconfigKeyRef {
-                section: "bes",
-                property: "backend",
-            })
-            .map(str::to_owned)
-            .or_else(|| connection.as_ref().map(|connection| connection.backend.clone())),
+        bes_backend: bes_backend.clone(),
         bes_headers,
         bes_tls,
         build_metadata: parse_bes_build_metadata(root_config.parse_list::<String>(
