@@ -2,6 +2,7 @@
 prelude = prelude
 none = none
 buildbuddy_toolchains = buildbuddy/toolchains
+namespace = namespace
 
 [cell_aliases]
 config = prelude

@@ -216,6 +216,9 @@ python_wheel_toolchain(
 downloaded_rust_toolchain(
     name = "rust",
     default_edition = "2024",
+    # Release builds pass e.g. -c rust.rustc_flags="-Copt-level=3 -Cstrip=debuginfo";
+    # the default is a debug build, as for cargo.
+    rustc_flags = read_root_config("rust", "rustc_flags", "").split(),
     rust_toolchain = "root//:rust-toolchain",
     visibility = ["PUBLIC"],
 )
