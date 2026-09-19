@@ -407,9 +407,16 @@ impl DaemonState {
                 })
                 .map(str::trim)
             {
-                Some("re_client") => Some(
-                    buck2_re_configuration::BesConnection::from_re_client(&root_config)?,
-                ),
+                Some("re_client") => {
+                    let connection =
+                        buck2_re_configuration::BesConnection::from_re_client(&root_config)?;
+                    if connection.is_none() {
+                        tracing::info!(
+                            "[bes] connection = re_client, but no [buck2_re_client] engine_address: build events off"
+                        );
+                    }
+                    connection
+                }
                 Some("") | None => None,
                 Some(other) => {
                     return Err(buck2_error::buck2_error!(
