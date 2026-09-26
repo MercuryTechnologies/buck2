@@ -14,6 +14,7 @@ use allocative::Allocative;
 use buck2_common::legacy_configs::configs::LegacyBuckConfig;
 use buck2_common::legacy_configs::key::BuckconfigKeyRef;
 use buck2_core::rollout_percentage::RolloutPercentage;
+use buck2_credential_helper::CredentialHelperSettings;
 
 static BUCK2_RE_CLIENT_CFG_SECTION: &str = "buck2_re_client";
 
@@ -463,6 +464,20 @@ pub struct Buck2OssReConfiguration {
     /// This can contain environment variables using shell interpolation syntax (i.e. $VAR). They
     /// will be substituted before using the value.
     pub http_headers: Vec<HttpHeader>,
+    /// Command line of a credential helper that provides (and refreshes) credentials for RE
+    /// endpoints. The helper follows the Bazel credential helper protocol: it is invoked as
+    /// `<helper> get` with a JSON request on stdin and returns a JSON response on stdout
+    /// containing `headers` and an optional `expires` timestamp.
+    ///
+    /// The value is split into a program and its arguments using shell-like quoting rules. It
+    /// can contain environment variables using shell interpolation syntax (i.e. $VAR). They will
+    /// be substituted before using the value.
+    pub credential_helper: Option<String>,
+    /// Maximum time in seconds to wait for the credential helper to respond. Defaults to 10.
+    pub credential_helper_timeout_secs: Option<u64>,
+    /// How long in seconds to cache credentials returned by the credential helper when the
+    /// helper does not report an `expires` timestamp. Defaults to 1800 (30 minutes).
+    pub credential_helper_cache_secs: Option<u64>,
     /// Whether to query capabilities from the RBE backend.
     pub capabilities: Option<bool>,
     /// The instance name to use in requests.
@@ -595,6 +610,18 @@ impl Buck2OssReConfiguration {
                     property: "http_headers",
                 })?
                 .unwrap_or_default(), // Empty list is as good None.
+            credential_helper: legacy_config.parse(BuckconfigKeyRef {
+                section: BUCK2_RE_CLIENT_CFG_SECTION,
+                property: "credential_helper",
+            })?,
+            credential_helper_timeout_secs: legacy_config.parse(BuckconfigKeyRef {
+                section: BUCK2_RE_CLIENT_CFG_SECTION,
+                property: "credential_helper_timeout_secs",
+            })?,
+            credential_helper_cache_secs: legacy_config.parse(BuckconfigKeyRef {
+                section: BUCK2_RE_CLIENT_CFG_SECTION,
+                property: "credential_helper_cache_secs",
+            })?,
             capabilities: legacy_config.parse(BuckconfigKeyRef {
                 section: BUCK2_RE_CLIENT_CFG_SECTION,
                 property: "capabilities",
@@ -704,6 +731,9 @@ pub struct BesConnection {
     /// PEM file with the client certificate and its key, when TLS is on and one is configured.
     pub tls_client_cert: Option<String>,
     pub tls_ca_certs: Option<String>,
+    /// `[buck2_re_client] credential_helper`, when set: the sink asks it for the headers the
+    /// remote would otherwise reject once `http_headers` expire.
+    pub credential_helper: Option<CredentialHelperSettings>,
 }
 
 impl BesConnection {
@@ -740,6 +770,11 @@ impl BesConnection {
                 .collect(),
             tls_client_cert: config.tls_client_cert.filter(|_| tls),
             tls_ca_certs: config.tls_ca_certs.filter(|_| tls),
+            credential_helper: CredentialHelperSettings::from_options(
+                config.credential_helper.as_deref(),
+                config.credential_helper_timeout_secs,
+                config.credential_helper_cache_secs,
+            ),
         }))
     }
 }
