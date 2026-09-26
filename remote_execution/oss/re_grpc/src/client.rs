@@ -89,15 +89,14 @@ use tonic::metadata;
 use tonic::metadata::MetadataKey;
 use tonic::metadata::MetadataValue;
 use tonic::service::Interceptor;
-use tonic::transport::Channel;
 
+use crate::credential_helper::Credentials;
 use crate::error::*;
 use crate::metadata::*;
 use crate::pool::ChannelConfig;
 use crate::pool::ChannelPool;
 use crate::pool::PoolConfig;
 use crate::pool::PooledChannel;
-use crate::pool::create_channel;
 use crate::request::*;
 use crate::response::*;
 
@@ -249,16 +248,27 @@ impl REClientBuilder {
             .await
             .context("Failed to create channel config")?;
 
-        // Create a single channel for fetching capabilities. Other channels are created
-        // on-demand through the connection pool.
-        let engine_address = opts.engine_address.as_ref().context("No engine address")?;
-        let capabilities_channel = create_channel(&channel_config, engine_address)
-            .context("Error creating Capabilities channel")?;
+        // Create connection pool
+        let min_connections = opts.min_connections.unwrap_or(1).max(1);
+        let max_connections = opts.max_connections.unwrap_or(100).max(min_connections);
+        let pool_config = PoolConfig {
+            min_connections,
+            max_connections,
+            max_concurrency_per_connection: opts.max_concurrency_per_connection.unwrap_or(100),
+        };
+        let pool = ChannelPool::new(pool_config, channel_config);
 
+        let engine_address = opts.engine_address.as_ref().context("No engine address")?;
         let interceptor = InjectHeadersInterceptor::new(&opts.http_headers)?;
 
-        let mut capabilities_client =
-            CapabilitiesClient::with_interceptor(capabilities_channel, interceptor.dupe());
+        let (capabilities_channel, credentials) = pool
+            .get(engine_address)
+            .await
+            .context("Error creating Capabilities channel")?;
+        let mut capabilities_client = CapabilitiesClient::with_interceptor(
+            capabilities_channel,
+            interceptor.with_credentials(credentials),
+        );
 
         if let Some(max_decoding_message_size) = opts.max_decoding_message_size {
             capabilities_client =
@@ -318,16 +328,6 @@ impl REClientBuilder {
             .clone()
             .context("No action cache address")?;
 
-        // Create connection pool
-        let min_connections = opts.min_connections.unwrap_or(1).max(1);
-        let max_connections = opts.max_connections.unwrap_or(100).max(min_connections);
-        let pool_config = PoolConfig {
-            min_connections,
-            max_connections,
-            max_concurrency_per_connection: opts.max_concurrency_per_connection.unwrap_or(100),
-        };
-        let pool = ChannelPool::new(pool_config, channel_config);
-
         Ok(REClient::new(
             RERuntimeOpts {
                 use_fbcode_metadata: opts.use_fbcode_metadata,
@@ -350,7 +350,7 @@ impl REClientBuilder {
     }
 
     async fn fetch_rbe_capabilities(
-        client: &mut CapabilitiesClient<InterceptedService<Channel, InjectHeadersInterceptor>>,
+        client: &mut CapabilitiesClient<GrpcService>,
         instance_name: &InstanceName,
         max_total_batch_size: Option<usize>,
     ) -> anyhow::Result<RECapabilities> {
@@ -401,7 +401,10 @@ impl REClientBuilder {
 
 #[derive(Clone, Dupe)]
 struct InjectHeadersInterceptor {
+    /// Static headers from the configuration.
     headers: Arc<Vec<(MetadataKey<metadata::Ascii>, MetadataValue<metadata::Ascii>)>>,
+    /// Headers from the credential helper, which take precedence over the static ones.
+    credentials: Option<Arc<Credentials>>,
 }
 
 impl InjectHeadersInterceptor {
@@ -428,7 +431,16 @@ impl InjectHeadersInterceptor {
 
         Ok(Self {
             headers: Arc::new(headers),
+            credentials: None,
         })
+    }
+
+    /// An interceptor that also injects the headers of `credentials`, if any.
+    fn with_credentials(&self, credentials: Option<Arc<Credentials>>) -> Self {
+        Self {
+            headers: self.headers.dupe(),
+            credentials,
+        }
     }
 }
 
@@ -439,6 +451,17 @@ impl Interceptor for InjectHeadersInterceptor {
     ) -> Result<tonic::Request<()>, tonic::Status> {
         for (k, v) in self.headers.iter() {
             request.metadata_mut().insert(k.clone(), v.clone());
+        }
+        if let Some(credentials) = &self.credentials {
+            let metadata = request.metadata_mut();
+            // A header from the helper replaces a static header of the same name, but a helper
+            // header with several values keeps all of them.
+            for (k, _) in credentials.headers() {
+                metadata.remove(k.clone());
+            }
+            for (k, v) in credentials.headers() {
+                metadata.append(k.clone(), v.clone());
+            }
         }
         Ok(request)
     }
@@ -568,6 +591,12 @@ fn is_transient_io_error(err: &std::io::Error) -> bool {
     )
 }
 
+/// The remote rejected a request's credentials while a credential helper is configured. The
+/// cached credentials were invalidated, so retrying the request fetches new ones.
+#[derive(Debug, thiserror::Error)]
+#[error("Remote rejected the request's credentials (retrying with fresh credentials): {0}")]
+struct CredentialsRejected(tonic::Status);
+
 /// Returns true if an error is a transient connection/transport error worth
 /// retrying. Walks the error chain checking for:
 ///   - `tonic::Status` with codes the gRPC retry policy treats as transient
@@ -585,8 +614,13 @@ fn is_transient_io_error(err: &std::io::Error) -> bool {
 /// surfaces as an `io::Error` somewhere in the chain, which we catch above.
 /// Non-transient transport errors (TLS handshake, invalid URI) do not have
 /// an `io::Error` source, so they correctly do not retry.
+///
+/// [`CredentialsRejected`] is retryable: the credentials were refreshed.
 fn is_retryable(err: &anyhow::Error) -> bool {
     for cause in err.chain() {
+        if cause.downcast_ref::<CredentialsRejected>().is_some() {
+            return true;
+        }
         if let Some(status) = cause.downcast_ref::<tonic::Status>() {
             match status.code() {
                 tonic::Code::Unavailable
@@ -703,7 +737,8 @@ impl REClient {
                     metadata,
                     self.runtime_opts.use_fbcode_metadata,
                 ))
-                .await?;
+                .await;
+            let res = self.rpc_result(res).await?;
 
             Ok(ActionResultResponse {
                 action_result: convert_action_result(res.into_inner())?,
@@ -735,7 +770,8 @@ impl REClient {
                     metadata,
                     self.runtime_opts.use_fbcode_metadata,
                 ))
-                .await?;
+                .await;
+            let res = self.rpc_result(res).await?;
 
             Ok(WriteActionResultResponse {
                 actual_action_result: convert_action_result(res.into_inner())?,
@@ -775,8 +811,8 @@ impl REClient {
                     metadata,
                     self.runtime_opts.use_fbcode_metadata,
                 ))
-                .await?
-                .into_inner();
+                .await;
+            let stream = self.rpc_result(stream).await?.into_inner();
             anyhow::Ok(stream)
         })
         .await?;
@@ -895,8 +931,8 @@ impl REClient {
                         metadata,
                         self.runtime_opts.use_fbcode_metadata,
                     ))
-                    .await?;
-                Ok(resp.into_inner())
+                    .await;
+                Ok(self.rpc_result(resp).await?.into_inner())
             },
             |segments| async move {
                 let resp = self
@@ -907,8 +943,8 @@ impl REClient {
                         metadata,
                         self.runtime_opts.use_fbcode_metadata,
                     ))
-                    .await?;
-                Ok(resp.into_inner())
+                    .await;
+                Ok(self.rpc_result(resp).await?.into_inner())
             },
         )
         .await
@@ -958,8 +994,8 @@ impl REClient {
                         metadata,
                         self.runtime_opts.use_fbcode_metadata,
                     ))
-                    .await?;
-                Ok(resp.into_inner())
+                    .await;
+                Ok(self.rpc_result(resp).await?.into_inner())
             },
             |read_request| async move {
                 let response = self
@@ -970,8 +1006,8 @@ impl REClient {
                         metadata,
                         self.runtime_opts.use_fbcode_metadata,
                     ))
-                    .await?
-                    .into_inner();
+                    .await;
+                let response = self.rpc_result(response).await?.into_inner();
                 Ok(Box::pin(response.into_stream()))
             },
         )
@@ -1023,6 +1059,9 @@ impl REClient {
                             metadata,
                             self.runtime_opts.use_fbcode_metadata,
                         ))
+                        .await;
+                    let resp = self
+                        .rpc_result(resp)
                         .await
                         .context("Failed to request what blobs are not present on remote")?;
                     Ok(resp.into_inner())
@@ -1084,39 +1123,51 @@ impl REClient {
         self
     }
 
+    /// A channel to `address` with the headers (static and from the credential helper) injected.
+    async fn grpc_service(&self, address: &str) -> anyhow::Result<GrpcService> {
+        let (channel, credentials) = self.pool.get(address).await?;
+        Ok(InterceptedService::new(
+            channel,
+            self.interceptor.with_credentials(credentials),
+        ))
+    }
+
     async fn cas_client(&self) -> anyhow::Result<ContentAddressableStorageClient<GrpcService>> {
-        let channel = self.pool.get(&self.cas_address).await?;
-        Ok(
-            ContentAddressableStorageClient::new(InterceptedService::new(
-                channel,
-                self.interceptor.dupe(),
-            ))
-            .max_decoding_message_size(self.max_decoding_msg_size),
-        )
+        let service = self.grpc_service(&self.cas_address).await?;
+        Ok(ContentAddressableStorageClient::new(service)
+            .max_decoding_message_size(self.max_decoding_msg_size))
     }
 
     async fn bytestream_client(&self) -> anyhow::Result<ByteStreamClient<GrpcService>> {
-        let channel = self.pool.get(&self.cas_address).await?;
-        Ok(
-            ByteStreamClient::new(InterceptedService::new(channel, self.interceptor.dupe()))
-                .max_decoding_message_size(self.max_decoding_msg_size),
-        )
+        let service = self.grpc_service(&self.cas_address).await?;
+        Ok(ByteStreamClient::new(service).max_decoding_message_size(self.max_decoding_msg_size))
     }
 
     async fn execution_client(&self) -> anyhow::Result<ExecutionClient<GrpcService>> {
-        let channel = self.pool.get(&self.engine_address).await?;
-        Ok(ExecutionClient::new(InterceptedService::new(
-            channel,
-            self.interceptor.dupe(),
-        )))
+        let service = self.grpc_service(&self.engine_address).await?;
+        Ok(ExecutionClient::new(service))
     }
 
     async fn action_cache_client(&self) -> anyhow::Result<ActionCacheClient<GrpcService>> {
-        let channel = self.pool.get(&self.action_cache_address).await?;
-        Ok(ActionCacheClient::new(InterceptedService::new(
-            channel,
-            self.interceptor.dupe(),
-        )))
+        let service = self.grpc_service(&self.action_cache_address).await?;
+        Ok(ActionCacheClient::new(service))
+    }
+
+    /// Handle the result of an RPC: if the remote rejected the request's credentials and a
+    /// credential helper is configured, drop the cached credentials so that the retry (see
+    /// [`retry`]) fetches fresh ones from the helper.
+    async fn rpc_result<T>(&self, result: Result<T, tonic::Status>) -> anyhow::Result<T> {
+        match result {
+            Ok(v) => Ok(v),
+            Err(status)
+                if status.code() == tonic::Code::Unauthenticated
+                    && self.pool.has_credential_helper() =>
+            {
+                self.pool.invalidate_credentials().await;
+                Err(CredentialsRejected(status).into())
+            }
+            Err(status) => Err(status.into()),
+        }
     }
 
     pub fn get_metrics_client(&self) -> &Self {

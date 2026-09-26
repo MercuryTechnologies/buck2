@@ -9,6 +9,7 @@
  */
 
 mod client;
+mod credential_helper;
 mod digest;
 mod error;
 mod grpc;

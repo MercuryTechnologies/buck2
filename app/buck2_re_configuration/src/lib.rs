@@ -448,6 +448,20 @@ pub struct Buck2OssReConfiguration {
     /// This can contain environment variables using shell interpolation syntax (i.e. $VAR). They
     /// will be substituted before using the value.
     pub http_headers: Vec<HttpHeader>,
+    /// Command line of a credential helper that provides (and refreshes) credentials for RE
+    /// endpoints. The helper follows the Bazel credential helper protocol: it is invoked as
+    /// `<helper> get` with a JSON request on stdin and returns a JSON response on stdout
+    /// containing `headers` and an optional `expires` timestamp.
+    ///
+    /// The value is split into a program and its arguments using shell-like quoting rules. It
+    /// can contain environment variables using shell interpolation syntax (i.e. $VAR). They will
+    /// be substituted before using the value.
+    pub credential_helper: Option<String>,
+    /// Maximum time in seconds to wait for the credential helper to respond. Defaults to 10.
+    pub credential_helper_timeout_secs: Option<u64>,
+    /// How long in seconds to cache credentials returned by the credential helper when the
+    /// helper does not report an `expires` timestamp. Defaults to 1800 (30 minutes).
+    pub credential_helper_cache_secs: Option<u64>,
     /// Whether to query capabilities from the RBE backend.
     pub capabilities: Option<bool>,
     /// The instance name to use in requests.
@@ -558,6 +572,18 @@ impl Buck2OssReConfiguration {
                     property: "http_headers",
                 })?
                 .unwrap_or_default(), // Empty list is as good None.
+            credential_helper: legacy_config.parse(BuckconfigKeyRef {
+                section: BUCK2_RE_CLIENT_CFG_SECTION,
+                property: "credential_helper",
+            })?,
+            credential_helper_timeout_secs: legacy_config.parse(BuckconfigKeyRef {
+                section: BUCK2_RE_CLIENT_CFG_SECTION,
+                property: "credential_helper_timeout_secs",
+            })?,
+            credential_helper_cache_secs: legacy_config.parse(BuckconfigKeyRef {
+                section: BUCK2_RE_CLIENT_CFG_SECTION,
+                property: "credential_helper_cache_secs",
+            })?,
             capabilities: legacy_config.parse(BuckconfigKeyRef {
                 section: BUCK2_RE_CLIENT_CFG_SECTION,
                 property: "capabilities",

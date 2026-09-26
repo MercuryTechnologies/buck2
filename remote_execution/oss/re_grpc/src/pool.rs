@@ -37,6 +37,8 @@ use tonic::transport::Uri;
 use tonic::transport::channel::ClientTlsConfig;
 use tower::Service;
 
+use crate::credential_helper::CredentialHelper;
+use crate::credential_helper::Credentials;
 use crate::stats::CountingConnector;
 
 /// Configuration for the connection pool
@@ -54,6 +56,7 @@ pub struct PoolConfig {
 #[derive(Clone)]
 pub struct ChannelConfig {
     tls_config: Option<ClientTlsConfig>,
+    credential_helper: Option<Arc<CredentialHelper>>,
     grpc_keepalive_time_secs: Option<u64>,
     grpc_keepalive_timeout_secs: Option<u64>,
     grpc_keepalive_while_idle: Option<bool>,
@@ -96,12 +99,49 @@ impl ChannelConfig {
             None
         };
 
+        let credential_helper = match opts.credential_helper.as_deref() {
+            Some(command_line) => {
+                let command_line =
+                    substitute_env_vars(command_line).context("Invalid `credential_helper`")?;
+                let helper = CredentialHelper::from_command_line(
+                    &command_line,
+                    opts.credential_helper_timeout_secs.map(Duration::from_secs),
+                    opts.credential_helper_cache_secs.map(Duration::from_secs),
+                )
+                .context("Invalid `credential_helper`")?;
+                Some(Arc::new(helper))
+            }
+            None => None,
+        };
+
         Ok(Self {
             tls_config,
+            credential_helper,
             grpc_keepalive_time_secs: opts.grpc_keepalive_time_secs,
             grpc_keepalive_timeout_secs: opts.grpc_keepalive_timeout_secs,
             grpc_keepalive_while_idle: opts.grpc_keepalive_while_idle,
         })
+    }
+
+    pub fn has_credential_helper(&self) -> bool {
+        self.credential_helper.is_some()
+    }
+
+    /// Obtain credentials for `address` from the credential helper, if one is configured.
+    async fn credentials(&self, address: &str) -> anyhow::Result<Option<Arc<Credentials>>> {
+        match &self.credential_helper {
+            Some(helper) => {
+                let uri = self.credential_uri(address)?;
+                Ok(Some(helper.get(&uri).await?))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// The URI passed to the credential helper for `address`: the address with the scheme that
+    /// matches the TLS setting, e.g. `https://host:port/`.
+    fn credential_uri(&self, address: &str) -> anyhow::Result<String> {
+        Ok(prepare_address(address, self.tls_config.is_some())?.to_string())
     }
 
     async fn create_tls_config(opts: &Buck2OssReConfiguration) -> anyhow::Result<ClientTlsConfig> {
@@ -174,15 +214,21 @@ fn prepare_uri(uri: Uri, tls: bool) -> anyhow::Result<Uri> {
     Ok(Uri::from_parts(parts)?)
 }
 
+/// Substitute environment variables in a configured address and turn it into a URI with the
+/// scheme matching the TLS setting.
+fn prepare_address(address: &str, tls: bool) -> anyhow::Result<Uri> {
+    let address = substitute_env_vars(address).context("Invalid address")?;
+    let uri = address.parse().context("Invalid address")?;
+    prepare_uri(uri, tls).context("Invalid URI")
+}
+
 /// Create a configured endpoint for the given address. The endpoint can be
 /// reused to create multiple channels without re-processing TLS config.
 fn create_endpoint(
     config: &ChannelConfig,
     address: &str,
 ) -> Result<tonic::transport::Endpoint, anyhow::Error> {
-    let address = substitute_env_vars(address).context("Invalid address")?;
-    let uri = address.parse().context("Invalid address")?;
-    let uri = prepare_uri(uri, config.tls_config.is_some()).context("Invalid URI")?;
+    let uri = prepare_address(address, config.tls_config.is_some())?;
 
     let mut endpoint = Channel::builder(uri);
     if let Some(tls_config) = &config.tls_config {
@@ -214,11 +260,6 @@ fn channel_from_endpoint(endpoint: &tonic::transport::Endpoint) -> Channel {
     // We need to use a lazy channel so the pool isn't blocked waiting for new
     // connection IO
     endpoint.connect_with_connector_lazy(connector)
-}
-
-pub fn create_channel(config: &ChannelConfig, address: &str) -> Result<Channel, anyhow::Error> {
-    let endpoint = create_endpoint(config, address)?;
-    Ok(channel_from_endpoint(&endpoint))
 }
 
 /// A response body wrapper that holds a semaphore permit until the body is fully consumed or dropped.
@@ -444,9 +485,33 @@ impl ChannelPool {
         }
     }
 
-    /// Get a pooled channel for the given address
-    pub async fn get(&self, address: &str) -> anyhow::Result<PooledChannel> {
+    pub fn has_credential_helper(&self) -> bool {
+        self.channel_config.has_credential_helper()
+    }
+
+    /// Forget credentials obtained from the credential helper, so that they are fetched again
+    /// for the next request. Called when the remote rejects the credentials.
+    pub async fn invalidate_credentials(&self) {
+        if let Some(helper) = &self.channel_config.credential_helper {
+            tracing::debug!("Invalidating cached credentials");
+            helper.invalidate().await;
+        }
+    }
+
+    /// Get a pooled channel for the given address, along with the credentials (headers) to use
+    /// for requests on it.
+    pub async fn get(
+        &self,
+        address: &str,
+    ) -> anyhow::Result<(PooledChannel, Option<Arc<Credentials>>)> {
         use std::collections::hash_map::Entry;
+
+        // Obtained outside the pools lock, since it may invoke the credential helper.
+        let credentials = self
+            .channel_config
+            .credentials(address)
+            .await
+            .with_context(|| format!("Failed to get credentials for {}", address))?;
 
         let host_pool = {
             let mut pools = self.pools.lock().await;
@@ -467,7 +532,20 @@ impl ChannelPool {
             }
         };
 
-        Ok(host_pool.get().await)
+        Ok((host_pool.get().await, credentials))
+    }
+}
+
+#[cfg(test)]
+impl ChannelConfig {
+    fn for_test(tls: bool, credential_helper: Option<CredentialHelper>) -> Self {
+        Self {
+            tls_config: tls.then(|| ClientTlsConfig::new().with_enabled_roots()),
+            credential_helper: credential_helper.map(Arc::new),
+            grpc_keepalive_time_secs: None,
+            grpc_keepalive_timeout_secs: None,
+            grpc_keepalive_while_idle: None,
+        }
     }
 }
 
@@ -475,7 +553,100 @@ impl ChannelPool {
 mod tests {
     use tonic::transport::Uri;
 
-    use super::prepare_uri;
+    use super::*;
+
+    #[test]
+    fn credential_uri_matches_tls_setting() {
+        let tls = ChannelConfig::for_test(true, None);
+        assert_eq!(
+            tls.credential_uri("grpc://cas.example.com:8980").unwrap(),
+            "https://cas.example.com:8980/"
+        );
+        assert_eq!(
+            tls.credential_uri("cas.example.com").unwrap(),
+            "https://cas.example.com/"
+        );
+        let plain = ChannelConfig::for_test(false, None);
+        assert_eq!(
+            plain.credential_uri("cas.example.com:8980").unwrap(),
+            "http://cas.example.com:8980/"
+        );
+        assert!(tls.credential_uri("https://cas.example.com").is_err());
+    }
+
+    #[tokio::test]
+    async fn pool_without_credential_helper_reuses_host_pool() {
+        let pool = ChannelPool::new(
+            PoolConfig {
+                min_connections: 1,
+                max_connections: 2,
+                max_concurrency_per_connection: 4,
+            },
+            ChannelConfig::for_test(true, None),
+        );
+        let (_, credentials) = pool.get("a.example.com:443").await.unwrap();
+        assert!(credentials.is_none());
+        let first = Arc::clone(&pool.pools.lock().await["a.example.com:443"]);
+        pool.get("a.example.com:443").await.unwrap();
+        assert!(Arc::ptr_eq(
+            &first,
+            &pool.pools.lock().await["a.example.com:443"]
+        ));
+        assert!(!pool.has_credential_helper());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pool_returns_helper_credentials() {
+        let dir = tempfile::tempdir().unwrap();
+        let response = dir.path().join("response.json");
+        let script = dir.path().join("helper.sh");
+        std::fs::write(&script, format!("cat {}\n", response.display())).unwrap();
+        let write_response = |token: &str| {
+            let json = serde_json::json!({ "headers": { "authorization": [token] } });
+            std::fs::write(&response, serde_json::to_vec(&json).unwrap()).unwrap();
+        };
+
+        // Run through `sh` rather than directly, see `credential_helper::tests::command`.
+        let helper = CredentialHelper::new(
+            vec!["/bin/sh".to_owned(), script.to_str().unwrap().to_owned()],
+            None,
+            None,
+        )
+        .unwrap();
+        let pool = ChannelPool::new(
+            PoolConfig {
+                min_connections: 1,
+                max_connections: 2,
+                max_concurrency_per_connection: 4,
+            },
+            ChannelConfig::for_test(true, Some(helper)),
+        );
+        assert!(pool.has_credential_helper());
+        let address = "a.example.com:443";
+        let host_pool = || async { Arc::clone(&pool.pools.lock().await[address]) };
+
+        write_response("Bearer one");
+        let (_, credentials) = pool.get(address).await.unwrap();
+        assert_eq!(credentials.unwrap().headers()[0].1, "Bearer one");
+        let first_pool = host_pool().await;
+
+        // Cached credentials: the helper is not asked again.
+        write_response("Bearer two");
+        let (_, credentials) = pool.get(address).await.unwrap();
+        assert_eq!(credentials.unwrap().headers()[0].1, "Bearer one");
+
+        // After invalidation the new credentials are used, on the same connections.
+        pool.invalidate_credentials().await;
+        let (_, credentials) = pool.get(address).await.unwrap();
+        assert_eq!(credentials.unwrap().headers()[0].1, "Bearer two");
+        assert!(Arc::ptr_eq(&first_pool, &host_pool().await));
+
+        // A failing helper fails the request.
+        pool.invalidate_credentials().await;
+        std::fs::remove_file(&response).unwrap();
+        assert!(pool.get(address).await.is_err());
+    }
 
     #[test]
     fn prepare_uri_adds_root_path_when_missing() {

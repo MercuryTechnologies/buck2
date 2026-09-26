@@ -38,6 +38,62 @@ Keys supported include:
   interpolation syntax ($VAR). They will be substituted before reading the file.
 - `instance_name` - an instance name to pass on execution, action cache, and CAS
   requests.
+- `credential_helper` - command line of a
+  [credential helper](#credential-helpers) that provides, and refreshes,
+  credentials for the RE endpoints. The value is split into a program and its
+  arguments using shell-like quoting rules, and can contain environment
+  variables using shell interpolation syntax ($VAR).
+- `credential_helper_timeout_secs` - how long to wait for the credential helper
+  to respond, in seconds. Defaults to 10.
+- `credential_helper_cache_secs` - how long to cache the credentials returned
+  by the helper when the helper does not report an `expires` timestamp, in
+  seconds. Defaults to 1800 (30 minutes).
+
+## Credential helpers
+
+Credentials given in `.buckconfig` (`http_headers`) are read once when the
+buck2 daemon connects to RE. If they expire while the daemon is running (for
+example a short-lived bearer token), builds start failing until the daemon is
+restarted. A credential helper is an executable that buck2 invokes instead to
+obtain the current credentials, and invokes again when they expire.
+
+```ini
+[buck2_re_client]
+engine_address = grpcs.example.com:443
+action_cache_address = grpcs.example.com:443
+cas_address = grpcs.example.com:443
+credential_helper = /usr/local/bin/my-credential-helper --some-flag
+```
+
+The helper follows the
+[Bazel credential helper protocol](https://github.com/EngFlow/credential-helper-spec),
+so helpers written for Bazel (`--credential_helper`) work with buck2. buck2 runs
+the helper as `<helper> get`, writes a JSON request to its stdin, and reads a
+JSON response from its stdout:
+
+```json
+{"uri": "https://grpcs.example.com:443/"}
+```
+
+```json
+{
+  "headers": {"Authorization": ["Bearer <token>"]},
+  "expires": "2030-01-01T12:00:00Z"
+}
+```
+
+- `headers` - headers to add to every request to that endpoint. They are added
+  to the ones in `http_headers`; a header from the helper replaces a static
+  header of the same name.
+- `expires` - optional RFC 3339 timestamp after which the helper is invoked
+  again. Without it, the credentials are cached for
+  `credential_helper_cache_secs`.
+
+The helper is invoked once per endpoint address and its response is cached
+until it expires. If the remote rejects a request with `UNAUTHENTICATED`, the
+cached credentials are dropped and the request is retried with fresh ones. A
+helper that exits with a non-zero status fails the requests that needed its
+credentials; its stderr is included in the error.
 
 Buck2 uses `SHA256` for all its hashing by default. If your RE engine requires
 something else, this can be configured in `.buckconfig` as follows:
