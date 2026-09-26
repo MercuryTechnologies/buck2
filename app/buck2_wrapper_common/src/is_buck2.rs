@@ -32,6 +32,10 @@ pub(crate) fn is_buck2_exe(path: &Path, who_is_asking: WhoIsAsking) -> bool {
         OsStr::new("buck2 (deleted)"),
         OsStr::new("buck2-daemon"),
         OsStr::new("buck2-daemon (deleted)"),
+        // The machine-local CAS daemon buck2 starts on demand; `buck2 killall` stops it too,
+        // which is also how a new buck2 gets a new daemon after an upgrade.
+        OsStr::new("buck2-casd"),
+        OsStr::new("buck2-casd (deleted)"),
     ]
     .contains(&file_stem)
     {
@@ -75,6 +79,13 @@ mod tests {
 
         assert!(is_buck2_exe(Path::new(fake_buck), WhoIsAsking::Buck2));
         assert!(is_buck2_exe(Path::new(fake_buck), WhoIsAsking::BuckWrapper));
+        let fake_casd = if cfg!(windows) {
+            "C:\\dir\\buck2-casd.exe"
+        } else {
+            "/dir/buck2-casd"
+        };
+        assert!(is_buck2_exe(Path::new(fake_casd), WhoIsAsking::Buck2));
+        assert!(is_buck2_exe(Path::new(fake_casd), WhoIsAsking::BuckWrapper));
 
         let current_exe = env::current_exe().unwrap();
 
