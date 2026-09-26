@@ -10,6 +10,8 @@
 
 use buck2_common::invocation_paths::InvocationPaths;
 #[cfg(not(fbcode_build))]
+use buck2_credential_helper::CredentialHelperSettings;
+#[cfg(not(fbcode_build))]
 use buck2_error::ErrorTag;
 #[cfg(not(fbcode_build))]
 use buck2_events::sink::remote::BesEventFormat;
@@ -22,6 +24,7 @@ struct BuckconfigBesSettings {
     bes_backend: Option<String>,
     bes_headers: Vec<(String, String)>,
     bes_tls: BesTls,
+    bes_credential_helper: Option<CredentialHelperSettings>,
     build_metadata: Vec<(String, String)>,
     bes_event_format: Option<BesEventFormat>,
     bazel_artifact_upload: Option<bool>,
@@ -47,6 +50,7 @@ pub fn with_buckconfig_overrides(
             }
             config.bes_headers = settings.bes_headers;
             config.bes_tls = settings.bes_tls;
+            config.bes_credential_helper = settings.bes_credential_helper;
             config.build_metadata = settings.build_metadata;
             if let Some(bes_event_format) = settings.bes_event_format {
                 config.event_format = bes_event_format;
@@ -127,6 +131,7 @@ fn read_buckconfig_bes_settings(
             bes_backend: None,
             bes_headers: Vec::new(),
             bes_tls: BesTls::default(),
+            bes_credential_helper: None,
             build_metadata: Vec::new(),
             bes_event_format: None,
             bazel_artifact_upload: None,
@@ -192,13 +197,16 @@ fn read_buckconfig_bes_settings(
             ));
         }
     };
-    let mut bes_headers = parse_bes_headers(root_config.parse_list::<String>(BuckconfigKeyRef {
+    let mut bes_headers =
+        parse_bes_headers(root_config.parse_list::<String>(BuckconfigKeyRef {
             section: "bes",
             property: "header",
         })?)?;
+    let mut bes_credential_helper = None;
     if bes_headers.is_empty() {
         if let Some(connection) = &connection {
             bes_headers = connection.headers.clone();
+            bes_credential_helper = connection.credential_helper.clone();
         }
     }
     let bes_tls = connection
@@ -215,7 +223,11 @@ fn read_buckconfig_bes_settings(
             property: "backend",
         })
         .map(str::to_owned)
-        .or_else(|| connection.as_ref().map(|connection| connection.backend.clone()));
+        .or_else(|| {
+            connection
+                .as_ref()
+                .map(|connection| connection.backend.clone())
+        });
     // No backend, no sink: a results URL would name a page that never gets written.
     let bes_results_url = bes_results_url.filter(|_| bes_backend.is_some());
 
@@ -223,6 +235,7 @@ fn read_buckconfig_bes_settings(
         bes_backend: bes_backend.clone(),
         bes_headers,
         bes_tls,
+        bes_credential_helper,
         build_metadata: parse_bes_build_metadata(root_config.parse_list::<String>(
             BuckconfigKeyRef {
                 section: "bes",

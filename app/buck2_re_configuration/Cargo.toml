@@ -11,6 +11,7 @@ license.workspace = true
 allocative.workspace = true
 buck2_common.workspace = true
 buck2_core.workspace = true
+buck2_credential_helper.workspace = true
 buck2_error.workspace = true
 
 [lints]
