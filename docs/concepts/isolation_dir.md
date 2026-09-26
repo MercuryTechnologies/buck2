@@ -63,6 +63,14 @@ significantly increase resource consumption due to duplicated caches and
 artifacts. Each isolation directory requires its own memory, disk space, and
 potentially network usage. :::
 
+When remote execution or a remote cache is in use, the duplicated blobs can be
+avoided by pointing every daemon at one
+[local CAS daemon](../users/remote_execution.md#sharing-downloaded-blobs-between-daemons),
+which stores each blob once and clones it into every isolation directory that
+needs it. Note that action cache entries are not shared between isolation
+directories, because an action's output paths, and therefore its digest,
+include the isolation directory name.
+
 ## When to Use Different Isolation Directories
 
 Isolation directories are particularly useful in the following scenarios:

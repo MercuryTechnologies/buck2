@@ -10,6 +10,7 @@
 
 #![allow(clippy::needless_update)]
 
+mod casd_autostart;
 mod client;
 mod digest;
 mod error;
@@ -17,7 +18,9 @@ mod grpc;
 mod metadata;
 mod request;
 mod response;
+mod shared_cache;
 mod stats;
+mod unix_socket;
 
 use std::sync::Arc;
 use std::sync::OnceLock;
@@ -30,6 +33,7 @@ pub use grpc::*;
 pub use metadata::*;
 pub use request::*;
 pub use response::*;
+pub use shared_cache::SharedCasCache;
 
 /// The global version of the network stats full of atomics
 #[derive(Default, Debug)]
