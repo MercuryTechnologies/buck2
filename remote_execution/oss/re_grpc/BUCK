@@ -6,6 +6,8 @@ rust_library(
     name = "remote_execution",
     srcs = glob(["src/**/*.rs"]),
     test_deps = [
+        "fbsource//third-party/rust:bytes",
+        "fbsource//third-party/rust:http-body-util",
         "fbsource//third-party/rust:tempfile",
         "fbsource//third-party/rust:tokio-stream",
     ],

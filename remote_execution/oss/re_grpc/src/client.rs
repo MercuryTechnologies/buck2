@@ -768,13 +768,26 @@ enum Recovery {
 }
 
 fn recovery_for_error(err: &anyhow::Error) -> Recovery {
-    if is_broken_connection_error(err) {
-        Recovery::Reconnect
-    } else if error_tcode(err) == Some(TCode::UNAUTHENTICATED) {
+    // Before the broken-connection test: a proxy's 401 arrives as INTERNAL, which that test
+    // would otherwise be the one to look at.
+    if error_rejects_credentials(err) {
         Recovery::RefreshCredentials
+    } else if is_broken_connection_error(err) {
+        Recovery::Reconnect
     } else {
         Recovery::None
     }
+}
+
+fn error_rejects_credentials(err: &anyhow::Error) -> bool {
+    error_tcode(err) == Some(TCode::UNAUTHENTICATED)
+        || err
+            .downcast_ref::<tonic::Status>()
+            .is_some_and(buck2_credential_helper::status_rejects_credentials)
+        || err
+            .downcast_ref::<io::Error>()
+            .and_then(tonic_status_from_io_error)
+            .is_some_and(buck2_credential_helper::status_rejects_credentials)
 }
 
 /// `recover` is asked to reconnect after a broken connection, as before, and to refresh
@@ -810,7 +823,12 @@ where
                     continue;
                 }
 
-                if retry_attempt >= retries || !is_retryable_grpc_error(&err) {
+                // Refused credentials that could not be refreshed would be refused again: a proxy's
+                // 401 reads as INTERNAL, which the retry policy would otherwise repeat.
+                if retry_attempt >= retries
+                    || !is_retryable_grpc_error(&err)
+                    || recovery == Recovery::RefreshCredentials
+                {
                     return Err(normalize_grpc_error(err));
                 }
 
@@ -8626,6 +8644,183 @@ mod tests {
         held?;
 
         assert_eq!(state.seen_tokens.lock().unwrap().len(), 3);
+        server.abort();
+        Ok(())
+    }
+
+    /// Stands in front of the real server the way Namespace's ingress does: a request whose
+    /// bearer it does not accept gets HTTP 401 with a plain-text body and no gRPC status.
+    #[derive(Clone)]
+    struct RefuseLikeAProxy<S> {
+        inner: S,
+        expected_token: Arc<Mutex<String>>,
+        seen_tokens: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl<S> tower::Service<http::Request<tonic::body::Body>> for RefuseLikeAProxy<S>
+    where
+        S: tower::Service<
+                http::Request<tonic::body::Body>,
+                Response = http::Response<tonic::body::Body>,
+            > + Clone
+            + Send
+            + 'static,
+        S::Future: Send + 'static,
+    {
+        type Response = S::Response;
+        type Error = S::Error;
+        type Future = futures::future::BoxFuture<'static, Result<Self::Response, Self::Error>>;
+
+        fn poll_ready(
+            &mut self,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), Self::Error>> {
+            self.inner.poll_ready(cx)
+        }
+
+        fn call(&mut self, request: http::Request<tonic::body::Body>) -> Self::Future {
+            let token = request
+                .headers()
+                .get("authorization")
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or_default()
+                .to_owned();
+            self.seen_tokens.lock().unwrap().push(token.clone());
+            if token != *self.expected_token.lock().unwrap() {
+                let response = http::Response::builder()
+                    .status(http::StatusCode::UNAUTHORIZED)
+                    .header("content-type", "text/plain")
+                    .body(tonic::body::Body::new(http_body_util::Full::new(
+                        bytes::Bytes::from_static(b"invalid bearer token\n"),
+                    )))
+                    .unwrap();
+                return Box::pin(async move { Ok(response) });
+            }
+            Box::pin(self.inner.call(request))
+        }
+    }
+
+    async fn serve_behind_refusing_proxy(
+        expected_token: &str,
+    ) -> anyhow::Result<(String, Arc<Mutex<Vec<String>>>, tokio::task::JoinHandle<()>)> {
+        let expected_token = Arc::new(Mutex::new(expected_token.to_owned()));
+        let seen_tokens = Arc::new(Mutex::new(Vec::new()));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let address = format!("grpc://{}", listener.local_addr()?);
+        let layer = {
+            let expected_token = expected_token.clone();
+            let seen_tokens = seen_tokens.clone();
+            tower::layer::layer_fn(move |inner| RefuseLikeAProxy {
+                inner,
+                expected_token: expected_token.clone(),
+                seen_tokens: seen_tokens.clone(),
+            })
+        };
+        let server = tokio::spawn(async move {
+            let _ = tonic::transport::Server::builder()
+                .layer(layer)
+                .add_service(ActionCacheServer::new(PassingActionCache))
+                .serve_with_incoming(TcpListenerStream::new(listener))
+                .await;
+        });
+        Ok((address, seen_tokens, server))
+    }
+
+    struct PassingActionCache;
+
+    #[tonic::async_trait]
+    impl ActionCache for PassingActionCache {
+        async fn get_action_result(
+            &self,
+            _request: tonic::Request<GetActionResultRequest>,
+        ) -> Result<tonic::Response<ActionResult>, tonic::Status> {
+            Ok(tonic::Response::new(ActionResult {
+                execution_metadata: Some(ExecutedActionMetadata::default()),
+                ..Default::default()
+            }))
+        }
+
+        async fn update_action_result(
+            &self,
+            _request: tonic::Request<UpdateActionResultRequest>,
+        ) -> Result<tonic::Response<ActionResult>, tonic::Status> {
+            Err(tonic::Status::unimplemented("not used by this test"))
+        }
+    }
+
+    fn action_result_request() -> ActionResultRequest {
+        ActionResultRequest {
+            digest: TDigest {
+                hash: "ab".repeat(32),
+                size_in_bytes: 1,
+                _dot_dot: (),
+            },
+            platform: None,
+            _dot_dot: (),
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_proxy_401_reruns_the_helper_and_retries_once() -> anyhow::Result<()> {
+        let (address, seen_tokens, server) = serve_behind_refusing_proxy("Bearer two").await?;
+        let dir = tempfile::tempdir()?;
+        let calls = dir.path().join("calls");
+        std::fs::write(&calls, "0")?;
+        // The first call hands out the token the proxy refuses, later calls the one it takes.
+        let script = dir.path().join("helper.sh");
+        std::fs::write(
+            &script,
+            format!(
+                "[ \"$1\" = get ] || exit 3\nn=$(cat {c}); echo $((n + 1)) > {c}\nif [ \"$n\" = 0 ]; then t=one; else t=two; fi\nprintf '{{\"headers\": {{\"authorization\": [\"Bearer %s\"]}}}}' \"$t\"\n",
+                c = calls.display()
+            ),
+        )?;
+        let opts = Buck2OssReConfiguration {
+            cas_address: Some(address.clone()),
+            engine_address: Some(address.clone()),
+            action_cache_address: Some(address),
+            tls: Some(false),
+            capabilities: Some(false),
+            retries: Some(0),
+            credential_helper: Some(format!("/bin/sh {}", script.display())),
+            ..Default::default()
+        };
+        let client = REClientBuilder::build_and_connect(&opts).await?;
+
+        client
+            .get_action_result(&RemoteExecutionMetadata::default(), action_result_request())
+            .await?;
+
+        assert_eq!(*seen_tokens.lock().unwrap(), ["Bearer one", "Bearer two"]);
+        assert_eq!(std::fs::read_to_string(&calls)?.trim(), "2");
+        server.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_proxy_401_without_a_helper_is_not_retried() -> anyhow::Result<()> {
+        let (address, seen_tokens, server) = serve_behind_refusing_proxy("Bearer two").await?;
+        let opts = Buck2OssReConfiguration {
+            cas_address: Some(address.clone()),
+            engine_address: Some(address.clone()),
+            action_cache_address: Some(address),
+            tls: Some(false),
+            capabilities: Some(false),
+            retries: Some(3),
+            ..Default::default()
+        };
+        let client = REClientBuilder::build_and_connect(&opts).await?;
+
+        let Err(err) = client
+            .get_action_result(&RemoteExecutionMetadata::default(), action_result_request())
+            .await
+        else {
+            panic!("the proxy refused the only credentials there are");
+        };
+
+        assert!(format!("{err:#}").contains("401"), "{err:#}");
+        assert_eq!(seen_tokens.lock().unwrap().len(), 1);
         server.abort();
         Ok(())
     }
