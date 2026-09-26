@@ -581,14 +581,20 @@ impl Buck2OssReConfiguration {
                 section: BUCK2_RE_CLIENT_CFG_SECTION,
                 property: "tls",
             })?,
-            tls_ca_certs: legacy_config.parse(BuckconfigKeyRef {
-                section: BUCK2_RE_CLIENT_CFG_SECTION,
-                property: "tls_ca_certs",
-            })?,
-            tls_client_cert: legacy_config.parse(BuckconfigKeyRef {
-                section: BUCK2_RE_CLIENT_CFG_SECTION,
-                property: "tls_client_cert",
-            })?,
+            // An empty value unsets the key, so a `.buckconfig.local` can drop a certificate
+            // that a file it includes, or one written by a tool such as nsc, has set.
+            tls_ca_certs: legacy_config
+                .parse::<String>(BuckconfigKeyRef {
+                    section: BUCK2_RE_CLIENT_CFG_SECTION,
+                    property: "tls_ca_certs",
+                })?
+                .filter(|path| !path.trim().is_empty()),
+            tls_client_cert: legacy_config
+                .parse::<String>(BuckconfigKeyRef {
+                    section: BUCK2_RE_CLIENT_CFG_SECTION,
+                    property: "tls_client_cert",
+                })?
+                .filter(|path| !path.trim().is_empty()),
             http_headers: legacy_config
                 .parse_list(BuckconfigKeyRef {
                     section: BUCK2_RE_CLIENT_CFG_SECTION,
@@ -820,6 +826,25 @@ mod tests {
                 ("x-b".to_owned(), "two words".to_owned()),
             ]
         );
+        Ok(())
+    }
+
+    #[test]
+    fn empty_tls_paths_unset_the_certificates() -> buck2_error::Result<()> {
+        let legacy_config = parse(
+            &[(
+                "config",
+                "[buck2_re_client]\nengine_address = grpcs://reapi.example:443\ntls_ca_certs =\ntls_client_cert =\n",
+            )],
+            "config",
+        )?;
+        let config = Buck2OssReConfiguration::from_legacy_config(&legacy_config, Vec::new())?;
+        assert_eq!(config.tls_ca_certs, None);
+        assert_eq!(config.tls_client_cert, None);
+
+        let connection = BesConnection::from_re_client(&legacy_config)?.expect("engine configured");
+        assert_eq!(connection.tls_ca_certs, None);
+        assert_eq!(connection.tls_client_cert, None);
         Ok(())
     }
 
