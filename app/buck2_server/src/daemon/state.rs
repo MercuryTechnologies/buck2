@@ -433,13 +433,18 @@ impl DaemonState {
                     .map(|connection| connection.backend.clone())
             });
             #[cfg(not(fbcode_build))]
-            let bes_headers = if bes_headers.is_empty() {
+            let (bes_headers, bes_credential_helper) = if bes_headers.is_empty() {
                 bes_connection
                     .as_ref()
-                    .map(|connection| connection.headers.clone())
+                    .map(|connection| {
+                        (
+                            connection.headers.clone(),
+                            connection.credential_helper.clone(),
+                        )
+                    })
                     .unwrap_or_default()
             } else {
-                bes_headers
+                (bes_headers, None)
             };
             #[cfg(not(fbcode_build))]
             let bes_tls = bes_connection
@@ -547,6 +552,8 @@ impl DaemonState {
                     bes_headers,
                     #[cfg(not(fbcode_build))]
                     bes_tls,
+                    #[cfg(not(fbcode_build))]
+                    bes_credential_helper,
                     #[cfg(not(fbcode_build))]
                     build_metadata,
                     #[cfg(not(fbcode_build))]

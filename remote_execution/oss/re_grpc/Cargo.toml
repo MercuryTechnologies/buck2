@@ -11,6 +11,7 @@ license.workspace = true
 anyhow.workspace = true
 async-compression.workspace = true
 blake3.workspace = true
+buck2_credential_helper.workspace = true
 buck2_data.workspace = true
 buck2_events.workspace = true
 buck2_re_configuration.workspace = true
@@ -39,6 +40,7 @@ uuid.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+tokio-stream.workspace = true
 
 [lints]
 workspace = true
