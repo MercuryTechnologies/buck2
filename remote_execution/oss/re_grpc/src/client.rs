@@ -33,6 +33,9 @@ use async_compression::tokio::bufread::DeflateDecoder;
 use async_compression::tokio::bufread::DeflateEncoder;
 use async_compression::tokio::bufread::ZstdDecoder;
 use async_compression::tokio::bufread::ZstdEncoder;
+use buck2_credential_helper::CredentialHelper;
+use buck2_credential_helper::CredentialHelperSettings;
+use buck2_credential_helper::Credentials;
 use buck2_events::dispatch::span_async;
 use buck2_re_configuration::Buck2OssReConfiguration;
 use buck2_re_configuration::HttpHeader;
@@ -753,34 +756,66 @@ where
     Fut: Future<Output = anyhow::Result<T>>,
     F: FnMut() -> Fut,
 {
-    retry_grpc_request_with_reconnect(retries, retry_max_delay, request, || async {}).await
+    retry_grpc_request_with_recovery(retries, retry_max_delay, request, |_| async { false }).await
 }
 
-async fn retry_grpc_request_with_reconnect<T, Fut, F, RFut, R>(
+/// What a failed attempt asks of the client before the next one.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+enum Recovery {
+    None,
+    Reconnect,
+    RefreshCredentials,
+}
+
+fn recovery_for_error(err: &anyhow::Error) -> Recovery {
+    if is_broken_connection_error(err) {
+        Recovery::Reconnect
+    } else if error_tcode(err) == Some(TCode::UNAUTHENTICATED) {
+        Recovery::RefreshCredentials
+    } else {
+        Recovery::None
+    }
+}
+
+/// `recover` is asked to reconnect after a broken connection, as before, and to refresh
+/// credentials after UNAUTHENTICATED. A refresh it confirms is followed by one attempt at once,
+/// outside the retry budget and the code's retry policy, and only once per call: a remote that
+/// rejects the refreshed credentials too fails the call instead of running the helper in a loop.
+async fn retry_grpc_request_with_recovery<T, Fut, F, RFut, R>(
     retries: usize,
     retry_max_delay: Duration,
     mut request: F,
-    mut reconnect: R,
+    mut recover: R,
 ) -> anyhow::Result<T>
 where
     Fut: Future<Output = anyhow::Result<T>>,
     F: FnMut() -> Fut,
-    RFut: Future<Output = ()>,
-    R: FnMut() -> RFut,
+    RFut: Future<Output = bool>,
+    R: FnMut(Recovery) -> RFut,
 {
     let mut retry_attempt = 0usize;
     let mut next_delay = Duration::from_millis(GRPC_RETRY_INITIAL_DELAY_MILLIS);
+    let mut credentials_refreshed = false;
 
     loop {
         match request().await {
             Ok(response) => return Ok(response),
             Err(err) => {
+                let recovery = recovery_for_error(&err);
+                if recovery == Recovery::RefreshCredentials
+                    && !credentials_refreshed
+                    && recover(recovery).await
+                {
+                    credentials_refreshed = true;
+                    continue;
+                }
+
                 if retry_attempt >= retries || !is_retryable_grpc_error(&err) {
                     return Err(normalize_grpc_error(err));
                 }
 
-                if is_broken_connection_error(&err) {
-                    reconnect().await;
+                if recovery == Recovery::Reconnect {
+                    recover(recovery).await;
                 }
 
                 let delay = grpc_error_retry_delay(&err)
@@ -811,11 +846,9 @@ where
     Fut: Future<Output = anyhow::Result<T>>,
     F: FnMut() -> Fut,
 {
-    retry_grpc_request_with_reconnect(retries, retry_max_delay, request, || {
+    retry_grpc_request_with_recovery(retries, retry_max_delay, request, |recovery| {
         let grpc_clients = grpc_clients.clone();
-        async move {
-            grpc_clients.reconnect_after_broken_connection(kind).await;
-        }
+        async move { grpc_clients.recover(kind, recovery).await }
     })
     .await
 }
@@ -857,7 +890,7 @@ async fn execute_stream(
                 let metadata = metadata.clone();
                 let request = request.clone();
                 async move {
-                    let mut client = grpc_clients.execution_client().await;
+                    let mut client = grpc_clients.execution_client().await?;
                     Ok(client
                         .execute(with_re_metadata(
                             request,
@@ -899,7 +932,7 @@ async fn wait_execution_stream(
                 let metadata = metadata.clone();
                 let operation_name = operation_name.clone();
                 async move {
-                    let mut client = grpc_clients.execution_client().await;
+                    let mut client = grpc_clients.execution_client().await?;
                     Ok(client
                         .wait_execution(with_re_metadata(
                             WaitExecutionRequest {
@@ -2235,30 +2268,43 @@ impl REClientBuilder {
         let request_metadata_tool_name = request_metadata_tool_name_from_options(opts)?;
         let tls_config = Arc::new(tokio::sync::OnceCell::new());
         let channel_settings = GrpcChannelSettings::from_options(opts);
+        let credential_helper = CredentialHelperSettings::from_options(
+            opts.credential_helper.as_deref(),
+            opts.credential_helper_timeout_secs,
+            opts.credential_helper_cache_secs,
+        )
+        .map(|settings| settings.build())
+        .transpose()?
+        .map(Arc::new);
         let cas_connector = GrpcChannelConnector::new(
             opts.cas_address.clone(),
             channel_settings.clone(),
             tls_config.clone(),
+            credential_helper.clone(),
         );
         let execution_connector = GrpcChannelConnector::new(
             opts.engine_address.clone(),
             channel_settings.clone(),
             tls_config.clone(),
+            credential_helper.clone(),
         );
         let action_cache_connector = GrpcChannelConnector::new(
             opts.action_cache_address.clone(),
             channel_settings.clone(),
             tls_config.clone(),
+            credential_helper.clone(),
         );
         let bytestream_connector = GrpcChannelConnector::new(
             opts.cas_address.clone(),
             channel_settings.clone(),
             tls_config.clone(),
+            credential_helper.clone(),
         );
         let capabilities_connector = GrpcChannelConnector::new(
             opts.engine_address.clone(),
             channel_settings,
             tls_config.clone(),
+            credential_helper.clone(),
         );
 
         let (cas, action_cache, bytestream, capabilities) = futures::future::join4(
@@ -2281,15 +2327,14 @@ impl REClientBuilder {
 
         let interceptor = InjectHeadersInterceptor::new(&opts.http_headers)?;
 
-        let mut capabilities_client = CapabilitiesClient::with_interceptor(
+        let capabilities_client = ResettableGrpcClient::new(
             capabilities.context("Error creating Capabilities client")?,
+            capabilities_connector,
             interceptor.dupe(),
+            opts.max_decoding_message_size
+                .unwrap_or(DEFAULT_MAX_TOTAL_BATCH_SIZE * 2),
+            build_capabilities_client,
         );
-
-        if let Some(max_decoding_message_size) = opts.max_decoding_message_size {
-            capabilities_client =
-                capabilities_client.max_decoding_message_size(max_decoding_message_size);
-        }
 
         let instance_name = InstanceName(opts.instance_name.clone());
         let retries = opts.retries.unwrap_or(DEFAULT_RETRIES);
@@ -2307,7 +2352,7 @@ impl REClientBuilder {
 
         let capabilities = if opts.capabilities.unwrap_or(true) {
             Self::fetch_rbe_capabilities(
-                &mut capabilities_client,
+                &capabilities_client,
                 &instance_name,
                 opts.max_total_batch_size,
                 retries,
@@ -2440,6 +2485,7 @@ impl REClientBuilder {
                 max_decoding_msg_size,
                 build_bytestream_client,
             ),
+            credential_helper,
         };
 
         Ok(REClient::new(
@@ -2473,7 +2519,7 @@ impl REClientBuilder {
     }
 
     async fn fetch_rbe_capabilities(
-        client: &mut CapabilitiesClient<GrpcService>,
+        client: &ResettableGrpcClient<CapabilitiesClient<GrpcService>>,
         instance_name: &InstanceName,
         max_total_batch_size: Option<usize>,
         retries: usize,
@@ -2483,12 +2529,14 @@ impl REClientBuilder {
         // TODO use more of the capabilities of the remote build executor
 
         let resp = retry_grpc_request(retries, Duration::from_millis(retry_max_delay_ms), || {
-            let mut client = client.clone();
             let mut request = tonic::Request::new(GetCapabilitiesRequest {
                 instance_name: instance_name.as_str().to_owned(),
             });
             request.set_timeout(grpc_request_timeout);
-            async move { Ok(client.get_capabilities(request).await?.into_inner()) }
+            async move {
+                let mut client = client.client().await?;
+                Ok(client.get_capabilities(request).await?.into_inner())
+            }
         })
         .await
         .context("Failed to query capabilities of remote")?;
@@ -2614,7 +2662,10 @@ impl REClientBuilder {
 
 #[derive(Clone, Dupe)]
 struct InjectHeadersInterceptor {
+    /// Static headers from the configuration.
     headers: Arc<Vec<(MetadataKey<metadata::Ascii>, MetadataValue<metadata::Ascii>)>>,
+    /// Headers from the credential helper, which take precedence over the static ones.
+    credentials: Option<Arc<Credentials>>,
 }
 
 impl InjectHeadersInterceptor {
@@ -2641,7 +2692,16 @@ impl InjectHeadersInterceptor {
 
         Ok(Self {
             headers: Arc::new(headers),
+            credentials: None,
         })
+    }
+
+    /// An interceptor that also injects the headers of `credentials`, if any.
+    fn with_credentials(&self, credentials: Option<Arc<Credentials>>) -> Self {
+        Self {
+            headers: self.headers.dupe(),
+            credentials,
+        }
     }
 }
 
@@ -2652,6 +2712,17 @@ impl Interceptor for InjectHeadersInterceptor {
     ) -> Result<tonic::Request<()>, tonic::Status> {
         for (k, v) in self.headers.iter() {
             request.metadata_mut().insert(k.clone(), v.clone());
+        }
+        if let Some(credentials) = &self.credentials {
+            let metadata = request.metadata_mut();
+            // A header from the helper replaces a static header of the same name, but a helper
+            // header with several values keeps all of them.
+            for (k, _) in credentials.headers() {
+                metadata.remove(k.clone());
+            }
+            for (k, v) in credentials.headers() {
+                metadata.append(k.clone(), v.clone());
+            }
         }
         Ok(request)
     }
@@ -2703,6 +2774,7 @@ struct GrpcChannelConnector {
     address: Option<String>,
     settings: GrpcChannelSettings,
     tls_config: Arc<tokio::sync::OnceCell<ClientTlsConfig>>,
+    credential_helper: Option<Arc<CredentialHelper>>,
 }
 
 impl GrpcChannelConnector {
@@ -2710,19 +2782,39 @@ impl GrpcChannelConnector {
         address: Option<String>,
         settings: GrpcChannelSettings,
         tls_config: Arc<tokio::sync::OnceCell<ClientTlsConfig>>,
+        credential_helper: Option<Arc<CredentialHelper>>,
     ) -> Self {
         Self {
             address,
             settings,
             tls_config,
+            credential_helper,
         }
     }
 
-    async fn connect(&self) -> anyhow::Result<Channel> {
+    fn address(&self) -> anyhow::Result<String> {
         let address = self.address.as_ref().context("No address")?;
-        let address = substitute_env_vars(address).context("Invalid address")?;
+        substitute_env_vars(address).context("Invalid address")
+    }
+
+    fn uri(&self, address: &str) -> anyhow::Result<(Uri, bool)> {
         let uri = address.parse().context("Invalid address")?;
-        let (uri, tls) = prepare_uri(uri, self.settings.tls.tls).context("Invalid URI")?;
+        prepare_uri(uri, self.settings.tls.tls).context("Invalid URI")
+    }
+
+    /// The helper is asked for the address with the scheme the TLS setting implies,
+    /// `https://host:port/`, which is what a helper written for Bazel keys its answers on.
+    async fn credentials(&self) -> anyhow::Result<Option<Arc<Credentials>>> {
+        let Some(helper) = &self.credential_helper else {
+            return Ok(None);
+        };
+        let (uri, _tls) = self.uri(&self.address()?)?;
+        Ok(Some(helper.get(&uri.to_string()).await?))
+    }
+
+    async fn connect(&self) -> anyhow::Result<Channel> {
+        let address = self.address()?;
+        let (uri, tls) = self.uri(&address)?;
 
         let mut endpoint = Channel::builder(uri);
         if tls {
@@ -2767,14 +2859,14 @@ impl GrpcChannelConnector {
 }
 
 struct ResettableGrpcClient<C> {
-    client: tokio::sync::RwLock<C>,
+    channel: tokio::sync::RwLock<Channel>,
     connector: GrpcChannelConnector,
     interceptor: InjectHeadersInterceptor,
     max_decoding_message_size: usize,
     build_client: fn(Channel, InjectHeadersInterceptor, usize) -> C,
 }
 
-impl<C: Clone> ResettableGrpcClient<C> {
+impl<C> ResettableGrpcClient<C> {
     fn new(
         channel: Channel,
         connector: GrpcChannelConnector,
@@ -2782,9 +2874,8 @@ impl<C: Clone> ResettableGrpcClient<C> {
         max_decoding_message_size: usize,
         build_client: fn(Channel, InjectHeadersInterceptor, usize) -> C,
     ) -> Self {
-        let client = build_client(channel, interceptor.dupe(), max_decoding_message_size);
         Self {
-            client: tokio::sync::RwLock::new(client),
+            channel: tokio::sync::RwLock::new(channel),
             connector,
             interceptor,
             max_decoding_message_size,
@@ -2792,18 +2883,21 @@ impl<C: Clone> ResettableGrpcClient<C> {
         }
     }
 
-    async fn client(&self) -> C {
-        self.client.read().await.clone()
+    /// A client for one request. It is built here rather than once, so the request carries the
+    /// credentials current at this moment; the channel underneath is shared and outlives them.
+    async fn client(&self) -> anyhow::Result<C> {
+        let credentials = self.connector.credentials().await?;
+        let channel = self.channel.read().await.clone();
+        Ok((self.build_client)(
+            channel,
+            self.interceptor.with_credentials(credentials),
+            self.max_decoding_message_size,
+        ))
     }
 
     async fn reconnect(&self) -> anyhow::Result<()> {
         let channel = self.connector.connect().await?;
-        let client = (self.build_client)(
-            channel,
-            self.interceptor.dupe(),
-            self.max_decoding_message_size,
-        );
-        *self.client.write().await = client;
+        *self.channel.write().await = channel;
         Ok(())
     }
 }
@@ -2827,7 +2921,7 @@ struct ResettableGrpcClientPool<C> {
     next_client: AtomicUsize,
 }
 
-impl<C: Clone> ResettableGrpcClientPool<C> {
+impl<C> ResettableGrpcClientPool<C> {
     fn new(
         channels: Vec<Channel>,
         connector: GrpcChannelConnector,
@@ -2853,7 +2947,7 @@ impl<C: Clone> ResettableGrpcClientPool<C> {
         }
     }
 
-    async fn client(&self) -> C {
+    async fn client(&self) -> anyhow::Result<C> {
         let index = self.next_client.fetch_add(1, Ordering::Relaxed) % self.clients.len();
         self.clients[index].client().await
     }
@@ -2908,6 +3002,15 @@ fn build_bytestream_client(
         .max_decoding_message_size(max_decoding_message_size)
 }
 
+fn build_capabilities_client(
+    channel: Channel,
+    interceptor: InjectHeadersInterceptor,
+    max_decoding_message_size: usize,
+) -> CapabilitiesClient<GrpcService> {
+    CapabilitiesClient::with_interceptor(channel, interceptor)
+        .max_decoding_message_size(max_decoding_message_size)
+}
+
 #[derive(Debug, Copy, Clone)]
 enum GrpcClientKind {
     Cas,
@@ -2921,23 +3024,44 @@ pub struct GRPCClients {
     execution_client: ResettableGrpcClientPool<ExecutionClient<GrpcService>>,
     action_cache_client: ResettableGrpcClient<ActionCacheClient<GrpcService>>,
     bytestream_client: ResettableGrpcClient<ByteStreamClient<GrpcService>>,
+    /// The helper every connector above asks; held here to drop its cache when a remote
+    /// rejects what it handed out.
+    credential_helper: Option<Arc<CredentialHelper>>,
 }
 
 impl GRPCClients {
-    async fn cas_client(&self) -> ContentAddressableStorageClient<GrpcService> {
+    async fn cas_client(&self) -> anyhow::Result<ContentAddressableStorageClient<GrpcService>> {
         self.cas_client.client().await
     }
 
-    async fn execution_client(&self) -> ExecutionClient<GrpcService> {
+    async fn execution_client(&self) -> anyhow::Result<ExecutionClient<GrpcService>> {
         self.execution_client.client().await
     }
 
-    async fn action_cache_client(&self) -> ActionCacheClient<GrpcService> {
+    async fn action_cache_client(&self) -> anyhow::Result<ActionCacheClient<GrpcService>> {
         self.action_cache_client.client().await
     }
 
-    async fn bytestream_client(&self) -> ByteStreamClient<GrpcService> {
+    async fn bytestream_client(&self) -> anyhow::Result<ByteStreamClient<GrpcService>> {
         self.bytestream_client.client().await
+    }
+
+    /// True when the next attempt will carry different credentials.
+    async fn recover(&self, kind: GrpcClientKind, recovery: Recovery) -> bool {
+        match recovery {
+            Recovery::None => false,
+            Recovery::Reconnect => {
+                self.reconnect_after_broken_connection(kind).await;
+                false
+            }
+            Recovery::RefreshCredentials => match &self.credential_helper {
+                Some(helper) => {
+                    helper.invalidate().await;
+                    true
+                }
+                None => false,
+            },
+        }
     }
 
     async fn reconnect(&self, kind: GrpcClientKind) -> anyhow::Result<()> {
@@ -3415,7 +3539,7 @@ impl REClient {
                     let metadata = metadata.clone();
                     let action_digest = action_digest.clone();
                     async move {
-                        let mut client = grpc_clients.action_cache_client().await;
+                        let mut client = grpc_clients.action_cache_client().await?;
                         client
                             .get_action_result(with_re_metadata_timeout(
                                 GetActionResultRequest {
@@ -3482,7 +3606,7 @@ impl REClient {
                     let action_digest = action_digest.clone();
                     let action_result = action_result.clone();
                     async move {
-                        let mut client = grpc_clients.action_cache_client().await;
+                        let mut client = grpc_clients.action_cache_client().await?;
                         client
                             .update_action_result(with_re_metadata_timeout(
                                 UpdateActionResultRequest {
@@ -3952,7 +4076,7 @@ impl REClient {
                                 let metadata = metadata.clone();
                                 let re_request = re_request.clone();
                                 async move {
-                                    let mut cas_client = grpc_clients.cas_client().await;
+                                    let mut cas_client = grpc_clients.cas_client().await?;
                                     Ok(cas_client
                                         .batch_update_blobs(with_re_metadata_timeout(
                                             re_request,
@@ -3999,7 +4123,7 @@ impl REClient {
                                 let segments = segments.clone();
                                 async move {
                                     let mut bytestream_client =
-                                        grpc_clients.bytestream_client().await;
+                                        grpc_clients.bytestream_client().await?;
                                     let segments = match self
                                         .bystream_write_plan(
                                             &mut bytestream_client,
@@ -4386,7 +4510,7 @@ impl REClient {
                 let metadata = metadata.clone();
                 let blob_digest = blob_digest.clone();
                 async move {
-                    let mut client = grpc_clients.cas_client().await;
+                    let mut client = grpc_clients.cas_client().await?;
                     client
                         .split_blob(with_re_metadata_timeout(
                             GSplitBlobRequest {
@@ -4459,7 +4583,7 @@ impl REClient {
                 let blob_digest = blob_digest.clone();
                 let chunk_digests = chunk_digests.clone();
                 async move {
-                    let mut client = grpc_clients.cas_client().await;
+                    let mut client = grpc_clients.cas_client().await?;
                     client
                         .splice_blob(with_re_metadata_timeout(
                             GSpliceBlobRequest {
@@ -4552,7 +4676,7 @@ impl REClient {
                                 let metadata = metadata.clone();
                                 let re_request = re_request.clone();
                                 async move {
-                                    let mut client = grpc_clients.cas_client().await;
+                                    let mut client = grpc_clients.cas_client().await?;
                                     Ok(client
                                         .batch_read_blobs(with_re_metadata_timeout(
                                             re_request,
@@ -4594,7 +4718,7 @@ impl REClient {
                                 let metadata = metadata.clone();
                                 let read_request = read_request.clone();
                                 async move {
-                                    let mut client = grpc_clients.bytestream_client().await;
+                                    let mut client = grpc_clients.bytestream_client().await?;
                                     Ok(client
                                         .read(with_re_metadata(
                                             read_request,
@@ -4979,7 +5103,7 @@ impl REClient {
                             let requested_digests = requested_digests.clone();
                             let grpc_clients = self.grpc_clients.clone();
                             async move {
-                                let mut cas_client = grpc_clients.cas_client().await;
+                                let mut cas_client = grpc_clients.cas_client().await?;
                                 cas_client
                                     .find_missing_blobs(with_re_metadata_timeout(
                                         FindMissingBlobsRequest {
@@ -6725,8 +6849,11 @@ mod tests {
 
     use re_grpc_proto::build::bazel::remote::execution::v2::ActionCacheUpdateCapabilities;
     use re_grpc_proto::build::bazel::remote::execution::v2::FastCdc2020Params;
+    use re_grpc_proto::build::bazel::remote::execution::v2::action_cache_server::ActionCache;
+    use re_grpc_proto::build::bazel::remote::execution::v2::action_cache_server::ActionCacheServer;
     use re_grpc_proto::build::bazel::remote::execution::v2::batch_read_blobs_response;
     use re_grpc_proto::build::bazel::remote::execution::v2::batch_update_blobs_response;
+    use tokio_stream::wrappers::TcpListenerStream;
 
     use super::*;
 
@@ -8314,6 +8441,192 @@ mod tests {
         .to_string();
         assert!(failed.contains("bad digest"));
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn retry_grpc_request_retries_once_after_credentials_are_refreshed() {
+        let attempts = AtomicU16::new(0);
+        let result: anyhow::Result<()> = retry_grpc_request_with_recovery(
+            0,
+            Duration::from_millis(1),
+            || async {
+                attempts.fetch_add(1, Ordering::Relaxed);
+                Err(anyhow::Error::from(tonic::Status::unauthenticated(
+                    "token expired",
+                )))
+            },
+            |recovery| {
+                assert_eq!(recovery, Recovery::RefreshCredentials);
+                async { true }
+            },
+        )
+        .await;
+
+        let err = result.unwrap_err();
+        let err = err.downcast_ref::<REClientError>().expect("REClientError");
+        assert_eq!(err.code, TCode::UNAUTHENTICATED);
+        assert_eq!(attempts.load(Ordering::Relaxed), 2);
+
+        let attempts = AtomicU16::new(0);
+        retry_grpc_request_with_recovery(
+            0,
+            Duration::from_millis(1),
+            || async {
+                if attempts.fetch_add(1, Ordering::Relaxed) == 0 {
+                    Err(anyhow::Error::from(tonic::Status::unauthenticated(
+                        "token expired",
+                    )))
+                } else {
+                    Ok(())
+                }
+            },
+            |_| async { true },
+        )
+        .await
+        .unwrap();
+        assert_eq!(attempts.load(Ordering::Relaxed), 2);
+    }
+
+    #[tokio::test]
+    async fn retry_grpc_request_does_not_retry_unauthenticated_without_a_helper() {
+        let attempts = AtomicU16::new(0);
+        let result: anyhow::Result<()> =
+            retry_grpc_request(3, Duration::from_millis(1), || async {
+                attempts.fetch_add(1, Ordering::Relaxed);
+                Err(anyhow::Error::from(tonic::Status::unauthenticated(
+                    "token expired",
+                )))
+            })
+            .await;
+
+        let err = result.unwrap_err();
+        let err = err.downcast_ref::<REClientError>().expect("REClientError");
+        assert_eq!(err.code, TCode::UNAUTHENTICATED);
+        assert_eq!(attempts.load(Ordering::Relaxed), 1);
+    }
+
+    struct FakeActionCacheState {
+        expected_token: Mutex<String>,
+        seen_tokens: Mutex<Vec<String>>,
+        hold_next: AtomicBool,
+        arrived: tokio::sync::Notify,
+        release: tokio::sync::Notify,
+    }
+
+    struct FakeActionCache(Arc<FakeActionCacheState>);
+
+    #[tonic::async_trait]
+    impl ActionCache for FakeActionCache {
+        async fn get_action_result(
+            &self,
+            request: tonic::Request<GetActionResultRequest>,
+        ) -> Result<tonic::Response<ActionResult>, tonic::Status> {
+            let state = &self.0;
+            let token = request
+                .metadata()
+                .get("authorization")
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or_default()
+                .to_owned();
+            state.seen_tokens.lock().unwrap().push(token.clone());
+            state.arrived.notify_one();
+            if token != *state.expected_token.lock().unwrap() {
+                return Err(tonic::Status::unauthenticated("bad token"));
+            }
+            if state.hold_next.swap(false, Ordering::SeqCst) {
+                state.release.notified().await;
+            }
+            Ok(tonic::Response::new(ActionResult {
+                execution_metadata: Some(ExecutedActionMetadata::default()),
+                ..Default::default()
+            }))
+        }
+
+        async fn update_action_result(
+            &self,
+            _request: tonic::Request<UpdateActionResultRequest>,
+        ) -> Result<tonic::Response<ActionResult>, tonic::Status> {
+            Err(tonic::Status::unimplemented("not used by this test"))
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn get_action_result_refreshes_credentials_from_the_helper() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let token_file = dir.path().join("token");
+        std::fs::write(&token_file, "one")?;
+        // Run through `sh`, as the helper crate's tests do, so a concurrent test writing its
+        // own script never makes this exec fail with "text file busy".
+        let script = dir.path().join("helper.sh");
+        std::fs::write(
+            &script,
+            format!(
+                "[ \"$1\" = get ] || exit 3\nprintf '{{\"headers\": {{\"authorization\": [\"Bearer %s\"]}}}}' \"$(cat {})\"\n",
+                token_file.display()
+            ),
+        )?;
+
+        let state = Arc::new(FakeActionCacheState {
+            expected_token: Mutex::new("Bearer one".to_owned()),
+            seen_tokens: Mutex::new(Vec::new()),
+            hold_next: AtomicBool::new(false),
+            arrived: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let address = format!("grpc://{}", listener.local_addr()?);
+        let server = tokio::spawn(
+            tonic::transport::Server::builder()
+                .add_service(ActionCacheServer::new(FakeActionCache(state.clone())))
+                .serve_with_incoming(TcpListenerStream::new(listener)),
+        );
+
+        let opts = Buck2OssReConfiguration {
+            cas_address: Some(address.clone()),
+            engine_address: Some(address.clone()),
+            action_cache_address: Some(address),
+            tls: Some(false),
+            capabilities: Some(false),
+            retries: Some(0),
+            credential_helper: Some(format!("/bin/sh {}", script.display())),
+            ..Default::default()
+        };
+        let client = REClientBuilder::build_and_connect(&opts).await?;
+        let metadata = RemoteExecutionMetadata::default();
+        let request = || ActionResultRequest {
+            digest: TDigest {
+                hash: "ab".repeat(32),
+                size_in_bytes: 1,
+                _dot_dot: (),
+            },
+            platform: None,
+            _dot_dot: (),
+        };
+
+        state.hold_next.store(true, Ordering::SeqCst);
+        let held = client.get_action_result(&metadata, request());
+        let while_held = async {
+            state.arrived.notified().await;
+            std::fs::write(&token_file, "two")?;
+            *state.expected_token.lock().unwrap() = "Bearer two".to_owned();
+
+            client.get_action_result(&metadata, request()).await?;
+            assert_eq!(
+                *state.seen_tokens.lock().unwrap(),
+                ["Bearer one", "Bearer one", "Bearer two"]
+            );
+
+            state.release.notify_one();
+            anyhow::Ok(())
+        };
+        let (held, while_held) = futures::join!(held, while_held);
+        while_held?;
+        held?;
+
+        assert_eq!(state.seen_tokens.lock().unwrap().len(), 3);
+        server.abort();
         Ok(())
     }
 

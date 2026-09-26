@@ -33,10 +33,13 @@ use bes_grpc_proto::google::devtools::build::v1::StreamId;
 use bes_grpc_proto::google::devtools::build::v1::build_event;
 use bes_grpc_proto::google::devtools::build::v1::publish_build_event_client::PublishBuildEventClient;
 use bes_grpc_proto::google::devtools::build::v1::stream_id;
+use buck2_credential_helper::CredentialHelper;
+use buck2_credential_helper::CredentialHelperSettings;
 use buck2_data::buck_event;
 use buck2_data::record_event;
 use buck2_data::span_end_event;
 use buck2_error::ErrorTag;
+use buck2_error::conversion::from_any_with_tag;
 use fbinit::FacebookInit;
 use google_grpc_proto::google::bytestream::WriteRequest;
 use google_grpc_proto::google::bytestream::byte_stream_client::ByteStreamClient;
@@ -80,6 +83,9 @@ pub struct BesConfig {
     pub bes_backend: Option<String>,
     pub bes_headers: Vec<(String, String)>,
     pub bes_tls: BesTls,
+    /// Set with `bes_headers` by `[bes] connection = re_client`: the remote execution client's
+    /// helper, asked again here so the sink's headers follow the same refresh.
+    pub bes_credential_helper: Option<CredentialHelperSettings>,
     pub build_metadata: Vec<(String, String)>,
     pub event_format: BesEventFormat,
     pub bazel_artifact_upload: bool,
@@ -110,6 +116,7 @@ impl Default for BesConfig {
             bes_backend: None,
             bes_headers: Vec::new(),
             bes_tls: BesTls::default(),
+            bes_credential_helper: None,
             build_metadata: Vec::new(),
             event_format: BesEventFormat::Buck,
             bazel_artifact_upload: true,
@@ -277,6 +284,7 @@ struct ConnectionConfig {
     endpoint: String,
     headers: Vec<(String, String)>,
     tls: BesTls,
+    credential_helper: Option<Arc<CredentialHelper>>,
 }
 
 #[derive(Clone, Debug)]
@@ -284,6 +292,7 @@ struct BazelArtifactUploadConfig {
     endpoint: String,
     headers: Vec<(String, String)>,
     tls: BesTls,
+    credential_helper: Option<Arc<CredentialHelper>>,
     instance_name: String,
     uri_authority: String,
     max_bytes: usize,
@@ -325,6 +334,7 @@ impl BazelArtifactUploadConfig {
             endpoint,
             headers: connection.headers.clone(),
             tls: connection.tls.clone(),
+            credential_helper: connection.credential_helper.clone(),
             instance_name: config
                 .bazel_artifact_upload_instance_name
                 .clone()
@@ -649,13 +659,13 @@ impl BazelArtifactUploader {
         let client = self.client.as_mut().expect("client was initialized");
         let outbound = tokio_stream::iter(requests);
         let mut request = tonic::Request::new(outbound);
-        for (header_key, header_value) in &self.config.headers {
-            let metadata_key = MetadataKey::from_bytes(header_key.as_bytes())
-                .map_err(|e| Status::invalid_argument(e.to_string()))?;
-            let metadata_value = MetadataValue::try_from(header_value.as_str())
-                .map_err(|e| Status::invalid_argument(e.to_string()))?;
-            request.metadata_mut().insert(metadata_key, metadata_value);
-        }
+        attach_headers(
+            &mut request,
+            &self.config.headers,
+            self.config.credential_helper.as_deref(),
+            &self.config.endpoint,
+        )
+        .await?;
         Ok(client.write(request).await?.into_inner())
     }
 
@@ -681,13 +691,13 @@ impl BazelArtifactUploader {
         let client = self.client.as_mut().expect("client was initialized");
         let outbound = file_write_stream(resource_name, path, size, chunk_size)?;
         let mut request = tonic::Request::new(outbound);
-        for (header_key, header_value) in &self.config.headers {
-            let metadata_key = MetadataKey::from_bytes(header_key.as_bytes())
-                .map_err(|e| Status::invalid_argument(e.to_string()))?;
-            let metadata_value = MetadataValue::try_from(header_value.as_str())
-                .map_err(|e| Status::invalid_argument(e.to_string()))?;
-            request.metadata_mut().insert(metadata_key, metadata_value);
-        }
+        attach_headers(
+            &mut request,
+            &self.config.headers,
+            self.config.credential_helper.as_deref(),
+            &self.config.endpoint,
+        )
+        .await?;
         Ok(client.write(request).await?.into_inner())
     }
 }
@@ -899,6 +909,13 @@ impl BesClient {
             endpoint: bes_backend(config.bes_backend.as_deref())?,
             headers: config.bes_headers.clone(),
             tls: config.bes_tls.clone(),
+            credential_helper: config
+                .bes_credential_helper
+                .as_ref()
+                .map(|settings| settings.build())
+                .transpose()
+                .map_err(|e| from_any_with_tag(e, ErrorTag::Input))?
+                .map(Arc::new),
         };
         let queue_capacity = config.buffer_size.max(1);
         let (tx, rx) = crossbeam_channel::bounded(queue_capacity);
@@ -1187,6 +1204,9 @@ struct WorkerState {
     connection: ConnectionConfig,
     counters: Arc<CounterState>,
     streams: HashMap<String, StreamState>,
+    /// The remote answered UNAUTHENTICATED since the last stream was opened, so the next one
+    /// asks the credential helper afresh instead of reusing what it cached.
+    credentials_rejected: bool,
     /// Set once the streams were finished for shutdown. Events that arrive afterwards, from
     /// commands being cancelled, are dropped rather than opening a second stream for an
     /// invocation the server already saw end.
@@ -1200,6 +1220,7 @@ impl WorkerState {
             connection,
             counters,
             streams: HashMap::new(),
+            credentials_rejected: false,
             closed: false,
         }
     }
@@ -1373,6 +1394,11 @@ impl WorkerState {
         }
 
         self.discard_stream_transport(invocation_id);
+        if std::mem::take(&mut self.credentials_rejected) {
+            if let Some(helper) = &self.connection.credential_helper {
+                helper.invalidate().await;
+            }
+        }
         let last_acked_sequence_number = {
             let stream = self
                 .streams
@@ -1409,13 +1435,13 @@ impl WorkerState {
         let (tx, rx) = mpsc::channel(self.config.buffer_size.max(1));
         let outbound = ReceiverStream::new(rx);
         let mut request = tonic::Request::new(outbound);
-        for (header_key, header_value) in &self.connection.headers {
-            let metadata_key = MetadataKey::from_bytes(header_key.as_bytes())
-                .map_err(|e| Status::invalid_argument(e.to_string()))?;
-            let metadata_value = MetadataValue::try_from(header_value.as_str())
-                .map_err(|e| Status::invalid_argument(e.to_string()))?;
-            request.metadata_mut().insert(metadata_key, metadata_value);
-        }
+        attach_headers(
+            &mut request,
+            &self.connection.headers,
+            self.connection.credential_helper.as_deref(),
+            &self.connection.endpoint,
+        )
+        .await?;
 
         let ack_sequence_for_task = last_acked_sequence_number;
         // Don't block stream creation on response headers; start sending events
@@ -1597,12 +1623,16 @@ impl WorkerState {
         }
     }
 
-    fn record_status_failure(&self, status: &Status) {
+    fn record_status_failure(&mut self, status: &Status) {
         match status.code() {
             tonic::Code::InvalidArgument | tonic::Code::FailedPrecondition => {
                 self.counters.inc_failures_invalid_request();
             }
-            tonic::Code::Unauthenticated | tonic::Code::PermissionDenied => {
+            tonic::Code::Unauthenticated => {
+                self.credentials_rejected = true;
+                self.counters.inc_failures_unauthorized();
+            }
+            tonic::Code::PermissionDenied => {
                 self.counters.inc_failures_unauthorized();
             }
             tonic::Code::ResourceExhausted => {
@@ -1973,6 +2003,42 @@ fn map_transport_error(err: tonic::transport::Error) -> Status {
     Status::unavailable(err.to_string())
 }
 
+/// The configured headers, then the credential helper's for `endpoint`. A helper header
+/// replaces a configured header of the same name, and a helper header with several values
+/// keeps all of them, as in the remote execution client.
+async fn attach_headers<T>(
+    request: &mut tonic::Request<T>,
+    headers: &[(String, String)],
+    credential_helper: Option<&CredentialHelper>,
+    endpoint: &str,
+) -> Result<(), Status> {
+    let metadata = request.metadata_mut();
+    for (header_key, header_value) in headers {
+        let metadata_key = MetadataKey::from_bytes(header_key.as_bytes())
+            .map_err(|e| Status::invalid_argument(e.to_string()))?;
+        let metadata_value = MetadataValue::try_from(header_value.as_str())
+            .map_err(|e| Status::invalid_argument(e.to_string()))?;
+        metadata.insert(metadata_key, metadata_value);
+    }
+    let Some(helper) = credential_helper else {
+        return Ok(());
+    };
+    // The same URI the remote execution client hands the helper for this endpoint, so a helper
+    // that keys its answers on it sees one endpoint, not two.
+    let uri = format!("{}/", endpoint.trim_end_matches('/'));
+    let credentials = helper
+        .get(&uri)
+        .await
+        .map_err(|e| Status::unauthenticated(format!("{e:#}")))?;
+    for (key, _) in credentials.headers() {
+        metadata.remove(key.clone());
+    }
+    for (key, value) in credentials.headers() {
+        metadata.append(key.clone(), value.clone());
+    }
+    Ok(())
+}
+
 fn endpoint_for(uri: &str, connect_timeout: Duration, tls: &BesTls) -> Result<Endpoint, Status> {
     let mut endpoint = Endpoint::from_shared(uri.to_owned())
         .map_err(|e| Status::internal(e.to_string()))?
@@ -2192,6 +2258,74 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn helper_headers_replace_configured_headers_of_the_same_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let request_file = dir.path().join("request.json");
+        let script = dir.path().join("helper.sh");
+        std::fs::write(
+            &script,
+            format!(
+                "cat > {}\necho '{{\"headers\": {{\"authorization\": [\"Bearer helper\"], \"x-multi\": [\"a\", \"b\"]}}}}'",
+                request_file.display()
+            ),
+        )
+        .unwrap();
+        let helper = CredentialHelper::new(
+            vec!["/bin/sh".to_owned(), script.to_str().unwrap().to_owned()],
+            None,
+            None,
+        )
+        .unwrap();
+        let headers = vec![
+            ("authorization".to_owned(), "Bearer configured".to_owned()),
+            ("x-configured".to_owned(), "kept".to_owned()),
+        ];
+
+        let mut request = tonic::Request::new(());
+        attach_headers(
+            &mut request,
+            &headers,
+            Some(&helper),
+            "https://bes.example.com:443",
+        )
+        .await
+        .unwrap();
+
+        let metadata = request.metadata();
+        assert_eq!(
+            metadata
+                .get_all("authorization")
+                .iter()
+                .map(|v| v.to_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["Bearer helper"]
+        );
+        assert_eq!(metadata.get("x-configured").unwrap(), "kept");
+        assert_eq!(
+            metadata
+                .get_all("x-multi")
+                .iter()
+                .map(|v| v.to_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["a", "b"]
+        );
+        assert_eq!(
+            std::fs::read_to_string(&request_file).unwrap(),
+            r#"{"uri":"https://bes.example.com:443/"}"#
+        );
+
+        let mut request = tonic::Request::new(());
+        attach_headers(&mut request, &headers, None, "https://bes.example.com:443")
+            .await
+            .unwrap();
+        assert_eq!(
+            request.metadata().get("authorization").unwrap(),
+            "Bearer configured"
+        );
+    }
+
     #[test]
     fn bazel_artifact_upload_defaults_to_re_client_cas() {
         let config = BesConfig {
@@ -2204,6 +2338,7 @@ mod tests {
             endpoint: "https://bes.example.com".to_owned(),
             headers: Vec::new(),
             tls: BesTls::default(),
+            credential_helper: None,
         };
         let upload = BazelArtifactUploadConfig::from_bes(&config, &connection)
             .unwrap()
@@ -2231,6 +2366,7 @@ mod tests {
             endpoint: "test://bytestream".to_owned(),
             headers: Vec::new(),
             tls: BesTls::default(),
+            credential_helper: None,
             instance_name: "remote/instance".to_owned(),
             uri_authority: "localhost:1985".to_owned(),
             max_bytes: 1024,
@@ -2602,6 +2738,7 @@ mod tests {
             endpoint: "http://127.0.0.1:1".to_owned(),
             headers: Vec::new(),
             tls: BesTls::default(),
+            credential_helper: None,
         };
         let counters = Arc::new(CounterState::default());
         let mut worker = WorkerState::new(config, connection, counters);
@@ -2630,6 +2767,7 @@ mod tests {
             endpoint: "http://127.0.0.1:1".to_owned(),
             headers: Vec::new(),
             tls: BesTls::default(),
+            credential_helper: None,
         };
         let counters = Arc::new(CounterState::default());
         let mut worker = WorkerState::new(config, connection, counters.clone());
@@ -2671,6 +2809,7 @@ mod tests {
             endpoint: "http://127.0.0.1:1".to_owned(),
             headers: Vec::new(),
             tls: BesTls::default(),
+            credential_helper: None,
         };
         let counters = Arc::new(CounterState::default());
         let mut worker = WorkerState::new(config, connection, counters);
