@@ -53,6 +53,8 @@ impl BuildGraphStats {
                 bes_headers: Vec::new(),
                 bes_tls: Default::default(),
                 #[cfg(not(fbcode_build))]
+                bes_credential_helper: None,
+                #[cfg(not(fbcode_build))]
                 build_metadata: Vec::new(),
                 #[cfg(not(fbcode_build))]
                 event_format: Default::default(),
