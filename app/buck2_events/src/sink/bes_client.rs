@@ -1624,12 +1624,15 @@ impl WorkerState {
     }
 
     fn record_status_failure(&mut self, status: &Status) {
+        // Also true of a proxy's HTTP 401, which tonic reports as INTERNAL.
+        if buck2_credential_helper::status_rejects_credentials(status) {
+            self.credentials_rejected = true;
+        }
         match status.code() {
             tonic::Code::InvalidArgument | tonic::Code::FailedPrecondition => {
                 self.counters.inc_failures_invalid_request();
             }
             tonic::Code::Unauthenticated => {
-                self.credentials_rejected = true;
                 self.counters.inc_failures_unauthorized();
             }
             tonic::Code::PermissionDenied => {
