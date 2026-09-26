@@ -40,6 +40,10 @@ rust_binary(
     name = "buck2-casd",
     srcs = ["src/main.rs"],
     crate_root = "src/main.rs",
+    # clap's `#[command(version)]` reads it, and only cargo sets it unasked.
+    env = {
+        "CARGO_PKG_VERSION": "0.1.0",
+    },
     deps = [
         "fbsource//third-party/rust:anyhow",
         "fbsource//third-party/rust:clap",
