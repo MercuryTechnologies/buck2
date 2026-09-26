@@ -65,6 +65,7 @@ members = [
   "app/buck2_common",
   "app/buck2_configured",
   "app/buck2_core",
+  "app/buck2_credential_helper",
   "app/buck2_critical_path",
   "app/buck2_daemon",
   "app/buck2_data",
@@ -231,6 +232,7 @@ buck2_cmd_targets_server = { path = "app/buck2_cmd_targets_server" }
 buck2_common = { path = "app/buck2_common" }
 buck2_configured = { path = "app/buck2_configured" }
 buck2_core = { path = "app/buck2_core" }
+buck2_credential_helper = { path = "app/buck2_credential_helper" }
 buck2_critical_path = { path = "app/buck2_critical_path" }
 buck2_daemon = { path = "app/buck2_daemon" }
 buck2_data = { path = "app/buck2_data" }
