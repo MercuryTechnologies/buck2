@@ -295,6 +295,25 @@ impl CredentialHelperSettings {
     }
 }
 
+/// Whether the remote refused the credentials a request carried.
+///
+/// A gRPC server says so with UNAUTHENTICATED. An HTTP proxy in front of it can instead answer
+/// HTTP 401 with a body that is not gRPC, as Namespace's ingress does for a bearer it no longer
+/// accepts. tonic 0.14 then fails decoding that body before it looks at the HTTP status, and
+/// returns INTERNAL with the status only in the message (`codec/decode.rs`: "... while
+/// receiving response with status: 401 Unauthorized"); its HTTP-to-gRPC mapping, which would
+/// have said UNAUTHENTICATED, runs only at the end of a stream that decoded. So the message is
+/// the one place the 401 survives.
+pub fn status_rejects_credentials(status: &tonic::Status) -> bool {
+    match status.code() {
+        tonic::Code::Unauthenticated => true,
+        tonic::Code::Internal | tonic::Code::Unknown => status
+            .message()
+            .contains("while receiving response with status: 401"),
+        _ => false,
+    }
+}
+
 fn parse_expires(expires: &str) -> anyhow::Result<SystemTime> {
     let timestamp: jiff::Timestamp = expires
         .parse()
@@ -540,5 +559,22 @@ mod tests {
             ..Default::default()
         };
         assert!(helper.parse_response(bad_header, now).is_err());
+    }
+
+    #[test]
+    fn status_rejects_credentials_reads_unauthenticated_and_a_proxy_401() {
+        assert!(status_rejects_credentials(&tonic::Status::unauthenticated(
+            "bad token"
+        )));
+        // The message tonic 0.14 builds when an HTTP 401 carries a plain-text body.
+        assert!(status_rejects_credentials(&tonic::Status::internal(
+            "protocol error: received message with invalid compression flag: 105 (valid flags are 0 and 1) while receiving response with status: 401 Unauthorized"
+        )));
+        assert!(!status_rejects_credentials(&tonic::Status::internal(
+            "protocol error: received message with invalid compression flag: 110 (valid flags are 0 and 1) while receiving response with status: 502 Bad Gateway"
+        )));
+        assert!(!status_rejects_credentials(
+            &tonic::Status::permission_denied("while receiving response with status: 401")
+        ));
     }
 }
