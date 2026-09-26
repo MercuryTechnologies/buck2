@@ -70,21 +70,44 @@ impl FromStr for CASdMode {
     }
 }
 
-#[derive(Clone, Debug, Allocative)]
+/// How a blob held in a local CAS cache is materialized into `buck-out`.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Allocative)]
 pub enum CopyPolicy {
+    /// Always write a full copy.
     Copy,
+    /// Always make a copy-on-write clone; fail if the filesystem cannot.
     Reflink,
+    /// Make a copy-on-write clone where the filesystem supports it, otherwise copy.
     Hybrid,
 }
 
 impl FromStr for CopyPolicy {
     type Err = buck2_error::Error;
 
+    /// Unknown values mean `Copy`; `cas_shared_cache_copy_policy_v2` relies on that. The
+    /// open-source `cas_shared_cache_copy_policy` key is parsed strictly instead, see
+    /// [`CopyPolicy::parse_strict`].
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
             "hybrid" => Ok(CopyPolicy::Hybrid),
             "reflink" => Ok(CopyPolicy::Reflink),
             _ => Ok(CopyPolicy::Copy),
+        }
+    }
+}
+
+impl CopyPolicy {
+    /// Like `from_str`, but a typo is an error rather than a silent `Copy`.
+    pub fn parse_strict(s: &str) -> buck2_error::Result<Self> {
+        match s.trim() {
+            "hybrid" => Ok(CopyPolicy::Hybrid),
+            "reflink" => Ok(CopyPolicy::Reflink),
+            "copy" => Ok(CopyPolicy::Copy),
+            other => Err(buck2_error::buck2_error!(
+                buck2_error::ErrorTag::Input,
+                "Invalid copy policy `{}` (expected `copy`, `reflink` or `hybrid`)",
+                other
+            )),
         }
     }
 }
@@ -515,6 +538,37 @@ pub struct Buck2OssReConfiguration {
     /// This is used by OSS RE clients to disambiguate hash validation when
     /// multiple algorithms share the same digest length (for example, SHA256 and BLAKE3).
     pub digest_algorithms: Vec<String>,
+    /// Directory of the machine-local CAS daemon (`buck2-casd --dir`). Blobs the daemon holds
+    /// are cloned into `buck-out` straight from this directory instead of being received over
+    /// gRPC, so every buck2 daemon on the host (any isolation dir, any checkout) shares one copy.
+    /// Buck2 only ever reads from it. Unset disables directory access.
+    ///
+    /// This can contain environment variables using shell interpolation syntax (i.e. $VAR). They
+    /// will be substituted before using the value.
+    pub cas_shared_cache: Option<String>,
+    /// Where the machine-local CAS daemon listens, if not at its default of a Unix socket named
+    /// `buck2-casd.sock` inside `cas_shared_cache`: `unix:///path/to/socket` or a loopback TCP
+    /// port number. The daemon never listens anywhere else. Whenever a daemon is configured, all
+    /// CAS traffic (`cas_address`) goes to it, and it passes misses and uploads through to the
+    /// real CAS.
+    pub cas_shared_cache_address: Option<CASdAddress>,
+    /// How blobs are cloned out of the shared cache directory. Defaults to `hybrid`.
+    pub cas_shared_cache_copy_policy: Option<CopyPolicy>,
+    /// `local_without_sync` (default) clones blobs from the directory; `remote` never touches
+    /// the directory and only talks gRPC to the daemon. `local_with_sync` is accepted and behaves
+    /// like `local_without_sync`, since the daemon owns synchronization.
+    pub cas_shared_cache_mode: Option<CASdMode>,
+    /// Start `buck2-casd` on demand when nothing answers at its socket or port. Defaults to
+    /// true. The daemon is started with the upstream settings from this section.
+    pub cas_shared_cache_autostart: Option<bool>,
+    /// The `buck2-casd` executable to start. Defaults to a `buck2-casd` next to the running
+    /// `buck2` binary, then to `buck2-casd` on `PATH`.
+    ///
+    /// This can contain environment variables using shell interpolation syntax (i.e. $VAR). They
+    /// will be substituted before using the value.
+    pub cas_shared_cache_binary: Option<String>,
+    /// Size cap passed to an auto-started daemon as `--max-size-bytes`. Unset never evicts.
+    pub cas_shared_cache_max_size_bytes: Option<u64>,
 }
 
 #[derive(Clone, Debug, Default, Allocative)]
@@ -684,6 +738,37 @@ impl Buck2OssReConfiguration {
                 property: "tcp_keepalive_secs",
             })?,
             digest_algorithms,
+            cas_shared_cache: legacy_config.parse(BuckconfigKeyRef {
+                section: BUCK2_RE_CLIENT_CFG_SECTION,
+                property: "cas_shared_cache",
+            })?,
+            cas_shared_cache_address: legacy_config.parse(BuckconfigKeyRef {
+                section: BUCK2_RE_CLIENT_CFG_SECTION,
+                property: "cas_shared_cache_address",
+            })?,
+            cas_shared_cache_copy_policy: legacy_config
+                .parse::<String>(BuckconfigKeyRef {
+                    section: BUCK2_RE_CLIENT_CFG_SECTION,
+                    property: "cas_shared_cache_copy_policy",
+                })?
+                .map(|s| CopyPolicy::parse_strict(&s))
+                .transpose()?,
+            cas_shared_cache_mode: legacy_config.parse(BuckconfigKeyRef {
+                section: BUCK2_RE_CLIENT_CFG_SECTION,
+                property: "cas_shared_cache_mode",
+            })?,
+            cas_shared_cache_autostart: legacy_config.parse(BuckconfigKeyRef {
+                section: BUCK2_RE_CLIENT_CFG_SECTION,
+                property: "cas_shared_cache_autostart",
+            })?,
+            cas_shared_cache_binary: legacy_config.parse(BuckconfigKeyRef {
+                section: BUCK2_RE_CLIENT_CFG_SECTION,
+                property: "cas_shared_cache_binary",
+            })?,
+            cas_shared_cache_max_size_bytes: legacy_config.parse(BuckconfigKeyRef {
+                section: BUCK2_RE_CLIENT_CFG_SECTION,
+                property: "cas_shared_cache_max_size_bytes",
+            })?,
         })
     }
 }
