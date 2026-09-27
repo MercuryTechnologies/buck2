@@ -222,7 +222,9 @@ def _cxx_llvm_toolchain_impl(ctx: AnalysisContext) -> list[Provider]:
             binary_extension = _binary_extension(os),
             generate_linker_maps = False,
             independent_shlib_interface_linker_flags = [],
-            is_pdb_generated = is_pdb_generated(linker_type, linker_flags),
+            # Only the caller's flags can ask for a PDB; the target and sysroot
+            # flags are cmd_args, which is_pdb_generated does not accept.
+            is_pdb_generated = is_pdb_generated(linker_type, ctx.attrs.linker_flags),
             link_binaries_locally = False,
             link_libraries_locally = False,
             link_style = LinkStyle(ctx.attrs.link_style),
@@ -282,7 +284,7 @@ cxx_llvm_toolchain = rule(
         "sysroot": attrs.option(attrs.source(allow_directory = True), default = None),
         "target": attrs.option(attrs.string(), default = None),
         "use_lld": attrs.bool(default = True),
-        "_cxx_internal_tools": attrs.default_only(attrs.dep(providers = [CxxInternalTools], default = "prelude//cxx/tools:internal_tools")),
+        "_cxx_internal_tools": attrs.default_only(attrs.exec_dep(providers = [CxxInternalTools], default = "prelude//cxx/tools:internal_tools")),
     },
     is_toolchain_rule = True,
 )
