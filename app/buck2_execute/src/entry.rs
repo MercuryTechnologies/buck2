@@ -88,7 +88,16 @@ fn do_normalize_permissions(path: &AbsNormPathBuf) -> buck2_error::Result<()> {
             };
         if mode != perms.mode() {
             perms.set_mode(mode);
-            fs_util::set_permissions(path, perms).categorize_input()?;
+            use std::os::unix::fs::MetadataExt;
+            if m.is_file() && m.nlink() > 1 {
+                // A local action that hard-linked one of its inputs into its output shares that
+                // input's inode, which under `cas_shared_cache_copy_policy = hardlink` is the
+                // read-only blob in the shared CAS directory. Chmod-ing it would make the store
+                // and every checkout's copy writable, so give this path its own inode first.
+                break_hard_link(path, perms)?;
+            } else {
+                fs_util::set_permissions(path, perms).categorize_input()?;
+            }
         }
     }
     #[cfg(not(unix))]
@@ -100,6 +109,31 @@ fn do_normalize_permissions(path: &AbsNormPathBuf) -> buck2_error::Result<()> {
         }
     }
     Ok(())
+}
+
+/// Replaces `path` with a copy carrying `perms`, through a sibling temporary name, so the other
+/// names of the old inode keep their content and mode.
+#[cfg(unix)]
+fn break_hard_link(path: &AbsNormPathBuf, perms: std::fs::Permissions) -> buck2_error::Result<()> {
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(format!(".buck2-unlink-{}", std::process::id()));
+    let tmp = std::path::PathBuf::from(tmp);
+    let result = (|| {
+        std::fs::copy(path, &tmp)?;
+        std::fs::set_permissions(&tmp, perms)?;
+        std::fs::rename(&tmp, path)
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result.map_err(|e| {
+        buck2_error::buck2_error!(
+            buck2_error::ErrorTag::Input,
+            "Error giving `{}` its own copy before changing its mode: {}",
+            path,
+            e
+        )
+    })
 }
 
 pub async fn build_entry_from_disk(
@@ -320,4 +354,47 @@ fn create_symlink(
         }
     }
     new_symlink(symlink_target)
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use std::os::unix::fs::MetadataExt;
+    use std::os::unix::fs::PermissionsExt;
+
+    use buck2_fs::paths::abs_norm_path::AbsNormPathBuf;
+
+    use super::do_normalize_permissions;
+
+    #[test]
+    fn normalizing_a_hard_linked_output_leaves_the_other_name_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let blob = dir.path().join("blob");
+        std::fs::write(&blob, b"same bytes").unwrap();
+        std::fs::set_permissions(&blob, std::fs::Permissions::from_mode(0o444)).unwrap();
+        let out = dir.path().join("out");
+        std::fs::hard_link(&blob, &out).unwrap();
+
+        do_normalize_permissions(&AbsNormPathBuf::new(out.clone()).unwrap()).unwrap();
+
+        let b = std::fs::metadata(&blob).unwrap();
+        let o = std::fs::metadata(&out).unwrap();
+        assert_eq!((b.mode() & 0o777, b.nlink()), (0o444, 1));
+        assert_eq!(o.mode() & 0o777, 0o644);
+        assert_ne!(b.ino(), o.ino());
+        assert_eq!(std::fs::read(&out).unwrap(), b"same bytes");
+    }
+
+    #[test]
+    fn normalizing_a_single_name_file_keeps_its_inode() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("out");
+        std::fs::write(&out, b"x").unwrap();
+        std::fs::set_permissions(&out, std::fs::Permissions::from_mode(0o444)).unwrap();
+        let ino = std::fs::metadata(&out).unwrap().ino();
+
+        do_normalize_permissions(&AbsNormPathBuf::new(out.clone()).unwrap()).unwrap();
+
+        let o = std::fs::metadata(&out).unwrap();
+        assert_eq!((o.ino(), o.mode() & 0o777), (ino, 0o644));
+    }
 }
