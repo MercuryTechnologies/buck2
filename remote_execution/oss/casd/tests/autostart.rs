@@ -32,7 +32,7 @@ use remote_execution::UploadRequest;
 
 #[tokio::test(flavor = "multi_thread")]
 async fn client_autostarts_the_daemon() -> anyhow::Result<()> {
-    // The client probes a clone from the store into `<working directory>/buck-out` and leaves the
+    // The client probes a clone from the store into its working directory and leaves the
     // daemon off when it fails, so the work directory is the working directory too. This is the
     // only test in the binary, so changing the process's directory races with nothing.
     // `BUCK2_CASD_REFLINK_TEST_DIR` names a reflink filesystem (the XFS /workspaces of a
@@ -71,7 +71,7 @@ async fn client_autostarts_the_daemon() -> anyhow::Result<()> {
         ..Default::default()
     };
 
-    let reflink = remote_execution::probe_reflink(&casd_dir, &work.path().join("buck-out")).is_ok();
+    let reflink = remote_execution::probe_reflink(&casd_dir, work.path()).is_ok();
 
     // Building the client is what starts the daemon.
     let client = REClientBuilder::build_and_connect(&opts).await?;
