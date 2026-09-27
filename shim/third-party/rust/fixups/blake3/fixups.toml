@@ -83,11 +83,6 @@ cfgs = ["blake3_neon"]
 [['cfg(target_arch = "aarch64")'.cxx_library]]
 name = "simd_neon-aarch64"
 srcs = ["c/blake3_neon.c"]
-# A compiler that protects the stack by default (Ubuntu's gcc) makes this
-# reference __stack_chk_guard, which aarch64 glibc exports only from ld.so, so
-# the statically linked buck2_miniperf fails to link. The file has no arrays
-# on the stack worth guarding.
-compiler_flags = ["-fno-stack-protector"]
 headers = ["c/*.h"]
 
 [['cfg(target_arch = "arm")'.cxx_library]]

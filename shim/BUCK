@@ -39,7 +39,25 @@ system_cxx_toolchain(
     # with clang-only flags and rejects them.
     compiler_type = "gcc",
     cxx_compiler = "g++",
-    cxx_flags = ["-std=c++20"],
+    # Ubuntu's gcc protects the stack by default, and on Linux aarch64 the
+    # guard, __stack_chk_guard, is exported by ld.so alone, which the link of
+    # a Rust binary does not name: buck2_miniperf (static) and buck2 both
+    # failed to link on it, from blake3 and ring. Other targets keep the
+    # compiler's default.
+    c_flags = select({
+        "DEFAULT": [],
+        "prelude//os:linux": select({
+            "DEFAULT": [],
+            "prelude//cpu:arm64": ["-fno-stack-protector"],
+        }),
+    }),
+    cxx_flags = ["-std=c++20"] + select({
+        "DEFAULT": [],
+        "prelude//os:linux": select({
+            "DEFAULT": [],
+            "prelude//cpu:arm64": ["-fno-stack-protector"],
+        }),
+    }),
     # The sandcastle OSS-bootstrap environment has `gcc`/`g++` on PATH but
     # not `clang`/`clang++` or `lld`, which are the defaults pulled in by
     # `prelude//toolchains/cxx/clang:path_clang_tools`. Using `g++` as the
