@@ -22,11 +22,14 @@
 //! ```text
 //! <root>/blobs/<first two hex chars>/<hash>-<size>     raw blob bytes, mode 0444 (the daemon's)
 //! <root>/blobs/<first two hex chars>/<hash>-<size>.x   the same bytes, mode 0555 (buck2's)
+//! <root>/tmp/<hash>-<size>.x.tmp-<pid>-<thread>      a twin being made (buck2's)
 //! ```
 //!
 //! A hard link shares the inode, and with it the mode, so the executable and the plain copy of
 //! the same bytes cannot be one file. The `.x` twin is made by buck2, once per digest, the first
-//! time a hard-linked output needs the executable bit. The daemon never reads it.
+//! time a hard-linked output needs the executable bit. The daemon never reads it, but its evictor
+//! counts every file in a shard, so the twin is written under `tmp/` and renamed into the shard
+//! only once complete.
 
 use std::fs;
 use std::fs::File;
@@ -46,6 +49,8 @@ use crate::response::TLocalCacheStats;
 
 pub struct SharedCasCache {
     blobs_dir: PathBuf,
+    /// The daemon's `tmp/`, where the executable twin is written before it is renamed into place.
+    tmp_dir: PathBuf,
     copy_policy: CopyPolicy,
     /// Under the hybrid policy, set once a reflink failed because the filesystem cannot do it,
     /// so later materializations go straight to copying.
@@ -118,6 +123,7 @@ impl SharedCasCache {
         }
         Ok(Self {
             blobs_dir,
+            tmp_dir: root.join("tmp"),
             copy_policy,
             reflink_unsupported: Arc::new(AtomicBool::new(false)),
             hardlink_unsupported: Arc::new(AtomicBool::new(false)),
@@ -160,6 +166,7 @@ impl SharedCasCache {
         let expected_size = digest.size_in_bytes as u64;
         let dst = dst.to_owned();
         let copy_policy = self.copy_policy;
+        let tmp_dir = self.tmp_dir.clone();
         let reflink_unsupported = Arc::clone(&self.reflink_unsupported);
         let hardlink_unsupported = Arc::clone(&self.hardlink_unsupported);
 
@@ -194,7 +201,11 @@ impl SharedCasCache {
                 executable,
                 copy_policy,
                 &reflink_unsupported,
-                &hardlink_unsupported,
+                &HardlinkStore {
+                    tmp_dir: &tmp_dir,
+                    blob_size: expected_size,
+                    unsupported: &hardlink_unsupported,
+                },
             )?;
             Ok(true)
         })
@@ -234,7 +245,7 @@ fn link_into(
     executable: bool,
     copy_policy: CopyPolicy,
     reflink_unsupported: &AtomicBool,
-    hardlink_unsupported: &AtomicBool,
+    hardlink: &HardlinkStore<'_>,
 ) -> anyhow::Result<()> {
     // Every path below writes `dst` as a new file. Opening an existing one with O_TRUNC would
     // write through a hard link left by an earlier `hardlink` run into the stored blob, and as
@@ -285,8 +296,8 @@ fn link_into(
     }
 
     if copy_policy == CopyPolicy::Hardlink
-        && !hardlink_unsupported.load(Ordering::Relaxed)
-        && try_hardlink(src_path, dst, executable, hardlink_unsupported)?
+        && !hardlink.unsupported.load(Ordering::Relaxed)
+        && try_hardlink(src_path, dst, executable, hardlink)?
     {
         return Ok(());
     }
@@ -309,15 +320,24 @@ fn remove_if_exists(path: &Path) -> anyhow::Result<()> {
     }
 }
 
-/// `Ok(false)` means "copy instead": the two paths are on different filesystems, or the inode
-/// is at its link limit (EMLINK, 65000 on ext4). The linked file is never chmod-ed, because
-/// that would change the store and every other link.
+/// What `try_hardlink` needs to know about the store besides the blob's path.
+struct HardlinkStore<'a> {
+    tmp_dir: &'a Path,
+    /// The size the digest promises, which `materialize` has already checked on the raw blob.
+    blob_size: u64,
+    unsupported: &'a AtomicBool,
+}
+
+/// `Ok(false)` means "copy instead": the two paths are on different filesystems, the inode is at
+/// its link limit (EMLINK, 65000 on ext4), or the store cannot take the executable twin because
+/// buck2 may not write there. The linked file is never chmod-ed, because that would change the
+/// store and every other link.
 #[cfg(unix)]
 fn try_hardlink(
     src_path: &Path,
     dst: &Path,
     executable: bool,
-    hardlink_unsupported: &AtomicBool,
+    store: &HardlinkStore<'_>,
 ) -> anyhow::Result<bool> {
     use std::os::unix::fs::MetadataExt;
 
@@ -327,12 +347,33 @@ fn try_hardlink(
         _ => false,
     };
     if !same_fs {
-        note_hardlink_unsupported(hardlink_unsupported, dst, "different filesystems");
+        note_hardlink_unsupported(store.unsupported, dst, "different filesystems");
         return Ok(false);
     }
 
     let link_src = if executable {
-        executable_twin(src_path)?
+        match executable_twin(src_path, store.blob_size, store.tmp_dir) {
+            Ok(twin) => twin,
+            Err(e) if is_store_not_writable(&e) => {
+                note_hardlink_unsupported(
+                    store.unsupported,
+                    dst,
+                    &format!(
+                        "cannot write the executable twin of `{}`: {e}",
+                        src_path.display()
+                    ),
+                );
+                return Ok(false);
+            }
+            Err(e) => {
+                return Err(e).with_context(|| {
+                    format!(
+                        "Error making the executable twin of `{}`",
+                        src_path.display()
+                    )
+                });
+            }
+        }
     } else {
         src_path.to_owned()
     };
@@ -341,7 +382,7 @@ fn try_hardlink(
         Err(e) => match e.raw_os_error() {
             Some(libc::EMLINK) => Ok(false),
             Some(libc::EXDEV) | Some(libc::EPERM) | Some(libc::EOPNOTSUPP) => {
-                note_hardlink_unsupported(hardlink_unsupported, dst, &e.to_string());
+                note_hardlink_unsupported(store.unsupported, dst, &e.to_string());
                 Ok(false)
             }
             _ => Err(e).with_context(|| {
@@ -360,9 +401,9 @@ fn try_hardlink(
     _src_path: &Path,
     _dst: &Path,
     _executable: bool,
-    hardlink_unsupported: &AtomicBool,
+    store: &HardlinkStore<'_>,
 ) -> anyhow::Result<bool> {
-    hardlink_unsupported.store(true, Ordering::Relaxed);
+    store.unsupported.store(true, Ordering::Relaxed);
     Ok(false)
 }
 
@@ -378,36 +419,68 @@ fn note_hardlink_unsupported(flag: &AtomicBool, dst: &Path, why: &str) {
     }
 }
 
-/// Made on first use by copying the blob to a temporary name beside it and renaming it into
-/// place, so a reader never sees a partial file and two concurrent makers leave identical
-/// content under the final name.
+/// A store buck2 may read but not write, such as one owned by another user or on a read-only
+/// mount. Materializing still works there, through copies.
+fn is_store_not_writable(e: &io::Error) -> bool {
+    e.kind() == io::ErrorKind::PermissionDenied || e.raw_os_error() == Some(libc::EROFS)
+}
+
+/// The 0555 copy of the blob that executables link to, made on first use and remade when the one
+/// on disk has the wrong size or mode.
+///
+/// The copy is written under the daemon's `tmp/` and renamed into the shard, so a reader never
+/// sees a partial twin and the daemon's evictor, which counts every file in a shard, cannot
+/// remove a twin still being written. Two concurrent makers rename identical content over each
+/// other, and the loser's inode lives on under whatever links it already has.
 #[cfg(unix)]
-fn executable_twin(src_path: &Path) -> anyhow::Result<PathBuf> {
+fn executable_twin(src_path: &Path, blob_size: u64, tmp_dir: &Path) -> io::Result<PathBuf> {
     use std::os::unix::fs::PermissionsExt;
 
     let mut twin = src_path.as_os_str().to_owned();
     twin.push(".x");
     let twin = PathBuf::from(twin);
-    if twin.exists() {
-        return Ok(twin);
+    match fs::metadata(&twin) {
+        Ok(m) if m.len() == blob_size && m.permissions().mode() & 0o777 == 0o555 => {
+            return Ok(twin);
+        }
+        Ok(m) => tracing::warn!(
+            "Executable twin `{}` has size {} and mode {:o} but should have size {} and mode 555; \
+             remaking it",
+            twin.display(),
+            m.len(),
+            m.permissions().mode() & 0o777,
+            blob_size
+        ),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
     }
-    let mut tmp = src_path.as_os_str().to_owned();
-    tmp.push(format!(
-        ".x.tmp-{}-{:?}",
+
+    fs::create_dir_all(tmp_dir)?;
+    let mut tmp_name = twin
+        .file_name()
+        .expect("a blob path has a file name")
+        .to_owned();
+    tmp_name.push(format!(
+        ".tmp-{}-{:?}",
         std::process::id(),
         std::thread::current().id()
     ));
-    let tmp = PathBuf::from(tmp);
+    let tmp = tmp_dir.join(tmp_name);
     let result = (|| {
-        fs::copy(src_path, &tmp)?;
+        let copied = fs::copy(src_path, &tmp)?;
+        if copied != blob_size {
+            return Err(io::Error::other(format!(
+                "copied {copied} bytes of `{}` but the digest says {blob_size}",
+                src_path.display()
+            )));
+        }
         fs::set_permissions(&tmp, fs::Permissions::from_mode(0o555))?;
         fs::rename(&tmp, &twin)
     })();
-    if let Err(e) = result {
+    if result.is_err() {
         let _ = fs::remove_file(&tmp);
-        return Err(e).with_context(|| format!("Error making `{}`", twin.display()));
     }
-    Ok(twin)
+    result.map(|()| twin)
 }
 
 /// Whether a failed reflink means "this filesystem (or this pair of filesystems) cannot do
@@ -640,6 +713,113 @@ pub(crate) mod tests {
         let mut twin = blob.into_os_string();
         twin.push(".x");
         assert!(!Path::new(&twin).exists());
+        Ok(())
+    }
+
+    fn shard_entries(blob: &Path) -> Vec<String> {
+        let mut names: Vec<String> = fs::read_dir(blob.parent().unwrap())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_concurrent_executable_twin_makers_agree() {
+        use std::sync::Barrier;
+
+        let work = tempfile::tempdir().unwrap();
+        let root = fake_daemon_dir(work.path());
+        let d = digest("00dd", 5);
+        let blob = publish_read_only(&root, &d, b"bytes");
+        let tmp_dir = root.join("tmp");
+
+        const MAKERS: usize = 8;
+        let barrier = Barrier::new(MAKERS);
+        let twins: Vec<PathBuf> = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..MAKERS)
+                .map(|_| {
+                    scope.spawn(|| {
+                        barrier.wait();
+                        executable_twin(&blob, 5, &tmp_dir).unwrap()
+                    })
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+
+        let mut expected_twin = blob.clone().into_os_string();
+        expected_twin.push(".x");
+        for twin in &twins {
+            assert_eq!(twin, Path::new(&expected_twin));
+            assert_eq!(fs::read(twin).unwrap(), b"bytes");
+            assert_eq!(ino_mode_links(twin).1, 0o555);
+        }
+        let (_, blob_mode, blob_links) = ino_mode_links(&blob);
+        assert_eq!((blob_mode, blob_links), (0o444, 1));
+        assert_eq!(shard_entries(&blob), vec!["00dd-5", "00dd-5.x"]);
+        assert_eq!(fs::read_dir(&tmp_dir).unwrap().count(), 0);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_twin_with_the_wrong_size_is_remade() -> anyhow::Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let work = tempfile::tempdir()?;
+        let root = fake_daemon_dir(work.path());
+        let d = digest("00ee", 4);
+        let blob = publish_read_only(&root, &d, b"data");
+        // A twin left by an interrupted copy, or by an older buck2 that wrote it in place.
+        let mut twin = blob.clone().into_os_string();
+        twin.push(".x");
+        let twin = PathBuf::from(twin);
+        fs::write(&twin, b"da")?;
+        fs::set_permissions(&twin, fs::Permissions::from_mode(0o555))?;
+
+        let cache = SharedCasCache::new(root.clone(), CopyPolicy::Hardlink)?;
+        let dst = work.path().join("x");
+        assert!(cache.materialize(&d, &dst, true).await?);
+
+        assert_eq!(fs::read(&dst)?, b"data");
+        assert_eq!(fs::read(&twin)?, b"data");
+        assert_eq!(ino_mode_links(&twin), (ino_mode_links(&dst).0, 0o555, 2));
+        assert_eq!(shard_entries(&blob), vec!["00ee-4", "00ee-4.x"]);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_read_only_store_copies_executables() -> anyhow::Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        // Root writes into a 0555 directory regardless, so there is nothing to test.
+        // SAFETY: geteuid takes no arguments and cannot fail.
+        if unsafe { libc::geteuid() } == 0 {
+            return Ok(());
+        }
+        let work = tempfile::tempdir()?;
+        let root = fake_daemon_dir(work.path());
+        let d = digest("00ff", 4);
+        let blob = publish_read_only(&root, &d, b"data");
+        let shard = blob.parent().unwrap().to_owned();
+        fs::set_permissions(&shard, fs::Permissions::from_mode(0o555))?;
+
+        let cache = SharedCasCache::new(root.clone(), CopyPolicy::Hardlink)?;
+        let dst = work.path().join("x");
+        let result = cache.materialize(&d, &dst, true).await;
+        // Hand the directory back before asserting, so the tempdir can be removed either way.
+        fs::set_permissions(&shard, fs::Permissions::from_mode(0o755))?;
+
+        assert!(result?);
+        assert_eq!(fs::read(&dst)?, b"data");
+        assert_eq!(ino_mode_links(&dst).1, 0o755);
+        let (_, blob_mode, blob_links) = ino_mode_links(&blob);
+        assert_eq!((blob_mode, blob_links), (0o444, 1));
+        assert_eq!(shard_entries(&blob), vec!["00ff-4"]);
+        assert!(cache.hardlink_unsupported.load(Ordering::Relaxed));
         Ok(())
     }
 
