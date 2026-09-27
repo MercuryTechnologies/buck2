@@ -154,6 +154,14 @@ num-traits = "0.2.19"
 num_cpus = "1.16"
 num_enum = "0.7.6"
 object = { version = "0.36.7", features = ["read", "write"] }
+# The Mercury fork of opentelemetry-rust, for
+# - https://github.com/open-telemetry/opentelemetry-rust/pull/3586
+# - https://github.com/open-telemetry/opentelemetry-rust/pull/3587
+# pinned at the commit the root Cargo.toml's `branch = "mercury-head"` resolved to.
+opentelemetry = { version = "0.32.0", git = "https://github.com/MercuryTechnologies/opentelemetry-rust.git", rev = "25294f306063813a4432baf91314b92e3efe12cf", features = ["experimental_propagation_env_carrier"] }
+opentelemetry-otlp = { version = "0.32.0", git = "https://github.com/MercuryTechnologies/opentelemetry-rust.git", rev = "25294f306063813a4432baf91314b92e3efe12cf", default-features = false, features = ["trace", "http-proto", "reqwest-blocking-client"] }
+opentelemetry-semantic-conventions = { version = "0.32.0", git = "https://github.com/MercuryTechnologies/opentelemetry-rust.git", rev = "25294f306063813a4432baf91314b92e3efe12cf", features = ["semconv_experimental"] }
+opentelemetry_sdk = { version = "0.32.1", git = "https://github.com/MercuryTechnologies/opentelemetry-rust.git", rev = "25294f306063813a4432baf91314b92e3efe12cf" }
 oid-registry = "0.4"
 once_cell = "1.21.4"
 os_str_bytes = { version = "6.6.1", features = ["conversions"] }
@@ -183,6 +191,11 @@ rand_xoshiro = "0.8"
 ref-cast = "1.0.18"
 regex = "1.12.3"
 relative-path = { version = "1.7.0", features = ["serde"] }
+# TLS for the OTLP exporter. The root Cargo.toml asks opentelemetry-otlp for
+# `reqwest-rustls`, which forces rustls's aws-lc-rs provider and so aws-lc-sys,
+# whose build script needs cmake. rustls here is ring-only (see its entry above),
+# and with a single provider compiled in, `rustls-no-provider` picks ring.
+reqwest = { version = "0.13.5", default-features = false, features = ["blocking", "rustls-no-provider"] }
 ring = "=0.17.14" # Upgrading this is possible, but a pain, so we don't want to pick up every new minor version
 ruff_formatter = "0.0.6"
 ruff_python_ast = "0.0.6"
