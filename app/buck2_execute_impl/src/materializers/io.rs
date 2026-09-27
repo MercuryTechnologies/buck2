@@ -22,8 +22,6 @@ use buck2_fs::error::IoResultExt;
 use buck2_fs::fs_util;
 use buck2_fs::paths::abs_norm_path::AbsNormPath;
 use buck2_fs::paths::abs_norm_path::AbsNormPathBuf;
-#[cfg(test)]
-use buck2_fs::paths::forward_rel_path::ForwardRelativePath;
 use buck2_hash::StdBuckHashMap;
 
 pub struct MaterializeTreeStructure {
@@ -165,10 +163,6 @@ where
         }
         DirectoryEntry::Leaf(ActionDirectoryMember::File(_)) => {
             if let Some(src) = file_src(dest) {
-                // A file already at `dest` may be a hard link into the shared CAS directory,
-                // left by an earlier materialization; copying onto it would open the store's
-                // inode for writing. Replace the name instead.
-                fs_util::remove_all(&dest).categorize_internal()?;
                 fs_util::copy(src, &dest).categorize_internal()?;
                 if let Some(executable_bit_override) = executable_bit_override {
                     fs_util::set_executable(&dest, executable_bit_override)
@@ -197,46 +191,5 @@ where
             }
             Ok(())
         }
-    }
-}
-
-#[cfg(all(test, unix))]
-mod tests {
-    use std::os::unix::fs::MetadataExt;
-    use std::os::unix::fs::PermissionsExt;
-
-    use buck2_common::file_ops::metadata::FileMetadata;
-    use buck2_execute::digest_config::DigestConfig;
-
-    use super::*;
-
-    #[test]
-    fn copying_over_a_hard_link_replaces_the_name_not_the_inode() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = AbsNormPathBuf::new(dir.path().to_owned()).unwrap();
-        let blob = root.join(ForwardRelativePath::new("blob").unwrap());
-        std::fs::write(&blob, b"stored").unwrap();
-        std::fs::set_permissions(&blob, std::fs::Permissions::from_mode(0o444)).unwrap();
-        let dest = root.join(ForwardRelativePath::new("dest").unwrap());
-        std::fs::hard_link(&blob, &dest).unwrap();
-        let src = root.join(ForwardRelativePath::new("src").unwrap());
-        std::fs::write(&src, b"fresh").unwrap();
-
-        let file = ActionDirectoryMember::File(FileMetadata::empty(
-            DigestConfig::testing_default().cas_digest_config(),
-        ));
-        materialize_files(
-            DirectoryEntry::<&ActionSharedDirectory, _>::Leaf(&file),
-            &src,
-            &dest,
-            None,
-        )
-        .unwrap();
-
-        assert_eq!(std::fs::read(&dest).unwrap(), b"fresh");
-        let b = std::fs::metadata(&blob).unwrap();
-        assert_eq!(std::fs::read(&blob).unwrap(), b"stored");
-        assert_eq!((b.mode() & 0o777, b.nlink()), (0o444, 1));
-        assert_ne!(std::fs::metadata(&dest).unwrap().ino(), b.ino());
     }
 }

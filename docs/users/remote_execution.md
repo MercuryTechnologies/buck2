@@ -212,16 +212,6 @@ $ buck2-casd --dir /var/cache/buck2-casd \
 - `cas_shared_cache_copy_policy` - how blobs are cloned out of the directory.
   `hybrid` (the default) reflinks where the filesystem supports it and copies
   otherwise; `reflink` fails instead of falling back; `copy` always copies.
-  `hardlink` reflinks where it can and otherwise hard-links the stored blob when
-  the directory and `buck-out` share a filesystem, which saves disk on ext4.
-  Outputs placed that way are read-only (0444, or 0555 through a `.x` copy of
-  the blob kept for executables) and share one inode with the store and every
-  other checkout. The mode is not a guard: the owner may chmod a file however
-  it is marked, and buck2 is the owner. What keeps the store intact is that
-  buck2 never opens a linked output for writing, replaces rather than
-  overwrites one, and gives the outputs an incremental action runs over in
-  place their own inode first. A tool or a person that makes a linked file in
-  `buck-out` writable by other means and writes into it changes every checkout.
 - `cas_shared_cache_mode` - `local_without_sync` (the default) clones from the
   directory and only fetches over gRPC when the daemon does not have a blob yet;
   `remote` never reads the directory and only talks gRPC to the daemon.
