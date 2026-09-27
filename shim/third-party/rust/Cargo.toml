@@ -151,6 +151,14 @@ num-traits = { version = "0.2.19", default-features = false }
 num_cpus = "1.16"
 num_enum = "0.7.6"
 object = { version = "0.40.0", features = ["read", "write"] }
+# The Mercury fork of opentelemetry-rust, for
+# - https://github.com/open-telemetry/opentelemetry-rust/pull/3586
+# - https://github.com/open-telemetry/opentelemetry-rust/pull/3587
+# pinned at the commit the root Cargo.toml's `branch = "mercury-head"` resolved to.
+opentelemetry = { version = "0.32.0", git = "https://github.com/MercuryTechnologies/opentelemetry-rust.git", rev = "25294f306063813a4432baf91314b92e3efe12cf", features = ["experimental_propagation_env_carrier"] }
+opentelemetry-otlp = { version = "0.32.0", git = "https://github.com/MercuryTechnologies/opentelemetry-rust.git", rev = "25294f306063813a4432baf91314b92e3efe12cf", default-features = false, features = ["trace", "http-proto", "reqwest-blocking-client"] }
+opentelemetry-semantic-conventions = { version = "0.32.0", git = "https://github.com/MercuryTechnologies/opentelemetry-rust.git", rev = "25294f306063813a4432baf91314b92e3efe12cf", features = ["semconv_experimental"] }
+opentelemetry_sdk = { version = "0.32.1", git = "https://github.com/MercuryTechnologies/opentelemetry-rust.git", rev = "25294f306063813a4432baf91314b92e3efe12cf" }
 oid-registry = "0.8.1"
 once_cell = "1.21.4"
 os_str_bytes = { version = "7.2.1", features = ["conversions"] }
@@ -182,6 +190,11 @@ rayon = "1.11.0"
 ref-cast = "1.0.27"
 regex = "1.13.1"
 relative-path = { version = "2.0.1", features = ["serde"] }
+# TLS for the OTLP exporter. The root Cargo.toml asks opentelemetry-otlp for
+# `reqwest-rustls`, which forces rustls's aws-lc-rs provider and so aws-lc-sys,
+# whose build script needs cmake. rustls here is ring-only (see its entry above),
+# and with a single provider compiled in, `rustls-no-provider` picks ring.
+reqwest = { version = "0.13.5", default-features = false, features = ["blocking", "rustls-no-provider"] }
 ring = "0.17.14"
 ruff_formatter = "0.0.14"
 ruff_python_ast = "0.0.14"
