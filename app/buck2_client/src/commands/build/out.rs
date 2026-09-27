@@ -240,9 +240,10 @@ where
                 .await
                 .buck_error_context(format!("Copying symlink {:?}", entry.path()))?
             } else {
-                copy_regular_file(&entry.path(), &entry_destination_path)
+                tokio::fs::copy(&entry.path(), &entry_destination_path)
                     .await
                     .buck_error_context(format!("Copying file {:?}", entry.path()))
+                    .map(|_| ())
             }
         })
         .await?;
@@ -266,48 +267,26 @@ async fn copy_file(src: &Path, dst: &Path) -> buck2_error::Result<()> {
         false => Cow::Borrowed(dst),
     };
 
-    copy_regular_file(src, &dest_path).await
-}
-
-/// Copies `src` over `dst`, which may be a pipe, and leaves a regular copy owner-writable.
-///
-/// `fs::copy` keeps the source's mode, and an artifact hard-linked out of the shared CAS
-/// directory is 0444, so the copy would refuse the next `--out` onto it with EACCES the way a
-/// running binary refuses it with ETXTBSY. Both are answered by writing beside it and renaming.
-async fn copy_regular_file(src: &Path, dst: &Path) -> buck2_error::Result<()> {
     // NOTE: We don't do the overwrite since we might be writing to e.g. a pipe here and we can't
     // do an atomic move into it.
-    match tokio::fs::copy(src, dst).await {
-        Ok(..) => {}
-        Err(e)
-            if e.raw_os_error() == Some(libc::ETXTBSY)
-                || e.kind() == io::ErrorKind::PermissionDenied =>
-        {
-            let dir = dst
+    match tokio::fs::copy(src, &dest_path).await {
+        Ok(..) => Ok(()),
+        Err(e) if e.raw_os_error() == Some(libc::ETXTBSY) => {
+            let dir = dest_path
                 .parent()
                 .ok_or_else(|| internal_error!("Output path has no parent"))?;
-            let mut tmp_name = dst
+            let mut tmp_name = dest_path
                 .file_name()
                 .ok_or_else(|| internal_error!("Output path has no file name"))?
                 .to_owned();
             tmp_name.push(".buck2.tmp");
             let tmp_path = dir.join(tmp_name);
             tokio::fs::copy(src, &tmp_path).await?;
-            tokio::fs::rename(&tmp_path, dst).await?;
+            tokio::fs::rename(&tmp_path, dest_path).await?;
+            Ok(())
         }
-        Err(e) => return Err(convert_broken_pipe_error(e)),
+        Err(e) => Err(convert_broken_pipe_error(e)),
     }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let meta = tokio::fs::metadata(dst).await?;
-        let current = meta.permissions().mode() & 0o777;
-        let mode = 0o644 | (current & 0o111);
-        if meta.is_file() && current != mode {
-            tokio::fs::set_permissions(dst, std::fs::Permissions::from_mode(mode)).await?;
-        }
-    }
-    Ok(())
 }
 
 fn convert_broken_pipe_error(e: io::Error) -> buck2_error::Error {
@@ -324,43 +303,6 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn test_out_copies_are_writable_and_overwrite_read_only_ones() -> buck2_error::Result<()>
-    {
-        use std::os::unix::fs::PermissionsExt;
-
-        let dir = tempfile::tempdir()?;
-        // What an artifact hard-linked out of the shared CAS directory looks like.
-        let src = dir.path().join("artifact");
-        std::fs::write(&src, b"v1")?;
-        std::fs::set_permissions(&src, std::fs::Permissions::from_mode(0o444))?;
-        let exe = dir.path().join("tool");
-        std::fs::write(&exe, b"#!/bin/sh")?;
-        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o555))?;
-        let dst = dir.path().join("out");
-        let dst_exe = dir.path().join("out-exe");
-
-        copy_file(&src, &dst).await?;
-        copy_file(&exe, &dst_exe).await?;
-        assert_eq!(std::fs::metadata(&dst)?.permissions().mode() & 0o777, 0o644);
-        assert_eq!(
-            std::fs::metadata(&dst_exe)?.permissions().mode() & 0o777,
-            0o755
-        );
-
-        // A copy left by an older buck2, or a file the user chmod-ed.
-        std::fs::set_permissions(&dst, std::fs::Permissions::from_mode(0o444))?;
-        let src2 = dir.path().join("artifact2");
-        std::fs::write(&src2, b"v2")?;
-        std::fs::set_permissions(&src2, std::fs::Permissions::from_mode(0o444))?;
-        copy_file(&src2, &dst).await?;
-        assert_eq!(std::fs::read(&dst)?, b"v2");
-        assert_eq!(std::fs::metadata(&dst)?.permissions().mode() & 0o777, 0o644);
-        assert!(!dir.path().join("out.buck2.tmp").exists());
-        Ok(())
-    }
 
     #[tokio::test]
     async fn test_copy_directory() -> buck2_error::Result<()> {
