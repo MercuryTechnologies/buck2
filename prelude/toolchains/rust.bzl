@@ -277,6 +277,14 @@ def _downloaded_rust_toolchain_impl(ctx):
             archives.append(package_info.url)
             archives.append(package_info.sha256)
 
+        # Cross-compiling needs the standard library of the target as well;
+        # rustc finds it under lib/rustlib/<target>/ of the same sysroot.
+        target_triple = ctx.attrs.rustc_target_triple
+        if target_triple and target_triple != rustc_host_triple:
+            package_info = _manifest_package(manifest_contents, "rust-std", target_triple)
+            archives.append(package_info.url)
+            archives.append(package_info.sha256)
+
         installer = ctx.actions.write(
             "install_rust_toolchain.sh",
             [
