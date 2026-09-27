@@ -38,6 +38,8 @@ rust_library(
         "fbsource//third-party/rust:futures",
         "fbsource//third-party/rust:hostname",
         "fbsource//third-party/rust:is_proc_translated",
+        "fbsource//third-party/rust:opentelemetry",
+        "fbsource//third-party/rust:opentelemetry-semantic-conventions",
         "fbsource//third-party/rust:pin-project",
         # @oss-disable[end= ]: "fbsource//third-party/rust:prost",
         "fbsource//third-party/rust:prost",
