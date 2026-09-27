@@ -45,6 +45,7 @@ use buck2_execute::directory::extract_artifact_value;
 use buck2_execute::directory::insert_entry;
 use buck2_execute::entry::HashingInfo;
 use buck2_execute::entry::build_entry_from_disk;
+use buck2_execute::entry::make_owner_writable;
 use buck2_execute::execute::action_digest::ActionDigest;
 use buck2_execute::execute::blocking::BlockingExecutor;
 use buck2_execute::execute::clean_output_paths::CleanOutputPaths;
@@ -563,13 +564,23 @@ impl LocalExecutor {
                             // When user requests to not perform a cleanup for a specific action
                             // output from previous run of that action could actually be used as the
                             // input during current run (e.g. extra output which is an incremental state describing the actual output).
-                            materialize_build_outputs(
+                            let previous_outputs = materialize_build_outputs(
                                 &self.artifact_fs,
                                 &self.incremental_db_state,
                                 self.materializer.as_ref(),
                                 request,
                             )
                             .await?;
+                            // The tool writes into them in place, and a materialized output
+                            // may be a hard link into the shared CAS directory.
+                            self.blocking_executor
+                                .execute_io_inline(|| {
+                                    for path in &previous_outputs {
+                                        make_owner_writable(&self.artifact_fs.fs().resolve(path))?;
+                                    }
+                                    Ok(())
+                                })
+                                .await?;
 
                             // TODO(minglunli): There might be a dedup opportunity here to save some copying/materialization
                             // if the paths already exist on disk, should explore that
@@ -1211,13 +1222,14 @@ impl LocalExecutor {
                     copy_futs.push(async move {
                         self.blocking_executor
                             .execute_io_inline(|| {
-                                self.artifact_fs.fs().copy(
-                                    content_path.clone(),
-                                    self.artifact_fs.resolve_build(
-                                        &output,
-                                        Some(&ContentBasedPathHash::OutputArtifact),
-                                    )?,
-                                )
+                                let dest = self.artifact_fs.resolve_build(
+                                    &output,
+                                    Some(&ContentBasedPathHash::OutputArtifact),
+                                )?;
+                                self.artifact_fs.fs().copy(content_path.clone(), &dest)?;
+                                // The copy keeps the source's mode, 0444 for a file that came
+                                // out of the shared CAS directory, and the tool has to write it.
+                                make_owner_writable(&self.artifact_fs.fs().resolve(&dest))
                             })
                             .await
                     })
