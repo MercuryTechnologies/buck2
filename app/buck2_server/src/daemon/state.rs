@@ -536,6 +536,8 @@ impl DaemonState {
                     buffer_size,
                     retry_backoff,
                     retry_attempts,
+                    #[cfg(not(fbcode_build))]
+                    retry_window: Duration::from_secs(60),
                     message_batch_size,
                     #[cfg(fbcode_build)]
                     thrift_timeout: Duration::from_secs(1),
