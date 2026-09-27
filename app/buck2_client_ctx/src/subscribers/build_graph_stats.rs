@@ -42,6 +42,8 @@ impl BuildGraphStats {
                 buffer_size: 1,
                 retry_backoff: Duration::from_millis(100),
                 retry_attempts: 2,
+                #[cfg(not(fbcode_build))]
+                retry_window: Duration::from_secs(60),
                 message_batch_size: None,
                 #[cfg(fbcode_build)]
                 thrift_timeout: Duration::from_secs(1),
