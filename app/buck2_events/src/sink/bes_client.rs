@@ -67,6 +67,7 @@ use crate::sink::bazel_converter::interrupted_finish_event;
 
 const BUCK2_EVENT_TYPE_URL: &str = "type.googleapis.com/buck.data.BuckEvent";
 const DEFAULT_BATCH_SIZE: usize = 1;
+const UNACKED_EVENTS_PER_QUEUED_EVENT: usize = 10;
 const CLOSE_ACK_TIMEOUT_MULTIPLIER: u32 = 30;
 const MIN_CLOSE_ACK_TIMEOUT: Duration = Duration::from_secs(30);
 const COMMAND_END_CLOSE_GRACE: Duration = Duration::from_millis(500);
@@ -78,6 +79,9 @@ pub struct BesConfig {
     pub buffer_size: usize,
     pub retry_backoff: Duration,
     pub retry_attempts: usize,
+    /// How long one invocation's stream may keep failing before the sink gives up on it and
+    /// drops its events. Past this the stream's memory is worth more than its events.
+    pub retry_window: Duration,
     pub message_batch_size: Option<usize>,
     pub grpc_timeout: Duration,
     pub bes_backend: Option<String>,
@@ -111,6 +115,7 @@ impl Default for BesConfig {
             buffer_size: 10_000,
             retry_backoff: Duration::from_millis(500),
             retry_attempts: 5,
+            retry_window: Duration::from_secs(60),
             message_batch_size: None,
             grpc_timeout: Duration::from_secs(10),
             bes_backend: None,
@@ -250,6 +255,10 @@ impl CounterState {
 
     fn inc_dropped(&self) {
         self.dropped.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn add_dropped(&self, count: u64) {
+        self.dropped.fetch_add(count, Ordering::Relaxed);
     }
 
     fn snapshot(&self) -> Counters {
@@ -1225,6 +1234,12 @@ impl WorkerState {
         }
     }
 
+    /// A live server acks behind a burst of events, so the cap sits well above the queue a
+    /// healthy stream holds; it is there for a server that takes events and never acks them.
+    fn max_unacked(&self) -> usize {
+        self.config.buffer_size.saturating_mul(UNACKED_EVENTS_PER_QUEUED_EVENT)
+    }
+
     fn batch_size(&self) -> usize {
         self.config
             .message_batch_size
@@ -1269,22 +1284,35 @@ impl WorkerState {
         }
 
         let close_after = Instant::now() + COMMAND_END_CLOSE_GRACE;
-        let close_immediately;
+        let close_immediately = parsed.is_invocation_record;
         let sequence_number;
+        let mut abandoned;
         {
             let stream = self
                 .streams
                 .get_mut(&parsed.invocation_id)
                 .expect("stream was inserted");
-            sequence_number = stream
-                .enqueue_event(&parsed, self.config.event_format)
-                .await;
-            close_immediately = parsed.is_invocation_record;
+            abandoned = stream.abandoned;
+            sequence_number = if abandoned {
+                self.counters.inc_dropped();
+                None
+            } else {
+                stream
+                    .enqueue_event(&parsed, self.config.event_format)
+                    .await
+            };
 
-            if parsed.is_command_end {
+            if parsed.is_command_end || close_immediately {
                 stream.saw_command_end = true;
+                // The record closes the stream below; the deadline is for when that fails, so
+                // the poll loop keeps trying and the stream is eventually abandoned and freed
+                // instead of holding its events until the daemon exits.
                 stream.pending_close = Some(PendingClose {
-                    close_after,
+                    close_after: if close_immediately {
+                        Instant::now()
+                    } else {
+                        close_after
+                    },
                     event_time: parsed.event_time,
                 });
             } else if stream.saw_command_end {
@@ -1296,10 +1324,57 @@ impl WorkerState {
             }
         }
 
-        let retries = self.config.retry_attempts;
+        if !abandoned
+            && self.streams[&parsed.invocation_id].pending_unacked.len() > self.max_unacked()
+        {
+            self.abandon_stream(
+                &parsed.invocation_id,
+                "unacknowledged events exceed the buffer",
+            );
+            abandoned = true;
+        }
+        if abandoned {
+            if close_immediately {
+                drop(
+                    self.close_stream(&parsed.invocation_id, parsed.event_time)
+                        .await,
+                );
+            }
+            return if fail_fast {
+                Err(buck2_error::buck2_error!(
+                    ErrorTag::Tier0,
+                    "BES stream for invocation {} was abandoned",
+                    parsed.invocation_id
+                ))
+            } else {
+                Ok(None)
+            };
+        }
+
+        // A queued message never waits on the stream: while it is down, events collect in
+        // `pending_unacked` and the first message after `next_attempt_at` tries again. A
+        // priority message has a caller waiting on it, so it waits out the backoff and retries.
+        let retries = if fail_fast {
+            self.config.retry_attempts
+        } else {
+            0
+        };
         let mut last_error: Option<Status> = None;
 
-        for attempt in 0..=retries {
+        for _ in 0..=retries {
+            let Some(stream) = self
+                .streams
+                .get(&parsed.invocation_id)
+                .filter(|stream| !stream.abandoned)
+            else {
+                break;
+            };
+            if let Some(wait) = stream.backoff_remaining(Instant::now()) {
+                if !fail_fast {
+                    return Ok(None);
+                }
+                tokio::time::sleep(wait).await;
+            }
             match self.flush_stream(&parsed.invocation_id).await {
                 Ok(()) => {
                     if close_immediately {
@@ -1312,8 +1387,7 @@ impl WorkerState {
                                 return Ok(None);
                             }
                             Err(status) => {
-                                self.record_status_failure(&status);
-                                self.discard_stream_transport(&parsed.invocation_id);
+                                self.stream_failed(&parsed.invocation_id, &status);
                                 last_error = Some(status);
                             }
                         }
@@ -1325,13 +1399,9 @@ impl WorkerState {
                     }
                 }
                 Err(status) => {
-                    self.record_status_failure(&status);
-                    self.discard_stream_transport(&parsed.invocation_id);
+                    self.stream_failed(&parsed.invocation_id, &status);
                     last_error = Some(status);
                 }
-            }
-            if attempt < retries {
-                tokio::time::sleep(backoff_for(&self.config.retry_backoff, attempt)).await;
             }
         }
 
@@ -1375,7 +1445,59 @@ impl WorkerState {
                 invocation_id
             )));
         };
-        stream.flush_pending().await
+        stream.flush_pending(self.config.grpc_timeout).await?;
+        stream.failing = None;
+        Ok(())
+    }
+
+    fn stream_failed(&mut self, invocation_id: &str, status: &Status) {
+        self.record_status_failure(status);
+        let Some(stream) = self.streams.get_mut(invocation_id) else {
+            return;
+        };
+        stream.discard_transport();
+        let now = Instant::now();
+        let failing = stream.failing.get_or_insert_with(|| StreamFailure {
+            since: now,
+            next_attempt_at: now,
+            attempts: 0,
+            last_status: status.clone(),
+        });
+        failing.last_status = status.clone();
+        // The last attempt falls on the window's edge rather than a whole backoff past it.
+        failing.next_attempt_at = (now + backoff_for(&self.config.retry_backoff, failing.attempts))
+            .min(failing.since + self.config.retry_window);
+        failing.attempts += 1;
+        if now.duration_since(failing.since) >= self.config.retry_window {
+            self.abandon_stream(
+                invocation_id,
+                "the stream failed for the whole retry window",
+            );
+        }
+    }
+
+    /// Events that arrive for an abandoned invocation are dropped without reconnecting; the
+    /// next invocation starts afresh. A reporting sink must not cost the build its memory.
+    fn abandon_stream(&mut self, invocation_id: &str, reason: &str) {
+        let Some(stream) = self.streams.get_mut(invocation_id) else {
+            return;
+        };
+        let dropped = stream.pending_unacked.len();
+        tracing::warn!(
+            "Giving up on the BES stream for invocation {}: {}; dropping {} unacknowledged events and every later one; last failure: {}",
+            invocation_id,
+            reason,
+            dropped,
+            stream.failing.as_ref().map_or_else(
+                || "none".to_owned(),
+                |failing| failing.last_status.to_string()
+            ),
+        );
+        self.counters.add_dropped(dropped as u64);
+        stream.pending_unacked = VecDeque::new();
+        stream.discard_transport();
+        stream.failing = None;
+        stream.abandoned = true;
     }
 
     async fn ensure_stream_transport(&mut self, invocation_id: &str) -> Result<(), Status> {
@@ -1429,7 +1551,11 @@ impl WorkerState {
     > {
         // Keep stream RPCs open for the duration of the build; use this value
         // only to bound connection establishment.
-        let endpoint = endpoint_for(&self.connection.endpoint, self.config.grpc_timeout, &self.connection.tls)?;
+        let endpoint = endpoint_for(
+            &self.connection.endpoint,
+            self.config.grpc_timeout,
+            &self.connection.tls,
+        )?;
         let channel = endpoint.connect().await.map_err(map_transport_error)?;
         let mut client = PublishBuildEventClient::new(channel);
         let (tx, rx) = mpsc::channel(self.config.buffer_size.max(1));
@@ -1473,6 +1599,7 @@ impl WorkerState {
         let due = self
             .streams
             .iter()
+            .filter(|(_, stream)| stream.backoff_remaining(now).is_none())
             .filter_map(|(invocation_id, stream)| {
                 stream.pending_close.as_ref().and_then(|pending_close| {
                     (pending_close.close_after <= now)
@@ -1483,7 +1610,7 @@ impl WorkerState {
 
         for (invocation_id, event_time) in due {
             if let Err(status) = self.close_stream(&invocation_id, event_time).await {
-                self.record_status_failure(&status);
+                self.stream_failed(&invocation_id, &status);
             }
         }
     }
@@ -1493,8 +1620,13 @@ impl WorkerState {
         invocation_id: &str,
         event_time: Option<Timestamp>,
     ) -> Result<(), Status> {
-        if !self.streams.contains_key(invocation_id) {
-            return Ok(());
+        match self.streams.get(invocation_id) {
+            None => return Ok(()),
+            Some(stream) if stream.abandoned => {
+                self.streams.remove(invocation_id);
+                return Ok(());
+            }
+            Some(_) => {}
         }
 
         {
@@ -1676,11 +1808,22 @@ struct StreamState {
     saw_command_end: bool,
     pending_close: Option<PendingClose>,
     stream_finished_enqueued: bool,
+    /// Set while the transport is down. A successful flush clears it.
+    failing: Option<StreamFailure>,
+    /// The sink gave up on this invocation: events are dropped and nothing reconnects.
+    abandoned: bool,
 }
 
 struct PendingClose {
     close_after: Instant,
     event_time: Option<Timestamp>,
+}
+
+struct StreamFailure {
+    since: Instant,
+    next_attempt_at: Instant,
+    attempts: usize,
+    last_status: Status,
 }
 
 impl StreamState {
@@ -1711,7 +1854,17 @@ impl StreamState {
             saw_command_end: false,
             pending_close: None,
             stream_finished_enqueued: false,
+            failing: None,
+            abandoned: false,
         }
+    }
+
+    /// How long until the stream may be retried, or `None` when it may be flushed now.
+    fn backoff_remaining(&self, now: Instant) -> Option<Duration> {
+        self.failing
+            .as_ref()
+            .and_then(|failing| failing.next_attempt_at.checked_duration_since(now))
+            .filter(|remaining| !remaining.is_zero())
     }
 
     async fn enqueue_event(
@@ -1802,7 +1955,7 @@ impl StreamState {
         }
     }
 
-    async fn flush_pending(&mut self) -> Result<(), Status> {
+    async fn flush_pending(&mut self, send_timeout: Duration) -> Result<(), Status> {
         self.prune_acked_requests();
         let sender = match self.sender.clone() {
             Some(sender) => sender,
@@ -1822,11 +1975,22 @@ impl StreamState {
             .collect::<Vec<_>>();
         for request in pending {
             let sequence_number = request_sequence_number(&request);
-            if sender.send(request).await.is_err() {
-                if let Some(status) = self.finished_ack_task_status().await {
-                    return Err(status);
+            // A server that stays connected but stops reading fills the channel; without a
+            // bound the worker thread would wait here for the rest of the daemon's life.
+            match tokio::time::timeout(send_timeout, sender.send(request)).await {
+                Ok(Ok(())) => {}
+                Ok(Err(_)) => {
+                    if let Some(status) = self.finished_ack_task_status().await {
+                        return Err(status);
+                    }
+                    return Err(Status::unavailable("BES stream was closed"));
                 }
-                return Err(Status::unavailable("BES stream was closed"));
+                Err(_) => {
+                    return Err(Status::deadline_exceeded(format!(
+                        "BES stream accepted no event for {:?}",
+                        send_timeout
+                    )));
+                }
             }
             self.last_sent_sequence_number = sequence_number;
         }
@@ -2118,6 +2282,9 @@ fn bes_backend(configured_endpoint: Option<&str>) -> buck2_error::Result<String>
 mod tests {
     use std::time::SystemTime;
 
+    use bes_grpc_proto::google::devtools::build::v1::PublishLifecycleEventRequest;
+    use bes_grpc_proto::google::devtools::build::v1::publish_build_event_server::PublishBuildEvent;
+    use bes_grpc_proto::google::devtools::build::v1::publish_build_event_server::PublishBuildEventServer;
     use buck2_wrapper_common::invocation_id::TraceId;
 
     use super::*;
@@ -2840,6 +3007,265 @@ mod tests {
                 .get(&parsed.invocation_id)
                 .and_then(|stream| stream.pending_close.as_ref())
                 .is_some()
+        );
+    }
+
+    struct BesThatStopsAcking {
+        acks: i64,
+        failed: std::sync::Mutex<Option<oneshot::Sender<()>>>,
+    }
+
+    #[tonic::async_trait]
+    impl PublishBuildEvent for BesThatStopsAcking {
+        async fn publish_lifecycle_event(
+            &self,
+            _request: tonic::Request<PublishLifecycleEventRequest>,
+        ) -> Result<tonic::Response<()>, Status> {
+            Ok(tonic::Response::new(()))
+        }
+
+        type PublishBuildToolEventStreamStream =
+            ReceiverStream<Result<PublishBuildToolEventStreamResponse, Status>>;
+
+        async fn publish_build_tool_event_stream(
+            &self,
+            request: tonic::Request<tonic::Streaming<PublishBuildToolEventStreamRequest>>,
+        ) -> Result<tonic::Response<Self::PublishBuildToolEventStreamStream>, Status> {
+            let mut inbound = request.into_inner();
+            let (tx, rx) = mpsc::channel(16);
+            let acks = self.acks;
+            let failed = self.failed.lock().unwrap().take();
+            tokio::spawn(async move {
+                while let Ok(Some(request)) = inbound.message().await {
+                    let sequence_number = request_sequence_number(&request);
+                    if sequence_number > acks {
+                        break;
+                    }
+                    let response = PublishBuildToolEventStreamResponse {
+                        stream_id: request
+                            .ordered_build_event
+                            .and_then(|ordered| ordered.stream_id),
+                        sequence_number,
+                    };
+                    if tx.send(Ok(response)).await.is_err() {
+                        break;
+                    }
+                }
+                if let Some(failed) = failed {
+                    failed.send(()).ok();
+                }
+            });
+            Ok(tonic::Response::new(ReceiverStream::new(rx)))
+        }
+    }
+
+    async fn serve_bes_that_stops_acking(acks: i64) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let endpoint = format!("http://{}", listener.local_addr().expect("local addr"));
+        let (failed_tx, failed_rx) = oneshot::channel();
+        let server = tokio::spawn(
+            tonic::transport::Server::builder()
+                .add_service(PublishBuildEventServer::new(BesThatStopsAcking {
+                    acks,
+                    failed: std::sync::Mutex::new(Some(failed_tx)),
+                }))
+                .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener)),
+        );
+        // Aborting drops the listener at once, so reconnects are refused rather than left in
+        // the accept backlog; a graceful shutdown keeps listening while connections drain.
+        tokio::spawn(async move {
+            drop(failed_rx.await);
+            server.abort();
+        });
+        endpoint
+    }
+
+    #[tokio::test]
+    async fn stream_that_stops_acking_is_abandoned_within_bounds() {
+        let endpoint = serve_bes_that_stops_acking(3).await;
+        let config = BesConfig {
+            buffer_size: 3,
+            retry_backoff: Duration::from_millis(20),
+            retry_attempts: 5,
+            retry_window: Duration::from_millis(400),
+            grpc_timeout: Duration::from_millis(500),
+            ..BesConfig::default()
+        };
+        let connection = ConnectionConfig {
+            endpoint,
+            headers: Vec::new(),
+            tls: BesTls::default(),
+            credential_helper: None,
+        };
+        let counters = Arc::new(CounterState::default());
+        let mut worker = WorkerState::new(config.clone(), connection, counters.clone());
+        let trace_id = TraceId::new().to_string();
+        async fn send_queued(
+            worker: &mut WorkerState,
+            trace_id: &str,
+            data: buck2_data::buck_event::Data,
+        ) -> Duration {
+            let message = make_message(Some(trace_id), Some(1), data);
+            let started = Instant::now();
+            let result = worker.send_message_with_retry(&message, false).await;
+            assert!(result.is_ok(), "queued sends never fail the command");
+            started.elapsed()
+        }
+        let action_start = || {
+            buck2_data::buck_event::Data::SpanStart(buck2_data::SpanStartEvent {
+                data: Some(buck2_data::span_start_event::Data::ActionExecution(
+                    buck2_data::ActionExecutionStart::default(),
+                )),
+            })
+        };
+        let per_message_retry_cost = (0..=config.retry_attempts)
+            .map(|attempt| backoff_for(&config.retry_backoff, attempt))
+            .sum::<Duration>();
+        let bound = per_message_retry_cost / 4;
+        let mut slowest = Duration::ZERO;
+
+        slowest = slowest.max(send_queued(&mut worker, &trace_id, command_start_data()).await);
+        let invocation_id = worker.streams.keys().next().expect("stream opened").clone();
+        let acked = tokio::time::timeout(Duration::from_secs(5), async {
+            while worker.streams[&invocation_id].last_acked_sequence_number() < 1 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+        assert!(
+            acked.is_ok(),
+            "the server acked the command start before dying"
+        );
+        let cap = config.buffer_size * UNACKED_EVENTS_PER_QUEUED_EVENT;
+        for _ in 0..(2 * cap) {
+            slowest = slowest.max(send_queued(&mut worker, &trace_id, action_start()).await);
+            // The server and the ack task share this test's thread; without a yield the burst
+            // would starve them and measure that starvation instead of the dead server.
+            tokio::task::yield_now().await;
+            let pending = worker.streams[&invocation_id].pending_unacked.len();
+            assert!(
+                pending <= cap,
+                "{pending} unacknowledged events held, cap is {cap}"
+            );
+        }
+
+        let stream = &worker.streams[&invocation_id];
+        assert!(
+            stream.abandoned,
+            "stream not abandoned after the server went away"
+        );
+        assert!(stream.pending_unacked.is_empty());
+        assert!(stream.sender.is_none() && stream.ack_task.is_none());
+        let dropped_before = counters.snapshot().dropped;
+        slowest = slowest.max(send_queued(&mut worker, &trace_id, action_start()).await);
+        slowest = slowest.max(
+            send_queued(
+                &mut worker,
+                &trace_id,
+                buck2_data::buck_event::Data::SpanEnd(buck2_data::SpanEndEvent {
+                    data: Some(buck2_data::CommandEnd::default().into()),
+                    ..Default::default()
+                }),
+            )
+            .await,
+        );
+        slowest = slowest.max(send_queued(&mut worker, &trace_id, invocation_record_data()).await);
+        assert_eq!(counters.snapshot().dropped - dropped_before, 3);
+        assert!(
+            !worker.streams.contains_key(&invocation_id),
+            "the record closes an abandoned stream without waiting for acks"
+        );
+        assert!(
+            slowest < bound,
+            "slowest send took {slowest:?}, bound {bound:?} (per-message retries cost {per_message_retry_cost:?})"
+        );
+    }
+
+    #[tokio::test]
+    async fn stream_failing_for_the_retry_window_is_abandoned() {
+        let config = BesConfig {
+            retry_backoff: Duration::from_millis(30),
+            retry_window: Duration::from_millis(100),
+            grpc_timeout: Duration::from_millis(500),
+            ..BesConfig::default()
+        };
+        let connection = ConnectionConfig {
+            endpoint: "http://127.0.0.1:1".to_owned(),
+            headers: Vec::new(),
+            tls: BesTls::default(),
+            credential_helper: None,
+        };
+        let counters = Arc::new(CounterState::default());
+        let mut worker = WorkerState::new(config, connection, counters.clone());
+        let trace_id = TraceId::new().to_string();
+        let action_start = || {
+            buck2_data::buck_event::Data::SpanStart(buck2_data::SpanStartEvent {
+                data: Some(buck2_data::span_start_event::Data::ActionExecution(
+                    buck2_data::ActionExecutionStart::default(),
+                )),
+            })
+        };
+        let message = make_message(Some(&trace_id), Some(1), command_start_data());
+        let parsed = ParsedMessage::from_message(&message).expect("valid message");
+
+        assert!(
+            worker
+                .send_message_with_retry(&message, false)
+                .await
+                .is_ok()
+        );
+        let failures_after_first = counters.snapshot().failures_pushed_back;
+        assert_eq!(failures_after_first, 1);
+        let started = Instant::now();
+        let message = make_message(Some(&trace_id), Some(1), action_start());
+        assert!(
+            worker
+                .send_message_with_retry(&message, false)
+                .await
+                .is_ok()
+        );
+        assert!(
+            started.elapsed() < Duration::from_millis(30),
+            "a send in backoff must not connect or sleep"
+        );
+        assert_eq!(
+            counters.snapshot().failures_pushed_back,
+            failures_after_first
+        );
+        assert_eq!(
+            worker.streams[&parsed.invocation_id].pending_unacked.len(),
+            2
+        );
+
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        let message = make_message(Some(&trace_id), Some(1), action_start());
+        assert!(
+            worker
+                .send_message_with_retry(&message, false)
+                .await
+                .is_ok()
+        );
+
+        let stream = &worker.streams[&parsed.invocation_id];
+        assert!(
+            stream.abandoned,
+            "stream not abandoned after failing for the whole window"
+        );
+        assert!(stream.pending_unacked.is_empty());
+        assert_eq!(counters.snapshot().dropped, 3);
+        let message = make_message(Some(&trace_id), Some(1), action_start());
+        assert!(
+            worker
+                .send_message_with_retry(&message, false)
+                .await
+                .is_ok()
+        );
+        assert_eq!(counters.snapshot().dropped, 4);
+        assert_eq!(
+            counters.snapshot().failures_pushed_back,
+            failures_after_first + 1
         );
     }
 }
