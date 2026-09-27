@@ -2313,14 +2313,14 @@ impl REClientBuilder {
                     .map(PathBuf::from)
             })
             .transpose()?;
-        // The daemon runs in the project root, so `buck-out` is relative to it. When the probe
-        // fails, the daemon is left out as well: nothing would clone its blobs.
+        // The daemon's working directory is `buck-out/<isolation dir>` (buck2_fs's cwd.rs moves it
+        // there), so a clone into it tells whether blobs can be reflinked into buck-out. When the
+        // probe fails, the daemon is left out as well: nothing would clone its blobs.
         let casd_refused = configured_cache_dir.is_some();
         let shared_cache_dir = match configured_cache_dir {
             Some(dir) => {
                 let buck_out = std::env::current_dir()
-                    .context("Error reading the daemon's working directory")?
-                    .join("buck-out");
+                    .context("Error reading the daemon's working directory")?;
                 crate::shared_cache::shared_cache_dir_if_reflink(dir, &buck_out)
             }
             None => None,
