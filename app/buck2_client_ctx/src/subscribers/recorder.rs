@@ -459,6 +459,8 @@ impl InvocationRecorder {
                 buffer_size: 1,
                 retry_backoff: Duration::from_millis(500),
                 retry_attempts: 5,
+                #[cfg(not(fbcode_build))]
+                retry_window: Duration::from_secs(60),
                 message_batch_size: None,
                 #[cfg(fbcode_build)]
                 thrift_timeout: Duration::from_secs(2),
@@ -693,6 +695,8 @@ impl InvocationRecorder {
                 buffer_size: 1,
                 retry_backoff: Duration::from_millis(500),
                 retry_attempts: 5,
+                #[cfg(not(fbcode_build))]
+                retry_window: Duration::from_secs(60),
                 message_batch_size: None,
                 #[cfg(fbcode_build)]
                 thrift_timeout: Duration::from_secs(2),
