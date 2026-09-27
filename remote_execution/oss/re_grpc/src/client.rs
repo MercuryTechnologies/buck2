@@ -2304,7 +2304,7 @@ impl REClientBuilder {
         // CAS traffic goes to the machine-local CAS daemon when one is configured; it is a Unix
         // socket or a loopback port and never uses TLS. The daemon passes misses and uploads
         // through to `cas_address`.
-        let shared_cache_dir = opts
+        let configured_cache_dir = opts
             .cas_shared_cache
             .as_deref()
             .map(|path| {
@@ -2313,16 +2313,30 @@ impl REClientBuilder {
                     .map(PathBuf::from)
             })
             .transpose()?;
-        let daemon_address =
-            if shared_cache_dir.is_some() || opts.cas_shared_cache_address.is_some() {
-                Some(DaemonAddress::resolve(
-                    opts.cas_shared_cache_address.as_ref(),
-                    shared_cache_dir.as_deref(),
-                    substitute_env_vars,
-                )?)
-            } else {
-                None
-            };
+        // The daemon runs in the project root, so `buck-out` is relative to it. When the probe
+        // fails, the daemon is left out as well: nothing would clone its blobs.
+        let casd_refused = configured_cache_dir.is_some();
+        let shared_cache_dir = match configured_cache_dir {
+            Some(dir) => {
+                let buck_out = std::env::current_dir()
+                    .context("Error reading the daemon's working directory")?
+                    .join("buck-out");
+                crate::shared_cache::shared_cache_dir_if_reflink(dir, &buck_out)
+            }
+            None => None,
+        };
+        let casd_refused = casd_refused && shared_cache_dir.is_none();
+        let daemon_address = if casd_refused {
+            None
+        } else if shared_cache_dir.is_some() || opts.cas_shared_cache_address.is_some() {
+            Some(DaemonAddress::resolve(
+                opts.cas_shared_cache_address.as_ref(),
+                shared_cache_dir.as_deref(),
+                substitute_env_vars,
+            )?)
+        } else {
+            None
+        };
         anyhow::ensure!(
             daemon_address.is_none() || !opts.remote_cache_chunking,
             "`remote_cache_chunking` cannot be combined with `cas_shared_cache`: buck2-casd does \

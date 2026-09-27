@@ -13,8 +13,9 @@
 //! The daemon is the single owner of that directory: it downloads, verifies, writes and evicts.
 //! Buck2 only opens blobs for reading, to clone them into `buck-out`. On a filesystem with
 //! reflink support (btrfs, XFS, APFS) the clone is copy-on-write, so the bytes exist once on disk
-//! however many isolation dirs or checkouts materialize them. Elsewhere it degrades to a plain
-//! copy, which still avoids receiving the bytes over gRPC.
+//! however many isolation dirs or checkouts materialize them. Where the directory and `buck-out`
+//! cannot share extents, the cache would cost a second copy of every blob instead, so
+//! [`shared_cache_dir_if_reflink`] turns it off and buck2 downloads as if it were not configured.
 //!
 //! Layout, shared with the daemon:
 //!
@@ -348,6 +349,49 @@ fn reflink(_src: &File, _src_path: &Path, _dst: &Path) -> io::Result<()> {
     ))
 }
 
+/// Clones a small file from `store_dir` into `target_dir` with the same call materialization
+/// uses, and reports why it failed if it did. `EXDEV` means the two directories are on different
+/// filesystems; `EOPNOTSUPP` and its relatives mean the filesystem has no reflink (ext4, tmpfs,
+/// overlayfs).
+pub fn probe_reflink(store_dir: &Path, target_dir: &Path) -> Result<(), String> {
+    let name = format!(".buck2-casd-reflink-probe-{}", std::process::id());
+    let src_path = store_dir.join(&name);
+    let dst_path = target_dir.join(&name);
+    let result = (|| -> io::Result<()> {
+        fs::create_dir_all(store_dir)?;
+        fs::create_dir_all(target_dir)?;
+        fs::write(&src_path, b"buck2-casd reflink probe")?;
+        let src = File::open(&src_path)?;
+        reflink(&src, &src_path, &dst_path)
+    })();
+    let _ = fs::remove_file(&dst_path);
+    let _ = fs::remove_file(&src_path);
+    result.map_err(|e| match e.raw_os_error() {
+        #[cfg(unix)]
+        Some(libc::EXDEV) => "they are on different filesystems".to_owned(),
+        _ if is_reflink_unsupported(&e) => format!("the filesystem cannot reflink ({e})"),
+        _ => format!("the probe failed ({e})"),
+    })
+}
+
+/// `store_dir` if a blob in it can be reflinked into `buck_out`, otherwise `None` after one
+/// warning. A copy per checkout on top of the store would use more disk than no cache at all.
+pub fn shared_cache_dir_if_reflink(store_dir: PathBuf, buck_out: &Path) -> Option<PathBuf> {
+    match probe_reflink(&store_dir, buck_out) {
+        Ok(()) => Some(store_dir),
+        Err(why) => {
+            tracing::warn!(
+                "cas_shared_cache disabled: `{}` and `{}` are not on one reflink filesystem \
+                 (XFS or btrfs): {}. Falling back to direct downloads.",
+                store_dir.display(),
+                buck_out.display(),
+                why
+            );
+            None
+        }
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
@@ -488,5 +532,74 @@ pub(crate) mod tests {
         assert_eq!(s.misses_files, 1);
         assert_eq!(s.misses_bytes, 7);
         assert_eq!(s.total_cache_lookup_attempts, 3);
+    }
+
+    /// Whether a plain clone between two files in `dir` works, independently of the probe.
+    fn reflink_works_in(dir: &Path) -> bool {
+        let src_path = dir.join("independent-src");
+        fs::write(&src_path, b"x").unwrap();
+        let src = File::open(&src_path).unwrap();
+        reflink(&src, &src_path, &dir.join("independent-dst")).is_ok()
+    }
+
+    #[cfg(unix)]
+    fn device(path: &Path) -> u64 {
+        use std::os::unix::fs::MetadataExt;
+        fs::metadata(path).unwrap().dev()
+    }
+
+    #[test]
+    fn test_probe_agrees_with_a_direct_clone() {
+        let work = tempfile::tempdir().unwrap();
+        let store = work.path().join("store");
+        let target = work.path().join("buck-out");
+        let direct = reflink_works_in(work.path());
+        assert_eq!(probe_reflink(&store, &target).is_ok(), direct);
+        assert_eq!(fs::read_dir(&store).unwrap().count(), 0);
+        assert_eq!(fs::read_dir(&target).unwrap().count(), 0);
+    }
+
+    /// `BUCK2_CASD_REFLINK_TEST_DIR` names a directory on a reflink filesystem (an XFS
+    /// /workspaces on a Namespace devbox); without it this test has nothing to check.
+    #[test]
+    fn test_probe_passes_on_a_reflink_filesystem() {
+        let Some(dir) = std::env::var_os("BUCK2_CASD_REFLINK_TEST_DIR") else {
+            return;
+        };
+        let work = tempfile::tempdir_in(dir).unwrap();
+        let store = work.path().join("store");
+        assert_eq!(probe_reflink(&store, &work.path().join("buck-out")), Ok(()));
+        assert_eq!(
+            shared_cache_dir_if_reflink(store.clone(), &work.path().join("buck-out")),
+            Some(store)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_probe_fails_across_devices() {
+        let tmp = tempfile::tempdir().unwrap();
+        let here = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).unwrap();
+        if device(tmp.path()) == device(here.path()) {
+            return;
+        }
+        let err = probe_reflink(tmp.path(), here.path()).unwrap_err();
+        assert!(
+            err.contains("different filesystems") || err.contains("cannot reflink"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn test_cache_stays_off_where_reflink_fails() {
+        let work = tempfile::tempdir().unwrap();
+        if reflink_works_in(work.path()) {
+            return;
+        }
+        let store = work.path().join("store");
+        assert_eq!(
+            shared_cache_dir_if_reflink(store, &work.path().join("buck-out")),
+            None
+        );
     }
 }
