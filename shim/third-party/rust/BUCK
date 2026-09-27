@@ -2302,7 +2302,6 @@ third_party_rust_cxx_library(
         ":blake3-1.8.7.crate[c/blake3.h]",
         ":blake3-1.8.7.crate[c/blake3_impl.h]",
     ],
-    compiler_flags = ["-fno-stack-protector"],
     platform = {
         "linux-arm64": dict(),
         "macos-arm64": dict(),
