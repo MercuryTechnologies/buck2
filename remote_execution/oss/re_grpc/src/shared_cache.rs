@@ -28,7 +28,7 @@
 //! A hard link shares the inode, and with it the mode, so the executable and the plain copy of
 //! the same bytes cannot be one file. The `.x` twin is made by buck2, once per digest, the first
 //! time a hard-linked output needs the executable bit. The daemon never reads it, but its evictor
-//! counts every file in a shard, so the twin is written under `tmp/` and renamed into the shard
+//! counts every file in a shard, so the twin is written under `tmp/` and linked into the shard
 //! only once complete.
 
 use std::fs;
@@ -351,48 +351,59 @@ fn try_hardlink(
         return Ok(false);
     }
 
-    let link_src = if executable {
-        match executable_twin(src_path, store.blob_size, store.tmp_dir) {
-            Ok(twin) => twin,
-            Err(e) if is_store_not_writable(&e) => {
-                note_hardlink_unsupported(
-                    store.unsupported,
-                    dst,
-                    &format!(
-                        "cannot write the executable twin of `{}`: {e}",
-                        src_path.display()
-                    ),
-                );
-                return Ok(false);
+    // The twin's name can vanish between the check that it is good and the link to it, when
+    // another materialization is replacing a bad twin at that moment, so a `NotFound` on an
+    // executable link is retried a few times before the file is copied instead.
+    let mut attempts = 0;
+    loop {
+        let link_src = if executable {
+            match executable_twin(src_path, store.blob_size, store.tmp_dir) {
+                Ok(twin) => twin,
+                Err(e) if is_store_not_writable(&e) => {
+                    note_hardlink_unsupported(
+                        store.unsupported,
+                        dst,
+                        &format!(
+                            "cannot write the executable twin of `{}`: {e}",
+                            src_path.display()
+                        ),
+                    );
+                    return Ok(false);
+                }
+                Err(e) => {
+                    return Err(e).with_context(|| {
+                        format!(
+                            "Error making the executable twin of `{}`",
+                            src_path.display()
+                        )
+                    });
+                }
+            }
+        } else {
+            src_path.to_owned()
+        };
+        match fs::hard_link(&link_src, dst) {
+            Ok(()) => return Ok(true),
+            Err(e) if executable && e.kind() == io::ErrorKind::NotFound && attempts < 3 => {
+                attempts += 1;
             }
             Err(e) => {
-                return Err(e).with_context(|| {
-                    format!(
-                        "Error making the executable twin of `{}`",
-                        src_path.display()
-                    )
-                });
+                return match e.raw_os_error() {
+                    Some(libc::EMLINK) => Ok(false),
+                    Some(libc::EXDEV) | Some(libc::EPERM) | Some(libc::EOPNOTSUPP) => {
+                        note_hardlink_unsupported(store.unsupported, dst, &e.to_string());
+                        Ok(false)
+                    }
+                    _ => Err(e).with_context(|| {
+                        format!(
+                            "Error hard-linking `{}` to `{}`",
+                            link_src.display(),
+                            dst.display()
+                        )
+                    }),
+                };
             }
         }
-    } else {
-        src_path.to_owned()
-    };
-    match fs::hard_link(&link_src, dst) {
-        Ok(()) => Ok(true),
-        Err(e) => match e.raw_os_error() {
-            Some(libc::EMLINK) => Ok(false),
-            Some(libc::EXDEV) | Some(libc::EPERM) | Some(libc::EOPNOTSUPP) => {
-                note_hardlink_unsupported(store.unsupported, dst, &e.to_string());
-                Ok(false)
-            }
-            _ => Err(e).with_context(|| {
-                format!(
-                    "Error hard-linking `{}` to `{}`",
-                    link_src.display(),
-                    dst.display()
-                )
-            }),
-        },
     }
 }
 
@@ -428,10 +439,12 @@ fn is_store_not_writable(e: &io::Error) -> bool {
 /// The 0555 copy of the blob that executables link to, made on first use and remade when the one
 /// on disk has the wrong size or mode.
 ///
-/// The copy is written under the daemon's `tmp/` and renamed into the shard, so a reader never
-/// sees a partial twin and the daemon's evictor, which counts every file in a shard, cannot
-/// remove a twin still being written. Two concurrent makers rename identical content over each
-/// other, and the loser's inode lives on under whatever links it already has.
+/// The copy is written under the daemon's `tmp/`, so the daemon's evictor, which counts every
+/// file in a shard, cannot remove a twin still being written, and is published with `link`, which
+/// refuses an existing name: of several concurrent makers exactly one creates the twin's inode,
+/// the others find `EEXIST` and use it, and a reader never sees a partial file. A bad twin is
+/// renamed into `tmp/` and removed before the new one is linked, so the only moment the name is
+/// missing is that replacement, which the caller retries through.
 #[cfg(unix)]
 fn executable_twin(src_path: &Path, blob_size: u64, tmp_dir: &Path) -> io::Result<PathBuf> {
     use std::os::unix::fs::PermissionsExt;
@@ -439,32 +452,43 @@ fn executable_twin(src_path: &Path, blob_size: u64, tmp_dir: &Path) -> io::Resul
     let mut twin = src_path.as_os_str().to_owned();
     twin.push(".x");
     let twin = PathBuf::from(twin);
+    let twin_name = twin
+        .file_name()
+        .expect("a blob path has a file name")
+        .to_owned();
+    let unique = format!("{}-{:?}", std::process::id(), std::thread::current().id());
+    fs::create_dir_all(tmp_dir)?;
     match fs::metadata(&twin) {
         Ok(m) if m.len() == blob_size && m.permissions().mode() & 0o777 == 0o555 => {
             return Ok(twin);
         }
-        Ok(m) => tracing::warn!(
-            "Executable twin `{}` has size {} and mode {:o} but should have size {} and mode 555; \
-             remaking it",
-            twin.display(),
-            m.len(),
-            m.permissions().mode() & 0o777,
-            blob_size
-        ),
+        Ok(m) => {
+            tracing::warn!(
+                "Executable twin `{}` has size {} and mode {:o} but should have size {} and mode \
+                 555; remaking it",
+                twin.display(),
+                m.len(),
+                m.permissions().mode() & 0o777,
+                blob_size
+            );
+            let mut aside_name = twin_name.clone();
+            aside_name.push(format!(".bad-{unique}"));
+            let aside = tmp_dir.join(aside_name);
+            match fs::rename(&twin, &aside) {
+                Ok(()) => {
+                    let _ = fs::remove_file(&aside);
+                }
+                // Another maker moved it first.
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e),
+            }
+        }
         Err(e) if e.kind() == io::ErrorKind::NotFound => {}
         Err(e) => return Err(e),
     }
 
-    fs::create_dir_all(tmp_dir)?;
-    let mut tmp_name = twin
-        .file_name()
-        .expect("a blob path has a file name")
-        .to_owned();
-    tmp_name.push(format!(
-        ".tmp-{}-{:?}",
-        std::process::id(),
-        std::thread::current().id()
-    ));
+    let mut tmp_name = twin_name;
+    tmp_name.push(format!(".tmp-{unique}"));
     let tmp = tmp_dir.join(tmp_name);
     let result = (|| {
         let copied = fs::copy(src_path, &tmp)?;
@@ -475,11 +499,13 @@ fn executable_twin(src_path: &Path, blob_size: u64, tmp_dir: &Path) -> io::Resul
             )));
         }
         fs::set_permissions(&tmp, fs::Permissions::from_mode(0o555))?;
-        fs::rename(&tmp, &twin)
+        match fs::hard_link(&tmp, &twin) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Ok(()),
+            Err(e) => Err(e),
+        }
     })();
-    if result.is_err() {
-        let _ = fs::remove_file(&tmp);
-    }
+    let _ = fs::remove_file(&tmp);
     result.map(|()| twin)
 }
 
@@ -761,6 +787,45 @@ pub(crate) mod tests {
         assert_eq!((blob_mode, blob_links), (0o444, 1));
         assert_eq!(shard_entries(&blob), vec!["00dd-5", "00dd-5.x"]);
         assert_eq!(fs::read_dir(&tmp_dir).unwrap().count(), 0);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn test_concurrent_executable_materializations_all_link() -> anyhow::Result<()> {
+        let work = tempfile::tempdir()?;
+        let root = fake_daemon_dir(work.path());
+        let d = digest("00de", 5);
+        let blob = publish_read_only(&root, &d, b"bytes");
+        let cache = Arc::new(SharedCasCache::new(root.clone(), CopyPolicy::Hardlink)?);
+        let out = work.path().join("out");
+        fs::create_dir_all(&out)?;
+
+        const MATERIALIZATIONS: usize = 64;
+        let results = futures::future::join_all((0..MATERIALIZATIONS).map(|i| {
+            let cache = Arc::clone(&cache);
+            let dst = out.join(format!("x{i}"));
+            let d = d.clone();
+            tokio::spawn(async move { cache.materialize(&d, &dst, true).await })
+        }))
+        .await;
+        for r in results {
+            assert!(r??);
+        }
+
+        let mut twin = blob.clone().into_os_string();
+        twin.push(".x");
+        let (twin_ino, twin_mode, twin_links) = ino_mode_links(Path::new(&twin));
+        assert_eq!(
+            (twin_mode, twin_links),
+            (0o555, MATERIALIZATIONS as u64 + 1)
+        );
+        for i in 0..MATERIALIZATIONS {
+            assert_eq!(ino_mode_links(&out.join(format!("x{i}"))).0, twin_ino);
+        }
+        assert!(!cache.hardlink_unsupported.load(Ordering::Relaxed));
+        assert_eq!(shard_entries(&blob), vec!["00de-5", "00de-5.x"]);
+        assert_eq!(fs::read_dir(root.join("tmp"))?.count(), 0);
+        Ok(())
     }
 
     #[cfg(unix)]
