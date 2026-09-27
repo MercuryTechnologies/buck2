@@ -46,11 +46,54 @@ download_llvm_distribution(
     url = "https://github.com/sluongng/buck2/releases/download/v0.202624.0/llvm-toolchain-minimal-22.1.7-linux-amd64-musl.tar.gz",
 )
 
+# A target configuration carrying prelude//abi/constraints:musl (the
+# namespace//:linux-*-musl platforms) compiles C against these headers and
+# links a static executable; the LLVM archive ships no libc headers of its
+# own. Nothing but headers is needed: rustc links the musl C runtime and
+# libc.a that the Rust toolchain's musl target carries as self-contained
+# objects (https://doc.rust-lang.org/rustc/codegen-options/index.html#link-self-contained).
+http_archive(
+    name = "musl-src",
+    sha256 = "a9a118bbe84d8764da0ea0d28b3ab3fae8477fc7e4085d90102b8596fc7c75e4",
+    strip_prefix = "musl-1.2.5",
+    urls = ["https://musl.libc.org/releases/musl-1.2.5.tar.gz"],
+)
+
+genrule(
+    name = "musl-sysroot-x86_64",
+    out = "sysroot",
+    cmd = "sh $SRCDIR/musl_sysroot.sh $(location :musl-src) x86_64 $OUT",
+    srcs = ["musl_sysroot.sh"],
+)
+
+genrule(
+    name = "musl-sysroot-aarch64",
+    out = "sysroot",
+    cmd = "sh $SRCDIR/musl_sysroot.sh $(location :musl-src) aarch64 $OUT",
+    srcs = ["musl_sysroot.sh"],
+)
+
 cxx_llvm_toolchain(
     name = "cxx",
     cxx_compiler_flags = ["-std=c++20"],
     distribution = ":llvm_dist",
-    target = "x86_64-unknown-linux-gnu",
+    sysroot = select({
+        "DEFAULT": None,
+        "prelude//abi:musl": select({
+            "prelude//cpu:arm64": ":musl-sysroot-aarch64",
+            "prelude//cpu:x86_64": ":musl-sysroot-x86_64",
+        }),
+    }),
+    target = select({
+        "DEFAULT": select({
+            "prelude//cpu:arm64": "aarch64-unknown-linux-gnu",
+            "prelude//cpu:x86_64": "x86_64-unknown-linux-gnu",
+        }),
+        "prelude//abi:musl": select({
+            "prelude//cpu:arm64": "aarch64-unknown-linux-musl",
+            "prelude//cpu:x86_64": "x86_64-unknown-linux-musl",
+        }),
+    }),
     visibility = ["PUBLIC"],
 )
 
@@ -219,6 +262,20 @@ downloaded_rust_toolchain(
     # Release builds pass e.g. -c rust.rustc_flags="-Copt-level=3 -Cstrip=debuginfo";
     # the default is a debug build, as for cargo.
     rustc_flags = read_root_config("rust", "rustc_flags", "").split(),
+    # The compiler runs on the remote execution workers, which are x86_64
+    # Linux whatever the target is; the prelude's default would follow the
+    # target configuration and fetch an aarch64 rustc for an aarch64 build.
+    rustc_host_triple = "x86_64-unknown-linux-gnu",
+    rustc_target_triple = select({
+        "DEFAULT": select({
+            "prelude//cpu:arm64": "aarch64-unknown-linux-gnu",
+            "prelude//cpu:x86_64": "x86_64-unknown-linux-gnu",
+        }),
+        "prelude//abi:musl": select({
+            "prelude//cpu:arm64": "aarch64-unknown-linux-musl",
+            "prelude//cpu:x86_64": "x86_64-unknown-linux-musl",
+        }),
+    }),
     rust_toolchain = "root//:rust-toolchain",
     visibility = ["PUBLIC"],
 )

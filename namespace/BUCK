@@ -13,3 +13,28 @@ buildbuddy_remote_execution_platform(
     os_family = "Linux",
     visibility = ["PUBLIC"],
 )
+
+# Target configurations for the release binaries, both built on the x86_64
+# workers above: `--target-platforms namespace//:linux-aarch64-musl` is a
+# cross-compile. The musl constraint makes the hermetic toolchains target
+# *-unknown-linux-musl with the musl headers, so the executable is static
+# and runs on any Linux of its architecture.
+platform(
+    name = "linux-x86_64-musl",
+    constraint_values = [
+        "prelude//abi/constraints:musl",
+        "prelude//cpu/constraints:x86_64",
+        "prelude//os/constraints:linux",
+    ],
+    visibility = ["PUBLIC"],
+)
+
+platform(
+    name = "linux-aarch64-musl",
+    constraint_values = [
+        "prelude//abi/constraints:musl",
+        "prelude//cpu/constraints:arm64",
+        "prelude//os/constraints:linux",
+    ],
+    visibility = ["PUBLIC"],
+)
