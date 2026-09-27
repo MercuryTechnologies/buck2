@@ -32,6 +32,9 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 uuid.workspace = true
 
+[target.'cfg(all(target_os = "linux", target_env = "musl"))'.dependencies]
+tikv-jemallocator.workspace = true
+
 [dev-dependencies]
 tempfile.workspace = true
 
