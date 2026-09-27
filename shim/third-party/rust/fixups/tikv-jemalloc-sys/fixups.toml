@@ -7,3 +7,188 @@
 # above-listed licenses.
 
 buildscript.run = false
+
+# The build script would run jemalloc's configure and make on the build
+# machine. Under buck the C library is compiled here instead, against the
+# headers configure writes, which regen.sh produces once per static musl
+# target and checks in; only jemalloc_internal_defs.h differs between the
+# two (page size, spin-wait instruction). Without the build script the Rust
+# side binds to the unprefixed `malloc`, `mallocx`, ..., so the library is
+# configured with no prefix and replaces musl's malloc for the C code in the
+# binary as well, which musl supports for static linking.
+#
+# The cfg cannot say target_env = "musl": reindeer evaluates it against its
+# platforms, which are all *-linux-gnu, and would emit nothing. Only the
+# musl configurations depend on jemallocator (app/buck2/BUCK), so a gnu
+# build never compiles this library.
+#
+# The archive is not a dep of the crate (add_dep = false): buck would then
+# put it on the link line after the `-lc` that rustc emits for the libc
+# crate, lld would take musl's malloc, free, calloc, posix_memalign for the
+# Rust objects first and report jemalloc's as duplicates. Instead the crate
+# bundles it into its rlib with -lstatic, as cargo does with the build
+# script's cargo:rustc-link-lib=static, and the rlib precedes -lc. rustc
+# wants a directory holding libjemalloc.a for that, which lib/BUCK next to this
+# file makes from the public alias reindeer emits for the library.
+['cfg(all(target_os = "linux", target_arch = "x86_64"))']
+rustc_flags = [
+    "-Lnative=$(location //third-party/rust/fixups/tikv-jemalloc-sys/lib:x86_64)",
+    "-lstatic=jemalloc",
+]
+
+[['cfg(all(target_os = "linux", target_arch = "x86_64"))'.cxx_library]]
+name = "jemalloc-x86_64"
+public = true
+add_dep = false
+srcs = [
+    "jemalloc/src/arena.c",
+    "jemalloc/src/background_thread.c",
+    "jemalloc/src/base.c",
+    "jemalloc/src/bin.c",
+    "jemalloc/src/bin_info.c",
+    "jemalloc/src/bitmap.c",
+    "jemalloc/src/buf_writer.c",
+    "jemalloc/src/cache_bin.c",
+    "jemalloc/src/ckh.c",
+    "jemalloc/src/counter.c",
+    "jemalloc/src/ctl.c",
+    "jemalloc/src/decay.c",
+    "jemalloc/src/div.c",
+    "jemalloc/src/ecache.c",
+    "jemalloc/src/edata.c",
+    "jemalloc/src/edata_cache.c",
+    "jemalloc/src/ehooks.c",
+    "jemalloc/src/emap.c",
+    "jemalloc/src/eset.c",
+    "jemalloc/src/exp_grow.c",
+    "jemalloc/src/extent.c",
+    "jemalloc/src/extent_dss.c",
+    "jemalloc/src/extent_mmap.c",
+    "jemalloc/src/fxp.c",
+    "jemalloc/src/hook.c",
+    "jemalloc/src/hpa.c",
+    "jemalloc/src/hpa_hooks.c",
+    "jemalloc/src/hpdata.c",
+    "jemalloc/src/inspect.c",
+    "jemalloc/src/jemalloc.c",
+    "jemalloc/src/large.c",
+    "jemalloc/src/log.c",
+    "jemalloc/src/malloc_io.c",
+    "jemalloc/src/mutex.c",
+    "jemalloc/src/nstime.c",
+    "jemalloc/src/pa.c",
+    "jemalloc/src/pa_extra.c",
+    "jemalloc/src/pac.c",
+    "jemalloc/src/pages.c",
+    "jemalloc/src/pai.c",
+    "jemalloc/src/peak_event.c",
+    "jemalloc/src/prof.c",
+    "jemalloc/src/prof_data.c",
+    "jemalloc/src/prof_log.c",
+    "jemalloc/src/prof_recent.c",
+    "jemalloc/src/prof_stats.c",
+    "jemalloc/src/prof_sys.c",
+    "jemalloc/src/psset.c",
+    "jemalloc/src/rtree.c",
+    "jemalloc/src/safety_check.c",
+    "jemalloc/src/san.c",
+    "jemalloc/src/san_bump.c",
+    "jemalloc/src/sc.c",
+    "jemalloc/src/sec.c",
+    "jemalloc/src/stats.c",
+    "jemalloc/src/sz.c",
+    "jemalloc/src/tcache.c",
+    "jemalloc/src/test_hooks.c",
+    "jemalloc/src/thread_event.c",
+    "jemalloc/src/ticker.c",
+    "jemalloc/src/tsd.c",
+    "jemalloc/src/witness.c",
+]
+headers = ["jemalloc/include/jemalloc/internal/*.h"]
+include_paths = ["jemalloc/include"]
+fixup_include_paths = ["include-x86_64/jemalloc/internal", "include"]
+preprocessor_flags = ["-D_GNU_SOURCE", "-D_REENTRANT"]
+# jemalloc's own Makefile flags, without the debug info.
+compiler_flags = ["-std=gnu11", "-O3", "-funroll-loops", "-fvisibility=hidden"]
+preferred_linkage = "static"
+
+['cfg(all(target_os = "linux", target_arch = "aarch64"))']
+rustc_flags = [
+    "-Lnative=$(location //third-party/rust/fixups/tikv-jemalloc-sys/lib:aarch64)",
+    "-lstatic=jemalloc",
+]
+
+[['cfg(all(target_os = "linux", target_arch = "aarch64"))'.cxx_library]]
+name = "jemalloc-aarch64"
+public = true
+add_dep = false
+srcs = [
+    "jemalloc/src/arena.c",
+    "jemalloc/src/background_thread.c",
+    "jemalloc/src/base.c",
+    "jemalloc/src/bin.c",
+    "jemalloc/src/bin_info.c",
+    "jemalloc/src/bitmap.c",
+    "jemalloc/src/buf_writer.c",
+    "jemalloc/src/cache_bin.c",
+    "jemalloc/src/ckh.c",
+    "jemalloc/src/counter.c",
+    "jemalloc/src/ctl.c",
+    "jemalloc/src/decay.c",
+    "jemalloc/src/div.c",
+    "jemalloc/src/ecache.c",
+    "jemalloc/src/edata.c",
+    "jemalloc/src/edata_cache.c",
+    "jemalloc/src/ehooks.c",
+    "jemalloc/src/emap.c",
+    "jemalloc/src/eset.c",
+    "jemalloc/src/exp_grow.c",
+    "jemalloc/src/extent.c",
+    "jemalloc/src/extent_dss.c",
+    "jemalloc/src/extent_mmap.c",
+    "jemalloc/src/fxp.c",
+    "jemalloc/src/hook.c",
+    "jemalloc/src/hpa.c",
+    "jemalloc/src/hpa_hooks.c",
+    "jemalloc/src/hpdata.c",
+    "jemalloc/src/inspect.c",
+    "jemalloc/src/jemalloc.c",
+    "jemalloc/src/large.c",
+    "jemalloc/src/log.c",
+    "jemalloc/src/malloc_io.c",
+    "jemalloc/src/mutex.c",
+    "jemalloc/src/nstime.c",
+    "jemalloc/src/pa.c",
+    "jemalloc/src/pa_extra.c",
+    "jemalloc/src/pac.c",
+    "jemalloc/src/pages.c",
+    "jemalloc/src/pai.c",
+    "jemalloc/src/peak_event.c",
+    "jemalloc/src/prof.c",
+    "jemalloc/src/prof_data.c",
+    "jemalloc/src/prof_log.c",
+    "jemalloc/src/prof_recent.c",
+    "jemalloc/src/prof_stats.c",
+    "jemalloc/src/prof_sys.c",
+    "jemalloc/src/psset.c",
+    "jemalloc/src/rtree.c",
+    "jemalloc/src/safety_check.c",
+    "jemalloc/src/san.c",
+    "jemalloc/src/san_bump.c",
+    "jemalloc/src/sc.c",
+    "jemalloc/src/sec.c",
+    "jemalloc/src/stats.c",
+    "jemalloc/src/sz.c",
+    "jemalloc/src/tcache.c",
+    "jemalloc/src/test_hooks.c",
+    "jemalloc/src/thread_event.c",
+    "jemalloc/src/ticker.c",
+    "jemalloc/src/tsd.c",
+    "jemalloc/src/witness.c",
+]
+headers = ["jemalloc/include/jemalloc/internal/*.h"]
+include_paths = ["jemalloc/include"]
+fixup_include_paths = ["include-aarch64/jemalloc/internal", "include"]
+preprocessor_flags = ["-D_GNU_SOURCE", "-D_REENTRANT"]
+compiler_flags = ["-std=gnu11", "-O3", "-funroll-loops", "-fvisibility=hidden"]
+preferred_linkage = "static"

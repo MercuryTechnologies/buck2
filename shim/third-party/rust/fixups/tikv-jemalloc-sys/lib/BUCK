@@ -1,0 +1,24 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+#
+# This source code is licensed under both the MIT license found in the
+# LICENSE-MIT file in the root directory of this source tree and the Apache
+# License, Version 2.0 found in the LICENSE-APACHE file in the root directory
+# of this source tree.
+
+# rustc's -lstatic=jemalloc looks for libjemalloc.a in a -Lnative directory;
+# these give the archive reindeer's cxx_library builds that name and place.
+# See fixups.toml for why the crate bundles it instead of depending on it.
+
+genrule(
+    name = "x86_64",
+    out = "lib",
+    cmd = "mkdir -p $OUT && cp $(location //third-party/rust:tikv-jemalloc-sys-jemalloc-x86_64[static]) $OUT/libjemalloc.a",
+    visibility = ["//third-party/rust/..."],
+)
+
+genrule(
+    name = "aarch64",
+    out = "lib",
+    cmd = "mkdir -p $OUT && cp $(location //third-party/rust:tikv-jemalloc-sys-jemalloc-aarch64[static]) $OUT/libjemalloc.a",
+    visibility = ["//third-party/rust/..."],
+)
