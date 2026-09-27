@@ -80,6 +80,12 @@ pub enum CopyPolicy {
     Reflink,
     /// Make a copy-on-write clone where the filesystem supports it, otherwise copy.
     Hybrid,
+    /// Like `Hybrid`, but where reflink is unsupported and the daemon's directory shares a
+    /// filesystem with the destination, hard-link the read-only stored blob instead of copying
+    /// it. Outputs placed this way are read-only and share one inode with the store and with
+    /// every other checkout, so a tool that chmods one and writes into it in place changes them
+    /// all. Only for builds that never run as root, because root ignores the read-only mode.
+    Hardlink,
 }
 
 impl FromStr for CopyPolicy {
@@ -104,9 +110,10 @@ impl CopyPolicy {
             "hybrid" => Ok(CopyPolicy::Hybrid),
             "reflink" => Ok(CopyPolicy::Reflink),
             "copy" => Ok(CopyPolicy::Copy),
+            "hardlink" => Ok(CopyPolicy::Hardlink),
             other => Err(buck2_error::buck2_error!(
                 buck2_error::ErrorTag::Input,
-                "Invalid copy policy `{}` (expected `copy`, `reflink` or `hybrid`)",
+                "Invalid copy policy `{}` (expected `copy`, `reflink`, `hybrid` or `hardlink`)",
                 other
             )),
         }

@@ -14,13 +14,19 @@
 //! Buck2 only opens blobs for reading, to clone them into `buck-out`. On a filesystem with
 //! reflink support (btrfs, XFS, APFS) the clone is copy-on-write, so the bytes exist once on disk
 //! however many isolation dirs or checkouts materialize them. Elsewhere it degrades to a plain
-//! copy, which still avoids receiving the bytes over gRPC.
+//! copy, which still avoids receiving the bytes over gRPC, or, under the `hardlink` policy and
+//! when the directory shares a filesystem with `buck-out`, to a hard link of the read-only blob.
 //!
 //! Layout, shared with the daemon:
 //!
 //! ```text
-//! <root>/blobs/<first two hex chars>/<hash>-<size>   raw blob bytes, read-only
+//! <root>/blobs/<first two hex chars>/<hash>-<size>     raw blob bytes, mode 0444 (the daemon's)
+//! <root>/blobs/<first two hex chars>/<hash>-<size>.x   the same bytes, mode 0555 (buck2's)
 //! ```
+//!
+//! A hard link shares the inode, and with it the mode, so the executable and the plain copy of
+//! the same bytes cannot be one file. The `.x` twin is made by buck2, once per digest, the first
+//! time a hard-linked output needs the executable bit. The daemon never reads it.
 
 use std::fs;
 use std::fs::File;
@@ -44,6 +50,9 @@ pub struct SharedCasCache {
     /// Under the hybrid policy, set once a reflink failed because the filesystem cannot do it,
     /// so later materializations go straight to copying.
     reflink_unsupported: Arc<AtomicBool>,
+    /// Under the hardlink policy, set once a hard link failed because the pair of filesystems
+    /// cannot do it, so later materializations stop trying.
+    hardlink_unsupported: Arc<AtomicBool>,
 }
 
 impl std::fmt::Debug for SharedCasCache {
@@ -111,6 +120,7 @@ impl SharedCasCache {
             blobs_dir,
             copy_policy,
             reflink_unsupported: Arc::new(AtomicBool::new(false)),
+            hardlink_unsupported: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -151,6 +161,7 @@ impl SharedCasCache {
         let dst = dst.to_owned();
         let copy_policy = self.copy_policy;
         let reflink_unsupported = Arc::clone(&self.reflink_unsupported);
+        let hardlink_unsupported = Arc::clone(&self.hardlink_unsupported);
 
         // Plain syscalls; keep them off the async executor.
         tokio::task::spawn_blocking(move || {
@@ -183,6 +194,7 @@ impl SharedCasCache {
                 executable,
                 copy_policy,
                 &reflink_unsupported,
+                &hardlink_unsupported,
             )?;
             Ok(true)
         })
@@ -213,7 +225,8 @@ fn set_output_permissions(path: &Path, executable: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Puts the contents of the stored blob `src` at `dst` according to the copy policy.
+/// Errors only when the policy is `reflink` and the filesystem cannot clone, or on a genuine
+/// I/O error; `hybrid` and `hardlink` fall back to copying rather than fail.
 fn link_into(
     src: &File,
     src_path: &Path,
@@ -221,11 +234,17 @@ fn link_into(
     executable: bool,
     copy_policy: CopyPolicy,
     reflink_unsupported: &AtomicBool,
+    hardlink_unsupported: &AtomicBool,
 ) -> anyhow::Result<()> {
+    // Every path below writes `dst` as a new file. Opening an existing one with O_TRUNC would
+    // write through a hard link left by an earlier `hardlink` run into the stored blob, and as
+    // root the blob's read-only mode would not stop it.
+    remove_if_exists(dst)?;
+
     let try_reflink = match copy_policy {
         CopyPolicy::Copy => false,
         CopyPolicy::Reflink => true,
-        CopyPolicy::Hybrid => !reflink_unsupported.load(Ordering::Relaxed),
+        CopyPolicy::Hybrid | CopyPolicy::Hardlink => !reflink_unsupported.load(Ordering::Relaxed),
     };
 
     if try_reflink {
@@ -234,8 +253,14 @@ fn link_into(
                 set_output_permissions(dst, executable)?;
                 return Ok(());
             }
-            Err(e) if matches!(copy_policy, CopyPolicy::Hybrid) && is_reflink_unsupported(&e) => {
-                if !reflink_unsupported.swap(true, Ordering::Relaxed) {
+            Err(e)
+                if matches!(copy_policy, CopyPolicy::Hybrid | CopyPolicy::Hardlink)
+                    && is_reflink_unsupported(&e) =>
+            {
+                remove_if_exists(dst)?;
+                if !reflink_unsupported.swap(true, Ordering::Relaxed)
+                    && copy_policy == CopyPolicy::Hybrid
+                {
                     tracing::warn!(
                         "Reflinking from the shared CAS cache into `{}` is not supported ({}); \
                          falling back to copying. Blobs will not share disk space. Put the \
@@ -259,6 +284,13 @@ fn link_into(
         }
     }
 
+    if copy_policy == CopyPolicy::Hardlink
+        && !hardlink_unsupported.load(Ordering::Relaxed)
+        && try_hardlink(src_path, dst, executable, hardlink_unsupported)?
+    {
+        return Ok(());
+    }
+
     fs::copy(src_path, dst).with_context(|| {
         format!(
             "Error copying `{}` to `{}`",
@@ -267,6 +299,115 @@ fn link_into(
         )
     })?;
     set_output_permissions(dst, executable)
+}
+
+fn remove_if_exists(path: &Path) -> anyhow::Result<()> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e).with_context(|| format!("Error removing `{}`", path.display())),
+    }
+}
+
+/// `Ok(false)` means "copy instead": the two paths are on different filesystems, or the inode
+/// is at its link limit (EMLINK, 65000 on ext4). The linked file is never chmod-ed, because
+/// that would change the store and every other link.
+#[cfg(unix)]
+fn try_hardlink(
+    src_path: &Path,
+    dst: &Path,
+    executable: bool,
+    hardlink_unsupported: &AtomicBool,
+) -> anyhow::Result<bool> {
+    use std::os::unix::fs::MetadataExt;
+
+    let dst_dir = dst.parent().unwrap_or(Path::new("."));
+    let same_fs = match (fs::metadata(src_path), fs::metadata(dst_dir)) {
+        (Ok(s), Ok(d)) => s.dev() == d.dev(),
+        _ => false,
+    };
+    if !same_fs {
+        note_hardlink_unsupported(hardlink_unsupported, dst, "different filesystems");
+        return Ok(false);
+    }
+
+    let link_src = if executable {
+        executable_twin(src_path)?
+    } else {
+        src_path.to_owned()
+    };
+    match fs::hard_link(&link_src, dst) {
+        Ok(()) => Ok(true),
+        Err(e) => match e.raw_os_error() {
+            Some(libc::EMLINK) => Ok(false),
+            Some(libc::EXDEV) | Some(libc::EPERM) | Some(libc::EOPNOTSUPP) => {
+                note_hardlink_unsupported(hardlink_unsupported, dst, &e.to_string());
+                Ok(false)
+            }
+            _ => Err(e).with_context(|| {
+                format!(
+                    "Error hard-linking `{}` to `{}`",
+                    link_src.display(),
+                    dst.display()
+                )
+            }),
+        },
+    }
+}
+
+#[cfg(not(unix))]
+fn try_hardlink(
+    _src_path: &Path,
+    _dst: &Path,
+    _executable: bool,
+    hardlink_unsupported: &AtomicBool,
+) -> anyhow::Result<bool> {
+    hardlink_unsupported.store(true, Ordering::Relaxed);
+    Ok(false)
+}
+
+fn note_hardlink_unsupported(flag: &AtomicBool, dst: &Path, why: &str) {
+    if !flag.swap(true, Ordering::Relaxed) {
+        tracing::warn!(
+            "Hard-linking from the shared CAS cache into `{}` is not possible ({}); falling back \
+             to copying. Put the daemon's directory on the same filesystem as buck-out to share \
+             disk space.",
+            dst.display(),
+            why
+        );
+    }
+}
+
+/// Made on first use by copying the blob to a temporary name beside it and renaming it into
+/// place, so a reader never sees a partial file and two concurrent makers leave identical
+/// content under the final name.
+#[cfg(unix)]
+fn executable_twin(src_path: &Path) -> anyhow::Result<PathBuf> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let mut twin = src_path.as_os_str().to_owned();
+    twin.push(".x");
+    let twin = PathBuf::from(twin);
+    if twin.exists() {
+        return Ok(twin);
+    }
+    let mut tmp = src_path.as_os_str().to_owned();
+    tmp.push(format!(
+        ".x.tmp-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    let tmp = PathBuf::from(tmp);
+    let result = (|| {
+        fs::copy(src_path, &tmp)?;
+        fs::set_permissions(&tmp, fs::Permissions::from_mode(0o555))?;
+        fs::rename(&tmp, &twin)
+    })();
+    if let Err(e) = result {
+        let _ = fs::remove_file(&tmp);
+        return Err(e).with_context(|| format!("Error making `{}`", twin.display()));
+    }
+    Ok(twin)
 }
 
 /// Whether a failed reflink means "this filesystem (or this pair of filesystems) cannot do
@@ -401,6 +542,104 @@ pub(crate) mod tests {
             use std::os::unix::fs::PermissionsExt;
             assert_eq!(fs::metadata(&dst)?.permissions().mode() & 0o777, 0o644);
         }
+        Ok(())
+    }
+
+    /// As the daemon does it: the blob is published read-only.
+    #[cfg(unix)]
+    fn publish_read_only(root: &Path, d: &TDigest, data: &[u8]) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        publish(root, d, data);
+        let path = root
+            .join("blobs")
+            .join(&d.hash[..2])
+            .join(format!("{}-{}", d.hash, d.size_in_bytes));
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o444)).unwrap();
+        path
+    }
+
+    #[cfg(unix)]
+    fn ino_mode_links(path: &Path) -> (u64, u32, u64) {
+        use std::os::unix::fs::MetadataExt;
+        let m = fs::metadata(path).unwrap();
+        (m.ino(), m.mode() & 0o777, m.nlink())
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_hardlink_policy_shares_the_read_only_inode() -> anyhow::Result<()> {
+        let work = tempfile::tempdir()?;
+        let root = fake_daemon_dir(work.path());
+        let cache = SharedCasCache::new(root.clone(), CopyPolicy::Hardlink)?;
+        let d = digest("00aa", 4);
+        let blob = publish_read_only(&root, &d, b"data");
+        let out = work.path().join("out");
+        fs::create_dir_all(&out)?;
+
+        assert!(cache.materialize(&d, &out.join("a"), false).await?);
+        assert!(cache.materialize(&d, &out.join("b"), false).await?);
+        assert!(cache.materialize(&d, &out.join("x"), true).await?);
+
+        let (blob_ino, blob_mode, blob_links) = ino_mode_links(&blob);
+        let (a_ino, a_mode, _) = ino_mode_links(&out.join("a"));
+        let (b_ino, _, _) = ino_mode_links(&out.join("b"));
+        let (x_ino, x_mode, x_links) = ino_mode_links(&out.join("x"));
+        assert_eq!((a_ino, b_ino), (blob_ino, blob_ino));
+        assert_eq!((a_mode, blob_mode, blob_links), (0o444, 0o444, 3));
+        let mut twin = blob.clone().into_os_string();
+        twin.push(".x");
+        assert_eq!(x_ino, ino_mode_links(Path::new(&twin)).0);
+        assert_ne!(x_ino, blob_ino);
+        assert_eq!((x_mode, x_links), (0o555, 2));
+        assert_eq!(fs::read(out.join("x"))?, b"data");
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_rematerializing_over_a_link_leaves_the_store_alone() -> anyhow::Result<()> {
+        let work = tempfile::tempdir()?;
+        let root = fake_daemon_dir(work.path());
+        let d = digest("00bb", 4);
+        let blob = publish_read_only(&root, &d, b"data");
+        let dst = work.path().join("dst");
+
+        let linking = SharedCasCache::new(root.clone(), CopyPolicy::Hardlink)?;
+        assert!(linking.materialize(&d, &dst, false).await?);
+        assert_eq!(ino_mode_links(&blob).2, 2);
+
+        let copying = SharedCasCache::new(root.clone(), CopyPolicy::Copy)?;
+        assert!(copying.materialize(&d, &dst, false).await?);
+        let (blob_ino, blob_mode, blob_links) = ino_mode_links(&blob);
+        let (dst_ino, dst_mode, _) = ino_mode_links(&dst);
+        assert_ne!(dst_ino, blob_ino);
+        assert_eq!((blob_mode, blob_links, dst_mode), (0o444, 1, 0o644));
+        assert_eq!(fs::read(&blob)?, b"data");
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_hardlink_across_filesystems_copies() -> anyhow::Result<()> {
+        use std::os::unix::fs::MetadataExt;
+        // The store in the system temp dir and the output under the crate: on hosts where the
+        // two are one filesystem there is nothing to test.
+        let store_side = tempfile::tempdir()?;
+        let out_side = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR"))?;
+        if fs::metadata(store_side.path())?.dev() == fs::metadata(out_side.path())?.dev() {
+            return Ok(());
+        }
+        let root = fake_daemon_dir(store_side.path());
+        let d = digest("00cc", 4);
+        let blob = publish_read_only(&root, &d, b"data");
+        let cache = SharedCasCache::new(root.clone(), CopyPolicy::Hardlink)?;
+        let dst = out_side.path().join("dst");
+        assert!(cache.materialize(&d, &dst, true).await?);
+        assert_eq!(ino_mode_links(&blob).2, 1);
+        assert_eq!(ino_mode_links(&dst).1, 0o755);
+        let mut twin = blob.into_os_string();
+        twin.push(".x");
+        assert!(!Path::new(&twin).exists());
         Ok(())
     }
 
