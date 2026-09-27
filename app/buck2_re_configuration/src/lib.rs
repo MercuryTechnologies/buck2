@@ -82,9 +82,12 @@ pub enum CopyPolicy {
     Hybrid,
     /// Like `Hybrid`, but where reflink is unsupported and the daemon's directory shares a
     /// filesystem with the destination, hard-link the read-only stored blob instead of copying
-    /// it. Outputs placed this way are read-only and share one inode with the store and with
-    /// every other checkout, so a tool that chmods one and writes into it in place changes them
-    /// all. Only for builds that never run as root, because root ignores the read-only mode.
+    /// it. Outputs placed this way share one inode with the store and with every other checkout.
+    /// Their 0444 mode is not what keeps the store intact, since the owner may chmod a file
+    /// however it is marked and buck2 is the owner: buck2 never opens a linked output for
+    /// writing, and gives an output a tool will run over in place its own inode first. A tool
+    /// or a person that chmods a linked file in `buck-out` and writes into it changes every
+    /// checkout.
     Hardlink,
 }
 
