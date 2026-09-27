@@ -146,6 +146,14 @@ buck_rust_binary(
             "fbsource//third-party/rust:mimalloc",
         ],
     })
+    # The static musl release of the open-source build; the global
+    # allocator in bin/buck2.rs is selected on the same configuration.
+    + select({  # @oss-enable
+        "DEFAULT": [],  # @oss-enable
+        "ovr_config//abi:musl": [  # @oss-enable
+            "fbsource//third-party/rust:jemallocator",  # @oss-enable
+        ],  # @oss-enable
+    })  # @oss-enable
     + select({
         ":buck2_client_only_setting[build]": [],
         "DEFAULT": [

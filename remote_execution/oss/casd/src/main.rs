@@ -17,6 +17,12 @@ use buck2_casd::digest::DigestFunction;
 use buck2_casd::upstream::UpstreamConfig;
 use clap::Parser;
 
+// The static musl release carries jemalloc (see the tikv-jemalloc-sys fixups);
+// musl's own malloc is much slower for a daemon that streams blobs.
+#[global_allocator]
+#[cfg(all(target_os = "linux", target_env = "musl"))]
+static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 /// A machine-local CAS daemon that fronts a remote CAS and shares its blobs, as raw files that
 /// buck2 can reflink, with every buck2 daemon on this host.
 #[derive(Parser, Debug)]

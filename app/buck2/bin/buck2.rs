@@ -47,6 +47,18 @@ use superconsole::Stdin;
     not(buck2_memfrag)
 ))]
 static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+// The open-source buck build has no fbcode.default_allocator; its static musl
+// release carries jemalloc's C library (see the tikv-jemalloc-sys fixups), and
+// musl's own malloc is much slower under the daemon's allocation pattern.
+#[global_allocator]
+#[cfg(all(
+    target_os = "linux",
+    target_env = "musl",
+    buck_build,
+    not(fbcode_build),
+    not(buck2_memfrag)
+))]
+static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 #[global_allocator]
 #[cfg(all(target_os = "windows", not(buck2_memfrag)))]
 static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;

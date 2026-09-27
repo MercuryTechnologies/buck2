@@ -51,5 +51,10 @@ rust_binary(
         "fbsource//third-party/rust:tracing",
         "fbsource//third-party/rust:tracing-subscriber",
         ":buck2_casd",
-    ],
+    ] + select({
+        "DEFAULT": [],
+        "ovr_config//abi:musl": [
+            "fbsource//third-party/rust:jemallocator",
+        ],
+    }),
 )
