@@ -32,7 +32,16 @@ use remote_execution::UploadRequest;
 
 #[tokio::test(flavor = "multi_thread")]
 async fn client_autostarts_the_daemon() -> anyhow::Result<()> {
-    let work = tempfile::tempdir()?;
+    // The client probes a clone from the store into `<working directory>/buck-out` and leaves the
+    // daemon off when it fails, so the work directory is the working directory too. This is the
+    // only test in the binary, so changing the process's directory races with nothing.
+    // `BUCK2_CASD_REFLINK_TEST_DIR` names a reflink filesystem (the XFS /workspaces of a
+    // Namespace devbox); elsewhere this test checks the fallback instead.
+    let work = match std::env::var_os("BUCK2_CASD_REFLINK_TEST_DIR") {
+        Some(dir) => tempfile::tempdir_in(dir)?,
+        None => tempfile::tempdir()?,
+    };
+    std::env::set_current_dir(work.path())?;
 
     // The remote: a standalone daemon in-process.
     let origin = buck2_casd::start(Config {
@@ -62,9 +71,16 @@ async fn client_autostarts_the_daemon() -> anyhow::Result<()> {
         ..Default::default()
     };
 
+    let reflink = remote_execution::probe_reflink(&casd_dir, &work.path().join("buck-out")).is_ok();
+
     // Building the client is what starts the daemon.
     let client = REClientBuilder::build_and_connect(&opts).await?;
     let pid_file = casd_dir.join(PID_FILE_NAME);
+    if !reflink {
+        assert!(!pid_file.exists(), "buck2-casd started without reflink");
+        assert!(!casd_dir.join(DEFAULT_SOCKET_NAME).exists());
+        return Ok(());
+    }
     let pid_contents = std::fs::read_to_string(&pid_file)?;
     let pid: u32 = pid_contents.lines().next().unwrap().parse()?;
     assert!(pid != std::process::id());

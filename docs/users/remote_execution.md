@@ -202,7 +202,8 @@ $ buck2-casd --dir /var/cache/buck2-casd \
 
 - `cas_shared_cache` - the daemon's `--dir`. Blobs found there are cloned into
   `buck-out`; buck2 never writes to it. Environment variables in `$VAR` form are
-  substituted. Unset disables directory access.
+  substituted. Unset disables directory access. Ignored, with a warning, unless
+  the directory and `buck-out` share a reflink filesystem (see below).
 - `cas_shared_cache_address` - only needed to move the daemon off its default
   socket: `unix:///path/to/socket`, or a loopback TCP port number (the only
   option on Windows, which has no Unix sockets). Whenever a daemon is
@@ -228,13 +229,21 @@ even the first daemon to need a blob gets a shared copy rather than a private
 one. If the blob still is not in the directory, buck2 falls back to receiving it
 over gRPC.
 
-Disk space is only shared when the clone is a reflink, which needs the daemon's
-directory and `buck-out` to be on the same btrfs, XFS or APFS filesystem. On
-other filesystems, or across filesystems, buck2 copies out of the directory: the
-daemons still share the network fetch and the daemon's store, but not the
-extents in `buck-out`. With the `hybrid` policy the buck2 daemon logs a warning
-the first time it has to fall back. The daemon and the buck2 daemons must run
-as users that can read each other's files.
+The shared cache needs the daemon's directory and `buck-out` on one filesystem
+that can reflink: btrfs, XFS with `reflink=1`, or APFS. Anywhere else each
+`buck-out` would hold a copy of every blob beside the one in the store, which is
+more disk than no shared cache at all. So when a buck2 daemon starts its remote
+execution client, it clones a small file from the directory into `buck-out`,
+and if that fails (ext4, tmpfs, overlayfs, or two different filesystems) it
+logs one warning naming both paths and the reason, starts no `buck2-casd`, and
+downloads from `cas_address` as if `cas_shared_cache` were unset. On Namespace
+devboxes, ask for an XFS workspace volume (the private feature
+`EXP_PERSISTENT_VOLUME_IS_XFS`) and put the directory under the workspace, for
+example `cas_shared_cache = /workspaces/.buck2-casd`; the home directory is a
+different filesystem there. After the check has passed, a single clone that
+still fails falls back to a copy under the `hybrid` policy, with a warning the
+first time. The daemon and the buck2 daemons must run as users that can read
+each other's files.
 
 Files buck2 uploads (sources and locally built outputs) pass through the daemon
 too, so a second buck2 daemon that gets an action cache hit for the same action
