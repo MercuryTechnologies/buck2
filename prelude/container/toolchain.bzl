@@ -39,3 +39,7 @@ _ENV_NAME_CHARS = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz012345678
 def check_env_name(name: str, what: str):
     if not name or name[0] in "0123456789" or [c for c in name.elems() if c not in _ENV_NAME_CHARS]:
         fail("container_run: invalid environment variable name `{}` in `{}`".format(name, what))
+
+    # The launcher's own variables use this prefix.
+    if name.startswith("_cr_"):
+        fail("container_run: environment variable names starting with `_cr_` are reserved (`{}` in `{}`)".format(name, what))

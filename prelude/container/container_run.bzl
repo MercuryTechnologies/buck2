@@ -20,7 +20,11 @@ load("@prelude//user:rule_spec.bzl", "RuleRegistrationSpec")
 # keeps configurations and action digests identical on every host, and keeps
 # the wrapped target usable as a tool on Linux (remote) executors.
 
-def _launcher_args(ctx: AnalysisContext, tc: ContainerRunToolchainInfo, extra_passthrough: list[str]) -> cmd_args:
+def _launcher_args(
+        ctx: AnalysisContext,
+        tc: ContainerRunToolchainInfo,
+        extra_passthrough: list[str] = [],
+        extra_env: dict[str, typing.Any] = {}) -> cmd_args:
     args = cmd_args(
         "/bin/sh",
         ctx.attrs._launcher,
@@ -46,15 +50,18 @@ def _launcher_args(ctx: AnalysisContext, tc: ContainerRunToolchainInfo, extra_pa
     for m in tc.mounts:
         args.add("--mount", m)
 
-    # Explicit `env` values win, and every name is passed once.
-    seen = {k: None for k in ctx.attrs.env}
+    # Explicit values win over passed-through names, the target's `env` wins
+    # over `extra_env`, and every name is passed once.
+    env = dict(extra_env)
+    env.update(ctx.attrs.env)
+    seen = {k: None for k in env}
     for k in tc.env_passthrough + ctx.attrs.env_passthrough + extra_passthrough:
         if k not in seen:
             seen[k] = None
             args.add("--env-passthrough", k)
-    for k, v in ctx.attrs.env.items():
-        args.add("--env", cmd_args(k + "=", v, delimiter = ""))
-    for p in ctx.attrs.ports:
+    for k, v in env.items():
+        args.add("--env", cmd_args(k + "=", cmd_args(v, delimiter = " "), delimiter = ""))
+    for p in dedupe(ctx.attrs.ports):
         args.add("--run-arg", "--publish", "--run-arg", "127.0.0.1:{}:{}".format(p, p))
     for a in tc.run_args + ctx.attrs.run_args:
         args.add("--run-arg", a)
@@ -66,7 +73,7 @@ def _wrap_test(ctx: AnalysisContext, tc: ContainerRunToolchainInfo, test: Extern
     # names have to be passed through to the container.
     return ExternalRunnerTestInfo(
         type = test.test_type,
-        command = [_launcher_args(ctx, tc, list((test.env or {}).keys()))] + list(test.command or []),
+        command = [_launcher_args(ctx, tc, extra_passthrough = list((test.env or {}).keys()))] + list(test.command or []),
         env = test.env,
         labels = test.labels,
         contacts = test.contacts,
@@ -101,13 +108,19 @@ def _container_run_impl(ctx: AnalysisContext) -> list[Provider]:
 
     # Forward everything, like `alias`, but run and test through the launcher.
     providers = []
+    run_info = None
     for p in ctx.attrs.binary.providers:
         if isinstance(p, RunInfo):
             continue
         if isinstance(p, ExternalRunnerTestInfo):
+            if p.env:
+                # The RunInfo of a test with `env` runs the prelude's Python
+                # env injector (see inject_test_run_info.bzl), which the image
+                # may not have. Pass the env to the launcher instead.
+                run_info = RunInfo(args = cmd_args(_launcher_args(ctx, tc, extra_env = p.env), p.command))
             p = _wrap_test(ctx, tc, p)
         providers.append(p)
-    providers.append(RunInfo(args = cmd_args(_launcher_args(ctx, tc, []), ctx.attrs.binary[RunInfo])))
+    providers.append(run_info or RunInfo(args = cmd_args(_launcher_args(ctx, tc), ctx.attrs.binary[RunInfo])))
     return providers
 
 registration_spec = RuleRegistrationSpec(
@@ -186,8 +199,9 @@ registration_spec = RuleRegistrationSpec(
         }))),
         "_container_run_toolchain": toolchains_common.container_run(),
         "_launcher": attrs.default_only(attrs.source(default = "prelude//container/tools:container_run.sh")),
+        # Without a CPU constraint, leave the choice to the CLI (the host's).
         "_platform": attrs.default_only(attrs.string(default = select({
-            "DEFAULT": "linux/arm64",
+            "DEFAULT": "",
             "config//cpu:arm64": "linux/arm64",
             "config//cpu:x86_64": "linux/amd64",
         }))),

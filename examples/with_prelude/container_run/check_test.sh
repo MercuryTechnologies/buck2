@@ -7,4 +7,16 @@
 # of this source tree. You may select, at your option, one of the
 # above-listed licenses.
 
-printf 'hello from %s, via launcher: %s\n' "$(uname -s)" "${VIA_LAUNCHER:-no}"
+# The test behind both `check_test_bin` and `check_test` (its `container_run`
+# wrapper). Only the wrapper sets VIA_LAUNCHER, and then the test's own `env`
+# must still arrive.
+if [ -z "${VIA_LAUNCHER+x}" ]; then
+    printf 'not wrapped\n'
+    exit 0
+fi
+[ "$VIA_LAUNCHER" = 1 ] || exit 1
+if [ "${TEST_ENV-}" != 1 ]; then
+    printf 'the test env was lost\n'
+    exit 1
+fi
+printf 'ok\n'

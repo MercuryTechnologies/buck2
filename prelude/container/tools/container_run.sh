@@ -21,8 +21,13 @@
 # Portability: this must run under macOS /bin/sh (bash 3.2 in POSIX mode),
 # dash and busybox ash. Do not use arrays, `local`, `echo` (use printf),
 # `set -e`, or `case` inside $(...) (bash 3.2 cannot parse it). Never append to
-# "$@" in a loop, which is quadratic in bash 3.2: container options are
-# collected as one quoted string and expanded by a single `eval` at the end.
+# "$@", or call a function with a growing argument list, in a loop: both are
+# quadratic in bash 3.2. Container options are collected as one quoted string
+# and expanded by a single `eval` at the end.
+#
+# Every variable is prefixed with `_cr_`: assigning to a variable that came from
+# the environment changes what the program sees, so the launcher must not
+# share names with the program's environment.
 
 set -u
 
@@ -35,41 +40,54 @@ note() {
     printf 'container_run: note: %s\n' "$1" >&2
 }
 
-# quote VALUE: set $quoted to VALUE as a single-quoted shell word.
+# quote VALUE: set $_cr_quoted to VALUE as a single-quoted shell word.
 quote() {
-    q_in=$1 quoted=
+    _cr_q_in=$1 _cr_quoted=''
     while :; do
-        case $q_in in
+        case $_cr_q_in in
             *\'*)
-                quoted=$quoted${q_in%%\'*}"'\\''"
-                q_in=${q_in#*\'}
+                _cr_quoted=$_cr_quoted${_cr_q_in%%\'*}"'\\''"
+                _cr_q_in=${_cr_q_in#*\'}
                 ;;
             *) break ;;
         esac
     done
-    quoted="'$quoted$q_in'"
+    _cr_quoted="'$_cr_quoted$_cr_q_in'"
 }
 
 # add VAR VALUE...: append each VALUE, quoted, to the string held in $VAR.
 add() {
-    add_var=$1
+    _cr_add_var=$1
     shift
-    for add_v in "$@"; do
-        quote "$add_v"
-        eval "$add_var=\"\$$add_var \$quoted\""
+    for _cr_add_v in "$@"; do
+        quote "$_cr_add_v"
+        eval "$_cr_add_var=\"\$$_cr_add_var \$_cr_quoted\""
     done
 }
 
 # show ARG...: print a command line to stderr (BUCK_CONTAINER_RUN_VERBOSE=1).
+# The quoting is inlined: calling `quote` here, with every argument in "$@",
+# would be quadratic in bash 3.2.
 show() {
-    shown=
-    for a in "$@"; do
-        quote "$a"
-        shown="$shown $quoted"
+    printf 'container_run: running:' >&2
+    for _cr_a in "$@"; do
+        _cr_s=''
+        while :; do
+            case $_cr_a in
+                *\'*)
+                    _cr_s=$_cr_s${_cr_a%%\'*}"'\\''"
+                    _cr_a=${_cr_a#*\'}
+                    ;;
+                *) break ;;
+            esac
+        done
+        printf " '%s'" "$_cr_s$_cr_a" >&2
     done
-    printf 'container_run: running:%s\n' "$shown" >&2
+    printf '\n' >&2
 }
 
+# Helpers are also looked up at their macOS paths: a test's `env` may set a
+# PATH without them.
 sysctl_n() {
     if command -v sysctl >/dev/null 2>&1; then
         sysctl -n "$1" 2>/dev/null
@@ -78,156 +96,174 @@ sysctl_n() {
     fi
 }
 
-mode=${BUCK_CONTAINER_RUN:-auto}
-case $mode in
+physical_pwd() {
+    /bin/pwd -P 2>/dev/null || pwd -P
+}
+
+_cr_mode=${BUCK_CONTAINER_RUN:-auto}
+case $_cr_mode in
     auto)
-        if [ "$(uname -s 2>/dev/null)" = Darwin ]; then mode=always; else mode=never; fi
+        _cr_os=$(uname -s 2>/dev/null || /usr/bin/uname -s 2>/dev/null)
+        if [ "$_cr_os" = Darwin ]; then _cr_mode=always; else _cr_mode=never; fi
         ;;
     always | never) ;;
-    *) die "BUCK_CONTAINER_RUN must be auto, always or never (got '$mode')" ;;
+    *) die "BUCK_CONTAINER_RUN must be auto, always or never (got '$_cr_mode')" ;;
 esac
 
-target=this cli=container flavor=apple image='' platform='' root='' cpus='' memory=''
-user=''
+_cr_target=this _cr_cli=container _cr_flavor=apple _cr_image='' _cr_platform=''
+_cr_root='' _cr_cpus='' _cr_memory='' _cr_user='' _cr_envs=''
 while :; do
-    [ $# -gt 0 ] || die "internal error: missing '--' before the command"
-    o=$1
+    [ "$#" -gt 0 ] || die "internal error: missing '--' before the command"
+    _cr_o=$1
     shift
-    case $o in
+    case $_cr_o in
         --) break ;;
         --target | --cli | --flavor | --image | --platform | --project-root | --cpus | --memory | \
             --mount | --env | --env-passthrough | --run-arg)
-            [ $# -gt 0 ] || die "internal error: option '$o' needs a value"
-            v=$1
+            [ "$#" -gt 0 ] || die "internal error: option '$_cr_o' needs a value"
+            _cr_v=$1
             shift
             ;;
-        *) die "internal error: unknown option '$o'" ;;
+        *) die "internal error: unknown option '$_cr_o'" ;;
     esac
-    if [ "$mode" = never ]; then
+    if [ "$_cr_mode" = never ]; then
         # Running directly: only `--env` matters, so that the rule's `env`
         # behaves the same on every host.
-        if [ "$o" = --env ]; then
-            k=${v%%=*}
-            case $k in
-                '' | [0-9]* | *[!A-Za-z0-9_]*) die "internal error: bad variable name in '--env $v'" ;;
+        if [ "$_cr_o" = --env ]; then
+            case ${_cr_v%%=*} in
+                '' | [0-9]* | *[!A-Za-z0-9_]*) die "internal error: bad variable name in '--env $_cr_v'" ;;
             esac
-            eval "$k=\${v#*=}"
-            # shellcheck disable=SC2163 # Exports the variable named by $k.
-            export "$k"
+            add _cr_envs "$_cr_v"
         fi
         continue
     fi
-    case $o in
-        --target) target=$v ;;
-        --cli) cli=$v ;;
-        --flavor) flavor=$v ;;
-        --image) image=$v ;;
-        --platform) platform=$v ;;
-        --project-root) root=$v ;;
-        --cpus) cpus=$v ;;
-        --memory) memory=$v ;;
+    case $_cr_o in
+        --target) _cr_target=$_cr_v ;;
+        --cli) _cr_cli=$_cr_v ;;
+        --flavor) _cr_flavor=$_cr_v ;;
+        --image) _cr_image=$_cr_v ;;
+        --platform) _cr_platform=$_cr_v ;;
+        --project-root) _cr_root=$_cr_v ;;
+        --cpus) _cr_cpus=$_cr_v ;;
+        --memory) _cr_memory=$_cr_v ;;
         --mount)
-            case $v in
+            case $_cr_v in
                 /*) ;;
-                *) die "internal error: mount '$v' is not an absolute path" ;;
+                *) die "internal error: mount '$_cr_v' is not an absolute path" ;;
             esac
-            case $v in
-                *:*) die "mount '$v' contains ':', which the container CLI cannot mount" ;;
+            case $_cr_v in
+                *:*) die "mount '$_cr_v' contains ':', which the container CLI cannot mount" ;;
             esac
-            if [ -e "$v" ]; then
-                add user --volume "$v:$v"
+            if [ -e "$_cr_v" ]; then
+                add _cr_user --volume "$_cr_v:$_cr_v"
             else
-                note "skipping mount '$v': it does not exist on this machine"
+                note "skipping mount '$_cr_v': it does not exist on this machine"
             fi
             ;;
         # Only the name: the CLI copies the value from this process's
         # environment (and skips unset names), so values never appear in argv.
-        --env-passthrough) add user --env "$v" ;;
-        --env) add user --env "$v" ;;
-        --run-arg) add user "$v" ;;
+        --env-passthrough) add _cr_user --env "$_cr_v" ;;
+        --env) add _cr_user --env "$_cr_v" ;;
+        --run-arg) add _cr_user "$_cr_v" ;;
     esac
 done
-[ $# -gt 0 ] || die "internal error: no command to run"
+[ "$#" -gt 0 ] || die "internal error: no command to run"
 
-if [ "$mode" = never ]; then
+if [ "$_cr_mode" = never ]; then
+    # Apply `env` with env(1) rather than shell assignments, which fail for
+    # readonly shell variables such as UID and change special ones such as
+    # RANDOM. env(1) would take a command that contains '=' for an assignment,
+    # so such a command goes through sh.
+    if [ -n "$_cr_envs" ]; then
+        _cr_env=/usr/bin/env
+        [ -x "$_cr_env" ] || _cr_env='env'
+        case $1 in
+            *=*) eval "set -- \"\$_cr_env\" $_cr_envs /bin/sh -c 'exec \"\$@\"' sh \"\$@\"" ;;
+            *) eval "set -- \"\$_cr_env\" $_cr_envs \"\$@\"" ;;
+        esac
+    fi
     if [ "${BUCK_CONTAINER_RUN_VERBOSE:-}" = 1 ]; then show "$@"; fi
     exec "$@"
 fi
 
-case $flavor in
+case $_cr_flavor in
     apple | docker) ;;
-    *) die "internal error: unknown CLI flavor '$flavor'" ;;
+    *) die "internal error: unknown CLI flavor '$_cr_flavor'" ;;
 esac
-[ -n "$image" ] || die "internal error: no image"
+[ -n "$_cr_image" ] || die "internal error: no image"
 
 # Locate the CLI. Processes started from an IDE, and the buck2 daemon (which
 # runs tests), often lack /usr/local/bin and /opt/homebrew/bin on PATH.
-found=
-case $cli in
-    */*) if [ -x "$cli" ]; then found=$cli; fi ;;
+_cr_found=''
+case $_cr_cli in
+    */*) if [ -x "$_cr_cli" ]; then _cr_found=$_cr_cli; fi ;;
     *)
-        found=$(command -v "$cli" 2>/dev/null) || found=
-        if [ -z "$found" ]; then
-            for d in /usr/local/bin /opt/homebrew/bin; do
-                if [ -x "$d/$cli" ]; then
-                    found=$d/$cli
+        _cr_found=$(command -v "$_cr_cli" 2>/dev/null) || _cr_found=''
+        if [ -z "$_cr_found" ]; then
+            for _cr_d in /usr/local/bin /opt/homebrew/bin; do
+                if [ -x "$_cr_d/$_cr_cli" ]; then
+                    _cr_found=$_cr_d/$_cr_cli
                     break
                 fi
             done
         fi
         ;;
 esac
-if [ -z "$found" ]; then
-    if [ "$flavor" = apple ]; then
-        die "'$cli' was not found on PATH or in /usr/local/bin or /opt/homebrew/bin.
-  $target is a Linux program. On macOS it runs in a lightweight Linux VM using
+if [ -z "$_cr_found" ]; then
+    if [ "$_cr_flavor" = apple ]; then
+        die "'$_cr_cli' was not found on PATH or in /usr/local/bin or /opt/homebrew/bin.
+  $_cr_target is a Linux program. On macOS it runs in a lightweight Linux VM using
   Apple's container CLI (Apple silicon, macOS 26 or later, container 1.0 or later).
   Install the signed package from https://github.com/apple/container/releases,
   then run: container system start
-  To run it directly instead, set BUCK_CONTAINER_RUN=never."
-    fi
-    die "'$cli' was not found on PATH or in /usr/local/bin or /opt/homebrew/bin.
-  $target is a Linux program; this repo runs it with a Docker-compatible CLI
-  (Docker Desktop, OrbStack, Colima or Podman). Install one, or set
+  If the program also runs on macOS (for example a script), set
   BUCK_CONTAINER_RUN=never to run it directly."
+    fi
+    die "'$_cr_cli' was not found on PATH or in /usr/local/bin or /opt/homebrew/bin.
+  $_cr_target is a Linux program; this repo runs it with a Docker-compatible CLI
+  (Docker Desktop, OrbStack, Colima or Podman). Install one. If the program also
+  runs on macOS (for example a script), set BUCK_CONTAINER_RUN=never to run it
+  directly."
 fi
-cli=$found
+_cr_cli=$_cr_found
 
 # The project root is mounted at the same path inside the container, so the
 # absolute paths buck2 renders stay valid there. Inside actions it arrives as
 # '.' or '../..'; it may carry a trailing '/'; and the current directory may
-# have been reached through symlinks (/tmp -> /private/tmp), so compare
-# physical paths.
-root_p=$(cd -P -- "${root:-.}" 2>/dev/null && pwd -P) || die "project root '$root' is not a directory"
-case $root in
+# have been reached through symlinks (/tmp -> /private/tmp) or, on a
+# case-insensitive file system, spelled differently, so compare physical paths.
+# (bash's `pwd -P` keeps an inherited $PWD spelling; /bin/pwd does not.)
+_cr_root_p=$(cd -P -- "${_cr_root:-.}" 2>/dev/null && physical_pwd) ||
+    die "project root '$_cr_root' is not a directory"
+case $_cr_root in
     /*) ;;
-    *) root=$root_p ;;
+    *) _cr_root=$_cr_root_p ;;
 esac
 while :; do
-    case $root in
-        ?*/) root=${root%/} ;;
+    case $_cr_root in
+        ?*/) _cr_root=${_cr_root%/} ;;
         *) break ;;
     esac
 done
-case $root in
-    *:*) die "the project root '$root' contains ':', which the container CLI cannot mount; move the checkout or set BUCK_CONTAINER_RUN=never" ;;
+case $_cr_root in
+    *:*) die "the project root '$_cr_root' contains ':', which the container CLI cannot mount; move the checkout" ;;
 esac
-here=$(pwd -P 2>/dev/null) || die "cannot determine the current directory"
-case $here/ in
-    "$root_p"/*) inside=1 workdir=$root${here#"$root_p"} ;;
+_cr_here=$(physical_pwd) || die "cannot determine the current directory"
+case $_cr_here/ in
+    "$_cr_root_p"/*) _cr_inside=1 _cr_workdir=$_cr_root${_cr_here#"$_cr_root_p"} ;;
     *)
-        inside=0 workdir=$root
-        note "'$here' is not inside the project root '$root'; running in '$root' instead"
+        _cr_inside=0 _cr_workdir=$_cr_root
+        note "'$_cr_here' is not inside the project root '$_cr_root'; running in '$_cr_root' instead"
         ;;
 esac
 
-entry=$1
+_cr_entry=$1
 shift
-case $entry in
+case $_cr_entry in
     /*) ;;
     */*)
-        [ "$inside" = 1 ] || die "cannot run '$entry' in the container: the current directory '$here' is outside the project root '$root'"
-        entry=$workdir/$entry
+        [ "$_cr_inside" = 1 ] || die "cannot run '$_cr_entry' in the container: the current directory '$_cr_here' is outside the project root '$_cr_root'"
+        _cr_entry=$_cr_workdir/$_cr_entry
         ;;
     *) ;; # A bare name is looked up on the image's PATH.
 esac
@@ -235,72 +271,104 @@ esac
 # `container system start` registers the API server with launchd from a plist
 # outside ~/Library/LaunchAgents, so the registration is gone after a reboot.
 # This is the same probe `container system status` uses.
-if [ "$flavor" = apple ] && command -v launchctl >/dev/null 2>&1 &&
-    ! launchctl list com.apple.container.apiserver >/dev/null 2>&1; then
-    printf 'container_run: starting container services (container system start)\n' >&2
-    "$cli" system start --disable-kernel-install </dev/null >&2 ||
-        die "could not start the container services. Run 'container system start' in a terminal (on first use it offers to install a Linux kernel), then try again."
+if [ "$_cr_flavor" = apple ]; then
+    _cr_launchctl=''
+    if command -v launchctl >/dev/null 2>&1; then
+        _cr_launchctl=launchctl
+    elif [ -x /bin/launchctl ]; then
+        _cr_launchctl=/bin/launchctl
+    fi
+    if [ -n "$_cr_launchctl" ] && ! "$_cr_launchctl" list com.apple.container.apiserver >/dev/null 2>&1; then
+        printf 'container_run: starting container services (container system start)\n' >&2
+        "$_cr_cli" system start --disable-kernel-install </dev/null >&2 ||
+            die "could not start the container services. Run 'container system start' in a terminal (on first use it offers to install a Linux kernel), then try again."
+    fi
 fi
 
 # The Apple CLI defaults to 4 CPUs and 1 GiB of memory per container, which
 # gets real programs OOM-killed. "host" sizes the container like the Mac.
-if [ "$cpus" = host ]; then
-    cpus=
-    if [ "$flavor" = apple ]; then cpus=$(sysctl_n hw.ncpu); fi
-    case $cpus in
-        '' | *[!0-9]*) cpus= ;;
+if [ "$_cr_cpus" = host ]; then
+    _cr_cpus=''
+    if [ "$_cr_flavor" = apple ]; then _cr_cpus=$(sysctl_n hw.ncpu); fi
+    case $_cr_cpus in
+        '' | *[!0-9]*) _cr_cpus='' ;;
     esac
 fi
-if [ "$memory" = host ]; then
-    memory=
-    if [ "$flavor" = apple ]; then
-        b=$(sysctl_n hw.memsize)
-        case $b in
+if [ "$_cr_memory" = host ]; then
+    _cr_memory=''
+    if [ "$_cr_flavor" = apple ]; then
+        _cr_b=$(sysctl_n hw.memsize)
+        case $_cr_b in
             '' | *[!0-9]*) ;;
-            *) memory=$((b / 2097152))M ;; # Half of physical memory, in MiB.
+            *) _cr_memory=$((_cr_b / 2097152))M ;; # Half of physical memory, in MiB.
         esac
     fi
 fi
 
-pre=
-add pre run --rm -i
+# Named, so that the watchdog below can stop it.
+_cr_name=buck2-$$-$(date +%s 2>/dev/null)
+
+_cr_pre=''
+add _cr_pre run --rm -i --name "$_cr_name"
 # -t only when stdin, stdout and stderr are all terminals: with -t the CLI
 # merges stderr into the pty, so `2>file` would silently stop working.
 if [ -t 0 ] && [ -t 1 ] && [ -t 2 ]; then
     case ${TERM:-} in
         xterm | xterm-256color | xterm-color | screen | screen-256color | tmux | tmux-256color | \
-            vt100 | vt220 | linux | dumb) term=$TERM ;;
-        *) term=xterm-256color ;; # e.g. xterm-kitty and xterm-ghostty are not in most images.
+            vt100 | vt220 | linux | dumb) _cr_term=$TERM ;;
+        *) _cr_term=xterm-256color ;; # e.g. xterm-kitty and xterm-ghostty are not in most images.
     esac
-    add pre -t --env "TERM=$term"
+    add _cr_pre -t --env "TERM=$_cr_term"
 fi
 # Keep image-pull progress out of redirected stderr.
 if [ ! -t 2 ]; then
-    if [ "$flavor" = apple ]; then add pre --progress none; else add pre --quiet; fi
+    if [ "$_cr_flavor" = apple ]; then add _cr_pre --progress none; else add _cr_pre --quiet; fi
 fi
-add pre --init
-if [ -n "$platform" ]; then add pre --platform "$platform"; fi
-# Label the container so leaked ones can be found with `container ls -a`. The
+add _cr_pre --init
+if [ -n "$_cr_platform" ]; then add _cr_pre --platform "$_cr_platform"; fi
+# Label the container with the target, to make leftovers easy to identify. The
 # CLI rejects values that contain '=' and labels longer than 4096 bytes.
-case $target in
+case $_cr_target in
     *=*) ;;
-    *) if [ "${#target}" -le 4000 ]; then add pre --label "buck2.target=$target"; fi ;;
+    *) if [ "${#_cr_target}" -le 4000 ]; then add _cr_pre --label "buck2.target=$_cr_target"; fi ;;
 esac
-add pre --volume "$root:$root" --workdir "$workdir"
-if [ -n "$cpus" ]; then add pre --cpus "$cpus"; fi
-if [ -n "$memory" ]; then add pre --memory "$memory"; fi
-add pre --env BUCK_RUN_BUILD_ID
+add _cr_pre --volume "$_cr_root:$_cr_root" --workdir "$_cr_workdir"
+if [ -n "$_cr_cpus" ]; then add _cr_pre --cpus "$_cr_cpus"; fi
+if [ -n "$_cr_memory" ]; then add _cr_pre --memory "$_cr_memory"; fi
+add _cr_pre --env BUCK_RUN_BUILD_ID
 
-# Per-invocation flags come last so that they win for single-valued options.
-extra=
+# Per-invocation flags come after the rule's, so that they win for
+# single-valued options.
+_cr_extra=''
 if [ -n "${BUCK_CONTAINER_RUN_ARGS:-}" ]; then
     set -f
-    for a in $BUCK_CONTAINER_RUN_ARGS; do add extra "$a"; done
+    for _cr_a in $BUCK_CONTAINER_RUN_ARGS; do add _cr_extra "$_cr_a"; done
     set +f
 fi
-add extra --entrypoint "$entry" "$image"
+# `--` stops the CLI from parsing the program's arguments as its own options
+# (for example '---' or '--generate-completion-script').
+add _cr_extra --entrypoint "$_cr_entry" -- "$_cr_image"
 
 if [ "${BUCK_CONTAINER_RUN_VERBOSE:-}" = 1 ]; then
-    eval "show \"\$cli\" $pre $user $extra \"\$@\""
+    eval "show \"\$_cr_cli\" $_cr_pre $_cr_user $_cr_extra \"\$@\""
 fi
-eval "exec \"\$cli\" $pre $user $extra \"\$@\""
+
+# If the CLI is killed, the container keeps running in its VM: buck2 SIGKILLs
+# the process group of a cancelled or timed-out test, and closing a terminal
+# sends SIGHUP, neither of which the CLI can forward. This watchdog stops the
+# container once this process (the CLI, after `exec`) is gone. `set -m` puts it
+# in its own process group so that it survives the process group being killed
+# (bash, which is macOS's /bin/sh, honours that without a terminal; dash does
+# not). Its output goes to /dev/null so that it does not hold buck2's pipes
+# open. After a normal exit `--rm` has removed the container and the stop is a
+# no-op.
+_cr_self=$$
+set -m 2>/dev/null
+(
+    trap '' HUP INT TERM
+    while kill -0 "$_cr_self" 2>/dev/null; do sleep 1; done
+    "$_cr_cli" stop "$_cr_name"
+) </dev/null >/dev/null 2>&1 &
+set +m 2>/dev/null
+
+eval "exec \"\$_cr_cli\" $_cr_pre $_cr_user $_cr_extra \"\$@\""

@@ -36,10 +36,30 @@ ln -s "$T/repo" "$T/link"
 
 cat >"$F/container" <<'EOF'
 #!/bin/sh
-if [ "${1-}" = system ]; then printf 'FAKE system %s\n' "$*" >&2; exit "${FAKE_START_EXIT:-0}"; fi
-printf '<%s>' "$@"; printf '\n'
+case ${1-} in
+    system)
+        printf 'FAKE system %s\n' "$*" >&2
+        exit "${FAKE_START_EXIT:-0}"
+        ;;
+    stop)
+        [ -z "${FAKE_LOG-}" ] || printf 'stop %s\n' "$2" >>"$FAKE_LOG"
+        exit 0
+        ;;
+esac
+if [ -n "${FAKE_SLEEP-}" ]; then exec sleep "$FAKE_SLEEP"; fi
+if [ -n "${FAKE_PID-}" ]; then
+    printf 'pid=%s\n' "$$"
+    exit 0
+fi
+if [ -n "${FAKE_ARGC-}" ]; then
+    eval "last=\${$#}"
+    printf 'argc=%s last=%s\n' "$#" "$last"
+    exit 0
+fi
+printf '<%s>' "$@"
+printf '\n'
 e=
-for k in SECRET BUCK_RUN_BUILD_ID; do
+for k in SECRET BUCK_RUN_BUILD_ID mode user image; do
     eval "v=\${$k-__unset__}"
     [ "$v" = __unset__ ] || e="$e $k=[$v]"
 done
@@ -59,11 +79,16 @@ esac
 EOF
 cat >"$F/inner" <<'EOF'
 #!/bin/sh
-printf 'inner:'; printf '<%s>' "$@"; printf ' A=[%s]\n' "${A-unset}"; exit "${INNER_EXIT:-0}"
+printf 'inner:'
+printf '<%s>' "$@"
+printf ' A=[%s] mode=[%s] k=[%s] o=[%s] UID=[%s]\n' "${A-unset}" "${mode-unset}" "${k-unset}" "${o-unset}" "${UID-unset}"
+exit "${INNER_EXIT:-0}"
 EOF
+printf '#!/bin/sh\nprintf "pid=%%s\\n" "$$"\n' >"$F/showpid"
 chmod +x "$F"/*
+cp "$F/inner" "$F/in=ner"
 export PATH="$F:/usr/bin:/bin"
-unset BUCK_CONTAINER_RUN BUCK_CONTAINER_RUN_ARGS BUCK_CONTAINER_RUN_VERBOSE BUCK_RUN_BUILD_ID A SECRET
+unset BUCK_CONTAINER_RUN BUCK_CONTAINER_RUN_ARGS BUCK_CONTAINER_RUN_VERBOSE BUCK_RUN_BUILD_ID A SECRET mode user image k o
 R=$T/repo
 
 fails=0
@@ -78,11 +103,14 @@ check() { # NAME EXPECTED ACTUAL
 
 for sh in $SHELLS; do
     printf '## %s\n' "$sh"
+    # Runs the launcher and prints its output followed by `rc=<status>`. The
+    # container name (which contains a PID and the time) becomes NAME.
     run() {
-        $sh "$L" "$@" </dev/null 2>&1
-        printf 'rc=%s' "$?"
+        { $sh "$L" "$@" </dev/null 2>&1; printf '%s' "$?" >"$T/rc"; } | sed 's/buck2-[0-9]*-[0-9]*/NAME/g'
+        printf 'rc=%s' "$(cat "$T/rc")"
     }
-    base="<run><--rm><-i><--progress><none><--init><--platform><linux/arm64><--label><buck2.target=//t:t><--volume><$R:$R>"
+    head="<run><--rm><-i><--name><NAME><--progress><none><--init>"
+    base="$head<--platform><linux/arm64><--label><buck2.target=//t:t><--volume><$R:$R>"
     tail="<--cpus><12><--memory><18432M><--env><BUCK_RUN_BUILD_ID>"
     std="--target //t:t --image img --platform linux/arm64 --cpus host --memory host"
 
@@ -90,29 +118,33 @@ for sh in $SHELLS; do
         --env-passthrough SECRET --env-passthrough UNSET --env 'A=x y' \
         --run-arg --publish --run-arg 127.0.0.1:80:80 \
         -- /abs/bin 'a b' '' -x "it's" 'q"q' '*' -- '$HOME')
-    check "quoting and order" "$base<--workdir><$R/sub>$tail<--env><SECRET><--env><UNSET><--env><A=x y><--publish><127.0.0.1:80:80><--entrypoint></abs/bin><img><a b><><-x><it's><q\"q><*><--><\$HOME>
+    check "quoting and order" "$base<--workdir><$R/sub>$tail<--env><SECRET><--env><UNSET><--env><A=x y><--publish><127.0.0.1:80:80><--entrypoint></abs/bin><--><img><a b><><-x><it's><q\"q><*><--><\$HOME>
 env: SECRET=[s3] BUCK_RUN_BUILD_ID=[b1]
 rc=0" "$out"
 
+    out=$(cd "$R" && run $std --project-root "$R" -- /abs/bin --- -=x --generate-completion-script zsh)
+    check "program arguments come after '--'" "$base<--workdir><$R>$tail<--entrypoint></abs/bin><--><img><---><-=x><--generate-completion-script><zsh>
+rc=0" "$out"
+
     out=$(cd "$T/link/sub" && run $std --project-root "$R" -- /abs/bin)
-    check "symlinked cwd maps to the physical path" "$base<--workdir><$R/sub>$tail<--entrypoint></abs/bin><img>
+    check "symlinked cwd maps to the physical path" "$base<--workdir><$R/sub>$tail<--entrypoint></abs/bin><--><img>
 rc=0" "$out"
 
     out=$(cd "$T/repo2" && run $std --project-root "$R" -- /abs/bin)
     check "/repo2 is not inside /repo" "container_run: note: '$T/repo2' is not inside the project root '$R'; running in '$R' instead
-$base<--workdir><$R>$tail<--entrypoint></abs/bin><img>
+$base<--workdir><$R>$tail<--entrypoint></abs/bin><--><img>
 rc=0" "$out"
 
     out=$(cd "$R" && run $std --project-root . -- buck-out/bin x)
-    check "relative root and argv0" "$base<--workdir><$R>$tail<--entrypoint><$R/buck-out/bin><img><x>
+    check "relative root and argv0" "$base<--workdir><$R>$tail<--entrypoint><$R/buck-out/bin><--><img><x>
 rc=0" "$out"
 
     out=$(cd "$R/sub" && run $std --project-root "$R/" -- python3)
-    check "trailing slash on root, bare argv0" "$base<--workdir><$R/sub>$tail<--entrypoint><python3><img>
+    check "trailing slash on root, bare argv0" "$base<--workdir><$R/sub>$tail<--entrypoint><python3><--><img>
 rc=0" "$out"
 
     out=$(cd "$R" && run $std --project-root "$R" -- ./rel)
-    check "./relative argv0" "$base<--workdir><$R>$tail<--entrypoint><$R/./rel><img>
+    check "./relative argv0" "$base<--workdir><$R>$tail<--entrypoint><$R/./rel><--><img>
 rc=0" "$out"
 
     out=$(cd "$T/repo2" && run $std --project-root "$R" -- rel/bin 2>&1 | tail -2)
@@ -120,16 +152,36 @@ rc=0" "$out"
 rc=125" "$out"
 
     out=$(cd "$R" && FAKE_UNAME=Linux INNER_EXIT=42 run $std --project-root "$R" --env 'A=b=c' --run-arg --x -- "$F/inner" 'a b' '')
-    check "direct on Linux: exec, env, exit code" "inner:<a b><> A=[b=c]
+    check "direct on Linux: exec, env, exit code" "inner:<a b><> A=[b=c] mode=[unset] k=[unset] o=[unset] UID=[unset]
 rc=42" "$out"
 
+    out=$(cd "$R" && FAKE_UNAME=Linux run $std --project-root "$R" --env mode=prod --env k='a b' --env o=keep --env UID=7 --env v=1 -- "$F/inner")
+    check "direct: env names the shell or launcher use" "inner:<> A=[unset] mode=[prod] k=[a b] o=[keep] UID=[7]
+rc=0" "$out"
+
+    out=$(cd "$R" && FAKE_UNAME=Linux run $std --project-root "$R" --env A=1 -- "$F/in=ner" x)
+    check "direct: command containing '='" "inner:<x> A=[1] mode=[unset] k=[unset] o=[unset] UID=[unset]
+rc=0" "$out"
+
+    out=$(cd "$R" && mode=debug user=alice image=ubuntu run $std --project-root "$R" \
+        --env-passthrough mode --env-passthrough user --env-passthrough image -- /abs/bin)
+    check "container: env names the launcher uses" "$base<--workdir><$R>$tail<--env><mode><--env><user><--env><image><--entrypoint></abs/bin><--><img>
+env: mode=[debug] user=[alice] image=[ubuntu]
+rc=0" "$out"
+
     out=$(cd "$R" && BUCK_CONTAINER_RUN=never run $std --project-root "$R" -- "$F/inner")
-    check "BUCK_CONTAINER_RUN=never" "inner:<> A=[unset]
+    check "BUCK_CONTAINER_RUN=never" "inner:<> A=[unset] mode=[unset] k=[unset] o=[unset] UID=[unset]
 rc=0" "$out"
 
     out=$(cd "$R" && FAKE_UNAME=Linux BUCK_CONTAINER_RUN=always run $std --project-root "$R" -- /abs/bin)
-    check "BUCK_CONTAINER_RUN=always" "$base<--workdir><$R>$tail<--entrypoint></abs/bin><img>
+    check "BUCK_CONTAINER_RUN=always" "$base<--workdir><$R>$tail<--entrypoint></abs/bin><--><img>
 rc=0" "$out"
+
+    # `exec` keeps the PID, in both modes.
+    out=$(cd "$R" && FAKE_UNAME=Linux sh -c 'printf "pid=%s\n" "$$"; exec "$@"' sh $sh "$L" $std --project-root "$R" -- "$F/showpid" </dev/null 2>&1)
+    check "direct mode execs the program" "1" "$(printf '%s\n' "$out" | sort -u | wc -l | tr -d ' ')"
+    out=$(cd "$R" && FAKE_PID=1 sh -c 'printf "pid=%s\n" "$$"; exec "$@"' sh $sh "$L" $std --project-root "$R" -- /abs/bin </dev/null 2>&1)
+    check "container mode execs the CLI" "1" "$(printf '%s\n' "$out" | sort -u | wc -l | tr -d ' ')"
 
     out=$(cd "$R" && FAKE_EXIT=37 run $std --project-root "$R" -- /abs/bin | tail -1)
     check "container exit code" "rc=37" "$out"
@@ -163,7 +215,7 @@ FAKE system system start --disable-kernel-install" "$out"
 
     out=$(cd "$R" && run $std --project-root "$R" --mount "$T/mnt" --mount /no/such -- /abs/bin)
     check "mounts" "container_run: note: skipping mount '/no/such': it does not exist on this machine
-$base<--workdir><$R>$tail<--volume><$T/mnt:$T/mnt><--entrypoint></abs/bin><img>
+$base<--workdir><$R>$tail<--volume><$T/mnt:$T/mnt><--entrypoint></abs/bin><--><img>
 rc=0" "$out"
 
     out=$(cd "$R" && run $std --project-root "$R" --mount /a:b -- /abs/bin)
@@ -171,28 +223,64 @@ rc=0" "$out"
 rc=125" "$out"
 
     out=$(cd "$R" && BUCK_CONTAINER_RUN_ARGS='-p 9:9  --memory 4G *' run $std --project-root "$R" -- /abs/bin)
-    check "BUCK_CONTAINER_RUN_ARGS" "$base<--workdir><$R>$tail<-p><9:9><--memory><4G><*><--entrypoint></abs/bin><img>
+    check "BUCK_CONTAINER_RUN_ARGS" "$base<--workdir><$R>$tail<-p><9:9><--memory><4G><*><--entrypoint></abs/bin><--><img>
 rc=0" "$out"
 
     out=$(cd "$R" && run --cli docker --flavor docker $std --project-root "$R" -- /abs/bin)
-    check "docker flavor" "<run><--rm><-i><--quiet><--init><--platform><linux/arm64><--label><buck2.target=//t:t><--volume><$R:$R><--workdir><$R><--env><BUCK_RUN_BUILD_ID><--entrypoint></abs/bin><img>
+    check "docker flavor" "<run><--rm><-i><--name><NAME><--quiet><--init><--platform><linux/arm64><--label><buck2.target=//t:t><--volume><$R:$R><--workdir><$R><--env><BUCK_RUN_BUILD_ID><--entrypoint></abs/bin><--><img>
 rc=0" "$out"
 
-    out=$(cd "$R" && run --target '//t:t[a=b]' --image img --project-root "$R" -- /abs/bin)
-    check "no label for targets containing '='" "<run><--rm><-i><--progress><none><--init><--volume><$R:$R><--workdir><$R><--env><BUCK_RUN_BUILD_ID><--entrypoint></abs/bin><img>
+    out=$(cd "$R" && run --target '//t:t[a=b]' --image img --platform '' --project-root "$R" -- /abs/bin)
+    check "no label for targets containing '=', no empty --platform" "$head<--volume><$R:$R><--workdir><$R><--env><BUCK_RUN_BUILD_ID><--entrypoint></abs/bin><--><img>
 rc=0" "$out"
 
     out=$(cd "$R" && BUCK_CONTAINER_RUN_VERBOSE=1 run $std --project-root "$R" -- /abs/bin "it's" | head -1)
-    check "verbose" "container_run: running: '$F/container' 'run' '--rm' '-i' '--progress' 'none' '--init' '--platform' 'linux/arm64' '--label' 'buck2.target=//t:t' '--volume' '$R:$R' '--workdir' '$R' '--cpus' '12' '--memory' '18432M' '--env' 'BUCK_RUN_BUILD_ID' '--entrypoint' '/abs/bin' 'img' 'it'\\''s'" "$out"
+    check "verbose" "container_run: running: '$F/container' 'run' '--rm' '-i' '--name' 'NAME' '--progress' 'none' '--init' '--platform' 'linux/arm64' '--label' 'buck2.target=//t:t' '--volume' '$R:$R' '--workdir' '$R' '--cpus' '12' '--memory' '18432M' '--env' 'BUCK_RUN_BUILD_ID' '--entrypoint' '/abs/bin' '--' 'img' 'it'\\''s'" "$out"
 
-    # Long argument lists must stay linear: appending to "$@" in a loop is
-    # quadratic in bash 3.2.
+    # Long argument lists must arrive intact and stay linear, also with
+    # verbose output: appending to "$@" in a loop is quadratic in bash 3.2.
     big=$(i=0; while [ $i -lt 5000 ]; do printf 'a%s ' $i; i=$((i + 1)); done)
+    argc0=$(cd "$R" && FAKE_ARGC=1 run $std --project-root "$R" -- /abs/bin | head -1)
+    argc0=${argc0#argc=}
+    argc0=${argc0%% *}
     start=$(date +%s)
-    out=$(cd "$R" && run $std --project-root "$R" -- /abs/bin $big | tail -1)
+    out=$(cd "$R" && FAKE_ARGC=1 run $std --project-root "$R" -- /abs/bin $big)
+    out=$out$(cd "$R" && FAKE_ARGC=1 BUCK_CONTAINER_RUN_VERBOSE=1 run $std --project-root "$R" -- /abs/bin $big | tail -2)
     elapsed=$(($(date +%s) - start))
-    check "5000 arguments" "rc=0" "$out"
+    check "5000 arguments" "argc=$((argc0 + 5000)) last=a4999
+rc=0argc=$((argc0 + 5000)) last=a4999
+rc=0" "$out"
     check "5000 arguments in under 20s" "fast" "$([ "$elapsed" -lt 20 ] && printf fast || printf 'slow (%ss)' "$elapsed")"
+
+    # With a terminal on all three streams: -t, a TERM that the image knows,
+    # and no --progress. With only stdout and stderr on it, no -t. Needs
+    # util-linux script(1); BSD script(1) handles a non-terminal stdin
+    # differently.
+    in_pty() {
+        script -qec "$1" /dev/null </dev/null 2>&1 | tr -d '\r' | sed 's/buck2-[0-9]*-[0-9]*/NAME/g'
+    }
+    cmd="cd '$R' && TERM=xterm-ghostty $sh '$L' $std --project-root '$R' -- /abs/bin"
+    if ! script --version 2>/dev/null | grep -q util-linux; then
+        printf 'skip terminal (needs util-linux script(1))\n'
+    else
+        out=$(in_pty "$cmd")
+        check "terminal" "<run><--rm><-i><--name><NAME><-t><--env><TERM=xterm-256color><--init><--platform><linux/arm64><--label><buck2.target=//t:t><--volume><$R:$R><--workdir><$R>$tail<--entrypoint></abs/bin><--><img>" "$out"
+        out=$(in_pty "$cmd </dev/null")
+        check "terminal without stdin" "<run><--rm><-i><--name><NAME><--init><--platform><linux/arm64><--label><buck2.target=//t:t><--volume><$R:$R><--workdir><$R>$tail<--entrypoint></abs/bin><--><img>" "$out"
+    fi
+
+    # If the CLI is killed, the watchdog stops the container.
+    : >"$T/log"
+    (cd "$R" && FAKE_SLEEP=30 FAKE_LOG="$T/log" exec $sh "$L" $std --project-root "$R" -- /abs/bin) </dev/null >/dev/null 2>&1 &
+    pid=$!
+    sleep 1
+    kill -9 "$pid" 2>/dev/null
+    i=0
+    while [ $i -lt 10 ] && ! [ -s "$T/log" ]; do
+        sleep 1
+        i=$((i + 1))
+    done
+    check "watchdog stops a killed container" "stop buck2-$pid-" "$(sed 's/-[0-9]*$/-/' "$T/log")"
 done
 
 if [ "$fails" = 0 ]; then

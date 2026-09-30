@@ -6,22 +6,21 @@ oncall("build_infra")
 # it in a Linux container there, and directly everywhere else. See
 # docs/users/how_tos/container_run.md.
 
+_UNIX = [
+    "config//os:linux",
+    "config//os:macos",
+]
+
 sh_binary(
     name = "hello_bin",
-    compatible_with = [
-        "config//os:linux",
-        "config//os:macos",
-    ],
+    compatible_with = _UNIX,
     main = "hello.sh",
 )
 
 container_run(
     name = "hello",
     binary = ":hello_bin",
-    compatible_with = [
-        "config//os:linux",
-        "config//os:macos",
-    ],
+    compatible_with = _UNIX,
     env = {"VIA_LAUNCHER": "yes"},
 )
 
@@ -31,14 +30,51 @@ container_run(
 assert_output(
     name = "check_hello",
     command = "$(exe_target :hello)",
-    compatible_with = [
-        "config//os:linux",
-        "config//os:macos",
-    ],
+    compatible_with = _UNIX,
     output = select({
         "DEFAULT": "via launcher: no",
         "config//os:linux": "via launcher: yes",
     }),
+)
+
+# Drives the container path end to end, with a fake `container` CLI, on every
+# host.
+container_run(
+    name = "hello_forced",
+    binary = ":hello_bin",
+    compatible_with = _UNIX,
+    enabled = True,
+    env = {"VIA_LAUNCHER": "yes"},
+)
+
+export_file(
+    name = "fake_container.sh",
+    compatible_with = _UNIX,
+)
+
+sh_test(
+    name = "container_path_test",
+    args = [
+        "$(location :fake_container.sh)",
+        "$(exe_target :hello_forced)",
+    ],
+    compatible_with = _UNIX,
+    test = "check_container_path.sh",
+)
+
+# A wrapped test: `buck2 test` runs it through the launcher, keeping its `env`.
+sh_test(
+    name = "check_test_bin",
+    compatible_with = _UNIX,
+    env = {"TEST_ENV": "1"},
+    test = "check_test.sh",
+)
+
+container_run(
+    name = "check_test",
+    binary = ":check_test_bin",
+    compatible_with = _UNIX,
+    env = {"VIA_LAUNCHER": "1"},
 )
 
 # Unit tests for the launcher, using fake `container` and `uname` programs to
@@ -46,9 +82,6 @@ assert_output(
 sh_test(
     name = "launcher_test",
     args = ["$(location prelude//container/tools:container_run.sh)"],
-    compatible_with = [
-        "config//os:linux",
-        "config//os:macos",
-    ],
+    compatible_with = _UNIX,
     test = "test_container_run.sh",
 )

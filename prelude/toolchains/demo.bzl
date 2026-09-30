@@ -74,6 +74,10 @@ def system_demo_toolchains():
 
     system_container_run_toolchain(
         name = "container_run",
+        # Lets each developer pick a CLI in their .buckconfig.local, e.g.
+        # `cli = docker` and `cli_flavor = docker` on an Intel Mac.
+        cli = read_root_config("container_run", "cli", "container"),
+        cli_flavor = read_root_config("container_run", "cli_flavor", "apple"),
         visibility = ["PUBLIC"],
     )
 
