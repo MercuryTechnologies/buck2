@@ -9,6 +9,7 @@
 load("@prelude//android/tools:jdk_system_image.bzl", "jdk_system_image")
 load("@prelude//tests:test_toolchain.bzl", "noop_test_toolchain")
 load("@prelude//toolchains:android.bzl", "android_sdk_tools", "system_android_toolchain")
+load("@prelude//toolchains:container.bzl", "system_container_run_toolchain")
 load("@prelude//toolchains:cxx.bzl", "system_cxx_toolchain")
 load("@prelude//toolchains:dex.bzl", "system_dex_toolchain", "system_noop_dex_toolchain")
 load("@prelude//toolchains:erlang.bzl", "system_erlang_toolchain")
@@ -68,6 +69,11 @@ def system_demo_toolchains():
     android_hack_alias(
         name = "android-hack",
         actual = ":cxx",
+        visibility = ["PUBLIC"],
+    )
+
+    system_container_run_toolchain(
+        name = "container_run",
         visibility = ["PUBLIC"],
     )
 

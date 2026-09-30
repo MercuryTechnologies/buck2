@@ -1,0 +1,54 @@
+load("//:test_utils.bzl", "assert_output")
+
+oncall("build_infra")
+
+# `container_run` makes a Linux program runnable from a Mac: `buck2 run` runs
+# it in a Linux container there, and directly everywhere else. See
+# docs/users/how_tos/container_run.md.
+
+sh_binary(
+    name = "hello_bin",
+    compatible_with = [
+        "config//os:linux",
+        "config//os:macos",
+    ],
+    main = "hello.sh",
+)
+
+container_run(
+    name = "hello",
+    binary = ":hello_bin",
+    compatible_with = [
+        "config//os:linux",
+        "config//os:macos",
+    ],
+    env = {"VIA_LAUNCHER": "yes"},
+)
+
+# Only Linux-configured targets are wrapped: on a Linux host the launcher execs
+# `hello_bin` directly (with `env` applied); on a macOS host this example is
+# configured for macOS, so `hello` is a plain alias.
+assert_output(
+    name = "check_hello",
+    command = "$(exe_target :hello)",
+    compatible_with = [
+        "config//os:linux",
+        "config//os:macos",
+    ],
+    output = select({
+        "DEFAULT": "via launcher: no",
+        "config//os:linux": "via launcher: yes",
+    }),
+)
+
+# Unit tests for the launcher, using fake `container` and `uname` programs to
+# cover the macOS code path on any host.
+sh_test(
+    name = "launcher_test",
+    args = ["$(location prelude//container/tools:container_run.sh)"],
+    compatible_with = [
+        "config//os:linux",
+        "config//os:macos",
+    ],
+    test = "test_container_run.sh",
+)

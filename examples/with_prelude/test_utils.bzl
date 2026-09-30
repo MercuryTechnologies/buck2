@@ -6,12 +6,13 @@
 # of this source tree. You may select, at your option, one of the
 # above-listed licenses.
 
-def assert_output(name, command, output):
+def assert_output(name, command, output, **kwargs):
     return native.genrule(
         name = name,
         bash = command + ' | grep "' + output + '" && touch "$OUT"',
         cmd_exe = command + ' | findstr "' + output + '" && type nul > "$OUT"',
         out = "out.txt",
+        **kwargs
     )
 
 def haskell_library(deps = [], **kwargs):
