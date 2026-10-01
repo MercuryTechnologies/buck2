@@ -10,6 +10,7 @@ rust_library(
         "fbsource//third-party/rust:http-body-util",
         "fbsource//third-party/rust:tempfile",
         "fbsource//third-party/rust:tokio-stream",
+        "//buck2/app/buck2_wrapper_common:buck2_wrapper_common",
     ],
     deps = [
         "fbsource//third-party/rust:anyhow",

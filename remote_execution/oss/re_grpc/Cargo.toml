@@ -41,6 +41,7 @@ tracing.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
+buck2_wrapper_common.workspace = true
 bytes.workspace = true
 http-body-util.workspace = true
 tempfile.workspace = true
