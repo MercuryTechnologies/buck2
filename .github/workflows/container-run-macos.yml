@@ -105,7 +105,12 @@ jobs:
     - name: Check whether this runner can run containers
       id: probe
       continue-on-error: true
-      run: container run --rm docker.io/library/alpine:3 uname -a
+      run: |
+        # Hosted macOS runners are VMs; containers need a hypervisor.
+        echo "chip: $(sysctl -n machdep.cpu.brand_string)"
+        echo "model: $(sysctl -n hw.model)"
+        echo "hypervisor available (kern.hv_support): $(sysctl -n kern.hv_support)"
+        container run --rm docker.io/library/alpine:3 uname -a
     - name: buck2 run a Linux target through the container CLI
       working-directory: ${{ runner.temp }}/project
       env:
