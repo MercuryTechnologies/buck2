@@ -1,0 +1,70 @@
+load("@root//buildbuddy:defs.bzl", "buildbuddy_remote_execution_platform")
+
+oncall("build_infra")
+
+# The executors of MercuryTechnologies/lab's BuildBuddy, in its pool `usw2`
+# (applications/buildbuddy/usw2/values-executor.yaml in lab). The endpoint,
+# the CA it trusts and the API key are lab's and come from lab's side, in a
+# [buck2_re_client] the release workflow writes; the platform only says what
+# an action needs. No local executor, so a build with --remote-only proves
+# every action ran remotely.
+#
+# Those executors run each action in the container image it names, under OCI
+# isolation, and pull it themselves. BuildBuddy's Ubuntu 24.04 image, pinned
+# by the digest gcr.io reported for :latest on 2026-10-01, is a public image,
+# which an executor pulls without a credential. It carries the curl that
+# `[http_archive] remote_download` fetches the toolchains and crates with.
+#
+# OCI isolation gives an action no network unless the platform asks for one,
+# and those fetches need it, so `network = external`: a network namespace of
+# its own, with a route out.
+# https://www.buildbuddy.io/docs/rbe-platforms, "network"
+#
+# An action without `Pool` could land on lab-staging's executors in
+# us-east-1, whose capacity production shares. The scheduler places an action
+# by `EstimatedMemory` and `EstimatedCPU`, and the executor caps the action's
+# cgroup at the memory estimate times four (cgroup_memory_limit_cushion 3.0),
+# so 8GB holds an opt-level 3 rustc of the largest crates and the link of
+# buck2 itself. Four CPUs, because rustc compiles sixteen codegen units in
+# parallel; four by eight fills an executor's 61 vCPU and 120 GiB alike.
+# https://www.buildbuddy.io/docs/rbe-platforms, "Runner resource allocation"
+buildbuddy_remote_execution_platform(
+    name = "rbe",
+    arch = "amd64",
+    container_image = "docker://gcr.io/flame-public/rbe-ubuntu24-04@sha256:f7db0d4791247f032fdb4451b7c3ba90e567923a341cc6dc43abfc283436791a",
+    cpu_configuration = "prelude//cpu:x86_64",
+    network = "external",
+    os_configuration = "prelude//os:linux",
+    os_family = "Linux",
+    remote_execution_properties = {
+        "EstimatedCPU": "4",
+        "EstimatedMemory": "8GB",
+        "Pool": "usw2",
+    },
+    visibility = ["PUBLIC"],
+)
+
+# Target configurations for the release binaries, both built on the x86_64
+# executors above: `--target-platforms lab//:linux-aarch64-musl` is a
+# cross-compile. The musl constraint makes the hermetic toolchains target
+# *-unknown-linux-musl with the musl headers, so the executable is static
+# and runs on any Linux of its architecture.
+platform(
+    name = "linux-x86_64-musl",
+    constraint_values = [
+        "prelude//abi/constraints:musl",
+        "prelude//cpu/constraints:x86_64",
+        "prelude//os/constraints:linux",
+    ],
+    visibility = ["PUBLIC"],
+)
+
+platform(
+    name = "linux-aarch64-musl",
+    constraint_values = [
+        "prelude//abi/constraints:musl",
+        "prelude//cpu/constraints:arm64",
+        "prelude//os/constraints:linux",
+    ],
+    visibility = ["PUBLIC"],
+)

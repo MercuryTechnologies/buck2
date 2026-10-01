@@ -1,0 +1,29 @@
+# Build buck2 with buck2 on MercuryTechnologies/lab's BuildBuddy, in its pool
+# `usw2`:
+#
+#   ./bootstrap/buck2 build //app/buck2:buck2-bin --config-file .buckconfig.lab \
+#       --remote-only --target-platforms lab//:linux-x86_64-musl
+#
+# The hermetic toolchains in buildbuddy/toolchains (an LLVM archive and a Rust
+# toolchain pinned by hash) replace the shim's system toolchains, and archives
+# are fetched on the executors rather than uploaded from the client.
+# [buck2_re_client] is lab's: its endpoint, the CA that signed the endpoint's
+# certificate, and the API key header. It cannot sit here, nor come from
+# --config-file, because the daemon builds its remote-execution client from
+# the buckconfig files alone; lab's buck2 release workflow writes it to
+# .buckconfig.local.
+
+[cell_aliases]
+toolchains = buildbuddy_toolchains
+
+[build]
+execution_platforms = lab//:rbe
+
+[http_archive]
+remote_download = true
+
+[buck2]
+digest_algorithms = BLAKE3
+materializations = deferred_skip_final_artifacts
+sqlite_materializer_state = true
+defer_write_actions = true

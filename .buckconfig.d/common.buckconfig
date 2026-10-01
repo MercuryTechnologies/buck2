@@ -3,6 +3,7 @@ prelude = prelude
 none = none
 buildbuddy_toolchains = buildbuddy/toolchains
 namespace = namespace
+lab = lab
 
 [cell_aliases]
 config = prelude
