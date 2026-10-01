@@ -1000,6 +1000,39 @@ fn drain_finished_operation_stream(mut stream: tonic::Streaming<Operation>) {
     });
 }
 
+/// An action's operation stream, between two polls of the stream `execute_with_progress` returns.
+struct OperationStream {
+    stream: tonic::Streaming<Operation>,
+    operation_name: Option<String>,
+    execute_retry_attempts: usize,
+    /// Resumptions with WaitExecution in a row that the operation said nothing new after.
+    stalled_resumes: usize,
+    /// The stream is a resumption that has sent nothing yet past its first message, which is the
+    /// operation's current status again (REAPI remote_execution.proto, `WaitExecution`).
+    resumed: bool,
+}
+
+/// Counts a resumption of an operation stream that said nothing new since the previous one, and
+/// waits before it, twice as long each time. The first resumption is the protocol at work, the
+/// rest are retries, so after `retries + 1` of them in a row this returns false: a server or proxy
+/// that keeps opening the stream and dropping it is not going to finish the operation.
+async fn pause_before_resume(
+    stalled_resumes: &mut usize,
+    retries: usize,
+    retry_max_delay: Duration,
+) -> bool {
+    if *stalled_resumes > retries {
+        return false;
+    }
+    *stalled_resumes += 1;
+    let doublings = (*stalled_resumes - 1).min(16) as u32;
+    let delay = Duration::from_millis(GRPC_RETRY_INITIAL_DELAY_MILLIS)
+        .saturating_mul(1 << doublings)
+        .min(retry_max_delay);
+    tokio::time::sleep(jittered_retry_delay(delay)).await;
+    true
+}
+
 async fn wait_execution_or_retry_execute(
     grpc_clients: Arc<GRPCClients>,
     metadata: RemoteExecutionMetadata,
@@ -3927,14 +3960,26 @@ impl REClient {
         let cas_ttl_secs = self.runtime_opts.cas_ttl_secs;
 
         let stream = futures::stream::try_unfold(
-            Some((stream, None::<String>, 0usize)),
+            Some(OperationStream {
+                stream,
+                operation_name: None,
+                execute_retry_attempts: 0,
+                stalled_resumes: 0,
+                resumed: false,
+            }),
             move |state| {
                 let grpc_clients = grpc_clients.clone();
                 let metadata = metadata_for_wait_execution.clone();
                 let grpc_request = grpc_request_for_retry.clone();
                 let request_metadata_tool_name = request_metadata_tool_name.clone();
                 async move {
-                    let Some((mut stream, mut operation_name, mut execute_retry_attempts)) = state
+                    let Some(OperationStream {
+                        mut stream,
+                        mut operation_name,
+                        mut execute_retry_attempts,
+                        mut stalled_resumes,
+                        mut resumed,
+                    }) = state
                     else {
                         return Ok(None);
                     };
@@ -3949,6 +3994,18 @@ impl REClient {
                                         ));
                                     };
 
+                                    if !pause_before_resume(
+                                        &mut stalled_resumes,
+                                        retries,
+                                        retry_max_delay,
+                                    )
+                                    .await
+                                    {
+                                        return Err(anyhow::anyhow!(
+                                            "RE operation `{name}` ended its stream {stalled_resumes} times in a row without progress"
+                                        ));
+                                    }
+                                    resumed = true;
                                     tracing::debug!(
                                         operation_name = %name,
                                         "Execute stream ended before completion; resuming with WaitExecution"
@@ -4049,6 +4106,18 @@ impl REClient {
                                         continue;
                                     };
 
+                                    if !pause_before_resume(
+                                        &mut stalled_resumes,
+                                        retries,
+                                        retry_max_delay,
+                                    )
+                                    .await
+                                    {
+                                        return Err(err.context(format!(
+                                            "RE operation `{name}` lost its stream {stalled_resumes} times in a row without progress"
+                                        )));
+                                    }
+                                    resumed = true;
                                     tracing::debug!(
                                         operation_name = %name,
                                         "Execute stream failed after operation creation; resuming with WaitExecution"
@@ -4077,6 +4146,10 @@ impl REClient {
                             }
                         };
 
+                        if !resumed {
+                            stalled_resumes = 0;
+                        }
+                        resumed = false;
                         if !msg.name.is_empty() {
                             operation_name = Some(msg.name.clone());
                         }
@@ -4217,7 +4290,13 @@ impl REClient {
                                 execute_response: None,
                                 ..Default::default()
                             },
-                            Some((stream, operation_name, execute_retry_attempts)),
+                            Some(OperationStream {
+                                stream,
+                                operation_name,
+                                execute_retry_attempts,
+                                stalled_resumes,
+                                resumed,
+                            }),
                         )));
                     }
                 }
@@ -9503,6 +9582,42 @@ mod tests {
         .await;
         assert_eq!(*log.resets.lock().unwrap(), HashMap::from([(H2_CANCEL, 2)]));
         assert_eq!(*log.go_away.lock().unwrap(), None);
+        server.abort();
+        Ok(())
+    }
+
+    static STALLED_OPERATION_WAITS: AtomicUsize = AtomicUsize::new(0);
+
+    /// Every stream sends the operation's status, which never changes, and ends.
+    fn raw_stalled_operation_reply(body: &[u8]) -> (Operation, RawTrailers) {
+        if WaitExecutionRequest::decode(body).is_ok_and(|request| !request.name.is_empty()) {
+            STALLED_OPERATION_WAITS.fetch_add(1, Ordering::SeqCst);
+        }
+        (
+            Operation {
+                name: "operations/stalled".to_owned(),
+                ..Default::default()
+            },
+            RawTrailers::After(Duration::ZERO),
+        )
+    }
+
+    #[tokio::test]
+    async fn an_operation_whose_stream_keeps_ending_without_progress_fails() -> anyhow::Result<()> {
+        let (address, _log, server) = serve_raw_h2(raw_stalled_operation_reply).await?;
+        let client = raw_h2_client(address, 2).await?;
+
+        let Err(err) =
+            tokio::time::timeout(Duration::from_secs(30), execute_raw_h2_action(&client)).await?
+        else {
+            panic!("the operation never finishes");
+        };
+
+        assert!(
+            format!("{err:#}").contains("3 times in a row without progress"),
+            "{err:#}"
+        );
+        assert_eq!(STALLED_OPERATION_WAITS.load(Ordering::SeqCst), 3);
         server.abort();
         Ok(())
     }
