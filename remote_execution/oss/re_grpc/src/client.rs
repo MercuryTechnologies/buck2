@@ -1042,6 +1042,23 @@ fn drain_finished_operation_stream(mut stream: tonic::Streaming<Operation>) {
     });
 }
 
+/// Puts a resumption or a new Execute of a remote action on the console, which the build event
+/// stream carries too, so it shows on the Build URL rather than only in the daemon's log.
+fn warn_re_execution_retry(message: String) {
+    tracing::warn!("{message}");
+    if let Some(dispatcher) = buck2_events::dispatch::get_dispatcher_opt() {
+        dispatcher.console_warning(message);
+    }
+}
+
+fn execute_request_action(request: &GExecuteRequest) -> String {
+    request
+        .action_digest
+        .as_ref()
+        .map(grpc_digest_string)
+        .unwrap_or_default()
+}
+
 /// An action's operation stream, between two polls of the stream `execute_with_progress` returns.
 struct OperationStream {
     stream: tonic::Streaming<Operation>,
@@ -1085,7 +1102,7 @@ async fn wait_execution_or_retry_execute(
     execute_retry_attempts: usize,
     retries: usize,
     retry_max_delay: Duration,
-    wait_failure_context: &'static str,
+    wait_failure_context: String,
 ) -> anyhow::Result<(tonic::Streaming<Operation>, Option<String>, usize)> {
     match wait_execution_stream(
         grpc_clients.clone(),
@@ -1101,18 +1118,16 @@ async fn wait_execution_or_retry_execute(
         Ok(stream) => Ok((stream, Some(operation_name), execute_retry_attempts)),
         Err(wait_err) if should_retry_execute_after_wait_execution_error(&wait_err) => {
             if !can_retry_execute(execute_retry_attempts, retries) {
-                return Err(wait_err.context(format!(
+                return Err(wait_err.context(wait_failure_context).context(format!(
                     "RE operation `{operation_name}` was lost after retry limit"
                 )));
             }
 
             let execute_retry_attempts = execute_retry_attempts + 1;
-            tracing::debug!(
-                operation_name = %operation_name,
-                retry_attempt = execute_retry_attempts,
-                retries,
-                "RE operation was lost; retrying Execute"
-            );
+            warn_re_execution_retry(format!(
+                "Executing RE action {} again (re-Execute {execute_retry_attempts}/{retries}): WaitExecution of operation `{operation_name}` failed: {wait_err:#}",
+                execute_request_action(&execute_request),
+            ));
             let stream = execute_stream(
                 grpc_clients,
                 metadata,
@@ -4066,7 +4081,7 @@ impl REClient {
                                         execute_retry_attempts,
                                         retries,
                                         retry_max_delay,
-                                        "RE WaitExecution failed after Execute stream ended before completion",
+                                        "RE WaitExecution failed after Execute stream ended before completion".to_owned(),
                                     )
                                     .await?;
                                     stream = next_stream;
@@ -4086,13 +4101,10 @@ impl REClient {
                                         }
 
                                         execute_retry_attempts += 1;
-                                        tracing::debug!(
-                                            operation_name =
-                                                operation_name.as_deref().unwrap_or(""),
-                                            retry_attempt = execute_retry_attempts,
-                                            retries,
-                                            "RE operation stream returned NOT_FOUND; retrying Execute"
-                                        );
+                                        warn_re_execution_retry(format!(
+                                            "Executing RE action {} again (re-Execute {execute_retry_attempts}/{retries}): its operation stream failed: {err:#}",
+                                            execute_request_action(&grpc_request),
+                                        ));
                                         stream = execute_stream(
                                             grpc_clients.clone(),
                                             metadata.clone(),
@@ -4111,13 +4123,16 @@ impl REClient {
                                     if !is_retryable_grpc_error(&err) {
                                         return Err(err.context("RE channel error"));
                                     }
-                                    if is_broken_connection_error(&err) {
+                                    let reconnected = if is_broken_connection_error(&err) {
                                         grpc_clients
                                             .reconnect_after_broken_connection(
                                                 GrpcClientKind::Execution,
                                             )
                                             .await;
-                                    }
+                                        " on a new connection"
+                                    } else {
+                                        ""
+                                    };
 
                                     let Some(name) = operation_name.clone() else {
                                         if !can_retry_execute(execute_retry_attempts, retries) {
@@ -4127,11 +4142,10 @@ impl REClient {
                                         }
 
                                         execute_retry_attempts += 1;
-                                        tracing::debug!(
-                                            retry_attempt = execute_retry_attempts,
-                                            retries,
-                                            "Execute stream failed before operation creation; retrying Execute"
-                                        );
+                                        warn_re_execution_retry(format!(
+                                            "Executing RE action {} again (re-Execute {execute_retry_attempts}/{retries}){reconnected}: its Execute stream failed before the operation was created: {err:#}",
+                                            execute_request_action(&grpc_request),
+                                        ));
                                         stream = execute_stream(
                                             grpc_clients.clone(),
                                             metadata.clone(),
@@ -4160,10 +4174,11 @@ impl REClient {
                                         )));
                                     }
                                     resumed = true;
-                                    tracing::debug!(
-                                        operation_name = %name,
-                                        "Execute stream failed after operation creation; resuming with WaitExecution"
-                                    );
+                                    warn_re_execution_retry(format!(
+                                        "Resuming RE operation `{name}` of action {} with WaitExecution (resume {stalled_resumes}/{}){reconnected}: its stream failed: {err:#}",
+                                        execute_request_action(&grpc_request),
+                                        retries + 1,
+                                    ));
                                     let (
                                         next_stream,
                                         next_operation_name,
@@ -4178,7 +4193,7 @@ impl REClient {
                                         execute_retry_attempts,
                                         retries,
                                         retry_max_delay,
-                                        "RE WaitExecution failed after Execute stream interruption",
+                                        format!("RE WaitExecution failed after Execute stream interruption ({err:#})"),
                                     )
                                     .await?;
                                     stream = next_stream;
@@ -4207,14 +4222,13 @@ impl REClient {
                                         && can_retry_execute(execute_retry_attempts, retries)
                                     {
                                         execute_retry_attempts += 1;
-                                        tracing::debug!(
-                                            operation_name =
-                                                operation_name.as_deref().unwrap_or(""),
-                                            retry_attempt = execute_retry_attempts,
-                                            retries,
-                                            code = rpc_status.code,
-                                            "Execute operation returned retryable error; retrying Execute"
-                                        );
+                                        warn_re_execution_retry(format!(
+                                            "Executing RE action {} again (re-Execute {execute_retry_attempts}/{retries}): operation `{}` failed with code {}: {}",
+                                            execute_request_action(&grpc_request),
+                                            operation_name.as_deref().unwrap_or(""),
+                                            rpc_status.code,
+                                            format_rpc_status_message(&rpc_status),
+                                        ));
                                         sleep_for_execute_retry_info(
                                             &rpc_status,
                                             retry_max_delay,
@@ -4251,14 +4265,13 @@ impl REClient {
                                     ) && can_retry_execute(execute_retry_attempts, retries)
                                     {
                                         execute_retry_attempts += 1;
-                                        tracing::debug!(
-                                            operation_name =
-                                                operation_name.as_deref().unwrap_or(""),
-                                            retry_attempt = execute_retry_attempts,
-                                            retries,
-                                            code = execute_response_status.code,
-                                            "Execute response returned retryable status; retrying Execute"
-                                        );
+                                        warn_re_execution_retry(format!(
+                                            "Executing RE action {} again (re-Execute {execute_retry_attempts}/{retries}): operation `{}` returned code {}: {}",
+                                            execute_request_action(&grpc_request),
+                                            operation_name.as_deref().unwrap_or(""),
+                                            execute_response_status.code,
+                                            format_rpc_status_message(&execute_response_status),
+                                        ));
                                         sleep_for_execute_retry_info(
                                             &execute_response_status,
                                             retry_max_delay,
@@ -9894,19 +9907,47 @@ mod tests {
         assert!(should_retry_execute_after_wait_execution_error(&lost));
         assert!(is_broken_connection_error(&normalize_grpc_error(lost)));
 
+        let (mut events, sink) = buck2_events::create_source_sink_pair();
+        let dispatcher = buck2_events::dispatch::EventDispatcher::new(
+            buck2_wrapper_common::invocation_id::TraceId::null(),
+            buck2_events::daemon_id::DaemonId::null(),
+            sink,
+        );
         let mut completed = None;
-        tokio::time::timeout(Duration::from_secs(30), async {
-            while let Some(response) = action.try_next().await? {
-                if let Some(response) = response.execute_response {
-                    completed = Some(response);
+        buck2_events::dispatch::with_dispatcher_async(
+            dispatcher,
+            tokio::time::timeout(Duration::from_secs(30), async {
+                while let Some(response) = action.try_next().await? {
+                    if let Some(response) = response.execute_response {
+                        completed = Some(response);
+                    }
                 }
-            }
-            anyhow::Ok(())
-        })
+                anyhow::Ok(())
+            }),
+        )
         .await??;
         assert_eq!(
             completed.map(|response| response.status.code),
             Some(TCode::OK)
+        );
+
+        let mut warnings = Vec::new();
+        while let Some(event) = events.try_receive() {
+            if let buck2_events::Event::Buck(event) = event
+                && let buck2_data::buck_event::Data::Instant(buck2_data::InstantEvent {
+                    data: Some(buck2_data::instant_event::Data::ConsoleWarning(warning)),
+                }) = event.data()
+            {
+                warnings.push(warning.message.clone());
+            }
+        }
+        assert_eq!(warnings.len(), 1, "{warnings:#?}");
+        assert!(
+            warnings[0].starts_with("Resuming RE operation `operations/in-flight`")
+                && warnings[0].contains("(resume 1/3) on a new connection")
+                && warnings[0].contains("too_many_internal_resets"),
+            "{}",
+            warnings[0]
         );
         server.abort();
         Ok(())
