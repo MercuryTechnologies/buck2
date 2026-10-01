@@ -554,7 +554,35 @@ fn tonic_status_rpc_status(status: &tonic::Status) -> Option<Status> {
     Status::decode(status.details()).ok()
 }
 
+/// A Status that the client's own connection produced as it went away, as opposed to one the
+/// server sent, which has no source. hyper fails a request with Canceled when the connection it
+/// was queued on closes under it (hyper 1.10.1 src/client/dispatch.rs:223) or is no longer ready
+/// for it (src/client/conn/http2.rs:196), which tonic reports as CANCELLED (tonic 0.14.6
+/// src/status.rs:440-442). A stream in flight when the connection closes with GOAWAY fails with
+/// h2's error, which tonic reports by the GOAWAY's reason (src/status.rs:384-412), as
+/// RESOURCE_EXHAUSTED for the ENHANCE_YOUR_CALM that h2 sends itself after too many resets.
+fn tonic_status_lost_with_connection(status: &tonic::Status) -> bool {
+    let mut source = std::error::Error::source(status);
+    while let Some(error) = source {
+        if error
+            .downcast_ref::<hyper::Error>()
+            .is_some_and(hyper::Error::is_canceled)
+            || error
+                .downcast_ref::<h2::Error>()
+                .is_some_and(h2::Error::is_go_away)
+        {
+            return true;
+        }
+        source = error.source();
+    }
+    false
+}
+
 fn tonic_status_indicates_broken_connection(status: &tonic::Status) -> bool {
+    if tonic_status_lost_with_connection(status) {
+        return true;
+    }
+
     if !matches!(
         status.code(),
         tonic::Code::Unavailable
@@ -701,6 +729,12 @@ fn is_broken_connection_error(err: &anyhow::Error) -> bool {
         }
     }
 
+    // The CANCELLED the connection produces was accepted above, by its source. A CANCELLED the
+    // server sends is its answer, whatever its message says.
+    if error_tcode(err) == Some(TCode::CANCELLED) {
+        return false;
+    }
+
     let message = format!("{err:#}").to_ascii_lowercase();
     message.contains("connection reset")
         || message.contains("connection refused")
@@ -709,16 +743,24 @@ fn is_broken_connection_error(err: &anyhow::Error) -> bool {
         || message.contains("transport error")
 }
 
+/// CANCELLED is retried only when it came from the connection: buck2 cancelling a request drops
+/// its future, which leaves no Status to look at, and a CANCELLED from the server is its answer.
 fn is_retryable_grpc_error(err: &anyhow::Error) -> bool {
-    grpc_error_retry_delay(err).is_some() || error_tcode(err).is_some_and(tcode_is_retryable)
+    grpc_error_retry_delay(err).is_some()
+        || error_tcode(err).is_some_and(tcode_is_retryable)
+        || (error_tcode(err) == Some(TCode::CANCELLED) && is_broken_connection_error(err))
 }
 
 fn is_operation_not_found(err: &anyhow::Error) -> bool {
     error_tcode(err) == Some(TCode::NOT_FOUND)
 }
 
+/// WaitExecution has used its own retries by now. NOT_FOUND says the server lost the operation,
+/// and a connection that keeps breaking may have taken the operation's stream with it. Execute
+/// with the same action digest returns the result if the first run finished, or joins it if it is
+/// still running. Any other error is the server's answer about the operation.
 fn should_retry_execute_after_wait_execution_error(err: &anyhow::Error) -> bool {
-    is_operation_not_found(err)
+    is_operation_not_found(err) || is_broken_connection_error(err)
 }
 
 fn should_retry_execute_after_operation_stream_error(err: &anyhow::Error) -> bool {
@@ -7417,6 +7459,106 @@ mod tests {
         assert!(!should_retry_execute_after_wait_execution_error(&err));
     }
 
+    /// What tonic makes of the error hyper gives a request whose connection closed before it was
+    /// sent.
+    async fn canceled_connection_status() -> tonic::Status {
+        let (io, _server) = tokio::io::duplex(1 << 16);
+        let (mut send_request, connection) = hyper::client::conn::http2::handshake(
+            hyper_util::rt::TokioExecutor::new(),
+            hyper_util::rt::TokioIo::new(io),
+        )
+        .await
+        .unwrap();
+        let response = send_request.send_request(http::Request::new(http_body_util::Empty::<
+            bytes::Bytes,
+        >::new()));
+        drop(connection);
+        let error = response.await.expect_err("the connection is gone");
+        tonic::Status::from_error(Box::new(error))
+    }
+
+    #[tokio::test]
+    async fn a_request_cancelled_by_its_connection_is_retried_after_a_reconnect() {
+        let status = canceled_connection_status().await;
+        assert_eq!(status.code(), tonic::Code::Cancelled, "{status:?}");
+
+        let err = anyhow::Error::from(status.clone());
+        assert!(is_retryable_grpc_error(&err), "{err:#}");
+        assert_eq!(recovery_for_error(&err), Recovery::Reconnect);
+        assert!(should_retry_execute_after_wait_execution_error(&err));
+        let err = normalize_grpc_error(err);
+        assert!(is_retryable_grpc_error(&err), "{err:#}");
+        assert_eq!(recovery_for_error(&err), Recovery::Reconnect);
+        assert!(should_retry_execute_after_wait_execution_error(&err));
+
+        let attempts = AtomicU16::new(0);
+        let recoveries = Mutex::new(Vec::new());
+        retry_grpc_request_with_recovery(
+            1,
+            Duration::from_millis(1),
+            || async {
+                if attempts.fetch_add(1, Ordering::Relaxed) == 0 {
+                    Err(anyhow::Error::from(status.clone()))
+                } else {
+                    Ok(())
+                }
+            },
+            |recovery| {
+                recoveries.lock().unwrap().push(recovery);
+                async { false }
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(attempts.load(Ordering::Relaxed), 2);
+        assert_eq!(*recoveries.lock().unwrap(), [Recovery::Reconnect]);
+    }
+
+    /// Whatever its message says: Go servers that lose an executor write "connection closed".
+    #[test]
+    fn a_cancelled_from_the_server_is_final() {
+        for message in [
+            "operation was canceled",
+            "connection closed by executor",
+            "connection reset",
+            "transport error",
+        ] {
+            for err in [
+                anyhow::Error::from(tonic::Status::cancelled(message)),
+                normalize_grpc_error(anyhow::Error::from(tonic::Status::cancelled(message))),
+            ] {
+                assert!(!is_retryable_grpc_error(&err), "{err:#}");
+                assert!(!is_broken_connection_error(&err), "{err:#}");
+                assert_eq!(recovery_for_error(&err), Recovery::None, "{err:#}");
+                assert!(
+                    !should_retry_execute_after_wait_execution_error(&err),
+                    "{err:#}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_wait_execution_answer_from_the_server_does_not_restart_execute() {
+        for status in [
+            tonic::Status::aborted("executor was lost"),
+            tonic::Status::internal("server failed"),
+            tonic::Status::invalid_argument("bad operation name"),
+            tonic::Status::failed_precondition("missing input"),
+            tonic::Status::permission_denied("not allowed"),
+            tonic::Status::resource_exhausted("quota"),
+            tonic::Status::deadline_exceeded("too slow"),
+        ] {
+            let err = anyhow::Error::from(status);
+            assert!(
+                !should_retry_execute_after_wait_execution_error(&err),
+                "{err:#}"
+            );
+        }
+        let err = anyhow::Error::from(tonic::Status::unknown("transport error"));
+        assert!(should_retry_execute_after_wait_execution_error(&err));
+    }
+
     #[test]
     fn configured_connection_count_uses_bazel_ratio_by_default() {
         assert_eq!(configured_connection_count(None, Some(2000)), 20);
@@ -9299,6 +9441,7 @@ mod tests {
     const H2_FLAG_ACK: u8 = 0x1;
     const H2_FLAG_END_HEADERS: u8 = 0x4;
     const H2_CANCEL: u32 = 0x8;
+    const H2_ENHANCE_YOUR_CALM: u32 = 0xb;
     // HPACK (RFC 7541): `:status: 200` is static entry 8; `content-type` (static name 31) and
     // `grpc-status` go as literals without indexing, so the client's decoder needs no state.
     const H2_RESPONSE_HEADERS: &[u8] = b"\x88\x0f\x10\x10application/grpc";
@@ -9307,9 +9450,24 @@ mod tests {
     /// When the raw server sends a stream's trailers.
     #[derive(Clone, Copy)]
     enum RawTrailers {
+        /// When the client resets the stream. These are the frames a server had already put on
+        /// the wire when the client's RST_STREAM reached it, which over a real network arrive
+        /// after the reset; on loopback they could only be produced this way.
+        OnReset,
         /// After the delay, or at the client's reset if that comes first.
         After(Duration),
         Never,
+    }
+
+    /// What the raw server does with a request.
+    enum RawReply {
+        /// Answers with the Operation and sends the trailers as `RawTrailers` says.
+        Operation(Operation, RawTrailers),
+        /// Answers with the Operation, then closes the connection, as a server or a proxy that
+        /// goes away does.
+        OperationThenClose(Operation),
+        /// Closes the connection without an answer.
+        Close,
     }
 
     #[derive(Default)]
@@ -9351,7 +9509,7 @@ mod tests {
     /// sends the trailers when `reply` says. tonic's server stops writing to a stream the client
     /// reset, as it should, so it cannot send the frames a real server had in flight then.
     async fn serve_raw_h2(
-        reply: fn(&[u8]) -> (Operation, RawTrailers),
+        reply: fn(&[u8]) -> RawReply,
     ) -> anyhow::Result<(String, Arc<RawH2Log>, tokio::task::JoinHandle<()>)> {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
         let address = format!("grpc://{}", listener.local_addr()?);
@@ -9370,14 +9528,15 @@ mod tests {
 
     async fn serve_raw_h2_connection(
         socket: tokio::net::TcpStream,
-        reply: fn(&[u8]) -> (Operation, RawTrailers),
+        reply: fn(&[u8]) -> RawReply,
         log: Arc<RawH2Log>,
     ) -> anyhow::Result<()> {
         let (mut reader, mut writer) = socket.into_split();
         let (frames, mut outgoing) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
         tokio::spawn(async move {
+            // An empty frame closes the connection, once everything before it is written.
             while let Some(frame) = outgoing.recv().await {
-                if writer.write_all(&frame).await.is_err() {
+                if frame.is_empty() || writer.write_all(&frame).await.is_err() {
                     break;
                 }
             }
@@ -9424,7 +9583,14 @@ mod tests {
                         continue;
                     }
                     let body = bodies.remove(&stream).unwrap_or_default();
-                    let (operation, trailers) = reply(body.get(5..).unwrap_or_default());
+                    let (operation, trailers) = match reply(body.get(5..).unwrap_or_default()) {
+                        RawReply::Operation(operation, trailers) => (operation, Some(trailers)),
+                        RawReply::OperationThenClose(operation) => (operation, None),
+                        RawReply::Close => {
+                            frames.send(Vec::new())?;
+                            return Ok(());
+                        }
+                    };
                     let message = operation.encode_to_vec();
                     let mut data = vec![0u8];
                     data.extend((message.len() as u32).to_be_bytes());
@@ -9436,8 +9602,15 @@ mod tests {
                         H2_RESPONSE_HEADERS,
                     ))?;
                     frames.send(h2_frame(H2_DATA, 0, stream, &data))?;
+                    let Some(trailers) = trailers else {
+                        frames.send(Vec::new())?;
+                        return Ok(());
+                    };
                     match trailers {
                         RawTrailers::Never => {}
+                        RawTrailers::OnReset => {
+                            pending.lock().unwrap().insert(stream);
+                        }
                         RawTrailers::After(delay) => {
                             pending.lock().unwrap().insert(stream);
                             let (pending, frames, log) =
@@ -9535,7 +9708,7 @@ mod tests {
     async fn finished_operation_streams_end_without_a_reset() -> anyhow::Result<()> {
         const ACTIONS: usize = 1500;
         let (address, log, server) = serve_raw_h2(|_| {
-            (
+            RawReply::Operation(
                 done_operation(),
                 RawTrailers::After(Duration::from_millis(200)),
             )
@@ -9564,7 +9737,7 @@ mod tests {
     async fn a_finished_stream_the_server_never_ends_is_reset_after_the_drain_timeout()
     -> anyhow::Result<()> {
         let (address, log, server) =
-            serve_raw_h2(|_| (done_operation(), RawTrailers::Never)).await?;
+            serve_raw_h2(|_| RawReply::Operation(done_operation(), RawTrailers::Never)).await?;
         let client = raw_h2_client(address, 0).await?;
 
         let started = Instant::now();
@@ -9589,11 +9762,11 @@ mod tests {
     static STALLED_OPERATION_WAITS: AtomicUsize = AtomicUsize::new(0);
 
     /// Every stream sends the operation's status, which never changes, and ends.
-    fn raw_stalled_operation_reply(body: &[u8]) -> (Operation, RawTrailers) {
+    fn raw_stalled_operation_reply(body: &[u8]) -> RawReply {
         if WaitExecutionRequest::decode(body).is_ok_and(|request| !request.name.is_empty()) {
             STALLED_OPERATION_WAITS.fetch_add(1, Ordering::SeqCst);
         }
-        (
+        RawReply::Operation(
             Operation {
                 name: "operations/stalled".to_owned(),
                 ..Default::default()
@@ -9622,11 +9795,164 @@ mod tests {
         Ok(())
     }
 
+    /// The action's Execute stream stays open; WaitExecution finishes it. Every other stream is
+    /// dropped after its first message, and its trailers arrive after the client reset it.
+    fn raw_go_away_reply(body: &[u8]) -> RawReply {
+        let name = WaitExecutionRequest::decode(body)
+            .map(|request| request.name)
+            .unwrap_or_default();
+        match name.as_str() {
+            "" => RawReply::Operation(
+                Operation {
+                    name: "operations/in-flight".to_owned(),
+                    ..Default::default()
+                },
+                RawTrailers::Never,
+            ),
+            "operations/in-flight" => {
+                RawReply::Operation(done_operation(), RawTrailers::After(Duration::ZERO))
+            }
+            "bystander" => RawReply::Operation(
+                Operation {
+                    name,
+                    ..Default::default()
+                },
+                RawTrailers::Never,
+            ),
+            _ => RawReply::Operation(
+                Operation {
+                    name,
+                    ..Default::default()
+                },
+                RawTrailers::OnReset,
+            ),
+        }
+    }
+
+    /// h2 resets a stream with STREAM_CLOSED when a frame arrives for one it no longer remembers,
+    /// and remembers a stream the client dropped for 1 s and only 50 at a time (h2 0.4.15
+    /// src/proto/mod.rs:34-41, streams/recv.rs:988-1003). The 1025th such reset on a connection
+    /// becomes GOAWAY ENHANCE_YOUR_CALM instead (streams/streams.rs:1641-1660), which fails every
+    /// stream on the connection, the action's among them.
+    #[tokio::test]
+    async fn an_action_in_flight_when_h2_closes_its_connection_is_resumed() -> anyhow::Result<()> {
+        let (address, log, server) = serve_raw_h2(raw_go_away_reply).await?;
+        let client = raw_h2_client(address, 2).await?;
+        let mut action = client
+            .execute_with_progress(
+                &RemoteExecutionMetadata::default(),
+                ExecuteRequest {
+                    action_digest: TDigest {
+                        hash: "ab".repeat(32),
+                        size_in_bytes: 1,
+                        _dot_dot: (),
+                    },
+                    ..Default::default()
+                },
+            )
+            .await?;
+        action.try_next().await?;
+
+        // The pool has one channel, so these share the action's connection.
+        let execution = client.grpc_clients.execution_client().await?;
+        let wait_execution = |name: String| {
+            let mut execution = execution.clone();
+            async move {
+                execution
+                    .wait_execution(WaitExecutionRequest { name })
+                    .await
+                    .map(tonic::Response::into_inner)
+            }
+        };
+        let mut bystander = wait_execution("bystander".to_owned()).await?;
+        bystander.message().await?;
+        futures::future::join_all((0..1500).map(|i| {
+            let stream = wait_execution(format!("operations/{i}"));
+            async move { stream.await?.message().await }
+        }))
+        .await;
+        let lost = bystander
+            .message()
+            .await
+            .expect_err("the bystander's connection was closed under it");
+
+        // What a stream in flight sees: RESOURCE_EXHAUSTED, from the GOAWAY its own client sent.
+        assert_eq!(lost.code(), tonic::Code::ResourceExhausted, "{lost:?}");
+        let _ = tokio::time::timeout(Duration::from_secs(5), async {
+            while log.go_away.lock().unwrap().is_none() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        assert_eq!(
+            *log.go_away.lock().unwrap(),
+            Some((H2_ENHANCE_YOUR_CALM, b"too_many_internal_resets".to_vec()))
+        );
+        let lost = anyhow::Error::from(lost);
+        assert!(is_broken_connection_error(&lost), "{lost:#}");
+        assert!(is_retryable_grpc_error(&lost), "{lost:#}");
+        assert!(should_retry_execute_after_wait_execution_error(&lost));
+        assert!(is_broken_connection_error(&normalize_grpc_error(lost)));
+
+        let mut completed = None;
+        tokio::time::timeout(Duration::from_secs(30), async {
+            while let Some(response) = action.try_next().await? {
+                if let Some(response) = response.execute_response {
+                    completed = Some(response);
+                }
+            }
+            anyhow::Ok(())
+        })
+        .await??;
+        assert_eq!(
+            completed.map(|response| response.status.code),
+            Some(TCode::OK)
+        );
+        server.abort();
+        Ok(())
+    }
+
+    static LOST_OPERATION_EXECUTES: AtomicUsize = AtomicUsize::new(0);
+    static LOST_OPERATION_WAITS: AtomicUsize = AtomicUsize::new(0);
+
+    /// The first Execute loses its connection after the first Operation, and so does every
+    /// WaitExecution; the second Execute finishes.
+    fn raw_lost_operation_reply(body: &[u8]) -> RawReply {
+        if WaitExecutionRequest::decode(body).is_ok_and(|request| !request.name.is_empty()) {
+            LOST_OPERATION_WAITS.fetch_add(1, Ordering::SeqCst);
+            return RawReply::Close;
+        }
+        if LOST_OPERATION_EXECUTES.fetch_add(1, Ordering::SeqCst) == 0 {
+            RawReply::OperationThenClose(Operation {
+                name: "operations/lost".to_owned(),
+                ..Default::default()
+            })
+        } else {
+            RawReply::Operation(done_operation(), RawTrailers::After(Duration::ZERO))
+        }
+    }
+
+    #[tokio::test]
+    async fn an_operation_whose_connection_keeps_closing_is_executed_again() -> anyhow::Result<()> {
+        let (address, _log, server) = serve_raw_h2(raw_lost_operation_reply).await?;
+        let client = raw_h2_client(address, 2).await?;
+
+        let completed = execute_raw_h2_action(&client).await?;
+
+        assert_eq!(completed.status.code, TCode::OK);
+        assert_eq!(LOST_OPERATION_EXECUTES.load(Ordering::SeqCst), 2);
+        assert_eq!(LOST_OPERATION_WAITS.load(Ordering::SeqCst), 3);
+        server.abort();
+        Ok(())
+    }
+
     #[tokio::test]
     async fn concurrent_reconnects_of_the_execution_pool_dial_each_channel_once()
     -> anyhow::Result<()> {
-        let (address, log, server) =
-            serve_raw_h2(|_| (done_operation(), RawTrailers::After(Duration::ZERO))).await?;
+        let (address, log, server) = serve_raw_h2(|_| {
+            RawReply::Operation(done_operation(), RawTrailers::After(Duration::ZERO))
+        })
+        .await?;
         let client = REClientBuilder::build_and_connect(&Buck2OssReConfiguration {
             cas_address: Some(address.clone()),
             engine_address: Some(address.clone()),
