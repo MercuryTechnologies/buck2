@@ -9132,6 +9132,20 @@ third_party_rust_library(
     ],
 )
 
+third_party_rust_alias(
+    name = "h2",
+    actual = ":h2-0.4",
+    platforms = [
+        "linux-arm64",
+        "linux-x86_64",
+        "macos-arm64",
+        "macos-x86_64",
+        "windows-gnu",
+        "windows-msvc",
+    ],
+    visibility = ["PUBLIC"],
+)
+
 http_archive(
     name = "h2-0.3.27.crate",
     sha256 = "0beca50380b1fc32983fc1cb4587bfa4bb9e78fc259aad4a0032d2080309222d",
