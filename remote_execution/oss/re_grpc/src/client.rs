@@ -554,7 +554,35 @@ fn tonic_status_rpc_status(status: &tonic::Status) -> Option<Status> {
     Status::decode(status.details()).ok()
 }
 
+/// A Status that the client's own connection produced as it went away, as opposed to one the
+/// server sent, which has no source. hyper fails a request with Canceled when the connection it
+/// was queued on closes under it (hyper 1.10.1 src/client/dispatch.rs:223) or is no longer ready
+/// for it (src/client/conn/http2.rs:196), which tonic reports as CANCELLED (tonic 0.14.6
+/// src/status.rs:440-442). A stream in flight when the connection closes with GOAWAY fails with
+/// h2's error, which tonic reports by the GOAWAY's reason (src/status.rs:384-412), as
+/// RESOURCE_EXHAUSTED for the ENHANCE_YOUR_CALM that h2 sends itself after too many resets.
+fn tonic_status_lost_with_connection(status: &tonic::Status) -> bool {
+    let mut source = std::error::Error::source(status);
+    while let Some(error) = source {
+        if error
+            .downcast_ref::<hyper::Error>()
+            .is_some_and(hyper::Error::is_canceled)
+            || error
+                .downcast_ref::<h2::Error>()
+                .is_some_and(h2::Error::is_go_away)
+        {
+            return true;
+        }
+        source = error.source();
+    }
+    false
+}
+
 fn tonic_status_indicates_broken_connection(status: &tonic::Status) -> bool {
+    if tonic_status_lost_with_connection(status) {
+        return true;
+    }
+
     if !matches!(
         status.code(),
         tonic::Code::Unavailable
@@ -701,6 +729,12 @@ fn is_broken_connection_error(err: &anyhow::Error) -> bool {
         }
     }
 
+    // The CANCELLED the connection produces was accepted above, by its source. A CANCELLED the
+    // server sends is its answer, whatever its message says.
+    if error_tcode(err) == Some(TCode::CANCELLED) {
+        return false;
+    }
+
     let message = format!("{err:#}").to_ascii_lowercase();
     message.contains("connection reset")
         || message.contains("connection refused")
@@ -709,16 +743,24 @@ fn is_broken_connection_error(err: &anyhow::Error) -> bool {
         || message.contains("transport error")
 }
 
+/// CANCELLED is retried only when it came from the connection: buck2 cancelling a request drops
+/// its future, which leaves no Status to look at, and a CANCELLED from the server is its answer.
 fn is_retryable_grpc_error(err: &anyhow::Error) -> bool {
-    grpc_error_retry_delay(err).is_some() || error_tcode(err).is_some_and(tcode_is_retryable)
+    grpc_error_retry_delay(err).is_some()
+        || error_tcode(err).is_some_and(tcode_is_retryable)
+        || (error_tcode(err) == Some(TCode::CANCELLED) && is_broken_connection_error(err))
 }
 
 fn is_operation_not_found(err: &anyhow::Error) -> bool {
     error_tcode(err) == Some(TCode::NOT_FOUND)
 }
 
+/// WaitExecution has used its own retries by now. NOT_FOUND says the server lost the operation,
+/// and a connection that keeps breaking may have taken the operation's stream with it. Execute
+/// with the same action digest returns the result if the first run finished, or joins it if it is
+/// still running. Any other error is the server's answer about the operation.
 fn should_retry_execute_after_wait_execution_error(err: &anyhow::Error) -> bool {
-    is_operation_not_found(err)
+    is_operation_not_found(err) || is_broken_connection_error(err)
 }
 
 fn should_retry_execute_after_operation_stream_error(err: &anyhow::Error) -> bool {
@@ -975,6 +1017,81 @@ async fn wait_execution_stream(
     .await
 }
 
+/// How long a finished operation's stream has to end once its done Operation is in. BuildBuddy
+/// writes the trailers as soon as it has sent the done Operation, so they are already in flight;
+/// a server that holds the stream open longer keeps one of its concurrent streams busy meanwhile.
+const OPERATION_STREAM_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Reads the rest of a stream whose done Operation is in, so it closes with the server's
+/// END_STREAM. Dropped instead, it is reset, and h2 remembers a reset stream for 1 s and only 50
+/// at a time (h2 0.4.15 src/proto/mod.rs:34-41): the trailers that arrive after that count
+/// against a per-connection limit of 1024, the next one closes the connection with GOAWAY
+/// ENHANCE_YOUR_CALM, and every action with a stream on it fails (streams.rs:1641-1660).
+fn drain_finished_operation_stream(mut stream: tonic::Streaming<Operation>) {
+    tokio::spawn(async move {
+        let drained = tokio::time::timeout(OPERATION_STREAM_DRAIN_TIMEOUT, async {
+            while let Ok(Some(_)) = stream.message().await {}
+        })
+        .await;
+        if drained.is_err() {
+            tracing::debug!(
+                timeout_secs = OPERATION_STREAM_DRAIN_TIMEOUT.as_secs(),
+                "A finished operation's stream did not end in time; resetting it"
+            );
+        }
+    });
+}
+
+/// Puts a resumption or a new Execute of a remote action on the console, which the build event
+/// stream carries too, so it shows on the Build URL rather than only in the daemon's log.
+fn warn_re_execution_retry(message: String) {
+    tracing::warn!("{message}");
+    if let Some(dispatcher) = buck2_events::dispatch::get_dispatcher_opt() {
+        dispatcher.console_warning(message);
+    }
+}
+
+fn execute_request_action(request: &GExecuteRequest) -> String {
+    request
+        .action_digest
+        .as_ref()
+        .map(grpc_digest_string)
+        .unwrap_or_default()
+}
+
+/// An action's operation stream, between two polls of the stream `execute_with_progress` returns.
+struct OperationStream {
+    stream: tonic::Streaming<Operation>,
+    operation_name: Option<String>,
+    execute_retry_attempts: usize,
+    /// Resumptions with WaitExecution in a row that the operation said nothing new after.
+    stalled_resumes: usize,
+    /// The stream is a resumption that has sent nothing yet past its first message, which is the
+    /// operation's current status again (REAPI remote_execution.proto, `WaitExecution`).
+    resumed: bool,
+}
+
+/// Counts a resumption of an operation stream that said nothing new since the previous one, and
+/// waits before it, twice as long each time. The first resumption is the protocol at work, the
+/// rest are retries, so after `retries + 1` of them in a row this returns false: a server or proxy
+/// that keeps opening the stream and dropping it is not going to finish the operation.
+async fn pause_before_resume(
+    stalled_resumes: &mut usize,
+    retries: usize,
+    retry_max_delay: Duration,
+) -> bool {
+    if *stalled_resumes > retries {
+        return false;
+    }
+    *stalled_resumes += 1;
+    let doublings = (*stalled_resumes - 1).min(16) as u32;
+    let delay = Duration::from_millis(GRPC_RETRY_INITIAL_DELAY_MILLIS)
+        .saturating_mul(1 << doublings)
+        .min(retry_max_delay);
+    tokio::time::sleep(jittered_retry_delay(delay)).await;
+    true
+}
+
 async fn wait_execution_or_retry_execute(
     grpc_clients: Arc<GRPCClients>,
     metadata: RemoteExecutionMetadata,
@@ -985,7 +1102,7 @@ async fn wait_execution_or_retry_execute(
     execute_retry_attempts: usize,
     retries: usize,
     retry_max_delay: Duration,
-    wait_failure_context: &'static str,
+    wait_failure_context: String,
 ) -> anyhow::Result<(tonic::Streaming<Operation>, Option<String>, usize)> {
     match wait_execution_stream(
         grpc_clients.clone(),
@@ -1001,18 +1118,16 @@ async fn wait_execution_or_retry_execute(
         Ok(stream) => Ok((stream, Some(operation_name), execute_retry_attempts)),
         Err(wait_err) if should_retry_execute_after_wait_execution_error(&wait_err) => {
             if !can_retry_execute(execute_retry_attempts, retries) {
-                return Err(wait_err.context(format!(
+                return Err(wait_err.context(wait_failure_context).context(format!(
                     "RE operation `{operation_name}` was lost after retry limit"
                 )));
             }
 
             let execute_retry_attempts = execute_retry_attempts + 1;
-            tracing::debug!(
-                operation_name = %operation_name,
-                retry_attempt = execute_retry_attempts,
-                retries,
-                "RE operation was lost; retrying Execute"
-            );
+            warn_re_execution_retry(format!(
+                "Executing RE action {} again (re-Execute {execute_retry_attempts}/{retries}): WaitExecution of operation `{operation_name}` failed: {wait_err:#}",
+                execute_request_action(&execute_request),
+            ));
             let stream = execute_stream(
                 grpc_clients,
                 metadata,
@@ -3032,8 +3147,17 @@ impl CasDaemonLauncher {
     }
 }
 
+/// Every request in flight on a connection that breaks fails at about the same moment, and each
+/// asks for a reconnect. One reconnect serves all of them, so another within this interval is
+/// skipped. Nothing is lost by that: tonic's Channel redials a connection that closes under it on
+/// its own (tonic 0.14.6 src/transport/channel/service/reconnect.rs:111-130).
+const RECONNECT_MIN_INTERVAL: Duration = Duration::from_secs(1);
+
 struct ResettableGrpcClient<C> {
     channel: tokio::sync::RwLock<Channel>,
+    /// When the channel was last replaced. Held through a reconnect, so the reconnects that
+    /// arrive meanwhile wait for it and then find it fresh.
+    reconnected_at: tokio::sync::Mutex<Option<Instant>>,
     connector: GrpcChannelConnector,
     interceptor: InjectHeadersInterceptor,
     max_decoding_message_size: usize,
@@ -3050,6 +3174,7 @@ impl<C> ResettableGrpcClient<C> {
     ) -> Self {
         Self {
             channel: tokio::sync::RwLock::new(channel),
+            reconnected_at: tokio::sync::Mutex::new(None),
             connector,
             interceptor,
             max_decoding_message_size,
@@ -3070,8 +3195,13 @@ impl<C> ResettableGrpcClient<C> {
     }
 
     async fn reconnect(&self) -> anyhow::Result<()> {
+        let mut reconnected_at = self.reconnected_at.lock().await;
+        if reconnected_at.is_some_and(|at| at.elapsed() < RECONNECT_MIN_INTERVAL) {
+            return Ok(());
+        }
         let channel = self.connector.connect().await?;
         *self.channel.write().await = channel;
+        *reconnected_at = Some(Instant::now());
         Ok(())
     }
 }
@@ -3887,13 +4017,29 @@ impl REClient {
         let cas_ttl_secs = self.runtime_opts.cas_ttl_secs;
 
         let stream = futures::stream::try_unfold(
-            (stream, None::<String>, 0usize),
-            move |(mut stream, mut operation_name, mut execute_retry_attempts)| {
+            Some(OperationStream {
+                stream,
+                operation_name: None,
+                execute_retry_attempts: 0,
+                stalled_resumes: 0,
+                resumed: false,
+            }),
+            move |state| {
                 let grpc_clients = grpc_clients.clone();
                 let metadata = metadata_for_wait_execution.clone();
                 let grpc_request = grpc_request_for_retry.clone();
                 let request_metadata_tool_name = request_metadata_tool_name.clone();
                 async move {
+                    let Some(OperationStream {
+                        mut stream,
+                        mut operation_name,
+                        mut execute_retry_attempts,
+                        mut stalled_resumes,
+                        mut resumed,
+                    }) = state
+                    else {
+                        return Ok(None);
+                    };
                     loop {
                         let msg = loop {
                             match stream.try_next().await {
@@ -3905,6 +4051,18 @@ impl REClient {
                                         ));
                                     };
 
+                                    if !pause_before_resume(
+                                        &mut stalled_resumes,
+                                        retries,
+                                        retry_max_delay,
+                                    )
+                                    .await
+                                    {
+                                        return Err(anyhow::anyhow!(
+                                            "RE operation `{name}` ended its stream {stalled_resumes} times in a row without progress"
+                                        ));
+                                    }
+                                    resumed = true;
                                     tracing::debug!(
                                         operation_name = %name,
                                         "Execute stream ended before completion; resuming with WaitExecution"
@@ -3923,7 +4081,7 @@ impl REClient {
                                         execute_retry_attempts,
                                         retries,
                                         retry_max_delay,
-                                        "RE WaitExecution failed after Execute stream ended before completion",
+                                        "RE WaitExecution failed after Execute stream ended before completion".to_owned(),
                                     )
                                     .await?;
                                     stream = next_stream;
@@ -3943,13 +4101,10 @@ impl REClient {
                                         }
 
                                         execute_retry_attempts += 1;
-                                        tracing::debug!(
-                                            operation_name =
-                                                operation_name.as_deref().unwrap_or(""),
-                                            retry_attempt = execute_retry_attempts,
-                                            retries,
-                                            "RE operation stream returned NOT_FOUND; retrying Execute"
-                                        );
+                                        warn_re_execution_retry(format!(
+                                            "Executing RE action {} again (re-Execute {execute_retry_attempts}/{retries}): its operation stream failed: {err:#}",
+                                            execute_request_action(&grpc_request),
+                                        ));
                                         stream = execute_stream(
                                             grpc_clients.clone(),
                                             metadata.clone(),
@@ -3968,13 +4123,16 @@ impl REClient {
                                     if !is_retryable_grpc_error(&err) {
                                         return Err(err.context("RE channel error"));
                                     }
-                                    if is_broken_connection_error(&err) {
+                                    let reconnected = if is_broken_connection_error(&err) {
                                         grpc_clients
                                             .reconnect_after_broken_connection(
                                                 GrpcClientKind::Execution,
                                             )
                                             .await;
-                                    }
+                                        " on a new connection"
+                                    } else {
+                                        ""
+                                    };
 
                                     let Some(name) = operation_name.clone() else {
                                         if !can_retry_execute(execute_retry_attempts, retries) {
@@ -3984,11 +4142,10 @@ impl REClient {
                                         }
 
                                         execute_retry_attempts += 1;
-                                        tracing::debug!(
-                                            retry_attempt = execute_retry_attempts,
-                                            retries,
-                                            "Execute stream failed before operation creation; retrying Execute"
-                                        );
+                                        warn_re_execution_retry(format!(
+                                            "Executing RE action {} again (re-Execute {execute_retry_attempts}/{retries}){reconnected}: its Execute stream failed before the operation was created: {err:#}",
+                                            execute_request_action(&grpc_request),
+                                        ));
                                         stream = execute_stream(
                                             grpc_clients.clone(),
                                             metadata.clone(),
@@ -4005,10 +4162,23 @@ impl REClient {
                                         continue;
                                     };
 
-                                    tracing::debug!(
-                                        operation_name = %name,
-                                        "Execute stream failed after operation creation; resuming with WaitExecution"
-                                    );
+                                    if !pause_before_resume(
+                                        &mut stalled_resumes,
+                                        retries,
+                                        retry_max_delay,
+                                    )
+                                    .await
+                                    {
+                                        return Err(err.context(format!(
+                                            "RE operation `{name}` lost its stream {stalled_resumes} times in a row without progress"
+                                        )));
+                                    }
+                                    resumed = true;
+                                    warn_re_execution_retry(format!(
+                                        "Resuming RE operation `{name}` of action {} with WaitExecution (resume {stalled_resumes}/{}){reconnected}: its stream failed: {err:#}",
+                                        execute_request_action(&grpc_request),
+                                        retries + 1,
+                                    ));
                                     let (
                                         next_stream,
                                         next_operation_name,
@@ -4023,7 +4193,7 @@ impl REClient {
                                         execute_retry_attempts,
                                         retries,
                                         retry_max_delay,
-                                        "RE WaitExecution failed after Execute stream interruption",
+                                        format!("RE WaitExecution failed after Execute stream interruption ({err:#})"),
                                     )
                                     .await?;
                                     stream = next_stream;
@@ -4033,11 +4203,16 @@ impl REClient {
                             }
                         };
 
+                        if !resumed {
+                            stalled_resumes = 0;
+                        }
+                        resumed = false;
                         if !msg.name.is_empty() {
                             operation_name = Some(msg.name.clone());
                         }
 
-                        let status = if msg.done {
+                        if msg.done {
+                            drain_finished_operation_stream(stream);
                             match msg
                                 .result
                                 .context("Missing `result` when message was `done`")?
@@ -4047,14 +4222,13 @@ impl REClient {
                                         && can_retry_execute(execute_retry_attempts, retries)
                                     {
                                         execute_retry_attempts += 1;
-                                        tracing::debug!(
-                                            operation_name =
-                                                operation_name.as_deref().unwrap_or(""),
-                                            retry_attempt = execute_retry_attempts,
-                                            retries,
-                                            code = rpc_status.code,
-                                            "Execute operation returned retryable error; retrying Execute"
-                                        );
+                                        warn_re_execution_retry(format!(
+                                            "Executing RE action {} again (re-Execute {execute_retry_attempts}/{retries}): operation `{}` failed with code {}: {}",
+                                            execute_request_action(&grpc_request),
+                                            operation_name.as_deref().unwrap_or(""),
+                                            rpc_status.code,
+                                            format_rpc_status_message(&rpc_status),
+                                        ));
                                         sleep_for_execute_retry_info(
                                             &rpc_status,
                                             retry_max_delay,
@@ -4091,14 +4265,13 @@ impl REClient {
                                     ) && can_retry_execute(execute_retry_attempts, retries)
                                     {
                                         execute_retry_attempts += 1;
-                                        tracing::debug!(
-                                            operation_name =
-                                                operation_name.as_deref().unwrap_or(""),
-                                            retry_attempt = execute_retry_attempts,
-                                            retries,
-                                            code = execute_response_status.code,
-                                            "Execute response returned retryable status; retrying Execute"
-                                        );
+                                        warn_re_execution_retry(format!(
+                                            "Executing RE action {} again (re-Execute {execute_retry_attempts}/{retries}): operation `{}` returned code {}: {}",
+                                            execute_request_action(&grpc_request),
+                                            operation_name.as_deref().unwrap_or(""),
+                                            execute_response_status.code,
+                                            format_rpc_status_message(&execute_response_status),
+                                        ));
                                         sleep_for_execute_retry_info(
                                             &execute_response_status,
                                             retry_max_delay,
@@ -4143,37 +4316,42 @@ impl REClient {
                                         action_digest: Default::default(), // Filled in below.
                                     };
 
-                                    ExecuteWithProgressResponse {
-                                        stage: Stage::COMPLETED,
-                                        execute_response: Some(execute_response),
-                                        ..Default::default()
-                                    }
+                                    return anyhow::Ok(Some((
+                                        ExecuteWithProgressResponse {
+                                            stage: Stage::COMPLETED,
+                                            execute_response: Some(execute_response),
+                                            ..Default::default()
+                                        },
+                                        None,
+                                    )));
                                 }
                             }
-                        } else {
-                            let meta = ExecuteOperationMetadata::decode(
-                                &msg.metadata.unwrap_or_default().value[..],
-                            )?;
+                        }
 
-                            let stage = match execution_stage::Value::try_from(meta.stage) {
-                                Ok(execution_stage::Value::Unknown) => Stage::UNKNOWN,
-                                Ok(execution_stage::Value::CacheCheck) => Stage::CACHE_CHECK,
-                                Ok(execution_stage::Value::Queued) => Stage::QUEUED,
-                                Ok(execution_stage::Value::Executing) => Stage::EXECUTING,
-                                Ok(execution_stage::Value::Completed) => Stage::COMPLETED,
-                                _ => Stage::UNKNOWN,
-                            };
-
+                        let meta = ExecuteOperationMetadata::decode(
+                            &msg.metadata.unwrap_or_default().value[..],
+                        )?;
+                        let stage = match execution_stage::Value::try_from(meta.stage) {
+                            Ok(execution_stage::Value::Unknown) => Stage::UNKNOWN,
+                            Ok(execution_stage::Value::CacheCheck) => Stage::CACHE_CHECK,
+                            Ok(execution_stage::Value::Queued) => Stage::QUEUED,
+                            Ok(execution_stage::Value::Executing) => Stage::EXECUTING,
+                            Ok(execution_stage::Value::Completed) => Stage::COMPLETED,
+                            _ => Stage::UNKNOWN,
+                        };
+                        return anyhow::Ok(Some((
                             ExecuteWithProgressResponse {
                                 stage,
                                 execute_response: None,
                                 ..Default::default()
-                            }
-                        };
-
-                        return anyhow::Ok(Some((
-                            status,
-                            (stream, operation_name, execute_retry_attempts),
+                            },
+                            Some(OperationStream {
+                                stream,
+                                operation_name,
+                                execute_retry_attempts,
+                                stalled_resumes,
+                                resumed,
+                            }),
                         )));
                     }
                 }
@@ -7294,6 +7472,106 @@ mod tests {
         assert!(!should_retry_execute_after_wait_execution_error(&err));
     }
 
+    /// What tonic makes of the error hyper gives a request whose connection closed before it was
+    /// sent.
+    async fn canceled_connection_status() -> tonic::Status {
+        let (io, _server) = tokio::io::duplex(1 << 16);
+        let (mut send_request, connection) = hyper::client::conn::http2::handshake(
+            hyper_util::rt::TokioExecutor::new(),
+            hyper_util::rt::TokioIo::new(io),
+        )
+        .await
+        .unwrap();
+        let response = send_request.send_request(http::Request::new(http_body_util::Empty::<
+            bytes::Bytes,
+        >::new()));
+        drop(connection);
+        let error = response.await.expect_err("the connection is gone");
+        tonic::Status::from_error(Box::new(error))
+    }
+
+    #[tokio::test]
+    async fn a_request_cancelled_by_its_connection_is_retried_after_a_reconnect() {
+        let status = canceled_connection_status().await;
+        assert_eq!(status.code(), tonic::Code::Cancelled, "{status:?}");
+
+        let err = anyhow::Error::from(status.clone());
+        assert!(is_retryable_grpc_error(&err), "{err:#}");
+        assert_eq!(recovery_for_error(&err), Recovery::Reconnect);
+        assert!(should_retry_execute_after_wait_execution_error(&err));
+        let err = normalize_grpc_error(err);
+        assert!(is_retryable_grpc_error(&err), "{err:#}");
+        assert_eq!(recovery_for_error(&err), Recovery::Reconnect);
+        assert!(should_retry_execute_after_wait_execution_error(&err));
+
+        let attempts = AtomicU16::new(0);
+        let recoveries = Mutex::new(Vec::new());
+        retry_grpc_request_with_recovery(
+            1,
+            Duration::from_millis(1),
+            || async {
+                if attempts.fetch_add(1, Ordering::Relaxed) == 0 {
+                    Err(anyhow::Error::from(status.clone()))
+                } else {
+                    Ok(())
+                }
+            },
+            |recovery| {
+                recoveries.lock().unwrap().push(recovery);
+                async { false }
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(attempts.load(Ordering::Relaxed), 2);
+        assert_eq!(*recoveries.lock().unwrap(), [Recovery::Reconnect]);
+    }
+
+    /// Whatever its message says: Go servers that lose an executor write "connection closed".
+    #[test]
+    fn a_cancelled_from_the_server_is_final() {
+        for message in [
+            "operation was canceled",
+            "connection closed by executor",
+            "connection reset",
+            "transport error",
+        ] {
+            for err in [
+                anyhow::Error::from(tonic::Status::cancelled(message)),
+                normalize_grpc_error(anyhow::Error::from(tonic::Status::cancelled(message))),
+            ] {
+                assert!(!is_retryable_grpc_error(&err), "{err:#}");
+                assert!(!is_broken_connection_error(&err), "{err:#}");
+                assert_eq!(recovery_for_error(&err), Recovery::None, "{err:#}");
+                assert!(
+                    !should_retry_execute_after_wait_execution_error(&err),
+                    "{err:#}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_wait_execution_answer_from_the_server_does_not_restart_execute() {
+        for status in [
+            tonic::Status::aborted("executor was lost"),
+            tonic::Status::internal("server failed"),
+            tonic::Status::invalid_argument("bad operation name"),
+            tonic::Status::failed_precondition("missing input"),
+            tonic::Status::permission_denied("not allowed"),
+            tonic::Status::resource_exhausted("quota"),
+            tonic::Status::deadline_exceeded("too slow"),
+        ] {
+            let err = anyhow::Error::from(status);
+            assert!(
+                !should_retry_execute_after_wait_execution_error(&err),
+                "{err:#}"
+            );
+        }
+        let err = anyhow::Error::from(tonic::Status::unknown("transport error"));
+        assert!(should_retry_execute_after_wait_execution_error(&err));
+    }
+
     #[test]
     fn configured_connection_count_uses_bazel_ratio_by_default() {
         assert_eq!(configured_connection_count(None, Some(2000)), 20);
@@ -9163,6 +9441,586 @@ mod tests {
         let err = result.unwrap_err();
         let err = err.downcast_ref::<REClientError>().expect("REClientError");
         assert_eq!(err.code, TCode::UNAVAILABLE);
+    }
+
+    const H2_DATA: u8 = 0x0;
+    const H2_HEADERS: u8 = 0x1;
+    const H2_RST_STREAM: u8 = 0x3;
+    const H2_SETTINGS: u8 = 0x4;
+    const H2_PING: u8 = 0x6;
+    const H2_GOAWAY: u8 = 0x7;
+    const H2_WINDOW_UPDATE: u8 = 0x8;
+    const H2_FLAG_END_STREAM: u8 = 0x1;
+    const H2_FLAG_ACK: u8 = 0x1;
+    const H2_FLAG_END_HEADERS: u8 = 0x4;
+    const H2_CANCEL: u32 = 0x8;
+    const H2_ENHANCE_YOUR_CALM: u32 = 0xb;
+    // HPACK (RFC 7541): `:status: 200` is static entry 8; `content-type` (static name 31) and
+    // `grpc-status` go as literals without indexing, so the client's decoder needs no state.
+    const H2_RESPONSE_HEADERS: &[u8] = b"\x88\x0f\x10\x10application/grpc";
+    const H2_OK_TRAILERS: &[u8] = b"\x00\x0bgrpc-status\x010";
+
+    /// When the raw server sends a stream's trailers.
+    #[derive(Clone, Copy)]
+    enum RawTrailers {
+        /// When the client resets the stream. These are the frames a server had already put on
+        /// the wire when the client's RST_STREAM reached it, which over a real network arrive
+        /// after the reset; on loopback they could only be produced this way.
+        OnReset,
+        /// After the delay, or at the client's reset if that comes first.
+        After(Duration),
+        Never,
+    }
+
+    /// What the raw server does with a request.
+    enum RawReply {
+        /// Answers with the Operation and sends the trailers as `RawTrailers` says.
+        Operation(Operation, RawTrailers),
+        /// Answers with the Operation, then closes the connection, as a server or a proxy that
+        /// goes away does.
+        OperationThenClose(Operation),
+        /// Closes the connection without an answer.
+        Close,
+    }
+
+    #[derive(Default)]
+    struct RawH2Log {
+        /// The client's RST_STREAM frames, by error code.
+        resets: Mutex<HashMap<u32, usize>>,
+        /// The client's GOAWAY with an error, as its code and debug data.
+        go_away: Mutex<Option<(u32, Vec<u8>)>>,
+        trailers_sent: AtomicUsize,
+        connections: AtomicUsize,
+    }
+
+    fn h2_frame(kind: u8, flags: u8, stream: u32, payload: &[u8]) -> Vec<u8> {
+        let mut frame = (payload.len() as u32).to_be_bytes()[1..].to_vec();
+        frame.extend([kind, flags]);
+        frame.extend(stream.to_be_bytes());
+        frame.extend(payload);
+        frame
+    }
+
+    fn send_raw_trailers(
+        stream: u32,
+        pending: &Mutex<HashSet<u32>>,
+        frames: &tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
+        log: &RawH2Log,
+    ) {
+        if pending.lock().unwrap().remove(&stream) {
+            let _ = frames.send(h2_frame(
+                H2_HEADERS,
+                H2_FLAG_END_HEADERS | H2_FLAG_END_STREAM,
+                stream,
+                H2_OK_TRAILERS,
+            ));
+            log.trailers_sent.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    /// An HTTP/2 server at the frame level, which answers every request with one Operation and
+    /// sends the trailers when `reply` says. tonic's server stops writing to a stream the client
+    /// reset, as it should, so it cannot send the frames a real server had in flight then.
+    async fn serve_raw_h2(
+        reply: fn(&[u8]) -> RawReply,
+    ) -> anyhow::Result<(String, Arc<RawH2Log>, tokio::task::JoinHandle<()>)> {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let address = format!("grpc://{}", listener.local_addr()?);
+        let log = Arc::new(RawH2Log::default());
+        let server = tokio::spawn({
+            let log = log.clone();
+            async move {
+                while let Ok((socket, _)) = listener.accept().await {
+                    log.connections.fetch_add(1, Ordering::SeqCst);
+                    tokio::spawn(serve_raw_h2_connection(socket, reply, log.clone()));
+                }
+            }
+        });
+        Ok((address, log, server))
+    }
+
+    async fn serve_raw_h2_connection(
+        socket: tokio::net::TcpStream,
+        reply: fn(&[u8]) -> RawReply,
+        log: Arc<RawH2Log>,
+    ) -> anyhow::Result<()> {
+        let (mut reader, mut writer) = socket.into_split();
+        let (frames, mut outgoing) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+        tokio::spawn(async move {
+            // An empty frame closes the connection, once everything before it is written.
+            while let Some(frame) = outgoing.recv().await {
+                if frame.is_empty() || writer.write_all(&frame).await.is_err() {
+                    break;
+                }
+            }
+        });
+        let pending = Arc::new(Mutex::new(HashSet::new()));
+        let mut bodies = HashMap::<u32, Vec<u8>>::new();
+
+        let mut preface = [0u8; 24];
+        reader.read_exact(&mut preface).await?;
+        // SETTINGS_MAX_CONCURRENT_STREAMS = 10000, so every stream of a test is open at once.
+        frames.send(h2_frame(H2_SETTINGS, 0, 0, &[0, 3, 0, 0, 0x27, 0x10]))?;
+        loop {
+            let mut header = [0u8; 9];
+            if reader.read_exact(&mut header).await.is_err() {
+                return Ok(());
+            }
+            let len = u32::from_be_bytes([0, header[0], header[1], header[2]]) as usize;
+            let (kind, flags) = (header[3], header[4]);
+            let stream = u32::from_be_bytes(header[5..9].try_into()?) & 0x7fff_ffff;
+            let mut payload = vec![0u8; len];
+            reader.read_exact(&mut payload).await?;
+            match kind {
+                H2_SETTINGS if flags & H2_FLAG_ACK == 0 => {
+                    frames.send(h2_frame(H2_SETTINGS, H2_FLAG_ACK, 0, &[]))?;
+                }
+                H2_PING if flags & H2_FLAG_ACK == 0 => {
+                    frames.send(h2_frame(H2_PING, H2_FLAG_ACK, 0, &payload))?;
+                }
+                H2_HEADERS => {
+                    bodies.insert(stream, Vec::new());
+                }
+                H2_DATA => {
+                    if len > 0 {
+                        // Give the connection window back, or requests stall after 64 KiB.
+                        frames.send(h2_frame(
+                            H2_WINDOW_UPDATE,
+                            0,
+                            0,
+                            &(len as u32).to_be_bytes(),
+                        ))?;
+                    }
+                    bodies.entry(stream).or_default().extend(&payload);
+                    if flags & H2_FLAG_END_STREAM == 0 {
+                        continue;
+                    }
+                    let body = bodies.remove(&stream).unwrap_or_default();
+                    let (operation, trailers) = match reply(body.get(5..).unwrap_or_default()) {
+                        RawReply::Operation(operation, trailers) => (operation, Some(trailers)),
+                        RawReply::OperationThenClose(operation) => (operation, None),
+                        RawReply::Close => {
+                            frames.send(Vec::new())?;
+                            return Ok(());
+                        }
+                    };
+                    let message = operation.encode_to_vec();
+                    let mut data = vec![0u8];
+                    data.extend((message.len() as u32).to_be_bytes());
+                    data.extend(message);
+                    frames.send(h2_frame(
+                        H2_HEADERS,
+                        H2_FLAG_END_HEADERS,
+                        stream,
+                        H2_RESPONSE_HEADERS,
+                    ))?;
+                    frames.send(h2_frame(H2_DATA, 0, stream, &data))?;
+                    let Some(trailers) = trailers else {
+                        frames.send(Vec::new())?;
+                        return Ok(());
+                    };
+                    match trailers {
+                        RawTrailers::Never => {}
+                        RawTrailers::OnReset => {
+                            pending.lock().unwrap().insert(stream);
+                        }
+                        RawTrailers::After(delay) => {
+                            pending.lock().unwrap().insert(stream);
+                            let (pending, frames, log) =
+                                (pending.clone(), frames.clone(), log.clone());
+                            tokio::spawn(async move {
+                                tokio::time::sleep(delay).await;
+                                send_raw_trailers(stream, &pending, &frames, &log);
+                            });
+                        }
+                    }
+                }
+                H2_RST_STREAM => {
+                    let code = u32::from_be_bytes(payload[..4].try_into()?);
+                    *log.resets.lock().unwrap().entry(code).or_default() += 1;
+                    send_raw_trailers(stream, &pending, &frames, &log);
+                }
+                H2_GOAWAY => {
+                    // NO_ERROR is a graceful close, such as of a channel the client dropped.
+                    let code = u32::from_be_bytes(payload[4..8].try_into()?);
+                    if code != 0 {
+                        *log.go_away.lock().unwrap() = Some((code, payload[8..].to_vec()));
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn done_operation() -> Operation {
+        let response = GExecuteResponse {
+            result: Some(ActionResult {
+                execution_metadata: Some(ExecutedActionMetadata::default()),
+                ..Default::default()
+            }),
+            status: Some(Status::default()),
+            ..Default::default()
+        };
+        Operation {
+            name: "operations/done".to_owned(),
+            done: true,
+            result: Some(OpResult::Response(prost_types::Any {
+                type_url: "type.googleapis.com/build.bazel.remote.execution.v2.ExecuteResponse"
+                    .to_owned(),
+                value: response.encode_to_vec(),
+            })),
+            ..Default::default()
+        }
+    }
+
+    /// A client whose engine, CAS and action cache are all `address`, over one connection.
+    async fn raw_h2_client(address: String, retries: usize) -> anyhow::Result<REClient> {
+        REClientBuilder::build_and_connect(&Buck2OssReConfiguration {
+            cas_address: Some(address.clone()),
+            engine_address: Some(address.clone()),
+            action_cache_address: Some(address),
+            tls: Some(false),
+            capabilities: Some(false),
+            engine_connection_count: Some(1),
+            retries: Some(retries),
+            retry_max_delay_ms: Some(10),
+            ..Default::default()
+        })
+        .await
+    }
+
+    /// Runs an action and stops reading once its ExecuteResponse is in, as the executor does
+    /// (buck2_execute src/re/client.rs, `execute_impl`), which drops the stream.
+    async fn execute_raw_h2_action(client: &REClient) -> anyhow::Result<ExecuteResponse> {
+        let mut stream = client
+            .execute_with_progress(
+                &RemoteExecutionMetadata::default(),
+                ExecuteRequest {
+                    action_digest: TDigest {
+                        hash: "ab".repeat(32),
+                        size_in_bytes: 1,
+                        _dot_dot: (),
+                    },
+                    ..Default::default()
+                },
+            )
+            .await?;
+        while let Some(response) = stream.try_next().await? {
+            if let Some(response) = response.execute_response {
+                return Ok(response);
+            }
+        }
+        Err(anyhow::anyhow!(
+            "the stream ended without an ExecuteResponse"
+        ))
+    }
+
+    /// Without the drain, the 1500 dropped streams provoke h2's GOAWAY ENHANCE_YOUR_CALM
+    /// "too_many_internal_resets", and the actions still in flight on the connection fail.
+    #[tokio::test]
+    async fn finished_operation_streams_end_without_a_reset() -> anyhow::Result<()> {
+        const ACTIONS: usize = 1500;
+        let (address, log, server) = serve_raw_h2(|_| {
+            RawReply::Operation(
+                done_operation(),
+                RawTrailers::After(Duration::from_millis(200)),
+            )
+        })
+        .await?;
+        let client = raw_h2_client(address, 0).await?;
+
+        let executed =
+            futures::future::join_all((0..ACTIONS).map(|_| execute_raw_h2_action(&client))).await;
+        let _ = tokio::time::timeout(Duration::from_secs(10), async {
+            while log.trailers_sent.load(Ordering::SeqCst) < ACTIONS {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        execute_raw_h2_action(&client).await?;
+
+        assert_eq!(*log.go_away.lock().unwrap(), None);
+        assert_eq!(*log.resets.lock().unwrap(), HashMap::new());
+        executed.into_iter().collect::<anyhow::Result<Vec<_>>>()?;
+        server.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_finished_stream_the_server_never_ends_is_reset_after_the_drain_timeout()
+    -> anyhow::Result<()> {
+        let (address, log, server) =
+            serve_raw_h2(|_| RawReply::Operation(done_operation(), RawTrailers::Never)).await?;
+        let client = raw_h2_client(address, 0).await?;
+
+        let started = Instant::now();
+        execute_raw_h2_action(&client).await?;
+        // A second action, while the first one's stream is still being drained.
+        execute_raw_h2_action(&client).await?;
+        assert!(started.elapsed() < OPERATION_STREAM_DRAIN_TIMEOUT);
+        assert_eq!(*log.resets.lock().unwrap(), HashMap::new());
+
+        let _ = tokio::time::timeout(OPERATION_STREAM_DRAIN_TIMEOUT * 3, async {
+            while log.resets.lock().unwrap().get(&H2_CANCEL) != Some(&2) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        assert_eq!(*log.resets.lock().unwrap(), HashMap::from([(H2_CANCEL, 2)]));
+        assert_eq!(*log.go_away.lock().unwrap(), None);
+        server.abort();
+        Ok(())
+    }
+
+    static STALLED_OPERATION_WAITS: AtomicUsize = AtomicUsize::new(0);
+
+    /// Every stream sends the operation's status, which never changes, and ends.
+    fn raw_stalled_operation_reply(body: &[u8]) -> RawReply {
+        if WaitExecutionRequest::decode(body).is_ok_and(|request| !request.name.is_empty()) {
+            STALLED_OPERATION_WAITS.fetch_add(1, Ordering::SeqCst);
+        }
+        RawReply::Operation(
+            Operation {
+                name: "operations/stalled".to_owned(),
+                ..Default::default()
+            },
+            RawTrailers::After(Duration::ZERO),
+        )
+    }
+
+    #[tokio::test]
+    async fn an_operation_whose_stream_keeps_ending_without_progress_fails() -> anyhow::Result<()> {
+        let (address, _log, server) = serve_raw_h2(raw_stalled_operation_reply).await?;
+        let client = raw_h2_client(address, 2).await?;
+
+        let Err(err) =
+            tokio::time::timeout(Duration::from_secs(30), execute_raw_h2_action(&client)).await?
+        else {
+            panic!("the operation never finishes");
+        };
+
+        assert!(
+            format!("{err:#}").contains("3 times in a row without progress"),
+            "{err:#}"
+        );
+        assert_eq!(STALLED_OPERATION_WAITS.load(Ordering::SeqCst), 3);
+        server.abort();
+        Ok(())
+    }
+
+    /// The action's Execute stream stays open; WaitExecution finishes it. Every other stream is
+    /// dropped after its first message, and its trailers arrive after the client reset it.
+    fn raw_go_away_reply(body: &[u8]) -> RawReply {
+        let name = WaitExecutionRequest::decode(body)
+            .map(|request| request.name)
+            .unwrap_or_default();
+        match name.as_str() {
+            "" => RawReply::Operation(
+                Operation {
+                    name: "operations/in-flight".to_owned(),
+                    ..Default::default()
+                },
+                RawTrailers::Never,
+            ),
+            "operations/in-flight" => {
+                RawReply::Operation(done_operation(), RawTrailers::After(Duration::ZERO))
+            }
+            "bystander" => RawReply::Operation(
+                Operation {
+                    name,
+                    ..Default::default()
+                },
+                RawTrailers::Never,
+            ),
+            _ => RawReply::Operation(
+                Operation {
+                    name,
+                    ..Default::default()
+                },
+                RawTrailers::OnReset,
+            ),
+        }
+    }
+
+    /// h2 resets a stream with STREAM_CLOSED when a frame arrives for one it no longer remembers,
+    /// and remembers a stream the client dropped for 1 s and only 50 at a time (h2 0.4.15
+    /// src/proto/mod.rs:34-41, streams/recv.rs:988-1003). The 1025th such reset on a connection
+    /// becomes GOAWAY ENHANCE_YOUR_CALM instead (streams/streams.rs:1641-1660), which fails every
+    /// stream on the connection, the action's among them.
+    #[tokio::test]
+    async fn an_action_in_flight_when_h2_closes_its_connection_is_resumed() -> anyhow::Result<()> {
+        let (address, log, server) = serve_raw_h2(raw_go_away_reply).await?;
+        let client = raw_h2_client(address, 2).await?;
+        let mut action = client
+            .execute_with_progress(
+                &RemoteExecutionMetadata::default(),
+                ExecuteRequest {
+                    action_digest: TDigest {
+                        hash: "ab".repeat(32),
+                        size_in_bytes: 1,
+                        _dot_dot: (),
+                    },
+                    ..Default::default()
+                },
+            )
+            .await?;
+        action.try_next().await?;
+
+        // The pool has one channel, so these share the action's connection.
+        let execution = client.grpc_clients.execution_client().await?;
+        let wait_execution = |name: String| {
+            let mut execution = execution.clone();
+            async move {
+                execution
+                    .wait_execution(WaitExecutionRequest { name })
+                    .await
+                    .map(tonic::Response::into_inner)
+            }
+        };
+        let mut bystander = wait_execution("bystander".to_owned()).await?;
+        bystander.message().await?;
+        futures::future::join_all((0..1500).map(|i| {
+            let stream = wait_execution(format!("operations/{i}"));
+            async move { stream.await?.message().await }
+        }))
+        .await;
+        let lost = bystander
+            .message()
+            .await
+            .expect_err("the bystander's connection was closed under it");
+
+        // What a stream in flight sees: RESOURCE_EXHAUSTED, from the GOAWAY its own client sent.
+        assert_eq!(lost.code(), tonic::Code::ResourceExhausted, "{lost:?}");
+        let _ = tokio::time::timeout(Duration::from_secs(5), async {
+            while log.go_away.lock().unwrap().is_none() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        assert_eq!(
+            *log.go_away.lock().unwrap(),
+            Some((H2_ENHANCE_YOUR_CALM, b"too_many_internal_resets".to_vec()))
+        );
+        let lost = anyhow::Error::from(lost);
+        assert!(is_broken_connection_error(&lost), "{lost:#}");
+        assert!(is_retryable_grpc_error(&lost), "{lost:#}");
+        assert!(should_retry_execute_after_wait_execution_error(&lost));
+        assert!(is_broken_connection_error(&normalize_grpc_error(lost)));
+
+        let (mut events, sink) = buck2_events::create_source_sink_pair();
+        let dispatcher = buck2_events::dispatch::EventDispatcher::new(
+            buck2_wrapper_common::invocation_id::TraceId::null(),
+            buck2_events::daemon_id::DaemonId::null(),
+            sink,
+        );
+        let mut completed = None;
+        buck2_events::dispatch::with_dispatcher_async(
+            dispatcher,
+            tokio::time::timeout(Duration::from_secs(30), async {
+                while let Some(response) = action.try_next().await? {
+                    if let Some(response) = response.execute_response {
+                        completed = Some(response);
+                    }
+                }
+                anyhow::Ok(())
+            }),
+        )
+        .await??;
+        assert_eq!(
+            completed.map(|response| response.status.code),
+            Some(TCode::OK)
+        );
+
+        let mut warnings = Vec::new();
+        while let Some(event) = events.try_receive() {
+            if let buck2_events::Event::Buck(event) = event
+                && let buck2_data::buck_event::Data::Instant(buck2_data::InstantEvent {
+                    data: Some(buck2_data::instant_event::Data::ConsoleWarning(warning)),
+                }) = event.data()
+            {
+                warnings.push(warning.message.clone());
+            }
+        }
+        assert_eq!(warnings.len(), 1, "{warnings:#?}");
+        assert!(
+            warnings[0].starts_with("Resuming RE operation `operations/in-flight`")
+                && warnings[0].contains("(resume 1/3) on a new connection")
+                && warnings[0].contains("too_many_internal_resets"),
+            "{}",
+            warnings[0]
+        );
+        server.abort();
+        Ok(())
+    }
+
+    static LOST_OPERATION_EXECUTES: AtomicUsize = AtomicUsize::new(0);
+    static LOST_OPERATION_WAITS: AtomicUsize = AtomicUsize::new(0);
+
+    /// The first Execute loses its connection after the first Operation, and so does every
+    /// WaitExecution; the second Execute finishes.
+    fn raw_lost_operation_reply(body: &[u8]) -> RawReply {
+        if WaitExecutionRequest::decode(body).is_ok_and(|request| !request.name.is_empty()) {
+            LOST_OPERATION_WAITS.fetch_add(1, Ordering::SeqCst);
+            return RawReply::Close;
+        }
+        if LOST_OPERATION_EXECUTES.fetch_add(1, Ordering::SeqCst) == 0 {
+            RawReply::OperationThenClose(Operation {
+                name: "operations/lost".to_owned(),
+                ..Default::default()
+            })
+        } else {
+            RawReply::Operation(done_operation(), RawTrailers::After(Duration::ZERO))
+        }
+    }
+
+    #[tokio::test]
+    async fn an_operation_whose_connection_keeps_closing_is_executed_again() -> anyhow::Result<()> {
+        let (address, _log, server) = serve_raw_h2(raw_lost_operation_reply).await?;
+        let client = raw_h2_client(address, 2).await?;
+
+        let completed = execute_raw_h2_action(&client).await?;
+
+        assert_eq!(completed.status.code, TCode::OK);
+        assert_eq!(LOST_OPERATION_EXECUTES.load(Ordering::SeqCst), 2);
+        assert_eq!(LOST_OPERATION_WAITS.load(Ordering::SeqCst), 3);
+        server.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn concurrent_reconnects_of_the_execution_pool_dial_each_channel_once()
+    -> anyhow::Result<()> {
+        let (address, log, server) = serve_raw_h2(|_| {
+            RawReply::Operation(done_operation(), RawTrailers::After(Duration::ZERO))
+        })
+        .await?;
+        let client = REClientBuilder::build_and_connect(&Buck2OssReConfiguration {
+            cas_address: Some(address.clone()),
+            engine_address: Some(address.clone()),
+            action_cache_address: Some(address),
+            tls: Some(false),
+            capabilities: Some(false),
+            engine_connection_count: Some(4),
+            ..Default::default()
+        })
+        .await?;
+        let settled = || async {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            log.connections.load(Ordering::SeqCst)
+        };
+        let before = settled().await;
+
+        futures::future::join_all((0..50).map(|_| {
+            client
+                .grpc_clients
+                .reconnect_after_broken_connection(GrpcClientKind::Execution)
+        }))
+        .await;
+
+        assert_eq!(settled().await, before + 4);
+        execute_raw_h2_action(&client).await?;
+        server.abort();
+        Ok(())
     }
 
     #[test]
