@@ -3057,8 +3057,17 @@ impl CasDaemonLauncher {
     }
 }
 
+/// Every request in flight on a connection that breaks fails at about the same moment, and each
+/// asks for a reconnect. One reconnect serves all of them, so another within this interval is
+/// skipped. Nothing is lost by that: tonic's Channel redials a connection that closes under it on
+/// its own (tonic 0.14.6 src/transport/channel/service/reconnect.rs:111-130).
+const RECONNECT_MIN_INTERVAL: Duration = Duration::from_secs(1);
+
 struct ResettableGrpcClient<C> {
     channel: tokio::sync::RwLock<Channel>,
+    /// When the channel was last replaced. Held through a reconnect, so the reconnects that
+    /// arrive meanwhile wait for it and then find it fresh.
+    reconnected_at: tokio::sync::Mutex<Option<Instant>>,
     connector: GrpcChannelConnector,
     interceptor: InjectHeadersInterceptor,
     max_decoding_message_size: usize,
@@ -3075,6 +3084,7 @@ impl<C> ResettableGrpcClient<C> {
     ) -> Self {
         Self {
             channel: tokio::sync::RwLock::new(channel),
+            reconnected_at: tokio::sync::Mutex::new(None),
             connector,
             interceptor,
             max_decoding_message_size,
@@ -3095,8 +3105,13 @@ impl<C> ResettableGrpcClient<C> {
     }
 
     async fn reconnect(&self) -> anyhow::Result<()> {
+        let mut reconnected_at = self.reconnected_at.lock().await;
+        if reconnected_at.is_some_and(|at| at.elapsed() < RECONNECT_MIN_INTERVAL) {
+            return Ok(());
+        }
         let channel = self.connector.connect().await?;
         *self.channel.write().await = channel;
+        *reconnected_at = Some(Instant::now());
         Ok(())
     }
 }
@@ -9225,6 +9240,7 @@ mod tests {
         /// The client's GOAWAY with an error, as its code and debug data.
         go_away: Mutex<Option<(u32, Vec<u8>)>>,
         trailers_sent: AtomicUsize,
+        connections: AtomicUsize,
     }
 
     fn h2_frame(kind: u8, flags: u8, stream: u32, payload: &[u8]) -> Vec<u8> {
@@ -9265,6 +9281,7 @@ mod tests {
             let log = log.clone();
             async move {
                 while let Ok((socket, _)) = listener.accept().await {
+                    log.connections.fetch_add(1, Ordering::SeqCst);
                     tokio::spawn(serve_raw_h2_connection(socket, reply, log.clone()));
                 }
             }
@@ -9486,6 +9503,40 @@ mod tests {
         .await;
         assert_eq!(*log.resets.lock().unwrap(), HashMap::from([(H2_CANCEL, 2)]));
         assert_eq!(*log.go_away.lock().unwrap(), None);
+        server.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn concurrent_reconnects_of_the_execution_pool_dial_each_channel_once()
+    -> anyhow::Result<()> {
+        let (address, log, server) =
+            serve_raw_h2(|_| (done_operation(), RawTrailers::After(Duration::ZERO))).await?;
+        let client = REClientBuilder::build_and_connect(&Buck2OssReConfiguration {
+            cas_address: Some(address.clone()),
+            engine_address: Some(address.clone()),
+            action_cache_address: Some(address),
+            tls: Some(false),
+            capabilities: Some(false),
+            engine_connection_count: Some(4),
+            ..Default::default()
+        })
+        .await?;
+        let settled = || async {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            log.connections.load(Ordering::SeqCst)
+        };
+        let before = settled().await;
+
+        futures::future::join_all((0..50).map(|_| {
+            client
+                .grpc_clients
+                .reconnect_after_broken_connection(GrpcClientKind::Execution)
+        }))
+        .await;
+
+        assert_eq!(settled().await, before + 4);
+        execute_raw_h2_action(&client).await?;
         server.abort();
         Ok(())
     }
