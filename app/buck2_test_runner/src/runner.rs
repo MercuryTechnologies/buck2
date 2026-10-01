@@ -160,7 +160,6 @@ impl Buck2TestRunner {
         let env = build_env(
             spec.env,
             &config_env,
-            std::env::var_os("LC_CTYPE").map(|value| value.to_string_lossy().into_owned()),
         );
 
         let target_handle = spec.target.handle;
@@ -194,9 +193,8 @@ impl Buck2TestRunner {
 fn build_env(
     spec_env: impl IntoIterator<Item = (String, ExternalRunnerSpecValue)>,
     config_env: &[EnvValue],
-    process_lc_ctype: Option<String>,
 ) -> TestEnvironment {
-    let mut env = build_test_env(spec_env, process_lc_ctype);
+    let mut env = build_test_env(spec_env);
 
     // Test-executor `--env` values have highest precedence.
     for EnvValue { name, value } in config_env {
@@ -276,7 +274,6 @@ mod tests {
                 ExternalRunnerSpecValue::Verbatim("from-test".to_owned()),
             )],
             &config_env,
-            Some("from-process".to_owned()),
         );
         assert_eq!(lc_ctype(&env), Some("from-cli"));
     }
