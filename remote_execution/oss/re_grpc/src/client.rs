@@ -975,6 +975,31 @@ async fn wait_execution_stream(
     .await
 }
 
+/// How long a finished operation's stream has to end once its done Operation is in. BuildBuddy
+/// writes the trailers as soon as it has sent the done Operation, so they are already in flight;
+/// a server that holds the stream open longer keeps one of its concurrent streams busy meanwhile.
+const OPERATION_STREAM_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Reads the rest of a stream whose done Operation is in, so it closes with the server's
+/// END_STREAM. Dropped instead, it is reset, and h2 remembers a reset stream for 1 s and only 50
+/// at a time (h2 0.4.15 src/proto/mod.rs:34-41): the trailers that arrive after that count
+/// against a per-connection limit of 1024, the next one closes the connection with GOAWAY
+/// ENHANCE_YOUR_CALM, and every action with a stream on it fails (streams.rs:1641-1660).
+fn drain_finished_operation_stream(mut stream: tonic::Streaming<Operation>) {
+    tokio::spawn(async move {
+        let drained = tokio::time::timeout(OPERATION_STREAM_DRAIN_TIMEOUT, async {
+            while let Ok(Some(_)) = stream.message().await {}
+        })
+        .await;
+        if drained.is_err() {
+            tracing::debug!(
+                timeout_secs = OPERATION_STREAM_DRAIN_TIMEOUT.as_secs(),
+                "A finished operation's stream did not end in time; resetting it"
+            );
+        }
+    });
+}
+
 async fn wait_execution_or_retry_execute(
     grpc_clients: Arc<GRPCClients>,
     metadata: RemoteExecutionMetadata,
@@ -3887,13 +3912,17 @@ impl REClient {
         let cas_ttl_secs = self.runtime_opts.cas_ttl_secs;
 
         let stream = futures::stream::try_unfold(
-            (stream, None::<String>, 0usize),
-            move |(mut stream, mut operation_name, mut execute_retry_attempts)| {
+            Some((stream, None::<String>, 0usize)),
+            move |state| {
                 let grpc_clients = grpc_clients.clone();
                 let metadata = metadata_for_wait_execution.clone();
                 let grpc_request = grpc_request_for_retry.clone();
                 let request_metadata_tool_name = request_metadata_tool_name.clone();
                 async move {
+                    let Some((mut stream, mut operation_name, mut execute_retry_attempts)) = state
+                    else {
+                        return Ok(None);
+                    };
                     loop {
                         let msg = loop {
                             match stream.try_next().await {
@@ -4037,7 +4066,8 @@ impl REClient {
                             operation_name = Some(msg.name.clone());
                         }
 
-                        let status = if msg.done {
+                        if msg.done {
+                            drain_finished_operation_stream(stream);
                             match msg
                                 .result
                                 .context("Missing `result` when message was `done`")?
@@ -4143,37 +4173,36 @@ impl REClient {
                                         action_digest: Default::default(), // Filled in below.
                                     };
 
-                                    ExecuteWithProgressResponse {
-                                        stage: Stage::COMPLETED,
-                                        execute_response: Some(execute_response),
-                                        ..Default::default()
-                                    }
+                                    return anyhow::Ok(Some((
+                                        ExecuteWithProgressResponse {
+                                            stage: Stage::COMPLETED,
+                                            execute_response: Some(execute_response),
+                                            ..Default::default()
+                                        },
+                                        None,
+                                    )));
                                 }
                             }
-                        } else {
-                            let meta = ExecuteOperationMetadata::decode(
-                                &msg.metadata.unwrap_or_default().value[..],
-                            )?;
+                        }
 
-                            let stage = match execution_stage::Value::try_from(meta.stage) {
-                                Ok(execution_stage::Value::Unknown) => Stage::UNKNOWN,
-                                Ok(execution_stage::Value::CacheCheck) => Stage::CACHE_CHECK,
-                                Ok(execution_stage::Value::Queued) => Stage::QUEUED,
-                                Ok(execution_stage::Value::Executing) => Stage::EXECUTING,
-                                Ok(execution_stage::Value::Completed) => Stage::COMPLETED,
-                                _ => Stage::UNKNOWN,
-                            };
-
+                        let meta = ExecuteOperationMetadata::decode(
+                            &msg.metadata.unwrap_or_default().value[..],
+                        )?;
+                        let stage = match execution_stage::Value::try_from(meta.stage) {
+                            Ok(execution_stage::Value::Unknown) => Stage::UNKNOWN,
+                            Ok(execution_stage::Value::CacheCheck) => Stage::CACHE_CHECK,
+                            Ok(execution_stage::Value::Queued) => Stage::QUEUED,
+                            Ok(execution_stage::Value::Executing) => Stage::EXECUTING,
+                            Ok(execution_stage::Value::Completed) => Stage::COMPLETED,
+                            _ => Stage::UNKNOWN,
+                        };
+                        return anyhow::Ok(Some((
                             ExecuteWithProgressResponse {
                                 stage,
                                 execute_response: None,
                                 ..Default::default()
-                            }
-                        };
-
-                        return anyhow::Ok(Some((
-                            status,
-                            (stream, operation_name, execute_retry_attempts),
+                            },
+                            Some((stream, operation_name, execute_retry_attempts)),
                         )));
                     }
                 }
@@ -9163,6 +9192,302 @@ mod tests {
         let err = result.unwrap_err();
         let err = err.downcast_ref::<REClientError>().expect("REClientError");
         assert_eq!(err.code, TCode::UNAVAILABLE);
+    }
+
+    const H2_DATA: u8 = 0x0;
+    const H2_HEADERS: u8 = 0x1;
+    const H2_RST_STREAM: u8 = 0x3;
+    const H2_SETTINGS: u8 = 0x4;
+    const H2_PING: u8 = 0x6;
+    const H2_GOAWAY: u8 = 0x7;
+    const H2_WINDOW_UPDATE: u8 = 0x8;
+    const H2_FLAG_END_STREAM: u8 = 0x1;
+    const H2_FLAG_ACK: u8 = 0x1;
+    const H2_FLAG_END_HEADERS: u8 = 0x4;
+    const H2_CANCEL: u32 = 0x8;
+    // HPACK (RFC 7541): `:status: 200` is static entry 8; `content-type` (static name 31) and
+    // `grpc-status` go as literals without indexing, so the client's decoder needs no state.
+    const H2_RESPONSE_HEADERS: &[u8] = b"\x88\x0f\x10\x10application/grpc";
+    const H2_OK_TRAILERS: &[u8] = b"\x00\x0bgrpc-status\x010";
+
+    /// When the raw server sends a stream's trailers.
+    #[derive(Clone, Copy)]
+    enum RawTrailers {
+        /// After the delay, or at the client's reset if that comes first.
+        After(Duration),
+        Never,
+    }
+
+    #[derive(Default)]
+    struct RawH2Log {
+        /// The client's RST_STREAM frames, by error code.
+        resets: Mutex<HashMap<u32, usize>>,
+        /// The client's GOAWAY with an error, as its code and debug data.
+        go_away: Mutex<Option<(u32, Vec<u8>)>>,
+        trailers_sent: AtomicUsize,
+    }
+
+    fn h2_frame(kind: u8, flags: u8, stream: u32, payload: &[u8]) -> Vec<u8> {
+        let mut frame = (payload.len() as u32).to_be_bytes()[1..].to_vec();
+        frame.extend([kind, flags]);
+        frame.extend(stream.to_be_bytes());
+        frame.extend(payload);
+        frame
+    }
+
+    fn send_raw_trailers(
+        stream: u32,
+        pending: &Mutex<HashSet<u32>>,
+        frames: &tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
+        log: &RawH2Log,
+    ) {
+        if pending.lock().unwrap().remove(&stream) {
+            let _ = frames.send(h2_frame(
+                H2_HEADERS,
+                H2_FLAG_END_HEADERS | H2_FLAG_END_STREAM,
+                stream,
+                H2_OK_TRAILERS,
+            ));
+            log.trailers_sent.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    /// An HTTP/2 server at the frame level, which answers every request with one Operation and
+    /// sends the trailers when `reply` says. tonic's server stops writing to a stream the client
+    /// reset, as it should, so it cannot send the frames a real server had in flight then.
+    async fn serve_raw_h2(
+        reply: fn(&[u8]) -> (Operation, RawTrailers),
+    ) -> anyhow::Result<(String, Arc<RawH2Log>, tokio::task::JoinHandle<()>)> {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let address = format!("grpc://{}", listener.local_addr()?);
+        let log = Arc::new(RawH2Log::default());
+        let server = tokio::spawn({
+            let log = log.clone();
+            async move {
+                while let Ok((socket, _)) = listener.accept().await {
+                    tokio::spawn(serve_raw_h2_connection(socket, reply, log.clone()));
+                }
+            }
+        });
+        Ok((address, log, server))
+    }
+
+    async fn serve_raw_h2_connection(
+        socket: tokio::net::TcpStream,
+        reply: fn(&[u8]) -> (Operation, RawTrailers),
+        log: Arc<RawH2Log>,
+    ) -> anyhow::Result<()> {
+        let (mut reader, mut writer) = socket.into_split();
+        let (frames, mut outgoing) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+        tokio::spawn(async move {
+            while let Some(frame) = outgoing.recv().await {
+                if writer.write_all(&frame).await.is_err() {
+                    break;
+                }
+            }
+        });
+        let pending = Arc::new(Mutex::new(HashSet::new()));
+        let mut bodies = HashMap::<u32, Vec<u8>>::new();
+
+        let mut preface = [0u8; 24];
+        reader.read_exact(&mut preface).await?;
+        // SETTINGS_MAX_CONCURRENT_STREAMS = 10000, so every stream of a test is open at once.
+        frames.send(h2_frame(H2_SETTINGS, 0, 0, &[0, 3, 0, 0, 0x27, 0x10]))?;
+        loop {
+            let mut header = [0u8; 9];
+            if reader.read_exact(&mut header).await.is_err() {
+                return Ok(());
+            }
+            let len = u32::from_be_bytes([0, header[0], header[1], header[2]]) as usize;
+            let (kind, flags) = (header[3], header[4]);
+            let stream = u32::from_be_bytes(header[5..9].try_into()?) & 0x7fff_ffff;
+            let mut payload = vec![0u8; len];
+            reader.read_exact(&mut payload).await?;
+            match kind {
+                H2_SETTINGS if flags & H2_FLAG_ACK == 0 => {
+                    frames.send(h2_frame(H2_SETTINGS, H2_FLAG_ACK, 0, &[]))?;
+                }
+                H2_PING if flags & H2_FLAG_ACK == 0 => {
+                    frames.send(h2_frame(H2_PING, H2_FLAG_ACK, 0, &payload))?;
+                }
+                H2_HEADERS => {
+                    bodies.insert(stream, Vec::new());
+                }
+                H2_DATA => {
+                    if len > 0 {
+                        // Give the connection window back, or requests stall after 64 KiB.
+                        frames.send(h2_frame(
+                            H2_WINDOW_UPDATE,
+                            0,
+                            0,
+                            &(len as u32).to_be_bytes(),
+                        ))?;
+                    }
+                    bodies.entry(stream).or_default().extend(&payload);
+                    if flags & H2_FLAG_END_STREAM == 0 {
+                        continue;
+                    }
+                    let body = bodies.remove(&stream).unwrap_or_default();
+                    let (operation, trailers) = reply(body.get(5..).unwrap_or_default());
+                    let message = operation.encode_to_vec();
+                    let mut data = vec![0u8];
+                    data.extend((message.len() as u32).to_be_bytes());
+                    data.extend(message);
+                    frames.send(h2_frame(
+                        H2_HEADERS,
+                        H2_FLAG_END_HEADERS,
+                        stream,
+                        H2_RESPONSE_HEADERS,
+                    ))?;
+                    frames.send(h2_frame(H2_DATA, 0, stream, &data))?;
+                    match trailers {
+                        RawTrailers::Never => {}
+                        RawTrailers::After(delay) => {
+                            pending.lock().unwrap().insert(stream);
+                            let (pending, frames, log) =
+                                (pending.clone(), frames.clone(), log.clone());
+                            tokio::spawn(async move {
+                                tokio::time::sleep(delay).await;
+                                send_raw_trailers(stream, &pending, &frames, &log);
+                            });
+                        }
+                    }
+                }
+                H2_RST_STREAM => {
+                    let code = u32::from_be_bytes(payload[..4].try_into()?);
+                    *log.resets.lock().unwrap().entry(code).or_default() += 1;
+                    send_raw_trailers(stream, &pending, &frames, &log);
+                }
+                H2_GOAWAY => {
+                    // NO_ERROR is a graceful close, such as of a channel the client dropped.
+                    let code = u32::from_be_bytes(payload[4..8].try_into()?);
+                    if code != 0 {
+                        *log.go_away.lock().unwrap() = Some((code, payload[8..].to_vec()));
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn done_operation() -> Operation {
+        let response = GExecuteResponse {
+            result: Some(ActionResult {
+                execution_metadata: Some(ExecutedActionMetadata::default()),
+                ..Default::default()
+            }),
+            status: Some(Status::default()),
+            ..Default::default()
+        };
+        Operation {
+            name: "operations/done".to_owned(),
+            done: true,
+            result: Some(OpResult::Response(prost_types::Any {
+                type_url: "type.googleapis.com/build.bazel.remote.execution.v2.ExecuteResponse"
+                    .to_owned(),
+                value: response.encode_to_vec(),
+            })),
+            ..Default::default()
+        }
+    }
+
+    /// A client whose engine, CAS and action cache are all `address`, over one connection.
+    async fn raw_h2_client(address: String, retries: usize) -> anyhow::Result<REClient> {
+        REClientBuilder::build_and_connect(&Buck2OssReConfiguration {
+            cas_address: Some(address.clone()),
+            engine_address: Some(address.clone()),
+            action_cache_address: Some(address),
+            tls: Some(false),
+            capabilities: Some(false),
+            engine_connection_count: Some(1),
+            retries: Some(retries),
+            retry_max_delay_ms: Some(10),
+            ..Default::default()
+        })
+        .await
+    }
+
+    /// Runs an action and stops reading once its ExecuteResponse is in, as the executor does
+    /// (buck2_execute src/re/client.rs, `execute_impl`), which drops the stream.
+    async fn execute_raw_h2_action(client: &REClient) -> anyhow::Result<ExecuteResponse> {
+        let mut stream = client
+            .execute_with_progress(
+                &RemoteExecutionMetadata::default(),
+                ExecuteRequest {
+                    action_digest: TDigest {
+                        hash: "ab".repeat(32),
+                        size_in_bytes: 1,
+                        _dot_dot: (),
+                    },
+                    ..Default::default()
+                },
+            )
+            .await?;
+        while let Some(response) = stream.try_next().await? {
+            if let Some(response) = response.execute_response {
+                return Ok(response);
+            }
+        }
+        Err(anyhow::anyhow!(
+            "the stream ended without an ExecuteResponse"
+        ))
+    }
+
+    /// Without the drain, the 1500 dropped streams provoke h2's GOAWAY ENHANCE_YOUR_CALM
+    /// "too_many_internal_resets", and the actions still in flight on the connection fail.
+    #[tokio::test]
+    async fn finished_operation_streams_end_without_a_reset() -> anyhow::Result<()> {
+        const ACTIONS: usize = 1500;
+        let (address, log, server) = serve_raw_h2(|_| {
+            (
+                done_operation(),
+                RawTrailers::After(Duration::from_millis(200)),
+            )
+        })
+        .await?;
+        let client = raw_h2_client(address, 0).await?;
+
+        let executed =
+            futures::future::join_all((0..ACTIONS).map(|_| execute_raw_h2_action(&client))).await;
+        let _ = tokio::time::timeout(Duration::from_secs(10), async {
+            while log.trailers_sent.load(Ordering::SeqCst) < ACTIONS {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        execute_raw_h2_action(&client).await?;
+
+        assert_eq!(*log.go_away.lock().unwrap(), None);
+        assert_eq!(*log.resets.lock().unwrap(), HashMap::new());
+        executed.into_iter().collect::<anyhow::Result<Vec<_>>>()?;
+        server.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_finished_stream_the_server_never_ends_is_reset_after_the_drain_timeout()
+    -> anyhow::Result<()> {
+        let (address, log, server) =
+            serve_raw_h2(|_| (done_operation(), RawTrailers::Never)).await?;
+        let client = raw_h2_client(address, 0).await?;
+
+        let started = Instant::now();
+        execute_raw_h2_action(&client).await?;
+        // A second action, while the first one's stream is still being drained.
+        execute_raw_h2_action(&client).await?;
+        assert!(started.elapsed() < OPERATION_STREAM_DRAIN_TIMEOUT);
+        assert_eq!(*log.resets.lock().unwrap(), HashMap::new());
+
+        let _ = tokio::time::timeout(OPERATION_STREAM_DRAIN_TIMEOUT * 3, async {
+            while log.resets.lock().unwrap().get(&H2_CANCEL) != Some(&2) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        assert_eq!(*log.resets.lock().unwrap(), HashMap::from([(H2_CANCEL, 2)]));
+        assert_eq!(*log.go_away.lock().unwrap(), None);
+        server.abort();
+        Ok(())
     }
 
     #[test]
