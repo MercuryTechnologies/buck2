@@ -81,12 +81,18 @@ cat >"$F/inner" <<'EOF'
 #!/bin/sh
 printf 'inner:'
 printf '<%s>' "$@"
-printf ' A=[%s] mode=[%s] k=[%s] o=[%s] UID=[%s]\n' "${A-unset}" "${mode-unset}" "${k-unset}" "${o-unset}" "${UID-unset}"
+printf ' A=[%s] mode=[%s] k=[%s] o=[%s] UID=[%s]\n' "${A-unset}" "${mode-unset}" "${k-unset}" "${o-unset}" "$(printenv UID || printf unset)"
 exit "${INNER_EXIT:-0}"
 EOF
 printf '#!/bin/sh\nprintf "pid=%%s\\n" "$$"\n' >"$F/showpid"
 chmod +x "$F"/*
 cp "$F/inner" "$F/in=ner"
+# Shells without the rest of the system, for running the launcher with a PATH
+# that lacks `sleep`.
+mkdir "$T/shells"
+for s in sh dash bash; do
+    if p=$(command -v "$s"); then ln -s "$p" "$T/shells/$s"; fi
+done
 export PATH="$F:/usr/bin:/bin"
 unset BUCK_CONTAINER_RUN BUCK_CONTAINER_RUN_ARGS BUCK_CONTAINER_RUN_VERBOSE BUCK_RUN_BUILD_ID A SECRET mode user image k o
 R=$T/repo
@@ -269,18 +275,31 @@ rc=0" "$out"
         check "terminal without stdin" "<run><--rm><-i><--name><NAME><--init><--platform><linux/arm64><--label><buck2.target=//t:t><--volume><$R:$R><--workdir><$R>$tail<--entrypoint></abs/bin><--><img>" "$out"
     fi
 
-    # If the CLI is killed, the watchdog stops the container.
-    : >"$T/log"
-    (cd "$R" && FAKE_SLEEP=30 FAKE_LOG="$T/log" exec $sh "$L" $std --project-root "$R" -- /abs/bin) </dev/null >/dev/null 2>&1 &
-    pid=$!
-    sleep 1
-    kill -9 "$pid" 2>/dev/null
-    i=0
-    while [ $i -lt 10 ] && ! [ -s "$T/log" ]; do
+    # If the CLI's process group is killed, as buck2 does to a cancelled or
+    # timed-out test, the watchdog stops the container, even when PATH lacks
+    # `sleep` (a test's `env` can replace it). Needs a way to start the
+    # launcher in its own process group.
+    if command -v perl >/dev/null 2>&1; then
+        : >"$T/log"
+        (cd "$R" && FAKE_SLEEP=30 FAKE_LOG="$T/log" exec perl -e 'setpgrp(0, 0); exec @ARGV or die' \
+            env PATH="$F:$T/shells" $sh "$L" $std --project-root "$R" -- /abs/bin) </dev/null >/dev/null 2>&1 &
+        pid=$!
         sleep 1
-        i=$((i + 1))
-    done
-    check "watchdog stops a killed container" "stop buck2-$pid-" "$(sed 's/-[0-9]*$/-/' "$T/log")"
+        kill -9 "-$pid" 2>/dev/null
+        i=0
+        while [ $i -lt 10 ] && ! [ -s "$T/log" ]; do
+            sleep 1
+            i=$((i + 1))
+        done
+        check "watchdog stops a killed container" "stop buck2-$pid-" "$(sed 's/-[0-9]*$/-/' "$T/log")"
+
+        : >"$T/log"
+        (cd "$R" && FAKE_SLEEP=3 FAKE_LOG="$T/log" BUCK_CONTAINER_RUN_ARGS=-d exec $sh "$L" $std --project-root "$R" -- /abs/bin) </dev/null >/dev/null 2>&1
+        sleep 2
+        check "no watchdog for detached containers" "" "$(cat "$T/log")"
+    else
+        printf 'skip watchdog (no perl)\n'
+    fi
 done
 
 if [ "$fails" = 0 ]; then

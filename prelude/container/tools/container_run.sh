@@ -111,7 +111,7 @@ case $_cr_mode in
 esac
 
 _cr_target=this _cr_cli=container _cr_flavor=apple _cr_image='' _cr_platform=''
-_cr_root='' _cr_cpus='' _cr_memory='' _cr_user='' _cr_envs=''
+_cr_root='' _cr_cpus='' _cr_memory='' _cr_user='' _cr_envs='' _cr_detach=0
 while :; do
     [ "$#" -gt 0 ] || die "internal error: missing '--' before the command"
     _cr_o=$1
@@ -164,7 +164,10 @@ while :; do
         # environment (and skips unset names), so values never appear in argv.
         --env-passthrough) add _cr_user --env "$_cr_v" ;;
         --env) add _cr_user --env "$_cr_v" ;;
-        --run-arg) add _cr_user "$_cr_v" ;;
+        --run-arg)
+            add _cr_user "$_cr_v"
+            case $_cr_v in -d | --detach) _cr_detach=1 ;; esac
+            ;;
     esac
 done
 [ "$#" -gt 0 ] || die "internal error: no command to run"
@@ -306,7 +309,7 @@ if [ "$_cr_memory" = host ]; then
 fi
 
 # Named, so that the watchdog below can stop it.
-_cr_name=buck2-$$-$(date +%s 2>/dev/null)
+_cr_name=buck2-$$-$(PATH=$PATH:/bin:/usr/bin date +%s 2>/dev/null)
 
 _cr_pre=''
 add _cr_pre run --rm -i --name "$_cr_name"
@@ -342,7 +345,10 @@ add _cr_pre --env BUCK_RUN_BUILD_ID
 _cr_extra=''
 if [ -n "${BUCK_CONTAINER_RUN_ARGS:-}" ]; then
     set -f
-    for _cr_a in $BUCK_CONTAINER_RUN_ARGS; do add _cr_extra "$_cr_a"; done
+    for _cr_a in $BUCK_CONTAINER_RUN_ARGS; do
+        add _cr_extra "$_cr_a"
+        case $_cr_a in -d | --detach) _cr_detach=1 ;; esac
+    done
     set +f
 fi
 # `--` stops the CLI from parsing the program's arguments as its own options
@@ -356,19 +362,31 @@ fi
 # If the CLI is killed, the container keeps running in its VM: buck2 SIGKILLs
 # the process group of a cancelled or timed-out test, and closing a terminal
 # sends SIGHUP, neither of which the CLI can forward. This watchdog stops the
-# container once this process (the CLI, after `exec`) is gone. `set -m` puts it
-# in its own process group so that it survives the process group being killed
-# (bash, which is macOS's /bin/sh, honours that without a terminal; dash does
-# not). Its output goes to /dev/null so that it does not hold buck2's pipes
-# open. After a normal exit `--rm` has removed the container and the stop is a
-# no-op.
-_cr_self=$$
-set -m 2>/dev/null
-(
-    trap '' HUP INT TERM
-    while kill -0 "$_cr_self" 2>/dev/null; do sleep 1; done
-    "$_cr_cli" stop "$_cr_name"
-) </dev/null >/dev/null 2>&1 &
-set +m 2>/dev/null
+# container once this process (the CLI, after `exec`) is gone; after a normal
+# exit `--rm` has already removed it and the stop does nothing. The watchdog
+# must leave our process group to survive it being killed: bash (macOS's
+# /bin/sh) does that for a background job under `set -m` without touching the
+# terminal; other shells use setsid(1) where it exists. Its output goes to
+# /dev/null so that it does not hold buck2's pipes open, and it gets the
+# system directories on PATH because a test's `env` may replace PATH. Detached
+# containers (`-d`) are left alone.
+if [ "$_cr_detach" = 0 ]; then
+    # shellcheck disable=SC2016 # Expanded by the watchdog's shell.
+    _cr_wd='trap "" HUP INT TERM
+PATH=$PATH:/bin:/usr/bin
+while kill -0 "$1" 2>/dev/null; do sleep 1 || exit 0; done
+exec "$2" stop "$3"'
+    _cr_setsid=$(command -v setsid 2>/dev/null) || _cr_setsid=/usr/bin/setsid
+    if [ -n "${BASH_VERSION-}" ]; then
+        set -m
+        /bin/sh -c "$_cr_wd" sh "$$" "$_cr_cli" "$_cr_name" </dev/null >/dev/null 2>&1 &
+        set +m
+    elif [ -x "$_cr_setsid" ]; then
+        "$_cr_setsid" /bin/sh -c "$_cr_wd" sh "$$" "$_cr_cli" "$_cr_name" </dev/null >/dev/null 2>&1 &
+    else
+        # Survives SIGHUP, but not the process group being killed.
+        /bin/sh -c "$_cr_wd" sh "$$" "$_cr_cli" "$_cr_name" </dev/null >/dev/null 2>&1 &
+    fi
+fi
 
 eval "exec \"\$_cr_cli\" $_cr_pre $_cr_user $_cr_extra \"\$@\""

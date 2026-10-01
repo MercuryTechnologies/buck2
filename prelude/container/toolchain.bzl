@@ -36,8 +36,11 @@ ContainerRunToolchainInfo = provider(
 
 _ENV_NAME_CHARS = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_"
 
+def is_env_name(name: str) -> bool:
+    return bool(name) and name[0] not in "0123456789" and not [c for c in name.elems() if c not in _ENV_NAME_CHARS]
+
 def check_env_name(name: str, what: str):
-    if not name or name[0] in "0123456789" or [c for c in name.elems() if c not in _ENV_NAME_CHARS]:
+    if not is_env_name(name):
         fail("container_run: invalid environment variable name `{}` in `{}`".format(name, what))
 
     # The launcher's own variables use this prefix.

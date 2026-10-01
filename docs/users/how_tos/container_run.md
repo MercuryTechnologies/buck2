@@ -215,9 +215,11 @@ container run --rm -i --name buck2-<pid>-<time> [-t --env TERM=...] \
   125; the container CLI's own errors (for example a failed image pull)
   exit with 1.
 - If the CLI is killed (for example when a test is cancelled or times
-  out, or a terminal is closed), a watchdog stops the container.
-  Anything left over can be found with `container ls -a`: containers are
-  named `buck2-...` and labelled with their target.
+  out, or a terminal is closed), a watchdog stops the container. It
+  needs `/bin/sh` to be bash (the macOS default) or `setsid` to be
+  installed, and it leaves containers started with `-d` alone. Anything
+  left over can be found with `container ls -a`: containers are named
+  `buck2-...` and labelled with their target.
 - Each run starts a lightweight VM, which takes about a second.
 
 ## Environment variables
@@ -288,14 +290,16 @@ share your home directory.
 - Sub-targets such as `buck2 run //svc:server[debug]` are not wrapped,
   and run natively.
 - Tests get only a fixed set of variables (`PATH`, `USER`, `LOGNAME`,
-  `HOME`, `TMPDIR`) from buck2, not your shell's, so exporting
-  `BUCK_CONTAINER_RUN*` or the `env_passthrough` names does not affect
-  `buck2 test`. Pass them to the test runner instead:
+  `HOME`, `TMPDIR`, `XDG_RUNTIME_DIR`) from buck2, not your shell's, so
+  exporting `BUCK_CONTAINER_RUN*` or the `env_passthrough` names does
+  not affect `buck2 test`. Pass them to the test runner instead:
   `buck2 test //svc:server_test -- --env BUCK_CONTAINER_RUN_VERBOSE=1`.
 - Local build actions do inherit the buck2 daemon's environment.
   `$(exe ...)` of a wrapped target in an action that runs locally on a
   Mac starts a container inside the action. Use such targets as tools
-  only on Linux executors.
+  only on Linux executors. Genrules also don't quote `$(exe ...)`, so
+  `env` values (including a wrapped test's) must not contain whitespace
+  there.
 - Paths that contain `:` cannot be mounted.
 - In a `while read ...; do buck2 run ...; done < file` loop, the
   container reads stdin eagerly; add `</dev/null` to the `buck2 run`

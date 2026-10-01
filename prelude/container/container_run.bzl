@@ -6,7 +6,7 @@
 # of this source tree. You may select, at your option, one of the
 # above-listed licenses.
 
-load("@prelude//container:toolchain.bzl", "ContainerRunToolchainInfo", "check_env_name")
+load("@prelude//container:toolchain.bzl", "ContainerRunToolchainInfo", "check_env_name", "is_env_name")
 load("@prelude//decls:common.bzl", "buck")
 load("@prelude//decls:toolchains_common.bzl", "toolchains_common")
 load("@prelude//transitions:constraint_overrides.bzl", "constraint_overrides")
@@ -113,10 +113,13 @@ def _container_run_impl(ctx: AnalysisContext) -> list[Provider]:
         if isinstance(p, RunInfo):
             continue
         if isinstance(p, ExternalRunnerTestInfo):
-            if p.env:
-                # The RunInfo of a test with `env` runs the prelude's Python
-                # env injector (see inject_test_run_info.bzl), which the image
-                # may not have. Pass the env to the launcher instead.
+            # For a test with `env`, the prelude's RunInfo runs a Python env
+            # injector around the test command (see inject_test_run_info.bzl),
+            # and the image may not have Python. Recognize that RunInfo and
+            # pass the env to the launcher instead; leave any other RunInfo
+            # (e.g. erlang_test's shell) alone.
+            if (p.env and not [k for k in p.env if not is_env_name(k)] and
+                "inject_test_env" in repr(ctx.attrs.binary[RunInfo])):
                 run_info = RunInfo(args = cmd_args(_launcher_args(ctx, tc, extra_env = p.env), p.command))
             p = _wrap_test(ctx, tc, p)
         providers.append(p)
