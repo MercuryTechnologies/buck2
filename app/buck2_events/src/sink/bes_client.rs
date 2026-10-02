@@ -3243,6 +3243,8 @@ mod tests {
     struct BesThatAcksAtEof {
         fail_first_stream_at: Option<i64>,
         streams: Arc<std::sync::Mutex<Vec<Vec<i64>>>>,
+        /// The invocation ID of each stream's first event, in the order the streams opened.
+        invocations: Arc<std::sync::Mutex<Vec<String>>>,
     }
 
     #[tonic::async_trait]
@@ -3270,6 +3272,7 @@ mod tests {
             };
             let fail_at = self.fail_first_stream_at.filter(|_| index == 0);
             let streams = self.streams.clone();
+            let invocations = self.invocations.clone();
             tokio::spawn(async move {
                 let mut stream_id = None;
                 loop {
@@ -3279,6 +3282,13 @@ mod tests {
                             stream_id = request
                                 .ordered_build_event
                                 .and_then(|ordered| ordered.stream_id);
+                            if sequence_number == 1 {
+                                invocations.lock().unwrap().push(
+                                    stream_id
+                                        .as_ref()
+                                        .map_or_else(String::new, |id| id.invocation_id.clone()),
+                                );
+                            }
                             streams.lock().unwrap()[index].push(sequence_number);
                             if fail_at == Some(sequence_number) {
                                 drop(tx.send(Err(Status::unavailable("injected failure"))).await);
@@ -3314,20 +3324,34 @@ mod tests {
     async fn serve_bes_that_acks_at_eof(
         fail_first_stream_at: Option<i64>,
     ) -> (String, Arc<std::sync::Mutex<Vec<Vec<i64>>>>) {
+        let (endpoint, streams, _invocations) =
+            serve_bes_that_acks_at_eof_recording_invocations(fail_first_stream_at).await;
+        (endpoint, streams)
+    }
+
+    async fn serve_bes_that_acks_at_eof_recording_invocations(
+        fail_first_stream_at: Option<i64>,
+    ) -> (
+        String,
+        Arc<std::sync::Mutex<Vec<Vec<i64>>>>,
+        Arc<std::sync::Mutex<Vec<String>>>,
+    ) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind");
         let endpoint = format!("http://{}", listener.local_addr().expect("local addr"));
         let streams = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let invocations = Arc::new(std::sync::Mutex::new(Vec::new()));
         tokio::spawn(
             tonic::transport::Server::builder()
                 .add_service(PublishBuildEventServer::new(BesThatAcksAtEof {
                     fail_first_stream_at,
                     streams: streams.clone(),
+                    invocations: invocations.clone(),
                 }))
                 .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener)),
         );
-        (endpoint, streams)
+        (endpoint, streams, invocations)
     }
 
     /// Acknowledges each event up to sequence number `acks` as it arrives, then keeps the stream
@@ -3529,6 +3553,66 @@ mod tests {
             assert_eq!(counters.snapshot().dropped, 0, "fail_fast={fail_fast}");
             assert_eq!(failures(&counters), 0, "fail_fast={fail_fast}");
         }
+    }
+
+    /// The daemon's own dispatcher, as daemon/state.rs builds it in buck2_server, and a command's
+    /// dispatcher share one remote sink. The materializer's clean-up result is the event the
+    /// daemon sends this way, and the sink's filter passes it.
+    #[tokio::test]
+    async fn a_daemon_dispatcher_beside_a_command_opens_no_stream_of_its_own() {
+        let (endpoint, streams, invocations) =
+            serve_bes_that_acks_at_eof_recording_invocations(None).await;
+        let config = BesConfig {
+            bes_backend: Some(endpoint.replacen("http://", "grpc://", 1)),
+            grpc_timeout: Duration::from_secs(1),
+            ..BesConfig::default()
+        };
+        let sink = Arc::new(
+            // SAFETY: `RemoteEventSink::new` ignores the token outside fbcode.
+            crate::sink::scribe::RemoteEventSink::new(
+                unsafe { fbinit::assume_init() },
+                "buck2_events".to_owned(),
+                config,
+            )
+            .expect("sink"),
+        );
+        let daemon = crate::dispatch::EventDispatcher::new(
+            TraceId::null(),
+            crate::daemon_id::DaemonId::null(),
+            crate::EventSinkWithStats::to_event_sync(sink.clone()),
+        );
+        let command_trace_id = TraceId::new();
+        let command = crate::dispatch::EventDispatcher::new(
+            command_trace_id.clone(),
+            crate::daemon_id::DaemonId::null(),
+            crate::EventSinkWithStats::to_event_sync(sink.clone()),
+        );
+
+        daemon.instant_event(buck2_data::CleanStaleResult::default());
+        command.console_message("built".to_owned());
+        daemon.instant_event(buck2_data::CleanStaleResult::default());
+
+        // The worker takes a message off the queue before it sends it, and handles one request at
+        // a time, so a close sent once the queue is empty runs after the last event.
+        let drained = tokio::time::timeout(Duration::from_secs(5), async {
+            while crate::EventSinkWithStats::stats(&*sink).buffered > 0 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+        assert!(drained.is_ok(), "the worker did not take the events off its queue");
+        crate::EventSinkWithStats::shutdown(&*sink)
+            .await
+            .expect("streams closed");
+
+        assert_eq!(
+            *invocations.lock().unwrap(),
+            vec![command_trace_id.to_string()],
+            "one stream, the command's"
+        );
+        assert_eq!(streams.lock().unwrap().len(), 1);
+        let stats = crate::EventSinkWithStats::stats(&*sink);
+        assert_eq!(stats.dropped, 0);
     }
 
     #[tokio::test]
