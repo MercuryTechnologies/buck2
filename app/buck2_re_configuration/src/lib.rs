@@ -827,6 +827,10 @@ pub use not_fbcode::RemoteExecutionStaticMetadata;
 pub struct BesConnection {
     /// `grpcs://host:port` or `grpc://host:port`, the spelling `[bes] backend` takes.
     pub backend: String,
+    /// `[buck2_re_client] cas_address`, spelled like `backend` and under the same TLS rule, or
+    /// `None` when it is unset. Files the sink attaches to a stream by digest go here, the CAS
+    /// the remote executes from, rather than to the engine.
+    pub cas_backend: Option<String>,
     pub headers: Vec<(String, String)>,
     /// PEM file with the client certificate and its key, when TLS is on and one is configured.
     pub tls_client_cert: Option<String>,
@@ -857,12 +861,24 @@ impl BesConnection {
         let tls = config
             .tls
             .unwrap_or_else(|| !matches!(scheme.as_deref(), Some("grpc") | Some("http")));
-        Ok(Some(Self {
-            backend: format!(
+        let spell = |host: &str| {
+            format!(
                 "{}://{}",
                 if tls { "grpcs" } else { "grpc" },
                 host.trim_end_matches('/')
-            ),
+            )
+        };
+        // The CAS takes the engine's TLS rule too: the `tls` key, else the engine's scheme.
+        // Upstream buck2 has one `tls` key for all three addresses.
+        let cas_backend = config
+            .cas_address
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|address| spell(address.split_once("://").map_or(address, |(_, h)| h)));
+        Ok(Some(Self {
+            backend: spell(host),
+            cas_backend,
             headers: config
                 .http_headers
                 .iter()
@@ -971,13 +987,50 @@ mod tests {
         )?;
         let connection = BesConnection::from_re_client(&legacy_config)?.expect("engine configured");
         assert_eq!(connection.backend, "grpcs://reapi.example:444");
-        assert_eq!(connection.tls_client_cert.as_deref(), Some("/tmp/client.pem"));
+        assert_eq!(connection.cas_backend, None);
+        assert_eq!(
+            connection.tls_client_cert.as_deref(),
+            Some("/tmp/client.pem")
+        );
         assert_eq!(
             connection.headers,
             vec![
                 ("x-a".to_owned(), "1".to_owned()),
                 ("x-b".to_owned(), "two words".to_owned()),
             ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn bes_connection_cas_backend_takes_the_engine_tls_rule() -> buck2_error::Result<()> {
+        // nsc's spelling: grpc:// addresses upgraded by `tls = true`. A grpc:// CAS taken
+        // literally would be dialled in plaintext on the TLS port, and every upload would fail.
+        let legacy_config = parse(
+            &[(
+                "config",
+                "[buck2_re_client]\nengine_address = grpc://reapi.example:443\ncas_address = grpc://cas.example:443\ntls = true\n",
+            )],
+            "config",
+        )?;
+        let connection = BesConnection::from_re_client(&legacy_config)?.expect("engine configured");
+        assert_eq!(
+            connection.cas_backend.as_deref(),
+            Some("grpcs://cas.example:443")
+        );
+        let plain = parse(
+            &[(
+                "config",
+                "[buck2_re_client]\nengine_address = grpc://reapi.example:80\ncas_address = cas.example:80\n",
+            )],
+            "config",
+        )?;
+        assert_eq!(
+            BesConnection::from_re_client(&plain)?
+                .expect("engine configured")
+                .cas_backend
+                .as_deref(),
+            Some("grpc://cas.example:80")
         );
         Ok(())
     }

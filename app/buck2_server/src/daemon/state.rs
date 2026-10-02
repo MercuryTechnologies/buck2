@@ -508,7 +508,15 @@ impl DaemonState {
                 })
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
-                .map(str::to_owned);
+                .map(str::to_owned)
+                // Under `connection = re_client` the CAS follows the engine's TLS rule. Taken
+                // from `cas_address` alone, a `grpc://host:443` with `tls = true` was dialled in
+                // plaintext, every upload failed, and each file stayed inline in its event.
+                .or_else(|| {
+                    bes_connection
+                        .as_ref()
+                        .and_then(|connection| connection.cas_backend.clone())
+                });
             #[cfg(not(fbcode_build))]
             let bazel_artifact_upload_instance_name = root_config
                 .get(BuckconfigKeyRef {
