@@ -542,6 +542,22 @@ impl DaemonState {
                     property: "bazel_artifact_upload_max_bytes",
                 })?
                 .unwrap_or(10 * 1024 * 1024);
+            #[cfg(not(fbcode_build))]
+            let upload_event_log = root_config
+                .parse::<bool>(BuckconfigKeyRef {
+                    section: "bes",
+                    property: "upload_event_log",
+                })?
+                .unwrap_or(false);
+            #[cfg(not(fbcode_build))]
+            let event_log_upload_timeout = Duration::from_secs(
+                root_config
+                    .parse::<u64>(BuckconfigKeyRef {
+                        section: "bes",
+                        property: "event_log_upload_timeout_secs",
+                    })?
+                    .unwrap_or(30),
+            );
             tracing::info!("Initializing scribe sink...");
             let scribe_sink = Self::init_scribe_sink(
                 fb,
@@ -584,6 +600,13 @@ impl DaemonState {
                     bazel_artifact_uri_authority,
                     #[cfg(not(fbcode_build))]
                     bazel_artifact_upload_max_bytes,
+                    #[cfg(not(fbcode_build))]
+                    upload_event_log,
+                    #[cfg(not(fbcode_build))]
+                    event_log_dir: upload_event_log
+                        .then(|| paths.log_dir().as_path().to_path_buf()),
+                    #[cfg(not(fbcode_build))]
+                    event_log_upload_timeout,
                 },
             )
             .buck_error_context("failed to init scribe sink")?;

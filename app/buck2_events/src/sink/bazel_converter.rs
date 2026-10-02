@@ -6178,7 +6178,7 @@ fn build_tool_logs_event_from_invocation(
     build_tool_logs_event(logs)
 }
 
-fn build_tool_logs_event(logs: Vec<bep::File>) -> bep::BuildEvent {
+pub(crate) fn build_tool_logs_event(logs: Vec<bep::File>) -> bep::BuildEvent {
     bep::BuildEvent {
         id: Some(build_tool_logs_id()),
         children: Vec::new(),
