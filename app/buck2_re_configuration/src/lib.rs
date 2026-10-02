@@ -539,6 +539,11 @@ pub struct Buck2OssReConfiguration {
     pub grpc_request_timeout_secs: Option<u64>,
     /// Maximum time in seconds a ByteStream download may make no read progress.
     pub bytestream_progress_timeout_secs: Option<u64>,
+    /// Time in seconds an operation may stay QUEUED after its Execute before the action is
+    /// executed again, within `retries`. 0 turns it off. Must exceed the time the server merges
+    /// a new Execute onto a queued operation of the same action, or the new Execute joins the
+    /// operation that is stuck.
+    pub queued_operation_timeout_secs: Option<u64>,
     /// Interval in seconds for HTTP/2 ping frames to detect stale connections.
     pub grpc_keepalive_time_secs: Option<u64>,
     /// Timeout in seconds for receiving HTTP/2 ping acknowledgement.
@@ -750,6 +755,10 @@ impl Buck2OssReConfiguration {
                 section: BUCK2_RE_CLIENT_CFG_SECTION,
                 property: "bytestream_progress_timeout_secs",
             })?,
+            queued_operation_timeout_secs: legacy_config.parse(BuckconfigKeyRef {
+                section: BUCK2_RE_CLIENT_CFG_SECTION,
+                property: "queued_operation_timeout_secs",
+            })?,
             grpc_keepalive_time_secs: legacy_config.parse(BuckconfigKeyRef {
                 section: BUCK2_RE_CLIENT_CFG_SECTION,
                 property: "grpc_keepalive_time_secs",
@@ -885,6 +894,30 @@ mod tests {
         let config = Buck2OssReConfiguration::from_legacy_config(&legacy_config, Vec::new())?;
 
         assert_eq!(config.engine_connection_count, Some(8));
+        Ok(())
+    }
+
+    #[test]
+    fn oss_config_parses_queued_operation_timeout_secs() -> buck2_error::Result<()> {
+        let unset = parse(&[("config", "")], "config")?;
+        let set = parse(
+            &[(
+                "config",
+                "[buck2_re_client]\nqueued_operation_timeout_secs = 0\n",
+            )],
+            "config",
+        )?;
+
+        assert_eq!(
+            Buck2OssReConfiguration::from_legacy_config(&unset, Vec::new())?
+                .queued_operation_timeout_secs,
+            None
+        );
+        assert_eq!(
+            Buck2OssReConfiguration::from_legacy_config(&set, Vec::new())?
+                .queued_operation_timeout_secs,
+            Some(0)
+        );
         Ok(())
     }
 
