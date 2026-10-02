@@ -1265,6 +1265,13 @@ impl WorkerState {
                 };
             }
         };
+        // The daemon's dispatcher in buck2_server's daemon/state.rs sends events outside any
+        // command under the nil trace ID; a stream for them would stay open for the daemon's life.
+        // They are not counted as dropped: that count is daemon-wide, and each command's record
+        // reports its growth as BES events lost during the command.
+        if parsed.is_daemon_scoped {
+            return Ok(None);
+        }
 
         if let Err(e) = self.ensure_stream_exists(&parsed) {
             self.counters.inc_failures_invalid_request();
@@ -2138,6 +2145,8 @@ struct ParsedMessage {
     payload_size: usize,
     is_command_end: bool,
     is_invocation_record: bool,
+    /// Sent by the daemon's own dispatcher under the nil trace ID, outside any command.
+    is_daemon_scoped: bool,
 }
 
 impl ParsedMessage {
@@ -2160,6 +2169,8 @@ impl ParsedMessage {
         let event_time = event.timestamp;
         let is_command_end = is_command_end(&event);
         let is_invocation_record = is_invocation_record(&event);
+        let is_daemon_scoped =
+            uuid::Uuid::parse_str(&event.trace_id).is_ok_and(|trace_id| trace_id.is_nil());
 
         Ok(Self {
             build_id: event_id.clone(),
@@ -2171,6 +2182,7 @@ impl ParsedMessage {
             payload: message.message.clone(),
             is_command_end,
             is_invocation_record,
+            is_daemon_scoped,
         })
     }
 }
@@ -2401,6 +2413,30 @@ mod tests {
         let parsed = ParsedMessage::from_message(&message).expect("valid message");
         assert_eq!(parsed.build_id, normalize_invocation_id("42"));
         assert_eq!(parsed.invocation_id, normalize_invocation_id("42"));
+    }
+
+    #[test]
+    fn parsed_message_marks_nil_trace_as_daemon_scoped() {
+        let daemon = make_message(
+            Some(&TraceId::null().to_string()),
+            Some(1),
+            command_start_data(),
+        );
+        let command = make_message(
+            Some(&TraceId::new().to_string()),
+            Some(1),
+            command_start_data(),
+        );
+        assert!(
+            ParsedMessage::from_message(&daemon)
+                .expect("valid message")
+                .is_daemon_scoped
+        );
+        assert!(
+            !ParsedMessage::from_message(&command)
+                .expect("valid message")
+                .is_daemon_scoped
+        );
     }
 
     #[test]
@@ -3316,6 +3352,40 @@ mod tests {
         assert_eq!(counters.snapshot().successes, (events - 1) as u64);
         assert_eq!(counters.snapshot().dropped, 0);
         assert_eq!(failures(&counters), 0);
+    }
+
+    #[tokio::test]
+    async fn daemon_scoped_events_open_no_stream() {
+        let nil_trace_id = TraceId::null().to_string();
+        for fail_fast in [false, true] {
+            let (endpoint, streams) = serve_bes_that_acks_at_eof(None).await;
+            let (mut worker, counters) = worker_for(endpoint);
+            let trace_id = TraceId::new().to_string();
+
+            let daemon_event = make_message(Some(&nil_trace_id), Some(1), action_start_data());
+            let sent = worker
+                .send_message_with_retry(&daemon_event, fail_fast)
+                .await
+                .expect("a daemon-scoped event is not an error");
+            assert_eq!(sent, None, "fail_fast={fail_fast}");
+            send_queued_ok(&mut worker, &trace_id, command_start_data()).await;
+
+            assert_eq!(
+                worker.streams.keys().collect::<Vec<_>>(),
+                vec![&trace_id],
+                "fail_fast={fail_fast}"
+            );
+            send_queued_ok(&mut worker, &trace_id, invocation_record_data()).await;
+
+            // The command's start, its record and the stream's finish event, on one stream.
+            assert_eq!(
+                *streams.lock().unwrap(),
+                vec![vec![1, 2, 3]],
+                "fail_fast={fail_fast}"
+            );
+            assert_eq!(counters.snapshot().dropped, 0, "fail_fast={fail_fast}");
+            assert_eq!(failures(&counters), 0, "fail_fast={fail_fast}");
+        }
     }
 
     #[tokio::test]
