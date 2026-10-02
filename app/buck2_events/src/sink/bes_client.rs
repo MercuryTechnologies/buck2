@@ -1165,8 +1165,16 @@ fn process_send_now_request(
     // Desired behavior for the ACK-waiting path (mirroring Bazel's BES
     // uploader semantics):
     //
-    // 1) `send_messages_now()` is an emergency path. Returning `Ok(())` means all events from this
-    //    request were ACKed by BES.
+    // 1) `send_messages_now()` is an emergency path. Returning `Ok(())` means every event of this
+    //    request was queued on an open stream for its invocation and, where that stream has
+    //    been acknowledged before, that BES acknowledged it. A stream with no acknowledgement
+    //    yet is not waited on: BuildBuddy acknowledges nothing until the client half-closes the
+    //    stream, so the wait could only time out, holding up every queued event behind it. Such
+    //    a stream fails the call only if its transport had already ended when the call checked;
+    //    a rejection that arrives later is counted when the stream closes. Its events stay held
+    //    for replay like any other, and closing the stream waits for the server to acknowledge
+    //    them, so they are confirmed only if the worker closes the stream before the process
+    //    exits. A sink opened to send one event, as `buck2 rage` does, is always in this case.
     // 2) Stream retries must preserve delivery intent for already-enqueued events.
     //
     // Bazel keeps an "unacked queue" and, after reconnect, replays unacked events with their
@@ -1801,15 +1809,22 @@ impl WorkerState {
                 let Some(stream) = self.streams.get(invocation_id) else {
                     continue;
                 };
-                if stream.last_acked_sequence_number() < *target_sequence_number {
-                    all_acked = false;
-                    if !stream.can_receive_more_acks() {
-                        return Err(Status::unavailable(format!(
-                            "BES stream closed before sequence {} was acknowledged for invocation {}",
-                            target_sequence_number, invocation_id
-                        )));
-                    }
+                let acked = stream.last_acked_sequence_number();
+                if acked >= *target_sequence_number {
+                    continue;
                 }
+                if !stream.can_receive_more_acks() {
+                    return Err(Status::unavailable(format!(
+                        "BES stream closed before sequence {} was acknowledged for invocation {}",
+                        target_sequence_number, invocation_id
+                    )));
+                }
+                // Sequence numbers start at 1, so this stream was never acknowledged, and its
+                // server may be one that acknowledges only at EOF.
+                if acked == 0 {
+                    continue;
+                }
+                all_acked = false;
             }
 
             if all_acked {
@@ -3279,6 +3294,65 @@ mod tests {
         (endpoint, streams)
     }
 
+    /// Acknowledges each event up to sequence number `acks` as it arrives, then keeps the stream
+    /// open and acknowledges nothing more.
+    struct BesThatWithholdsAcks {
+        acks: i64,
+    }
+
+    #[tonic::async_trait]
+    impl PublishBuildEvent for BesThatWithholdsAcks {
+        async fn publish_lifecycle_event(
+            &self,
+            _request: tonic::Request<PublishLifecycleEventRequest>,
+        ) -> Result<tonic::Response<()>, Status> {
+            Ok(tonic::Response::new(()))
+        }
+
+        type PublishBuildToolEventStreamStream =
+            ReceiverStream<Result<PublishBuildToolEventStreamResponse, Status>>;
+
+        async fn publish_build_tool_event_stream(
+            &self,
+            request: tonic::Request<tonic::Streaming<PublishBuildToolEventStreamRequest>>,
+        ) -> Result<tonic::Response<Self::PublishBuildToolEventStreamStream>, Status> {
+            let mut inbound = request.into_inner();
+            let (tx, rx) = mpsc::channel(16);
+            let acks = self.acks;
+            tokio::spawn(async move {
+                while let Ok(Some(request)) = inbound.message().await {
+                    let sequence_number = request_sequence_number(&request);
+                    if sequence_number > acks {
+                        continue;
+                    }
+                    let response = PublishBuildToolEventStreamResponse {
+                        stream_id: request
+                            .ordered_build_event
+                            .and_then(|ordered| ordered.stream_id),
+                        sequence_number,
+                    };
+                    if tx.send(Ok(response)).await.is_err() {
+                        break;
+                    }
+                }
+            });
+            Ok(tonic::Response::new(ReceiverStream::new(rx)))
+        }
+    }
+
+    async fn serve_bes_that_withholds_acks(acks: i64) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let endpoint = format!("http://{}", listener.local_addr().expect("local addr"));
+        tokio::spawn(
+            tonic::transport::Server::builder()
+                .add_service(PublishBuildEventServer::new(BesThatWithholdsAcks { acks }))
+                .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener)),
+        );
+        endpoint
+    }
+
     fn action_start_data() -> buck2_data::buck_event::Data {
         buck2_data::buck_event::Data::SpanStart(buck2_data::SpanStartEvent {
             data: Some(buck2_data::span_start_event::Data::ActionExecution(
@@ -3385,6 +3459,75 @@ mod tests {
         assert_eq!(counters.snapshot().successes, (events - 1) as u64);
         assert_eq!(counters.snapshot().dropped, 0);
         assert_eq!(failures(&counters), 0);
+    }
+
+    #[tokio::test]
+    async fn send_messages_now_does_not_wait_for_a_server_that_acks_only_at_eof() {
+        let (endpoint, streams) = serve_bes_that_acks_at_eof(None).await;
+        let config = BesConfig {
+            bes_backend: Some(endpoint.replacen("http://", "grpc://", 1)),
+            grpc_timeout: Duration::from_secs(1),
+            ..BesConfig::default()
+        };
+        let ack_timeout = close_ack_timeout(config.grpc_timeout);
+        // SAFETY: `BesClient::new` ignores the token, which outside fbcode stands for nothing.
+        let client = BesClient::new(unsafe { fbinit::assume_init() }, config).expect("client");
+        let trace_id = TraceId::new().to_string();
+        let messages = vec![
+            make_message(Some(&trace_id), Some(1), command_start_data()),
+            make_message(Some(&trace_id), Some(1), action_start_data()),
+        ];
+
+        let sent =
+            tokio::time::timeout(Duration::from_secs(5), client.send_messages_now(messages)).await;
+        let Ok(sent) = sent else {
+            panic!(
+                "send_messages_now waited for acknowledgements the server sends only at EOF \
+                 (close_ack_timeout {ack_timeout:?})"
+            );
+        };
+        sent.expect("events sent");
+        client.close_all_streams().await.expect("streams closed");
+
+        // Both events and the stream's finish event, each acknowledged at EOF: the server
+        // acknowledges only a stream without a gap, and closing fails on a missing one.
+        assert_eq!(*streams.lock().unwrap(), vec![vec![1, 2, 3]]);
+        assert_eq!(failures(&client.counters), 0);
+        assert_eq!(client.counters.snapshot().dropped, 0);
+    }
+
+    #[tokio::test]
+    async fn wait_for_acks_waits_on_a_stream_that_was_acknowledged_before() {
+        let endpoint = serve_bes_that_withholds_acks(1).await;
+        let (mut worker, _counters) = worker_for(endpoint);
+        let trace_id = TraceId::new().to_string();
+
+        send_queued_ok(&mut worker, &trace_id, command_start_data()).await;
+        let invocation_id = worker.streams.keys().next().expect("stream opened").clone();
+        let acked = tokio::time::timeout(Duration::from_secs(5), async {
+            while worker.streams[&invocation_id].last_acked_sequence_number() < 1 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+        assert!(acked.is_ok(), "the server did not ack the command start");
+
+        let message = make_message(Some(&trace_id), Some(1), action_start_data());
+        let target = worker
+            .send_message_with_retry(&message, true)
+            .await
+            .expect("sent")
+            .expect("the event has a sequence number");
+        assert_eq!(target, (invocation_id, 2));
+        let waited = tokio::time::timeout(
+            Duration::from_millis(500),
+            worker.wait_for_acks(&HashMap::from([target])),
+        )
+        .await;
+        assert!(
+            waited.is_err(),
+            "returned {waited:?} for an event an acknowledging server has not acknowledged"
+        );
     }
 
     #[tokio::test]
