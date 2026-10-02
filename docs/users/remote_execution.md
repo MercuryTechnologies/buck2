@@ -67,6 +67,24 @@ Keys supported include:
   blobs. When set with `remote_cache_chunking`, Buck2 checks this directory
   before downloading chunks from remote CAS and writes validated chunks after
   chunked uploads or downloads. The directory is managed by the user.
+- `queued_operation_timeout_secs` - how long an operation may stay `QUEUED`
+  before Buck2 sends the action's `Execute` again, in seconds. Defaults to 900
+  (15 minutes); 0 turns it off. Each wait gets up to a quarter more at random,
+  so the actions of one build do not all send their `Execute` together. Each
+  such `Execute` counts against `retries`, doubles the time allowed to the next
+  operation, and shows a console warning saying the operation stayed `QUEUED`.
+  Because `retries` also covers lost operations and failed executors, an action
+  that waited through a long queue has fewer of them left: with the default of
+  5, a 94-minute queue spends 2. Buck2 keeps reading the earlier operation, and
+  uses whichever operation of the action an executor claims first, or that
+  finishes first with a result; an earlier operation that finishes with an
+  error is dropped. A claimed operation has no deadline, which is any operation
+  that is executing, or that is in `CACHE_CHECK` after being `QUEUED`, as
+  BuildBuddy's executors report a claim. Buck2 cannot cancel the operation it
+  drops, so the server may still run it later, in full when the action skips
+  the cache lookup. The timeout has to be longer than the time the server joins
+  a new `Execute` to a pending execution of the same action, or the new
+  `Execute` joins the stuck one: 10 minutes on BuildBuddy.
 
 ## Credential helpers
 

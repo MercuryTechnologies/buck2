@@ -148,6 +148,11 @@ const DEFAULT_GRPC_KEEPALIVE_TIMEOUT_SECS: u64 = 20;
 const DEFAULT_GRPC_KEEPALIVE_WHILE_IDLE: bool = false;
 const DEFAULT_GRPC_REQUEST_TIMEOUT_SECS: u64 = 60;
 const DEFAULT_BYTESTREAM_PROGRESS_TIMEOUT_SECS: u64 = 60;
+/// BuildBuddy merges an Execute onto a pending execution of the same action digest for 10
+/// minutes after that execution's Execute while no executor has claimed it (v2.310.0
+/// enterprise/server/remote_execution/action_merger/action_merger.go:27, 288-294), so only an
+/// Execute sent later than that starts a fresh execution.
+const DEFAULT_QUEUED_OPERATION_TIMEOUT_SECS: u64 = 15 * 60;
 const DEFAULT_FAST_CDC_2020_AVG_CHUNK_SIZE: u64 = 512 * 1024;
 // Match Bazel's default gRPC remote-execution fanout: roughly 100 requests per
 // connection, with at most 100 connections unless explicitly overridden.
@@ -788,10 +793,14 @@ fn can_retry_execute(retry_attempts: usize, retries: usize) -> bool {
     retry_attempts < retries
 }
 
-fn jittered_retry_delay(base_delay: Duration) -> Duration {
+/// A number in [0, 1].
+fn random_unit() -> f64 {
     let random_bytes = Uuid::new_v4().into_bytes();
-    let random = u16::from_be_bytes([random_bytes[0], random_bytes[1]]) as f64 / u16::MAX as f64;
-    let jitter_ratio = GRPC_RETRY_JITTER * ((2.0 * random) - 1.0);
+    u16::from_be_bytes([random_bytes[0], random_bytes[1]]) as f64 / u16::MAX as f64
+}
+
+fn jittered_retry_delay(base_delay: Duration) -> Duration {
+    let jitter_ratio = GRPC_RETRY_JITTER * ((2.0 * random_unit()) - 1.0);
     Duration::try_from_secs_f64(base_delay.as_secs_f64() * (1.0 + jitter_ratio))
         .unwrap_or(base_delay)
 }
@@ -1070,6 +1079,330 @@ struct OperationStream {
     /// The stream is a resumption that has sent nothing yet past its first message, which is the
     /// operation's current status again (REAPI remote_execution.proto, `WaitExecution`).
     resumed: bool,
+    queued: QueuedDeadline,
+    /// Operations of the action that stayed QUEUED and were executed again, still read.
+    superseded: Vec<SupersededOperation>,
+}
+
+/// When an action is executed again because its operation is still QUEUED.
+///
+/// BuildBuddy sends one QUEUED Operation on an Execute stream and then only what is published
+/// for the execution, which starts when an executor claims it (v2.310.0
+/// enterprise/server/remote_execution/execution_server/execution_server.go:1297-1313), and
+/// nothing at all meanwhile: no queue position, no heartbeat. An execution whose task the
+/// scheduler has lost therefore looks like one waiting in a long queue, and its stream, kept
+/// alive by HTTP/2 pings, never ends. The clock is the only way out of that wait.
+struct QueuedDeadline {
+    timeout: Duration,
+    /// Times the action was executed again because an operation stayed QUEUED, each of which
+    /// doubles the next period, so a long legitimate queue gets few duplicates.
+    reexecutes: u32,
+    /// None once an executor has claimed the operation (`operation_claimed`): a claimed
+    /// operation is the executor's lease to keep, and an action may run for as long as it needs.
+    at: Option<tokio::time::Instant>,
+    /// The period with its jitter, which is how long the operation stayed QUEUED when `at` comes.
+    wait: Duration,
+    /// Whether the current operation has said QUEUED, after which its CACHE_CHECK is a claim.
+    seen_queued: bool,
+}
+
+impl QueuedDeadline {
+    fn new(timeout: Duration) -> Self {
+        let mut deadline = Self {
+            timeout,
+            reexecutes: 0,
+            at: None,
+            wait: Duration::ZERO,
+            seen_queued: false,
+        };
+        deadline.start();
+        deadline
+    }
+
+    /// Starts the clock of a new operation, which an Execute has just created. tonic returns the
+    /// stream once the response headers are in, which BuildBuddy sends with the first QUEUED
+    /// Operation (execution_server.go:1302), after it has recorded the execution for merging
+    /// (execution_server.go:1144, action_merger.go:288-294). So the merge record is older than
+    /// the clock, and a timeout longer than its TTL outlives it.
+    fn start(&mut self) {
+        self.seen_queued = false;
+        self.rearm();
+    }
+
+    /// Starts the clock again for the current operation. The period gets up to a quarter more at
+    /// random, because the actions a build enqueues together would otherwise reach their
+    /// deadlines together and send a burst of Executes to a scheduler that may be what is in
+    /// trouble. The jitter only lengthens the period, so it still outlives the merge record.
+    fn rearm(&mut self) {
+        let period = self.period();
+        self.wait = period.saturating_add(
+            Duration::try_from_secs_f64(period.as_secs_f64() / 4.0 * random_unit())
+                .unwrap_or_default(),
+        );
+        self.at = if self.timeout.is_zero() {
+            None
+        } else {
+            tokio::time::Instant::now().checked_add(self.wait)
+        };
+    }
+
+    fn period(&self) -> Duration {
+        self.timeout.saturating_mul(1 << self.reexecutes.min(16))
+    }
+}
+
+/// An operation that stayed QUEUED past its deadline, whose action was executed again. Its stream
+/// stays open, so a legitimately queued operation keeps its place in the queue: the first
+/// operation of the action that an executor claims, or that finishes with the action's result, is
+/// the one the action waits for.
+struct SupersededOperation {
+    stream: tonic::Streaming<Operation>,
+    operation_name: Option<String>,
+    seen_queued: bool,
+}
+
+/// What ends a wait on an action's operation streams.
+enum OperationStreamEvent {
+    /// The current operation's stream has a message, has ended, or has failed.
+    Next(Result<Option<Operation>, tonic::Status>),
+    /// A superseded operation has been claimed, or has finished with the action's result.
+    Superseded(SupersededOperation, Operation),
+    /// The current operation is still QUEUED at its deadline.
+    StayedQueued,
+}
+
+/// Whether an operation's stage says an executor has claimed it, which stops its QUEUED clock.
+/// CACHE_CHECK comes before QUEUED in REAPI's order, and a server may send it before it queues the
+/// operation. BuildBuddy's executor sends it when it claims the task, after the app's QUEUED, and
+/// gets a runner during it before it publishes EXECUTING with the image pull (v2.310.0
+/// enterprise/server/remote_execution/executor/executor.go:275-291, 348,
+/// operation/operation.go:87-90). By then the merge record lives only as long as the executor's
+/// lease, so an Execute sent then would queue a duplicate.
+fn operation_claimed(stage: i32, seen_queued: &mut bool) -> bool {
+    match execution_stage::Value::try_from(stage) {
+        Ok(execution_stage::Value::Queued) => {
+            *seen_queued = true;
+            false
+        }
+        Ok(execution_stage::Value::CacheCheck) => *seen_queued,
+        Ok(execution_stage::Value::Executing | execution_stage::Value::Completed) => true,
+        _ => false,
+    }
+}
+
+fn operation_stage(operation: &Operation) -> i32 {
+    operation
+        .metadata
+        .as_ref()
+        .and_then(|metadata| ExecuteOperationMetadata::decode(&metadata.value[..]).ok())
+        .map_or(0, |metadata| metadata.stage)
+}
+
+/// Whether a finished operation has the action's result, cached or not, whatever the command's
+/// exit code. Any other end says nothing about the current operation, which may still succeed.
+fn operation_succeeded(operation: &Operation) -> bool {
+    match &operation.result {
+        Some(OpResult::Response(any)) => GExecuteResponse::decode(&any.value[..])
+            .is_ok_and(|response| response.status.is_none_or(|status| status.code == 0)),
+        _ => false,
+    }
+}
+
+/// Waits for the current operation's stream, for the superseded ones and for the deadline. A
+/// superseded stream that ends, fails, or finishes without the action's result is dropped, not
+/// resumed.
+async fn next_operation_event(
+    stream: &mut tonic::Streaming<Operation>,
+    superseded: &mut Vec<SupersededOperation>,
+    deadline: Option<tokio::time::Instant>,
+) -> OperationStreamEvent {
+    let mut deadline = deadline.map(|at| Box::pin(tokio::time::sleep_until(at)));
+    std::future::poll_fn(|cx| {
+        if let std::task::Poll::Ready(next) = stream.poll_next_unpin(cx) {
+            return std::task::Poll::Ready(OperationStreamEvent::Next(next.transpose()));
+        }
+        let mut i = 0;
+        while i < superseded.len() {
+            match superseded[i].stream.poll_next_unpin(cx) {
+                std::task::Poll::Pending => i += 1,
+                std::task::Poll::Ready(Some(Ok(operation))) => {
+                    if !operation.name.is_empty() {
+                        superseded[i].operation_name = Some(operation.name.clone());
+                    }
+                    if operation.done {
+                        let first = superseded.swap_remove(i);
+                        if operation_succeeded(&operation) {
+                            return std::task::Poll::Ready(OperationStreamEvent::Superseded(
+                                first, operation,
+                            ));
+                        }
+                        tracing::debug!(
+                            operation_name = first.operation_name.as_deref().unwrap_or(""),
+                            "An operation that stayed QUEUED finished without a result; waiting for the later Execute"
+                        );
+                        drain_finished_operation_stream(first.stream);
+                    } else if operation_claimed(
+                        operation_stage(&operation),
+                        &mut superseded[i].seen_queued,
+                    ) {
+                        return std::task::Poll::Ready(OperationStreamEvent::Superseded(
+                            superseded.swap_remove(i),
+                            operation,
+                        ));
+                    }
+                }
+                std::task::Poll::Ready(_) => {
+                    superseded.swap_remove(i);
+                }
+            }
+        }
+        match deadline.as_mut().map(|sleep| sleep.as_mut().poll(cx)) {
+            Some(std::task::Poll::Ready(())) => {
+                std::task::Poll::Ready(OperationStreamEvent::StayedQueued)
+            }
+            _ => std::task::Poll::Pending,
+        }
+    })
+    .await
+}
+
+/// Puts an operation that stayed QUEUED past its deadline on the console, with the re-Execute
+/// (`attempt` of `retries`) it causes, or that none is left.
+fn warn_stayed_queued(
+    request: &GExecuteRequest,
+    operation_name: Option<&str>,
+    waited: Duration,
+    attempt: Option<usize>,
+    retries: usize,
+) {
+    let operation_name = operation_name.unwrap_or("");
+    let waited = waited.as_secs();
+    warn_re_execution_retry(match attempt {
+        Some(attempt) => format!(
+            "Executing RE action {} again (re-Execute {attempt}/{retries}): operation `{operation_name}` stayed QUEUED for {waited}s",
+            execute_request_action(request),
+        ),
+        None => format!(
+            "RE operation `{operation_name}` of action {} stayed QUEUED for {waited}s and its re-Executes are spent ({retries}/{retries}); still waiting for it",
+            execute_request_action(request),
+        ),
+    });
+}
+
+/// Resumes an operation with WaitExecution, or executes its action again when WaitExecution says
+/// the operation or its connection is lost, or when the operation is still QUEUED at the deadline
+/// before the resumption answers. BuildBuddy answers a WaitExecution with the last status
+/// published for the execution (execution_server.go:1292), nothing is published until an
+/// executor claims it, and grpc-go sends the response headers with the first message, so the
+/// resumption of a queued operation does not even return its stream until then.
+async fn resume_or_retry_execute(
+    grpc_clients: Arc<GRPCClients>,
+    metadata: RemoteExecutionMetadata,
+    use_fbcode_metadata: bool,
+    request_metadata_tool_name: &str,
+    operation_name: String,
+    execute_request: GExecuteRequest,
+    mut execute_retry_attempts: usize,
+    retries: usize,
+    retry_max_delay: Duration,
+    wait_failure_context: String,
+    queued: &mut QueuedDeadline,
+) -> anyhow::Result<(tonic::Streaming<Operation>, Option<String>, usize)> {
+    loop {
+        // Only the WaitExecution runs against the clock. An Execute cut off by it might already
+        // have queued a task on the server that no attempt counts.
+        let wait = wait_execution_stream(
+            grpc_clients.clone(),
+            metadata.clone(),
+            use_fbcode_metadata,
+            request_metadata_tool_name,
+            operation_name.clone(),
+            retries,
+            retry_max_delay,
+        );
+        let waited = match queued.at {
+            None => Some(wait.await),
+            Some(at) => tokio::time::timeout_at(at, wait).await.ok(),
+        };
+        let failure_context = match waited {
+            Some(Ok(stream)) => return Ok((stream, Some(operation_name), execute_retry_attempts)),
+            Some(Err(wait_err)) if should_retry_execute_after_wait_execution_error(&wait_err) => {
+                if !can_retry_execute(execute_retry_attempts, retries) {
+                    return Err(wait_err.context(wait_failure_context).context(format!(
+                        "RE operation `{operation_name}` was lost after retry limit"
+                    )));
+                }
+                execute_retry_attempts += 1;
+                warn_re_execution_retry(format!(
+                    "Executing RE action {} again (re-Execute {execute_retry_attempts}/{retries}): WaitExecution of operation `{operation_name}` failed: {wait_err:#}",
+                    execute_request_action(&execute_request),
+                ));
+                format!("RE operation `{operation_name}` was lost and Execute retry failed")
+            }
+            Some(Err(wait_err)) => return Err(wait_err.context(wait_failure_context)),
+            None if can_retry_execute(execute_retry_attempts, retries) => {
+                execute_retry_attempts += 1;
+                warn_stayed_queued(
+                    &execute_request,
+                    Some(&operation_name),
+                    queued.wait,
+                    Some(execute_retry_attempts),
+                    retries,
+                );
+                queued.reexecutes += 1;
+                match execute_stream(
+                    grpc_clients.clone(),
+                    metadata.clone(),
+                    use_fbcode_metadata,
+                    request_metadata_tool_name,
+                    execute_request.clone(),
+                    retries,
+                    retry_max_delay,
+                )
+                .await
+                {
+                    Ok(stream) => {
+                        queued.start();
+                        return Ok((stream, None, execute_retry_attempts));
+                    }
+                    // The operation may still be queued legitimately, so, as on its own stream,
+                    // it is waited for rather than failed, and the attempt is spent.
+                    Err(err) => {
+                        warn_re_execution_retry(format!(
+                            "RE action {} could not be executed again, so its operation `{operation_name}` is still waited for: {err:#}",
+                            execute_request_action(&execute_request),
+                        ));
+                        queued.rearm();
+                        continue;
+                    }
+                }
+            }
+            None => {
+                warn_stayed_queued(
+                    &execute_request,
+                    Some(&operation_name),
+                    queued.wait,
+                    None,
+                    retries,
+                );
+                queued.at = None;
+                continue;
+            }
+        };
+        let stream = execute_stream(
+            grpc_clients.clone(),
+            metadata.clone(),
+            use_fbcode_metadata,
+            request_metadata_tool_name,
+            execute_request.clone(),
+            retries,
+            retry_max_delay,
+        )
+        .await
+        .context(failure_context)?;
+        queued.start();
+        return Ok((stream, None, execute_retry_attempts));
+    }
 }
 
 /// Counts a resumption of an operation stream that said nothing new since the previous one, and
@@ -1091,61 +1424,6 @@ async fn pause_before_resume(
         .min(retry_max_delay);
     tokio::time::sleep(jittered_retry_delay(delay)).await;
     true
-}
-
-async fn wait_execution_or_retry_execute(
-    grpc_clients: Arc<GRPCClients>,
-    metadata: RemoteExecutionMetadata,
-    use_fbcode_metadata: bool,
-    request_metadata_tool_name: &str,
-    operation_name: String,
-    execute_request: GExecuteRequest,
-    execute_retry_attempts: usize,
-    retries: usize,
-    retry_max_delay: Duration,
-    wait_failure_context: String,
-) -> anyhow::Result<(tonic::Streaming<Operation>, Option<String>, usize)> {
-    match wait_execution_stream(
-        grpc_clients.clone(),
-        metadata.clone(),
-        use_fbcode_metadata,
-        request_metadata_tool_name,
-        operation_name.clone(),
-        retries,
-        retry_max_delay,
-    )
-    .await
-    {
-        Ok(stream) => Ok((stream, Some(operation_name), execute_retry_attempts)),
-        Err(wait_err) if should_retry_execute_after_wait_execution_error(&wait_err) => {
-            if !can_retry_execute(execute_retry_attempts, retries) {
-                return Err(wait_err.context(wait_failure_context).context(format!(
-                    "RE operation `{operation_name}` was lost after retry limit"
-                )));
-            }
-
-            let execute_retry_attempts = execute_retry_attempts + 1;
-            warn_re_execution_retry(format!(
-                "Executing RE action {} again (re-Execute {execute_retry_attempts}/{retries}): WaitExecution of operation `{operation_name}` failed: {wait_err:#}",
-                execute_request_action(&execute_request),
-            ));
-            let stream = execute_stream(
-                grpc_clients,
-                metadata,
-                use_fbcode_metadata,
-                request_metadata_tool_name,
-                execute_request,
-                retries,
-                retry_max_delay,
-            )
-            .await
-            .context(format!(
-                "RE operation `{operation_name}` was lost and Execute retry failed"
-            ))?;
-            Ok((stream, None, execute_retry_attempts))
-        }
-        Err(wait_err) => Err(wait_err.context(wait_failure_context)),
-    }
 }
 
 enum BystreamWritePlan {
@@ -1342,6 +1620,8 @@ pub struct RERuntimeOpts {
     grpc_request_timeout: Duration,
     /// Maximum idle time for a ByteStream download before the stream is retried.
     bytestream_progress_timeout: Duration,
+    /// Time an operation may stay QUEUED before its action is executed again; zero is never.
+    queued_operation_timeout: Duration,
     /// Digest function selected from user config and capabilities for download hash validation.
     download_hash_digest_function: Option<digest_function::Value>,
     /// Digest functions selected from daemon config for RE request fields.
@@ -2595,6 +2875,10 @@ impl REClientBuilder {
             opts.bytestream_progress_timeout_secs
                 .unwrap_or(DEFAULT_BYTESTREAM_PROGRESS_TIMEOUT_SECS),
         );
+        let queued_operation_timeout = Duration::from_secs(
+            opts.queued_operation_timeout_secs
+                .unwrap_or(DEFAULT_QUEUED_OPERATION_TIMEOUT_SECS),
+        );
 
         let capabilities = if opts.capabilities.unwrap_or(true) {
             Self::fetch_rbe_capabilities(
@@ -2759,6 +3043,7 @@ impl REClientBuilder {
                 retry_max_delay_ms,
                 grpc_request_timeout,
                 bytestream_progress_timeout,
+                queued_operation_timeout,
                 download_hash_digest_function,
                 request_digest_function_config,
             },
@@ -4064,6 +4349,8 @@ impl REClient {
                 execute_retry_attempts: 0,
                 stalled_resumes: 0,
                 resumed: false,
+                queued: QueuedDeadline::new(self.runtime_opts.queued_operation_timeout),
+                superseded: Vec::new(),
             }),
             move |state| {
                 let grpc_clients = grpc_clients.clone();
@@ -4077,15 +4364,85 @@ impl REClient {
                         mut execute_retry_attempts,
                         mut stalled_resumes,
                         mut resumed,
+                        mut queued,
+                        mut superseded,
                     }) = state
                     else {
                         return Ok(None);
                     };
                     loop {
                         let msg = loop {
-                            match stream.try_next().await {
-                                Ok(Some(msg)) => break msg,
-                                Ok(None) => {
+                            match next_operation_event(&mut stream, &mut superseded, queued.at)
+                                .await
+                            {
+                                OperationStreamEvent::Next(Ok(Some(msg))) => break msg,
+                                OperationStreamEvent::Superseded(first, msg) => {
+                                    tracing::debug!(
+                                        operation_name =
+                                            first.operation_name.as_deref().unwrap_or(""),
+                                        "An operation that stayed QUEUED was claimed or finished first; dropping the later Execute"
+                                    );
+                                    stream = first.stream;
+                                    operation_name = first.operation_name;
+                                    queued.seen_queued = first.seen_queued;
+                                    resumed = false;
+                                    break msg;
+                                }
+                                OperationStreamEvent::StayedQueued => {
+                                    let waited = queued.wait;
+                                    if !can_retry_execute(execute_retry_attempts, retries) {
+                                        warn_stayed_queued(
+                                            &grpc_request,
+                                            operation_name.as_deref(),
+                                            waited,
+                                            None,
+                                            retries,
+                                        );
+                                        queued.at = None;
+                                        continue;
+                                    }
+                                    execute_retry_attempts += 1;
+                                    warn_stayed_queued(
+                                        &grpc_request,
+                                        operation_name.as_deref(),
+                                        waited,
+                                        Some(execute_retry_attempts),
+                                        retries,
+                                    );
+                                    queued.reexecutes += 1;
+                                    match execute_stream(
+                                        grpc_clients.clone(),
+                                        metadata.clone(),
+                                        use_fbcode_metadata,
+                                        request_metadata_tool_name.as_str(),
+                                        grpc_request.clone(),
+                                        retries,
+                                        retry_max_delay,
+                                    )
+                                    .await
+                                    {
+                                        Ok(next_stream) => {
+                                            superseded.push(SupersededOperation {
+                                                stream: std::mem::replace(&mut stream, next_stream),
+                                                operation_name: operation_name.take(),
+                                                seen_queued: queued.seen_queued,
+                                            });
+                                            resumed = false;
+                                            queued.start();
+                                        }
+                                        // The operation may still be queued legitimately, so it is
+                                        // waited for rather than failed; the attempt is spent.
+                                        Err(err) => {
+                                            warn_re_execution_retry(format!(
+                                                "RE action {} could not be executed again, so its operation `{}` is still waited for: {err:#}",
+                                                execute_request_action(&grpc_request),
+                                                operation_name.as_deref().unwrap_or(""),
+                                            ));
+                                            queued.rearm();
+                                        }
+                                    }
+                                }
+                                OperationStreamEvent::Next(Ok(None)) => {
                                     let Some(name) = operation_name.clone() else {
                                         return Err(anyhow::anyhow!(
                                             "RE Execute stream ended before operation creation"
@@ -4112,7 +4469,7 @@ impl REClient {
                                         next_stream,
                                         next_operation_name,
                                         next_execute_retry_attempts,
-                                    ) = wait_execution_or_retry_execute(
+                                    ) = resume_or_retry_execute(
                                         grpc_clients.clone(),
                                         metadata.clone(),
                                         use_fbcode_metadata,
@@ -4123,13 +4480,14 @@ impl REClient {
                                         retries,
                                         retry_max_delay,
                                         "RE WaitExecution failed after Execute stream ended before completion".to_owned(),
+                                        &mut queued,
                                     )
                                     .await?;
                                     stream = next_stream;
                                     operation_name = next_operation_name;
                                     execute_retry_attempts = next_execute_retry_attempts;
                                 }
-                                Err(err) => {
+                                OperationStreamEvent::Next(Err(err)) => {
                                     let err = anyhow::Error::from(err);
                                     if should_retry_execute_after_operation_stream_error(&err) {
                                         if !can_retry_execute(execute_retry_attempts, retries) {
@@ -4157,6 +4515,7 @@ impl REClient {
                                         )
                                         .await
                                         .context("RE operation stream returned NOT_FOUND and Execute retry failed")?;
+                                        queued.start();
                                         operation_name = None;
                                         continue;
                                     }
@@ -4200,6 +4559,7 @@ impl REClient {
                                         .context(
                                             "Execute stream failed before operation creation and Execute retry failed",
                                         )?;
+                                        queued.start();
                                         continue;
                                     };
 
@@ -4224,7 +4584,7 @@ impl REClient {
                                         next_stream,
                                         next_operation_name,
                                         next_execute_retry_attempts,
-                                    ) = wait_execution_or_retry_execute(
+                                    ) = resume_or_retry_execute(
                                         grpc_clients.clone(),
                                         metadata.clone(),
                                         use_fbcode_metadata,
@@ -4235,6 +4595,7 @@ impl REClient {
                                         retries,
                                         retry_max_delay,
                                         format!("RE WaitExecution failed after Execute stream interruption ({err:#})"),
+                                        &mut queued,
                                     )
                                     .await?;
                                     stream = next_stream;
@@ -4289,6 +4650,7 @@ impl REClient {
                                         .context(
                                             "Execute operation failed and Execute retry failed",
                                         )?;
+                                        queued.start();
                                         operation_name = None;
                                         continue;
                                     }
@@ -4332,6 +4694,7 @@ impl REClient {
                                         .context(
                                             "Execute response failed and Execute retry failed",
                                         )?;
+                                        queued.start();
                                         operation_name = None;
                                         continue;
                                     }
@@ -4380,6 +4743,10 @@ impl REClient {
                             Ok(execution_stage::Value::Completed) => Stage::COMPLETED,
                             _ => Stage::UNKNOWN,
                         };
+                        if operation_claimed(meta.stage, &mut queued.seen_queued) {
+                            queued.at = None;
+                            superseded.clear();
+                        }
                         return anyhow::Ok(Some((
                             ExecuteWithProgressResponse {
                                 stage,
@@ -4392,6 +4759,8 @@ impl REClient {
                                 execute_retry_attempts,
                                 stalled_resumes,
                                 resumed,
+                                queued,
+                                superseded,
                             }),
                         )));
                     }
@@ -8076,6 +8445,7 @@ mod tests {
             bytestream_progress_timeout: Duration::from_secs(
                 DEFAULT_BYTESTREAM_PROGRESS_TIMEOUT_SECS,
             ),
+            queued_operation_timeout: Duration::from_secs(DEFAULT_QUEUED_OPERATION_TIMEOUT_SECS),
             download_hash_digest_function: Some(digest_function::Value::Sha256),
             request_digest_function_config: digest_function_config,
         };
@@ -9522,6 +9892,12 @@ mod tests {
         OperationThenClose(Operation),
         /// Closes the connection without an answer.
         Close,
+        /// Answers with each Operation once its delay after the previous one has passed. The
+        /// trailers follow the last Operation after the delay of a `RawTrailers::After`; with any
+        /// other `RawTrailers` the stream stays open.
+        Operations(Vec<(Duration, Operation)>, RawTrailers),
+        /// Holds the stream open without even its response headers.
+        Nothing,
     }
 
     #[derive(Default)]
@@ -9563,26 +9939,35 @@ mod tests {
     /// sends the trailers when `reply` says. tonic's server stops writing to a stream the client
     /// reset, as it should, so it cannot send the frames a real server had in flight then.
     async fn serve_raw_h2(
-        reply: fn(&[u8]) -> RawReply,
+        reply: impl Fn(&[u8]) -> RawReply + Send + Sync + 'static,
     ) -> anyhow::Result<(String, Arc<RawH2Log>, tokio::task::JoinHandle<()>)> {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
         let address = format!("grpc://{}", listener.local_addr()?);
         let log = Arc::new(RawH2Log::default());
+        let reply: Arc<dyn Fn(&[u8]) -> RawReply + Send + Sync> = Arc::new(reply);
         let server = tokio::spawn({
             let log = log.clone();
             async move {
                 while let Ok((socket, _)) = listener.accept().await {
                     log.connections.fetch_add(1, Ordering::SeqCst);
-                    tokio::spawn(serve_raw_h2_connection(socket, reply, log.clone()));
+                    tokio::spawn(serve_raw_h2_connection(socket, reply.clone(), log.clone()));
                 }
             }
         });
         Ok((address, log, server))
     }
 
+    fn raw_grpc_message(operation: &Operation) -> Vec<u8> {
+        let message = operation.encode_to_vec();
+        let mut data = vec![0u8];
+        data.extend((message.len() as u32).to_be_bytes());
+        data.extend(message);
+        data
+    }
+
     async fn serve_raw_h2_connection(
         socket: tokio::net::TcpStream,
-        reply: fn(&[u8]) -> RawReply,
+        reply: Arc<dyn Fn(&[u8]) -> RawReply + Send + Sync>,
         log: Arc<RawH2Log>,
     ) -> anyhow::Result<()> {
         let (mut reader, mut writer) = socket.into_split();
@@ -9644,11 +10029,36 @@ mod tests {
                             frames.send(Vec::new())?;
                             return Ok(());
                         }
+                        RawReply::Nothing => continue,
+                        RawReply::Operations(operations, trailers) => {
+                            frames.send(h2_frame(
+                                H2_HEADERS,
+                                H2_FLAG_END_HEADERS,
+                                stream,
+                                H2_RESPONSE_HEADERS,
+                            ))?;
+                            let (pending, frames, log) =
+                                (pending.clone(), frames.clone(), log.clone());
+                            tokio::spawn(async move {
+                                for (delay, operation) in operations {
+                                    tokio::time::sleep(delay).await;
+                                    let _ = frames.send(h2_frame(
+                                        H2_DATA,
+                                        0,
+                                        stream,
+                                        &raw_grpc_message(&operation),
+                                    ));
+                                }
+                                if let RawTrailers::After(delay) = trailers {
+                                    pending.lock().unwrap().insert(stream);
+                                    tokio::time::sleep(delay).await;
+                                    send_raw_trailers(stream, &pending, &frames, &log);
+                                }
+                            });
+                            continue;
+                        }
                     };
-                    let message = operation.encode_to_vec();
-                    let mut data = vec![0u8];
-                    data.extend((message.len() as u32).to_be_bytes());
-                    data.extend(message);
+                    let data = raw_grpc_message(&operation);
                     frames.send(h2_frame(
                         H2_HEADERS,
                         H2_FLAG_END_HEADERS,
@@ -9716,6 +10126,21 @@ mod tests {
 
     /// A client whose engine, CAS and action cache are all `address`, over one connection.
     async fn raw_h2_client(address: String, retries: usize) -> anyhow::Result<REClient> {
+        raw_h2_client_with(
+            address,
+            Buck2OssReConfiguration {
+                retries: Some(retries),
+                ..Default::default()
+            },
+        )
+        .await
+    }
+
+    /// `raw_h2_client`, with the rest of its configuration from `opts`.
+    async fn raw_h2_client_with(
+        address: String,
+        opts: Buck2OssReConfiguration,
+    ) -> anyhow::Result<REClient> {
         REClientBuilder::build_and_connect(&Buck2OssReConfiguration {
             cas_address: Some(address.clone()),
             engine_address: Some(address.clone()),
@@ -9723,9 +10148,8 @@ mod tests {
             tls: Some(false),
             capabilities: Some(false),
             engine_connection_count: Some(1),
-            retries: Some(retries),
             retry_max_delay_ms: Some(10),
-            ..Default::default()
+            ..opts
         })
         .await
     }
@@ -10026,6 +10450,453 @@ mod tests {
         assert_eq!(LOST_OPERATION_WAITS.load(Ordering::SeqCst), 3);
         server.abort();
         Ok(())
+    }
+
+    fn staged_operation(name: &str, stage: execution_stage::Value) -> Operation {
+        Operation {
+            name: name.to_owned(),
+            metadata: Some(prost_types::Any {
+                type_url:
+                    "type.googleapis.com/build.bazel.remote.execution.v2.ExecuteOperationMetadata"
+                        .to_owned(),
+                value: ExecuteOperationMetadata {
+                    stage: stage as i32,
+                    ..Default::default()
+                }
+                .encode_to_vec(),
+            }),
+            ..Default::default()
+        }
+    }
+
+    fn queued_operation(name: &str) -> Operation {
+        staged_operation(name, execution_stage::Value::Queued)
+    }
+
+    /// The Executes and WaitExecutions a raw server has answered.
+    #[derive(Default)]
+    struct ExecutionCalls {
+        executes: AtomicUsize,
+        waits: AtomicUsize,
+    }
+
+    impl ExecutionCalls {
+        /// Counts the request, and returns the number of earlier requests of its kind and the
+        /// operation name of a WaitExecution, or None for an Execute.
+        fn count(&self, body: &[u8]) -> (usize, Option<String>) {
+            match WaitExecutionRequest::decode(body) {
+                Ok(request) if !request.name.is_empty() => (
+                    self.waits.fetch_add(1, Ordering::SeqCst),
+                    Some(request.name),
+                ),
+                _ => (self.executes.fetch_add(1, Ordering::SeqCst), None),
+            }
+        }
+
+        fn executes(&self) -> usize {
+            self.executes.load(Ordering::SeqCst)
+        }
+
+        fn waits(&self) -> usize {
+            self.waits.load(Ordering::SeqCst)
+        }
+    }
+
+    /// A raw server that answers through `reply`, and a client of it whose operations may stay
+    /// QUEUED for 1 s.
+    async fn serve_queued(
+        retries: usize,
+        reply: impl Fn(usize, Option<String>) -> RawReply + Send + Sync + 'static,
+    ) -> anyhow::Result<(
+        REClient,
+        Arc<ExecutionCalls>,
+        Arc<RawH2Log>,
+        tokio::task::JoinHandle<()>,
+    )> {
+        let calls = Arc::new(ExecutionCalls::default());
+        let (address, log, server) = serve_raw_h2({
+            let calls = calls.clone();
+            move |body| {
+                let (earlier, wait) = calls.count(body);
+                reply(earlier, wait)
+            }
+        })
+        .await?;
+        let client = raw_h2_client_with(
+            address,
+            Buck2OssReConfiguration {
+                retries: Some(retries),
+                queued_operation_timeout_secs: Some(1),
+                ..Default::default()
+            },
+        )
+        .await?;
+        Ok((client, calls, log, server))
+    }
+
+    /// Runs an action as `execute_raw_h2_action` does, and returns the console warnings it put
+    /// on the event stream.
+    async fn execute_raw_h2_action_with_warnings(
+        client: &REClient,
+    ) -> anyhow::Result<(ExecuteResponse, Vec<String>)> {
+        let (mut events, sink) = buck2_events::create_source_sink_pair();
+        let dispatcher = buck2_events::dispatch::EventDispatcher::new(
+            buck2_wrapper_common::invocation_id::TraceId::null(),
+            buck2_events::daemon_id::DaemonId::null(),
+            sink,
+        );
+        let response = buck2_events::dispatch::with_dispatcher_async(
+            dispatcher,
+            tokio::time::timeout(Duration::from_secs(30), execute_raw_h2_action(client)),
+        )
+        .await??;
+        let mut warnings = Vec::new();
+        while let Some(event) = events.try_receive() {
+            if let buck2_events::Event::Buck(event) = event
+                && let buck2_data::buck_event::Data::Instant(buck2_data::InstantEvent {
+                    data: Some(buck2_data::instant_event::Data::ConsoleWarning(warning)),
+                }) = event.data()
+            {
+                warnings.push(warning.message.clone());
+            }
+        }
+        Ok((response, warnings))
+    }
+
+    /// The incident of 2026-10-02 on BuildBuddy v2.310.0: the scheduler lost a task it had
+    /// accepted, so its Execute stream sent one QUEUED Operation and then nothing for 1h35m.
+    #[tokio::test]
+    async fn an_operation_that_stays_queued_is_executed_again() -> anyhow::Result<()> {
+        let (client, calls, _log, server) = serve_queued(2, |earlier, _| match earlier {
+            0 => RawReply::Operation(queued_operation("operations/stuck"), RawTrailers::Never),
+            _ => RawReply::Operation(done_operation(), RawTrailers::After(Duration::ZERO)),
+        })
+        .await?;
+
+        let started = Instant::now();
+        let (completed, warnings) = execute_raw_h2_action_with_warnings(&client).await?;
+
+        assert_eq!(completed.status.code, TCode::OK);
+        assert!(started.elapsed() >= Duration::from_secs(1));
+        assert_eq!((calls.executes(), calls.waits()), (2, 0));
+        assert_eq!(
+            warnings,
+            vec![format!(
+                "Executing RE action {}/1 again (re-Execute 1/2): operation `operations/stuck` stayed QUEUED for 1s",
+                "ab".repeat(32)
+            )]
+        );
+        server.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn an_operation_that_starts_executing_before_its_deadline_is_not_executed_again()
+    -> anyhow::Result<()> {
+        let (client, calls, _log, server) = serve_queued(2, |earlier, _| match earlier {
+            0 => RawReply::Operations(
+                vec![
+                    (Duration::ZERO, queued_operation("operations/slow")),
+                    (
+                        Duration::from_millis(200),
+                        staged_operation("operations/slow", execution_stage::Value::Executing),
+                    ),
+                    (Duration::from_millis(2300), done_operation()),
+                ],
+                RawTrailers::After(Duration::ZERO),
+            ),
+            _ => RawReply::Operation(done_operation(), RawTrailers::After(Duration::ZERO)),
+        })
+        .await?;
+
+        let started = Instant::now();
+        let (completed, warnings) = execute_raw_h2_action_with_warnings(&client).await?;
+
+        assert_eq!(completed.status.code, TCode::OK);
+        assert!(started.elapsed() >= Duration::from_millis(2500));
+        assert_eq!((calls.executes(), calls.waits()), (1, 0));
+        assert_eq!(warnings, Vec::<String>::new());
+        server.abort();
+        Ok(())
+    }
+
+    /// The operation executed again because it stayed QUEUED is not dropped: when it is the one
+    /// an executor picks up first, the action takes its result.
+    #[tokio::test]
+    async fn an_operation_that_stayed_queued_still_finishes_the_action_if_it_starts_first()
+    -> anyhow::Result<()> {
+        let (client, calls, log, server) = serve_queued(2, |earlier, _| match earlier {
+            0 => RawReply::Operations(
+                vec![
+                    (Duration::ZERO, queued_operation("operations/first")),
+                    (Duration::from_millis(1500), done_operation()),
+                ],
+                RawTrailers::After(Duration::ZERO),
+            ),
+            _ => RawReply::Operation(queued_operation("operations/second"), RawTrailers::Never),
+        })
+        .await?;
+
+        let (completed, warnings) = execute_raw_h2_action_with_warnings(&client).await?;
+
+        assert_eq!(completed.status.code, TCode::OK);
+        assert_eq!((calls.executes(), calls.waits()), (2, 0));
+        assert_eq!(warnings.len(), 1, "{warnings:#?}");
+        // The second Execute's stream, which never finishes, is dropped with the action.
+        let _ = tokio::time::timeout(Duration::from_secs(5), async {
+            while log.resets.lock().unwrap().get(&H2_CANCEL) != Some(&1) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        assert_eq!(*log.resets.lock().unwrap(), HashMap::from([(H2_CANCEL, 1)]));
+        server.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn an_operation_that_stays_queued_past_the_retries_is_still_waited_for()
+    -> anyhow::Result<()> {
+        let (client, calls, _log, server) = serve_queued(0, |_, _| {
+            RawReply::Operations(
+                vec![
+                    (Duration::ZERO, queued_operation("operations/backlog")),
+                    (Duration::from_millis(1500), done_operation()),
+                ],
+                RawTrailers::After(Duration::ZERO),
+            )
+        })
+        .await?;
+
+        let (completed, warnings) = execute_raw_h2_action_with_warnings(&client).await?;
+
+        assert_eq!(completed.status.code, TCode::OK);
+        assert_eq!((calls.executes(), calls.waits()), (1, 0));
+        assert_eq!(
+            warnings,
+            vec![format!(
+                "RE operation `operations/backlog` of action {}/1 stayed QUEUED for 1s and its re-Executes are spent (0/0); still waiting for it",
+                "ab".repeat(32)
+            )]
+        );
+        server.abort();
+        Ok(())
+    }
+
+    /// A resumption repeats the operation's status, which is not progress: the clock that started
+    /// with the Execute keeps running through it.
+    #[tokio::test]
+    async fn resuming_an_operation_that_stays_queued_does_not_restart_its_clock()
+    -> anyhow::Result<()> {
+        let (client, calls, _log, server) =
+            serve_queued(2, |earlier, wait| match (earlier, wait) {
+                (0, None) => RawReply::Operations(
+                    vec![(Duration::ZERO, queued_operation("operations/stuck"))],
+                    RawTrailers::After(Duration::from_millis(800)),
+                ),
+                (_, Some(name)) => RawReply::Operation(queued_operation(&name), RawTrailers::Never),
+                _ => RawReply::Operation(done_operation(), RawTrailers::After(Duration::ZERO)),
+            })
+            .await?;
+
+        let started = Instant::now();
+        let (completed, warnings) = execute_raw_h2_action_with_warnings(&client).await?;
+
+        assert_eq!(completed.status.code, TCode::OK);
+        // The Execute's clock ends by 1.25 s with its jitter, and one restarted by the resumption
+        // at 0.8 s could not end before 1.8 s, so the bound sits between them with room for a
+        // loaded runner on either side.
+        assert!(
+            started.elapsed() < Duration::from_millis(1650),
+            "{:?}",
+            started.elapsed()
+        );
+        assert_eq!((calls.executes(), calls.waits()), (2, 1));
+        assert_eq!(warnings.len(), 1, "{warnings:#?}");
+        assert!(
+            warnings[0].contains("stayed QUEUED for 1s"),
+            "{}",
+            warnings[0]
+        );
+        server.abort();
+        Ok(())
+    }
+
+    /// BuildBuddy answers a WaitExecution with the last status published for the execution, and
+    /// nothing is published for one no executor has claimed, so not even the response headers
+    /// come back.
+    #[tokio::test]
+    async fn a_resumption_of_an_operation_that_stays_queued_that_never_answers_is_abandoned()
+    -> anyhow::Result<()> {
+        let (client, calls, _log, server) =
+            serve_queued(2, |earlier, wait| match (earlier, wait) {
+                (0, None) => RawReply::Operations(
+                    vec![(Duration::ZERO, queued_operation("operations/stuck"))],
+                    RawTrailers::After(Duration::from_millis(400)),
+                ),
+                (_, Some(_)) => RawReply::Nothing,
+                _ => RawReply::Operation(done_operation(), RawTrailers::After(Duration::ZERO)),
+            })
+            .await?;
+
+        let (completed, warnings) = execute_raw_h2_action_with_warnings(&client).await?;
+
+        assert_eq!(completed.status.code, TCode::OK);
+        assert_eq!((calls.executes(), calls.waits()), (2, 1));
+        assert_eq!(
+            warnings,
+            vec![format!(
+                "Executing RE action {}/1 again (re-Execute 1/2): operation `operations/stuck` stayed QUEUED for 1s",
+                "ab".repeat(32)
+            )]
+        );
+        server.abort();
+        Ok(())
+    }
+
+    /// An operation that stayed QUEUED and was executed again may still finish, with an error once
+    /// the scheduler recovers enough to fail it. The later Execute's operation is still queued and
+    /// may well succeed, so the failure is not the action's.
+    #[tokio::test]
+    async fn an_operation_that_stayed_queued_and_then_fails_does_not_replace_the_later_one()
+    -> anyhow::Result<()> {
+        let (client, calls, _log, server) = serve_queued(2, |earlier, _| match earlier {
+            0 => RawReply::Operations(
+                vec![
+                    (Duration::ZERO, queued_operation("operations/stuck")),
+                    (
+                        Duration::from_millis(1500),
+                        Operation {
+                            name: "operations/stuck".to_owned(),
+                            done: true,
+                            result: Some(OpResult::Error(Status {
+                                code: TCode::UNAVAILABLE.0,
+                                message: "failed to dispatch".to_owned(),
+                                ..Default::default()
+                            })),
+                            ..Default::default()
+                        },
+                    ),
+                ],
+                RawTrailers::After(Duration::ZERO),
+            ),
+            1 => RawReply::Operations(
+                vec![
+                    (Duration::ZERO, queued_operation("operations/fresh")),
+                    (Duration::from_millis(1000), done_operation()),
+                ],
+                RawTrailers::After(Duration::ZERO),
+            ),
+            _ => RawReply::Operation(done_operation(), RawTrailers::After(Duration::ZERO)),
+        })
+        .await?;
+
+        let (completed, warnings) = execute_raw_h2_action_with_warnings(&client).await?;
+
+        assert_eq!(completed.status.code, TCode::OK);
+        assert_eq!((calls.executes(), calls.waits()), (2, 0));
+        assert_eq!(warnings.len(), 1, "{warnings:#?}");
+        assert!(
+            warnings[0].contains("stayed QUEUED for 1s"),
+            "{}",
+            warnings[0]
+        );
+        server.abort();
+        Ok(())
+    }
+
+    /// BuildBuddy's executor sends CACHE_CHECK when it claims a task, after the app's QUEUED, and
+    /// gets a runner before it sends EXECUTING.
+    #[tokio::test]
+    async fn an_operation_claimed_in_cache_check_before_its_deadline_is_not_executed_again()
+    -> anyhow::Result<()> {
+        let (client, calls, _log, server) = serve_queued(2, |_, _| {
+            RawReply::Operations(
+                vec![
+                    (Duration::ZERO, queued_operation("operations/claimed")),
+                    (
+                        Duration::from_millis(200),
+                        staged_operation("operations/claimed", execution_stage::Value::CacheCheck),
+                    ),
+                    (Duration::from_millis(1300), done_operation()),
+                ],
+                RawTrailers::After(Duration::ZERO),
+            )
+        })
+        .await?;
+
+        let (completed, warnings) = execute_raw_h2_action_with_warnings(&client).await?;
+
+        assert_eq!(completed.status.code, TCode::OK);
+        assert_eq!((calls.executes(), calls.waits()), (1, 0));
+        assert_eq!(warnings, Vec::<String>::new());
+        server.abort();
+        Ok(())
+    }
+
+    /// A resumption of a claimed operation runs without a clock, even when it has not said yet
+    /// that the operation is executing.
+    #[tokio::test]
+    async fn resuming_an_executing_operation_does_not_start_its_clock_again() -> anyhow::Result<()>
+    {
+        let (client, calls, _log, server) =
+            serve_queued(2, |earlier, wait| match (earlier, wait) {
+                (0, None) => RawReply::Operations(
+                    vec![
+                        (Duration::ZERO, queued_operation("operations/running")),
+                        (
+                            Duration::from_millis(100),
+                            staged_operation("operations/running", execution_stage::Value::Executing),
+                        ),
+                    ],
+                    RawTrailers::After(Duration::from_millis(200)),
+                ),
+                (_, Some(_)) => RawReply::Operations(
+                    vec![(Duration::from_millis(1500), done_operation())],
+                    RawTrailers::After(Duration::ZERO),
+                ),
+                _ => RawReply::Operation(done_operation(), RawTrailers::After(Duration::ZERO)),
+            })
+            .await?;
+
+        let (completed, warnings) = execute_raw_h2_action_with_warnings(&client).await?;
+
+        assert_eq!(completed.status.code, TCode::OK);
+        assert_eq!((calls.executes(), calls.waits()), (1, 1));
+        assert_eq!(warnings, Vec::<String>::new());
+        server.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn an_unset_queued_operation_timeout_is_fifteen_minutes() -> anyhow::Result<()> {
+        let (address, _log, server) = serve_raw_h2(|_| RawReply::Close).await?;
+        let client = raw_h2_client(address, 0).await?;
+
+        assert_eq!(
+            client.runtime_opts.queued_operation_timeout,
+            Duration::from_secs(900)
+        );
+        server.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn queued_deadline_doubles_with_each_reexecute_and_zero_turns_it_off() {
+        let mut deadline = QueuedDeadline::new(Duration::from_secs(900));
+        assert!(deadline.at.is_some());
+        assert!(
+            (Duration::from_secs(900)..=Duration::from_secs(1125)).contains(&deadline.wait),
+            "{:?}",
+            deadline.wait
+        );
+        deadline.reexecutes = 2;
+        assert_eq!(deadline.period(), Duration::from_secs(3600));
+        deadline.reexecutes = u32::MAX;
+        assert_eq!(deadline.period(), Duration::from_secs(900 << 16));
+
+        assert!(QueuedDeadline::new(Duration::ZERO).at.is_none());
+        assert!(QueuedDeadline::new(Duration::MAX).at.is_none());
     }
 
     #[tokio::test]
