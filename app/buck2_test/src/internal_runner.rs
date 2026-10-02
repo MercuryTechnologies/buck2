@@ -307,7 +307,6 @@ fn build_env_from_spec(spec: &ExternalRunnerSpec) -> TestEnvironment {
         spec.env
             .iter()
             .map(|(key, value)| (key.clone(), value.clone())),
-        std::env::var_os("LC_CTYPE").map(|value| value.to_string_lossy().into_owned()),
     )
 }
 

@@ -22,12 +22,9 @@ pub type TestEnvironment = SortedVectorMap<String, ArgValue>;
 /// In practice, this means that iconv related functions in libc will not corrupt or error out on
 /// UTF-8 text.
 ///
-/// The caller supplies the test runner's process value so precedence can be tested without
-/// mutating the process environment. Test-runner CLI overrides, if any, should be applied after
-/// this function returns.
+/// Test-runner CLI overrides, if any, should be applied after this function returns.
 pub fn build_test_env(
     spec_env: impl IntoIterator<Item = (String, ExternalRunnerSpecValue)>,
-    process_lc_ctype: Option<String>,
 ) -> TestEnvironment {
     let mut env = spec_env
         .into_iter()
@@ -46,8 +43,7 @@ pub fn build_test_env(
         return env;
     }
 
-    let lc_ctype = process_lc_ctype.or_else(|| default_lc_ctype().map(str::to_owned));
-    if let Some(lc_ctype) = lc_ctype {
+    if let Some(lc_ctype) = default_lc_ctype().map(str::to_owned) {
         env.insert(
             "LC_CTYPE".to_owned(),
             ArgValue {
@@ -97,27 +93,18 @@ mod tests {
     }
 
     #[test]
-    fn test_existing_value_wins_over_process() {
-        let env = build_test_env(
-            vec![(
-                "LC_CTYPE".to_owned(),
-                ExternalRunnerSpecValue::Verbatim("from-test".to_owned()),
-            )],
-            Some("from-process".to_owned()),
-        );
-        assert_eq!(lc_ctype(&env), Some("from-test"));
-    }
-
-    #[test]
-    fn test_process_value_wins_over_default() {
-        let env = build_test_env(vec![], Some("from-process".to_owned()));
-        assert_eq!(lc_ctype(&env), Some("from-process"));
+    fn test_spec_value_wins_over_default() {
+        let env = build_test_env(vec![(
+                 "LC_CTYPE".to_owned(),
+                 ExternalRunnerSpecValue::Verbatim("from-spec".to_owned()),
+        )]);
+        assert_eq!(lc_ctype(&env), Some("from-spec"));
     }
 
     #[cfg(any(unix, windows))]
     #[test]
     fn test_platform_default() {
-        let env = build_test_env(vec![], None);
+        let env = build_test_env(vec![]);
         let expected = if cfg!(all(unix, not(target_os = "macos"))) {
             "C.UTF-8"
         } else {
