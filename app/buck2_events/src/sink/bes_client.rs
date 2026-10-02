@@ -1165,8 +1165,16 @@ fn process_send_now_request(
     // Desired behavior for the ACK-waiting path (mirroring Bazel's BES
     // uploader semantics):
     //
-    // 1) `send_messages_now()` is an emergency path. Returning `Ok(())` means all events from this
-    //    request were ACKed by BES.
+    // 1) `send_messages_now()` is an emergency path. Returning `Ok(())` means every event of this
+    //    request was queued on an open stream for its invocation and, where that stream has
+    //    been acknowledged before, that BES acknowledged it. A stream with no acknowledgement
+    //    yet is not waited on: BuildBuddy acknowledges nothing until the client half-closes the
+    //    stream, so the wait could only time out, holding up every queued event behind it. Such
+    //    a stream fails the call only if its transport had already ended when the call checked;
+    //    a rejection that arrives later is counted when the stream closes. Its events stay held
+    //    for replay like any other, and closing the stream waits for the server to acknowledge
+    //    them, so they are confirmed only if the worker closes the stream before the process
+    //    exits. A sink opened to send one event, as `buck2 rage` does, is always in this case.
     // 2) Stream retries must preserve delivery intent for already-enqueued events.
     //
     // Bazel keeps an "unacked queue" and, after reconnect, replays unacked events with their
@@ -1234,8 +1242,9 @@ impl WorkerState {
         }
     }
 
-    /// A live server acks behind a burst of events, so the cap sits well above the queue a
-    /// healthy stream holds; it is there for a server that takes events and never acks them.
+    /// How many events a stream keeps for replay. A server may hold every acknowledgement until
+    /// the client half-closes the stream, so a healthy stream can pass this; it then keeps
+    /// sending and lets the oldest copies go, which costs it only the ability to replay.
     fn max_unacked(&self) -> usize {
         self.config.buffer_size.saturating_mul(UNACKED_EVENTS_PER_QUEUED_EVENT)
     }
@@ -1327,11 +1336,7 @@ impl WorkerState {
         if !abandoned
             && self.streams[&parsed.invocation_id].pending_unacked.len() > self.max_unacked()
         {
-            self.abandon_stream(
-                &parsed.invocation_id,
-                "unacknowledged events exceed the buffer",
-            );
-            abandoned = true;
+            abandoned = !self.bound_unacked(&parsed.invocation_id);
         }
         if abandoned {
             if close_immediately {
@@ -1450,12 +1455,60 @@ impl WorkerState {
         Ok(())
     }
 
+    /// Brings a stream's `pending_unacked` back to `max_unacked` by dropping the oldest copies
+    /// already sent, and returns whether the stream lives on. A stream that is down needs every
+    /// copy to replay, and events never sent are the only copy, so either way it is abandoned.
+    fn bound_unacked(&mut self, invocation_id: &str) -> bool {
+        let max_unacked = self.max_unacked();
+        let Some(stream) = self.streams.get_mut(invocation_id) else {
+            return false;
+        };
+        stream.prune_acked_requests();
+        if stream.pending_unacked.len() <= max_unacked {
+            return true;
+        }
+        if stream.failing.is_some() {
+            self.abandon_stream(
+                invocation_id,
+                "more events await acknowledgement than the stream can keep while it is down",
+            );
+            return false;
+        }
+        if stream.transport_needs_reopen() {
+            // The server ended the stream since the last flush, and nothing has noticed yet.
+            // These copies are what the reopen replays, so the flush that follows keeps them:
+            // it either replays them or fails the stream, and the next event bounds it.
+            return true;
+        }
+        let first_drop = stream.replay_copies_dropped == 0;
+        if !stream.drop_oldest_replay_copies(max_unacked) {
+            // Only one message that enqueues more than `max_unacked` events gets here, because
+            // a live stream sends everything it holds on each flush.
+            self.abandon_stream(
+                invocation_id,
+                "one message enqueued more events than the stream can keep unacknowledged",
+            );
+            return false;
+        }
+        if first_drop {
+            tracing::info!(
+                "More than {} events of invocation {} await acknowledgement on the BES stream; it keeps sending, and lets go of the oldest copies, so it cannot be replayed until the server acknowledges past them",
+                max_unacked,
+                invocation_id,
+            );
+        }
+        true
+    }
+
     fn stream_failed(&mut self, invocation_id: &str, status: &Status) {
         self.record_status_failure(status);
+        let max_unacked = self.max_unacked();
         let Some(stream) = self.streams.get_mut(invocation_id) else {
             return;
         };
         stream.discard_transport();
+        let replay_copies_dropped = stream.replay_copies_dropped;
+        let replay_has_gap = stream.replay_has_gap();
         let now = Instant::now();
         let failing = stream.failing.get_or_insert_with(|| StreamFailure {
             since: now,
@@ -1468,7 +1521,15 @@ impl WorkerState {
         failing.next_attempt_at = (now + backoff_for(&self.config.retry_backoff, failing.attempts))
             .min(failing.since + self.config.retry_window);
         failing.attempts += 1;
-        if now.duration_since(failing.since) >= self.config.retry_window {
+        if replay_has_gap {
+            // A replay starts at the first unacknowledged event, whose copy is gone.
+            self.abandon_stream(
+                invocation_id,
+                &format!(
+                    "the stream failed after letting go of {replay_copies_dropped} sent but unacknowledged events to keep within {max_unacked}, so it cannot be replayed"
+                ),
+            );
+        } else if now.duration_since(failing.since) >= self.config.retry_window {
             self.abandon_stream(
                 invocation_id,
                 "the stream failed for the whole retry window",
@@ -1478,6 +1539,10 @@ impl WorkerState {
 
     /// Events that arrive for an abandoned invocation are dropped without reconnecting; the
     /// next invocation starts afresh. A reporting sink must not cost the build its memory.
+    ///
+    /// The `dropped` counter takes the events still held here. Replay copies let go of earlier
+    /// were counted as successes when they were sent, and nothing says which of them reached the
+    /// server, so they stay out of it; the warning gives their number instead.
     fn abandon_stream(&mut self, invocation_id: &str, reason: &str) {
         let Some(stream) = self.streams.get_mut(invocation_id) else {
             return;
@@ -1513,6 +1578,20 @@ impl WorkerState {
 
         if !needs_reopen {
             return Ok(());
+        }
+
+        let stream = self
+            .streams
+            .get_mut(invocation_id)
+            .expect("stream exists before reopen");
+        if stream.replay_has_gap() {
+            // The server ended the stream between flushes. Reopening would replay from the
+            // first unacknowledged event, whose copy is gone, and leave a gap the server
+            // rejects; failing here lets `stream_failed` abandon it.
+            return Err(stream
+                .finished_ack_task_status()
+                .await
+                .unwrap_or_else(|| Status::unavailable("BES stream closed")));
         }
 
         self.discard_stream_transport(invocation_id);
@@ -1730,15 +1809,22 @@ impl WorkerState {
                 let Some(stream) = self.streams.get(invocation_id) else {
                     continue;
                 };
-                if stream.last_acked_sequence_number() < *target_sequence_number {
-                    all_acked = false;
-                    if !stream.can_receive_more_acks() {
-                        return Err(Status::unavailable(format!(
-                            "BES stream closed before sequence {} was acknowledged for invocation {}",
-                            target_sequence_number, invocation_id
-                        )));
-                    }
+                let acked = stream.last_acked_sequence_number();
+                if acked >= *target_sequence_number {
+                    continue;
                 }
+                if !stream.can_receive_more_acks() {
+                    return Err(Status::unavailable(format!(
+                        "BES stream closed before sequence {} was acknowledged for invocation {}",
+                        target_sequence_number, invocation_id
+                    )));
+                }
+                // Sequence numbers start at 1, so this stream was never acknowledged, and its
+                // server may be one that acknowledges only at EOF.
+                if acked == 0 {
+                    continue;
+                }
+                all_acked = false;
             }
 
             if all_acked {
@@ -1812,6 +1898,12 @@ struct StreamState {
     failing: Option<StreamFailure>,
     /// The sink gave up on this invocation: events are dropped and nothing reconnects.
     abandoned: bool,
+    /// Sent events whose copies were dropped from `pending_unacked` before they were
+    /// acknowledged, over the stream's life.
+    replay_copies_dropped: u64,
+    /// The sequence number of the newest dropped copy. Until the server acknowledges it, a
+    /// replay would leave a gap, so a failure abandons the stream instead of retrying.
+    newest_dropped_replay_copy: i64,
 }
 
 struct PendingClose {
@@ -1856,6 +1948,8 @@ impl StreamState {
             stream_finished_enqueued: false,
             failing: None,
             abandoned: false,
+            replay_copies_dropped: 0,
+            newest_dropped_replay_copy: 0,
         }
     }
 
@@ -1995,6 +2089,30 @@ impl StreamState {
             self.last_sent_sequence_number = sequence_number;
         }
         Ok(())
+    }
+
+    /// Drops the oldest entries of `pending_unacked` down to `max`, provided they were all sent:
+    /// a server that acknowledges at the end still acknowledges their sequence numbers. Returns
+    /// false, dropping nothing, when the excess includes events never sent.
+    fn drop_oldest_replay_copies(&mut self, max: usize) -> bool {
+        let excess = self.pending_unacked.len().saturating_sub(max);
+        if excess == 0 {
+            return true;
+        }
+        // `pending_unacked` is in sequence order, so the newest entry to drop decides.
+        let newest_dropped = request_sequence_number(&self.pending_unacked[excess - 1]);
+        if newest_dropped > self.last_sent_sequence_number {
+            return false;
+        }
+        self.pending_unacked.drain(..excess);
+        self.replay_copies_dropped += excess as u64;
+        self.newest_dropped_replay_copy = newest_dropped;
+        true
+    }
+
+    /// Whether a replay from the first unacknowledged event would need a copy that is gone.
+    fn replay_has_gap(&self) -> bool {
+        self.last_acked_sequence_number() < self.newest_dropped_replay_copy
     }
 
     fn prune_acked_requests(&mut self) {
@@ -3082,8 +3200,502 @@ mod tests {
         endpoint
     }
 
+    /// Acknowledges nothing until the client half-closes the stream, then every sequence number
+    /// it carried, provided they run from 1 without a gap; BuildBuddy's `postProcessStream` does
+    /// the same. Records each stream's sequence numbers. The first stream fails once it carries
+    /// `fail_first_stream_at`.
+    struct BesThatAcksAtEof {
+        fail_first_stream_at: Option<i64>,
+        streams: Arc<std::sync::Mutex<Vec<Vec<i64>>>>,
+    }
+
+    #[tonic::async_trait]
+    impl PublishBuildEvent for BesThatAcksAtEof {
+        async fn publish_lifecycle_event(
+            &self,
+            _request: tonic::Request<PublishLifecycleEventRequest>,
+        ) -> Result<tonic::Response<()>, Status> {
+            Ok(tonic::Response::new(()))
+        }
+
+        type PublishBuildToolEventStreamStream =
+            ReceiverStream<Result<PublishBuildToolEventStreamResponse, Status>>;
+
+        async fn publish_build_tool_event_stream(
+            &self,
+            request: tonic::Request<tonic::Streaming<PublishBuildToolEventStreamRequest>>,
+        ) -> Result<tonic::Response<Self::PublishBuildToolEventStreamStream>, Status> {
+            let mut inbound = request.into_inner();
+            let (tx, rx) = mpsc::channel(16);
+            let index = {
+                let mut streams = self.streams.lock().unwrap();
+                streams.push(Vec::new());
+                streams.len() - 1
+            };
+            let fail_at = self.fail_first_stream_at.filter(|_| index == 0);
+            let streams = self.streams.clone();
+            tokio::spawn(async move {
+                let mut stream_id = None;
+                loop {
+                    match inbound.message().await {
+                        Ok(Some(request)) => {
+                            let sequence_number = request_sequence_number(&request);
+                            stream_id = request
+                                .ordered_build_event
+                                .and_then(|ordered| ordered.stream_id);
+                            streams.lock().unwrap()[index].push(sequence_number);
+                            if fail_at == Some(sequence_number) {
+                                drop(tx.send(Err(Status::unavailable("injected failure"))).await);
+                                return;
+                            }
+                        }
+                        Ok(None) => break,
+                        Err(_) => return,
+                    }
+                }
+                let received = streams.lock().unwrap()[index].clone();
+                if received.iter().copied().ne(1..=received.len() as i64) {
+                    drop(
+                        tx.send(Err(Status::unknown("event sequence number mismatch")))
+                            .await,
+                    );
+                    return;
+                }
+                for sequence_number in received {
+                    let response = PublishBuildToolEventStreamResponse {
+                        stream_id: stream_id.clone(),
+                        sequence_number,
+                    };
+                    if tx.send(Ok(response)).await.is_err() {
+                        return;
+                    }
+                }
+            });
+            Ok(tonic::Response::new(ReceiverStream::new(rx)))
+        }
+    }
+
+    async fn serve_bes_that_acks_at_eof(
+        fail_first_stream_at: Option<i64>,
+    ) -> (String, Arc<std::sync::Mutex<Vec<Vec<i64>>>>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let endpoint = format!("http://{}", listener.local_addr().expect("local addr"));
+        let streams = Arc::new(std::sync::Mutex::new(Vec::new()));
+        tokio::spawn(
+            tonic::transport::Server::builder()
+                .add_service(PublishBuildEventServer::new(BesThatAcksAtEof {
+                    fail_first_stream_at,
+                    streams: streams.clone(),
+                }))
+                .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener)),
+        );
+        (endpoint, streams)
+    }
+
+    /// Acknowledges each event up to sequence number `acks` as it arrives, then keeps the stream
+    /// open and acknowledges nothing more.
+    struct BesThatWithholdsAcks {
+        acks: i64,
+    }
+
+    #[tonic::async_trait]
+    impl PublishBuildEvent for BesThatWithholdsAcks {
+        async fn publish_lifecycle_event(
+            &self,
+            _request: tonic::Request<PublishLifecycleEventRequest>,
+        ) -> Result<tonic::Response<()>, Status> {
+            Ok(tonic::Response::new(()))
+        }
+
+        type PublishBuildToolEventStreamStream =
+            ReceiverStream<Result<PublishBuildToolEventStreamResponse, Status>>;
+
+        async fn publish_build_tool_event_stream(
+            &self,
+            request: tonic::Request<tonic::Streaming<PublishBuildToolEventStreamRequest>>,
+        ) -> Result<tonic::Response<Self::PublishBuildToolEventStreamStream>, Status> {
+            let mut inbound = request.into_inner();
+            let (tx, rx) = mpsc::channel(16);
+            let acks = self.acks;
+            tokio::spawn(async move {
+                while let Ok(Some(request)) = inbound.message().await {
+                    let sequence_number = request_sequence_number(&request);
+                    if sequence_number > acks {
+                        continue;
+                    }
+                    let response = PublishBuildToolEventStreamResponse {
+                        stream_id: request
+                            .ordered_build_event
+                            .and_then(|ordered| ordered.stream_id),
+                        sequence_number,
+                    };
+                    if tx.send(Ok(response)).await.is_err() {
+                        break;
+                    }
+                }
+            });
+            Ok(tonic::Response::new(ReceiverStream::new(rx)))
+        }
+    }
+
+    async fn serve_bes_that_withholds_acks(acks: i64) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let endpoint = format!("http://{}", listener.local_addr().expect("local addr"));
+        tokio::spawn(
+            tonic::transport::Server::builder()
+                .add_service(PublishBuildEventServer::new(BesThatWithholdsAcks { acks }))
+                .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener)),
+        );
+        endpoint
+    }
+
+    fn action_start_data() -> buck2_data::buck_event::Data {
+        buck2_data::buck_event::Data::SpanStart(buck2_data::SpanStartEvent {
+            data: Some(buck2_data::span_start_event::Data::ActionExecution(
+                buck2_data::ActionExecutionStart::default(),
+            )),
+        })
+    }
+
+    fn command_end_data() -> buck2_data::buck_event::Data {
+        buck2_data::buck_event::Data::SpanEnd(buck2_data::SpanEndEvent {
+            data: Some(buck2_data::CommandEnd::default().into()),
+            ..Default::default()
+        })
+    }
+
+    fn worker_for(endpoint: String) -> (WorkerState, Arc<CounterState>) {
+        let config = BesConfig {
+            buffer_size: 3,
+            retry_backoff: Duration::from_millis(20),
+            retry_window: Duration::from_secs(5),
+            grpc_timeout: Duration::from_secs(2),
+            ..BesConfig::default()
+        };
+        let connection = ConnectionConfig {
+            endpoint,
+            headers: Vec::new(),
+            tls: BesTls::default(),
+            credential_helper: None,
+        };
+        let counters = Arc::new(CounterState::default());
+        (
+            WorkerState::new(config, connection, counters.clone()),
+            counters,
+        )
+    }
+
+    async fn send_queued_ok(
+        worker: &mut WorkerState,
+        trace_id: &str,
+        data: buck2_data::buck_event::Data,
+    ) {
+        let message = make_message(Some(trace_id), Some(1), data);
+        assert!(
+            worker
+                .send_message_with_retry(&message, false)
+                .await
+                .is_ok(),
+            "queued sends never fail the command"
+        );
+        // The server and the ack task share this test's thread.
+        tokio::task::yield_now().await;
+    }
+
+    fn failures(counters: &CounterState) -> u64 {
+        let c = counters.snapshot();
+        c.failures_invalid_request
+            + c.failures_unauthorized
+            + c.failures_rate_limited
+            + c.failures_pushed_back
+            + c.failures_enqueue_failed
+            + c.failures_internal_error
+            + c.failures_timed_out
+            + c.failures_unknown
+    }
+
     #[tokio::test]
-    async fn stream_that_stops_acking_is_abandoned_within_bounds() {
+    async fn stream_acked_only_at_eof_delivers_every_event_past_the_bound() {
+        let (endpoint, streams) = serve_bes_that_acks_at_eof(None).await;
+        let (mut worker, counters) = worker_for(endpoint);
+        let bound = worker.max_unacked();
+        let trace_id = TraceId::new().to_string();
+
+        send_queued_ok(&mut worker, &trace_id, command_start_data()).await;
+        let invocation_id = worker.streams.keys().next().expect("stream opened").clone();
+        let actions = 3 * bound;
+        for _ in 0..actions {
+            send_queued_ok(&mut worker, &trace_id, action_start_data()).await;
+            let stream = &worker.streams[&invocation_id];
+            assert!(
+                !stream.abandoned,
+                "a stream that is not acked yet was abandoned"
+            );
+            assert_eq!(stream.last_acked_sequence_number(), 0);
+            let pending = stream.pending_unacked.len();
+            assert!(pending <= bound, "{pending} events held, bound is {bound}");
+        }
+        assert_eq!(
+            worker.streams[&invocation_id].replay_copies_dropped,
+            (1 + actions - bound) as u64
+        );
+        send_queued_ok(&mut worker, &trace_id, command_end_data()).await;
+        send_queued_ok(&mut worker, &trace_id, invocation_record_data()).await;
+
+        assert!(
+            !worker.streams.contains_key(&invocation_id),
+            "the record closes the stream once every event is acknowledged"
+        );
+        // Every message, the stream's finish event, and nothing twice.
+        let events = (1 + actions + 2 + 1) as i64;
+        assert_eq!(
+            *streams.lock().unwrap(),
+            vec![(1..=events).collect::<Vec<_>>()]
+        );
+        assert_eq!(counters.snapshot().successes, (events - 1) as u64);
+        assert_eq!(counters.snapshot().dropped, 0);
+        assert_eq!(failures(&counters), 0);
+    }
+
+    #[tokio::test]
+    async fn send_messages_now_does_not_wait_for_a_server_that_acks_only_at_eof() {
+        let (endpoint, streams) = serve_bes_that_acks_at_eof(None).await;
+        let config = BesConfig {
+            bes_backend: Some(endpoint.replacen("http://", "grpc://", 1)),
+            grpc_timeout: Duration::from_secs(1),
+            ..BesConfig::default()
+        };
+        let ack_timeout = close_ack_timeout(config.grpc_timeout);
+        // SAFETY: `BesClient::new` ignores the token, which outside fbcode stands for nothing.
+        let client = BesClient::new(unsafe { fbinit::assume_init() }, config).expect("client");
+        let trace_id = TraceId::new().to_string();
+        let messages = vec![
+            make_message(Some(&trace_id), Some(1), command_start_data()),
+            make_message(Some(&trace_id), Some(1), action_start_data()),
+        ];
+
+        let sent =
+            tokio::time::timeout(Duration::from_secs(5), client.send_messages_now(messages)).await;
+        let Ok(sent) = sent else {
+            panic!(
+                "send_messages_now waited for acknowledgements the server sends only at EOF \
+                 (close_ack_timeout {ack_timeout:?})"
+            );
+        };
+        sent.expect("events sent");
+        client.close_all_streams().await.expect("streams closed");
+
+        // Both events and the stream's finish event, each acknowledged at EOF: the server
+        // acknowledges only a stream without a gap, and closing fails on a missing one.
+        assert_eq!(*streams.lock().unwrap(), vec![vec![1, 2, 3]]);
+        assert_eq!(failures(&client.counters), 0);
+        assert_eq!(client.counters.snapshot().dropped, 0);
+    }
+
+    #[tokio::test]
+    async fn wait_for_acks_waits_on_a_stream_that_was_acknowledged_before() {
+        let endpoint = serve_bes_that_withholds_acks(1).await;
+        let (mut worker, _counters) = worker_for(endpoint);
+        let trace_id = TraceId::new().to_string();
+
+        send_queued_ok(&mut worker, &trace_id, command_start_data()).await;
+        let invocation_id = worker.streams.keys().next().expect("stream opened").clone();
+        let acked = tokio::time::timeout(Duration::from_secs(5), async {
+            while worker.streams[&invocation_id].last_acked_sequence_number() < 1 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+        assert!(acked.is_ok(), "the server did not ack the command start");
+
+        let message = make_message(Some(&trace_id), Some(1), action_start_data());
+        let target = worker
+            .send_message_with_retry(&message, true)
+            .await
+            .expect("sent")
+            .expect("the event has a sequence number");
+        assert_eq!(target, (invocation_id, 2));
+        let waited = tokio::time::timeout(
+            Duration::from_millis(500),
+            worker.wait_for_acks(&HashMap::from([target])),
+        )
+        .await;
+        assert!(
+            waited.is_err(),
+            "returned {waited:?} for an event an acknowledging server has not acknowledged"
+        );
+    }
+
+    #[tokio::test]
+    async fn stream_that_fails_after_dropping_replay_copies_is_abandoned() {
+        let (endpoint, streams) = serve_bes_that_acks_at_eof(Some(60)).await;
+        let (mut worker, counters) = worker_for(endpoint);
+        let bound = worker.max_unacked();
+        assert!(bound < 60, "the stream must overflow before it fails");
+        let trace_id = TraceId::new().to_string();
+
+        send_queued_ok(&mut worker, &trace_id, command_start_data()).await;
+        let invocation_id = worker.streams.keys().next().expect("stream opened").clone();
+        let abandoned = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                send_queued_ok(&mut worker, &trace_id, action_start_data()).await;
+                let stream = &worker.streams[&invocation_id];
+                let pending = stream.pending_unacked.len();
+                assert!(pending <= bound, "{pending} events held, bound is {bound}");
+                if stream.abandoned {
+                    return;
+                }
+                if stream.next_sequence_number > 60 {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            }
+        })
+        .await;
+        assert!(abandoned.is_ok(), "stream not abandoned after it failed");
+
+        let stream = &worker.streams[&invocation_id];
+        assert!(stream.replay_copies_dropped > 0);
+        assert!(stream.pending_unacked.is_empty());
+        assert!(stream.sender.is_none() && stream.ack_task.is_none());
+        assert_eq!(
+            streams.lock().unwrap().len(),
+            1,
+            "a stream that dropped replay copies must not be replayed"
+        );
+        let dropped_before = counters.snapshot().dropped;
+        send_queued_ok(&mut worker, &trace_id, action_start_data()).await;
+        assert_eq!(counters.snapshot().dropped - dropped_before, 1);
+    }
+
+    #[tokio::test]
+    async fn stream_that_fails_within_the_bound_replays_from_the_first_unacknowledged_event() {
+        let (endpoint, streams) = serve_bes_that_acks_at_eof(Some(5)).await;
+        let (mut worker, counters) = worker_for(endpoint);
+        let trace_id = TraceId::new().to_string();
+
+        send_queued_ok(&mut worker, &trace_id, command_start_data()).await;
+        let invocation_id = worker.streams.keys().next().expect("stream opened").clone();
+        let actions = 10;
+        for _ in 0..actions {
+            send_queued_ok(&mut worker, &trace_id, action_start_data()).await;
+        }
+        let failed = tokio::time::timeout(Duration::from_secs(5), async {
+            while streams.lock().unwrap()[0].last() != Some(&5) {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+        assert!(failed.is_ok(), "the server did not fail the first stream");
+        // Past the backoff of the stream's first failure, if the sink saw it yet.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        send_queued_ok(&mut worker, &trace_id, command_end_data()).await;
+        send_queued_ok(&mut worker, &trace_id, invocation_record_data()).await;
+        // A send that meets the failure backs off without closing; the worker's poll loop
+        // closes the stream after it.
+        let closed = tokio::time::timeout(Duration::from_secs(5), async {
+            while worker.streams.contains_key(&invocation_id) {
+                worker.close_due_streams().await;
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        assert!(
+            closed.is_ok(),
+            "the replayed stream closes once every event is acknowledged"
+        );
+        let events = (1 + actions + 2 + 1) as i64;
+        assert_eq!(
+            *streams.lock().unwrap(),
+            vec![
+                (1..=5).collect::<Vec<_>>(),
+                (1..=events).collect::<Vec<_>>()
+            ]
+        );
+        assert_eq!(counters.snapshot().dropped, 0);
+    }
+
+    #[tokio::test]
+    async fn stream_whose_server_ends_it_at_the_bound_replays_before_dropping_copies() {
+        let (endpoint, streams) = serve_bes_that_acks_at_eof(Some(30)).await;
+        let (mut worker, counters) = worker_for(endpoint);
+        let bound = worker.max_unacked();
+        assert_eq!(bound, 30, "the server ends the first stream at the bound");
+        let trace_id = TraceId::new().to_string();
+
+        send_queued_ok(&mut worker, &trace_id, command_start_data()).await;
+        let invocation_id = worker.streams.keys().next().expect("stream opened").clone();
+        let actions = 2 * bound;
+        for _ in 1..bound {
+            send_queued_ok(&mut worker, &trace_id, action_start_data()).await;
+        }
+        let ended = tokio::time::timeout(Duration::from_secs(5), async {
+            while !worker.streams[&invocation_id].transport_needs_reopen() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+        assert!(ended.is_ok(), "the server did not end the first stream");
+        assert!(worker.streams[&invocation_id].failing.is_none());
+        for _ in bound..=actions {
+            send_queued_ok(&mut worker, &trace_id, action_start_data()).await;
+            assert!(!worker.streams[&invocation_id].abandoned);
+        }
+        send_queued_ok(&mut worker, &trace_id, command_end_data()).await;
+        send_queued_ok(&mut worker, &trace_id, invocation_record_data()).await;
+
+        assert!(
+            !worker.streams.contains_key(&invocation_id),
+            "the replayed stream closes once every event is acknowledged"
+        );
+        let events = (1 + actions + 2 + 1) as i64;
+        assert_eq!(
+            *streams.lock().unwrap(),
+            vec![
+                (1..=bound as i64).collect::<Vec<_>>(),
+                (1..=events).collect::<Vec<_>>()
+            ]
+        );
+        assert_eq!(counters.snapshot().dropped, 0);
+    }
+
+    #[tokio::test]
+    async fn stream_is_replayable_again_once_acks_pass_its_dropped_copies() {
+        let message = make_message(
+            Some(&TraceId::new().to_string()),
+            Some(1),
+            command_start_data(),
+        );
+        let parsed = ParsedMessage::from_message(&message).expect("valid message");
+        let mut stream = StreamState::new(&parsed, &[], None, true);
+        for _ in 0..10 {
+            stream.enqueue_event(&parsed, BesEventFormat::Buck).await;
+        }
+        let held = stream.pending_unacked.len() as i64;
+        stream.last_sent_sequence_number = held;
+
+        assert!(stream.drop_oldest_replay_copies(6));
+        let newest_dropped = held - 6;
+        assert_eq!(
+            request_sequence_number(&stream.pending_unacked[0]),
+            newest_dropped + 1
+        );
+        assert!(stream.replay_has_gap());
+        stream
+            .last_acked_sequence_number
+            .store(newest_dropped - 1, Ordering::Relaxed);
+        assert!(stream.replay_has_gap());
+        stream
+            .last_acked_sequence_number
+            .store(newest_dropped, Ordering::Relaxed);
+        assert!(!stream.replay_has_gap());
+    }
+
+    #[tokio::test]
+    async fn stream_whose_server_goes_away_is_abandoned_within_bounds() {
         let endpoint = serve_bes_that_stops_acking(3).await;
         let config = BesConfig {
             buffer_size: 3,
@@ -3113,13 +3725,6 @@ mod tests {
             assert!(result.is_ok(), "queued sends never fail the command");
             started.elapsed()
         }
-        let action_start = || {
-            buck2_data::buck_event::Data::SpanStart(buck2_data::SpanStartEvent {
-                data: Some(buck2_data::span_start_event::Data::ActionExecution(
-                    buck2_data::ActionExecutionStart::default(),
-                )),
-            })
-        };
         let per_message_retry_cost = (0..=config.retry_attempts)
             .map(|attempt| backoff_for(&config.retry_backoff, attempt))
             .sum::<Duration>();
@@ -3140,7 +3745,7 @@ mod tests {
         );
         let cap = config.buffer_size * UNACKED_EVENTS_PER_QUEUED_EVENT;
         for _ in 0..(2 * cap) {
-            slowest = slowest.max(send_queued(&mut worker, &trace_id, action_start()).await);
+            slowest = slowest.max(send_queued(&mut worker, &trace_id, action_start_data()).await);
             // The server and the ack task share this test's thread; without a yield the burst
             // would starve them and measure that starvation instead of the dead server.
             tokio::task::yield_now().await;
@@ -3159,18 +3764,8 @@ mod tests {
         assert!(stream.pending_unacked.is_empty());
         assert!(stream.sender.is_none() && stream.ack_task.is_none());
         let dropped_before = counters.snapshot().dropped;
-        slowest = slowest.max(send_queued(&mut worker, &trace_id, action_start()).await);
-        slowest = slowest.max(
-            send_queued(
-                &mut worker,
-                &trace_id,
-                buck2_data::buck_event::Data::SpanEnd(buck2_data::SpanEndEvent {
-                    data: Some(buck2_data::CommandEnd::default().into()),
-                    ..Default::default()
-                }),
-            )
-            .await,
-        );
+        slowest = slowest.max(send_queued(&mut worker, &trace_id, action_start_data()).await);
+        slowest = slowest.max(send_queued(&mut worker, &trace_id, command_end_data()).await);
         slowest = slowest.max(send_queued(&mut worker, &trace_id, invocation_record_data()).await);
         assert_eq!(counters.snapshot().dropped - dropped_before, 3);
         assert!(
@@ -3200,13 +3795,6 @@ mod tests {
         let counters = Arc::new(CounterState::default());
         let mut worker = WorkerState::new(config, connection, counters.clone());
         let trace_id = TraceId::new().to_string();
-        let action_start = || {
-            buck2_data::buck_event::Data::SpanStart(buck2_data::SpanStartEvent {
-                data: Some(buck2_data::span_start_event::Data::ActionExecution(
-                    buck2_data::ActionExecutionStart::default(),
-                )),
-            })
-        };
         let message = make_message(Some(&trace_id), Some(1), command_start_data());
         let parsed = ParsedMessage::from_message(&message).expect("valid message");
 
@@ -3219,7 +3807,7 @@ mod tests {
         let failures_after_first = counters.snapshot().failures_pushed_back;
         assert_eq!(failures_after_first, 1);
         let started = Instant::now();
-        let message = make_message(Some(&trace_id), Some(1), action_start());
+        let message = make_message(Some(&trace_id), Some(1), action_start_data());
         assert!(
             worker
                 .send_message_with_retry(&message, false)
@@ -3240,7 +3828,7 @@ mod tests {
         );
 
         tokio::time::sleep(Duration::from_millis(120)).await;
-        let message = make_message(Some(&trace_id), Some(1), action_start());
+        let message = make_message(Some(&trace_id), Some(1), action_start_data());
         assert!(
             worker
                 .send_message_with_retry(&message, false)
@@ -3255,7 +3843,7 @@ mod tests {
         );
         assert!(stream.pending_unacked.is_empty());
         assert_eq!(counters.snapshot().dropped, 3);
-        let message = make_message(Some(&trace_id), Some(1), action_start());
+        let message = make_message(Some(&trace_id), Some(1), action_start_data());
         assert!(
             worker
                 .send_message_with_retry(&message, false)
