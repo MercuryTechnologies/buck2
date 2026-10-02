@@ -67,6 +67,17 @@ Keys supported include:
   blobs. When set with `remote_cache_chunking`, Buck2 checks this directory
   before downloading chunks from remote CAS and writes validated chunks after
   chunked uploads or downloads. The directory is managed by the user.
+- `find_missing_blobs_batch_size` - the most digests Buck2 asks about in one
+  `FindMissingBlobs` request before an upload. Defaults to 1000, about 73 KB of
+  SHA-256 digests. A value above `find_missing_blobs_max_digests_in_flight` is
+  lowered to it.
+- `find_missing_blobs_concurrency` - how many `FindMissingBlobs` requests one
+  upload keeps in flight when its digests span several batches. Defaults to 16.
+- `find_missing_blobs_max_digests_in_flight` - the most digests in flight in
+  `FindMissingBlobs` requests across the whole daemon, shared by every upload.
+  Defaults to 100000. A request waits until there is room for all its digests.
+  The limit counts digests, not requests, so it bounds the server's work but not
+  the number of streams open on the CAS connection.
 - `queued_operation_timeout_secs` - how long an operation may stay `QUEUED`
   before Buck2 sends the action's `Execute` again, in seconds. Defaults to 900
   (15 minutes); 0 turns it off. Each wait gets up to a quarter more at random,
