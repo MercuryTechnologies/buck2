@@ -76,6 +76,12 @@ impl BuildGraphStats {
                 bazel_artifact_uri_authority: None,
                 #[cfg(not(fbcode_build))]
                 bazel_artifact_upload_max_bytes: 10 * 1024 * 1024,
+                #[cfg(not(fbcode_build))]
+                upload_event_log: false,
+                #[cfg(not(fbcode_build))]
+                event_log_dir: None,
+                #[cfg(not(fbcode_build))]
+                event_log_upload_timeout: Duration::from_secs(30),
             },
         );
 

@@ -175,6 +175,31 @@ impl EventLogOptions {
                         .spawn()?,
                 )
             }
+            #[cfg(not(fbcode_build))]
+            LogDownloadMethod::Bes => {
+                let config = crate::remote_sink_config::event_log_download_config(ctx.paths()?)?;
+                crate::eprintln!(
+                    "Fetching the event log of {} from the Build Event Service backend ({})",
+                    trace_id,
+                    config.lookup_backend
+                )?;
+                let downloaded = buck2_events::sink::bes_event_log::download_event_log(
+                    &config,
+                    &trace_id.to_string(),
+                    temp_path.path().as_path(),
+                )
+                .await?;
+                if !downloaded.complete {
+                    crate::eprintln!(
+                        "warning: the build's client had not finished writing this log when it was attached; pass --incomplete if a command stops at its end"
+                    )?;
+                }
+                return Self::keep_download(temp_path, log_path);
+            }
+            #[cfg(fbcode_build)]
+            LogDownloadMethod::Bes => {
+                return Err(EventLogOptionsError::LogNotFoundLocally(trace_id.dupe()).into());
+            }
             LogDownloadMethod::None => {
                 return Err(EventLogOptionsError::LogNotFoundLocally(trace_id.dupe()).into());
             }
@@ -190,6 +215,15 @@ impl EventLogOptions {
             .into());
         }
 
+        Self::keep_download(temp_path, log_path)
+    }
+
+    /// Moves a finished download to the name later runs look for, so the next command reads it
+    /// locally. A download is only ever renamed into place whole.
+    fn keep_download(
+        temp_path: TempPath,
+        log_path: buck2_fs::paths::abs_norm_path::AbsNormPathBuf,
+    ) -> buck2_error::Result<AbsPathBuf> {
         fs_util::create_dir_all(
             log_path
                 .parent()

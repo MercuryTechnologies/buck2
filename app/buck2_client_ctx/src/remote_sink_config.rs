@@ -15,9 +15,9 @@ use buck2_credential_helper::CredentialHelperSettings;
 use buck2_error::ErrorTag;
 #[cfg(not(fbcode_build))]
 use buck2_events::sink::remote::BesEventFormat;
-use buck2_events::sink::remote::RemoteEventConfig;
 #[cfg(not(fbcode_build))]
 use buck2_events::sink::remote::BesTls;
+use buck2_events::sink::remote::RemoteEventConfig;
 
 #[cfg(not(fbcode_build))]
 struct BuckconfigBesSettings {
@@ -330,6 +330,135 @@ where
     Ok(headers)
 }
 
+/// How `buck2 log --trace-id` reads a log from the Build Event Service backend, from the keys
+/// the daemon's sink reads: `[bes] event_log_lookup` picks the lookup, which asks
+/// `[bes] event_log_lookup_backend` or else the BES backend; the log is then read from the
+/// sink's artifact upload endpoint, `[bes] bazel_artifact_upload_backend` or else the CAS of
+/// `[buck2_re_client]`, with the sink's headers and TLS settings.
+#[cfg(not(fbcode_build))]
+pub fn event_log_download_config(
+    paths: &InvocationPaths,
+) -> buck2_error::Result<buck2_events::sink::bes_event_log::EventLogDownloadConfig> {
+    use buck2_common::legacy_configs::cells::BuckConfigBasedCells;
+
+    let fs = paths.project_root();
+    let legacy_cells =
+        futures::executor::block_on(BuckConfigBasedCells::parse_with_config_args(fs, &[]))?;
+    let cells = &legacy_cells.cell_resolver;
+    let root_config =
+        futures::executor::block_on(legacy_cells.parse_single_cell(cells.root_cell(), fs))?;
+    event_log_download_config_from(&root_config, paths.buck_out_path().as_path())
+}
+
+/// `daemon_dir` is the daemon's working directory, which relative certificate paths are read
+/// from.
+#[cfg(not(fbcode_build))]
+fn event_log_download_config_from(
+    root_config: &buck2_common::legacy_configs::configs::LegacyBuckConfig,
+    daemon_dir: &std::path::Path,
+) -> buck2_error::Result<buck2_events::sink::bes_event_log::EventLogDownloadConfig> {
+    use buck2_common::legacy_configs::key::BuckconfigKeyRef;
+    use buck2_events::sink::bes_event_log::EventLogDownloadConfig;
+    use buck2_events::sink::bes_event_log::EventLogLookup;
+    use buck2_events::sink::remote::expand_bes_config_env_vars;
+
+    let get = |property: &'static str| {
+        root_config
+            .get(BuckconfigKeyRef {
+                section: "bes",
+                property,
+            })
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+    };
+    let missing = |what: &str| {
+        buck2_error::buck2_error!(
+            ErrorTag::Input,
+            "`buck2 log --trace-id` cannot read logs from the Build Event Service backend: {what}"
+        )
+    };
+
+    let lookup: EventLogLookup = get("event_log_lookup")
+        .ok_or_else(|| missing("`[bes] event_log_lookup` is not set"))?
+        .parse()?;
+    let connection = match get("connection").as_deref() {
+        Some("re_client") => buck2_re_configuration::BesConnection::from_re_client(&root_config)?,
+        _ => None,
+    };
+    let bes_backend = get("backend").or_else(|| connection.as_ref().map(|c| c.backend.clone()));
+    let lookup_backend = get("event_log_lookup_backend")
+        .or_else(|| bes_backend.clone())
+        .ok_or_else(|| missing("no `[bes] backend` or `connection`"))?;
+    let re_client_cas = root_config
+        .parse::<String>(BuckconfigKeyRef {
+            section: "buck2_re_client",
+            property: "cas_address",
+        })?
+        .map(|address| match address.split_once("://") {
+            Some(("http" | "grpc", host)) => format!("grpc://{host}"),
+            Some((_, host)) => format!("grpcs://{host}"),
+            None => format!("grpcs://{address}"),
+        });
+    let cas_backend = get("bazel_artifact_upload_backend")
+        .or_else(|| connection.as_ref().and_then(|c| c.cas_backend.clone()))
+        .or(re_client_cas)
+        .or(bes_backend)
+        .ok_or_else(|| missing("no CAS address"))?;
+
+    let mut headers = parse_bes_headers(root_config.parse_list::<String>(BuckconfigKeyRef {
+        section: "bes",
+        property: "header",
+    })?)?;
+    let mut credential_helper = None;
+    if headers.is_empty() {
+        if let Some(connection) = &connection {
+            headers = connection
+                .headers
+                .iter()
+                .map(|(k, v)| (k.clone(), expand_bes_config_env_vars(v)))
+                .collect();
+            credential_helper = connection.credential_helper.clone();
+        }
+    }
+    // The daemon reads these paths from its working directory, buck-out/<isolation dir>, and
+    // repositories write them relative to it; this process may run anywhere.
+    let resolve = |path: Option<String>| {
+        path.map(|path| {
+            let expanded = expand_bes_config_env_vars(&path);
+            if std::path::Path::new(&expanded).is_relative() {
+                daemon_dir.join(expanded).to_string_lossy().into_owned()
+            } else {
+                expanded
+            }
+        })
+    };
+    let tls = connection
+        .as_ref()
+        .map(|connection| BesTls {
+            client_cert: resolve(connection.tls_client_cert.clone()),
+            ca_certs: resolve(connection.tls_ca_certs.clone()),
+        })
+        .unwrap_or_default();
+
+    Ok(EventLogDownloadConfig {
+        lookup,
+        lookup_backend,
+        cas_backend,
+        instance_name: get("bazel_artifact_upload_instance_name")
+            .or(root_config.parse(BuckconfigKeyRef {
+                section: "buck2_re_client",
+                property: "instance_name",
+            })?)
+            .unwrap_or_default(),
+        headers,
+        tls,
+        credential_helper,
+        timeout: std::time::Duration::from_secs(30),
+        results_url: get("results_url"),
+    })
+}
+
 #[cfg(not(fbcode_build))]
 fn parse_bes_build_metadata(
     raw_entries: Option<Vec<String>>,
@@ -438,5 +567,59 @@ mod tests {
             "BUILDBUDDY_RUN_ID" => Some("run-id".to_owned()),
             _ => None,
         }
+    }
+
+    fn download_config(
+        config: &str,
+    ) -> buck2_error::Result<buck2_events::sink::bes_event_log::EventLogDownloadConfig> {
+        let config =
+            buck2_common::legacy_configs::configs::testing::parse(&[("config", config)], "config")?;
+        event_log_download_config_from(&config, std::path::Path::new("/repo/buck-out/v2"))
+    }
+
+    /// A checked-in config of this shape: the sink's connection reused, an explicit header, a CA path
+    /// relative to the daemon's directory.
+    #[test]
+    fn event_log_download_reads_what_the_sink_reads() {
+        let config = download_config(
+            "[bes]\nconnection = re_client\nheader = x-key=literal\nevent_log_lookup = buildbuddy_api\nresults_url = https://bb.example/invocation/\n\
+             [buck2_re_client]\nengine_address = grpc://re.example:443\ncas_address = grpc://cas.example:443\ntls = true\ntls_ca_certs = ../../ca.crt\nhttp_headers = x-key: $UNUSED\n",
+        )
+        .unwrap();
+        assert_eq!(config.lookup_backend, "grpcs://re.example:443");
+        assert_eq!(config.cas_backend, "grpcs://cas.example:443");
+        assert_eq!(
+            config.headers,
+            vec![("x-key".to_owned(), "literal".to_owned())]
+        );
+        assert_eq!(
+            config.tls.ca_certs.as_deref(),
+            Some("/repo/buck-out/v2/../../ca.crt")
+        );
+        assert_eq!(
+            config.results_url.as_deref(),
+            Some("https://bb.example/invocation/")
+        );
+    }
+
+    #[test]
+    fn event_log_download_takes_explicit_endpoints_over_the_connection() {
+        let config = download_config(
+            "[bes]\nbackend = grpcs://bes.example\nevent_log_lookup = buildbuddy_api\nevent_log_lookup_backend = grpcs://api.example\nbazel_artifact_upload_backend = grpcs://upload.example\nbazel_artifact_upload_instance_name = main\n",
+        )
+        .unwrap();
+        assert_eq!(config.lookup_backend, "grpcs://api.example");
+        assert_eq!(config.cas_backend, "grpcs://upload.example");
+        assert_eq!(config.instance_name, "main");
+    }
+
+    #[test]
+    fn event_log_download_needs_a_lookup() {
+        let err = download_config("[bes]\nbackend = grpcs://bes.example\n").unwrap_err();
+        assert!(format!("{err:#}").contains("event_log_lookup"), "{err:#}");
+        let err =
+            download_config("[bes]\nbackend = grpcs://bes.example\nevent_log_lookup = scan\n")
+                .unwrap_err();
+        assert!(format!("{err:#}").contains("buildbuddy_api"), "{err:#}");
     }
 }

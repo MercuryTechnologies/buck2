@@ -63,6 +63,7 @@ use tonic::transport::Identity;
 
 use crate::sink::bazel_converter::BazelEventConverter;
 use crate::sink::bazel_converter::encode_bep_event;
+use crate::sink::bazel_converter::build_tool_logs_event;
 use crate::sink::bazel_converter::interrupted_finish_event;
 
 const BUCK2_EVENT_TYPE_URL: &str = "type.googleapis.com/buck.data.BuckEvent";
@@ -72,6 +73,13 @@ const CLOSE_ACK_TIMEOUT_MULTIPLIER: u32 = 30;
 const MIN_CLOSE_ACK_TIMEOUT: Duration = Duration::from_secs(30);
 const COMMAND_END_CLOSE_GRACE: Duration = Duration::from_millis(500);
 const COMMAND_END_CLOSE_POLL_INTERVAL: Duration = Duration::from_millis(100);
+/// A command that has not ended, whose client is gone (its event log finished) and whose daemon
+/// has sent nothing for this long, was interrupted; see `client_gone_without_command_end`.
+const CLIENT_GONE_QUIET: Duration = Duration::from_secs(10);
+const CLIENT_GONE_CHECK_INTERVAL: Duration = Duration::from_secs(1);
+/// How many invocations closed as interrupted are remembered, so that events their cancelled
+/// command still sends are dropped instead of opening a second stream for them.
+const INTERRUPTED_INVOCATIONS_KEPT: usize = 1024;
 const DEFAULT_BAZEL_ARTIFACT_UPLOAD_MAX_BYTES: usize = 10 * 1024 * 1024;
 
 #[derive(Clone, Debug)]
@@ -100,6 +108,17 @@ pub struct BesConfig {
     pub re_client_instance_name: Option<String>,
     pub bazel_artifact_uri_authority: Option<String>,
     pub bazel_artifact_upload_max_bytes: usize,
+    /// `[bes] upload_event_log`: at the end of each command, write the client's event log to
+    /// the CAS and name it by digest in the stream's `BuildToolLogs`, so `buck2 log
+    /// --trace-id` can read it back from any machine that reaches the backend. Needs
+    /// `event_format = bazel` and an artifact upload endpoint.
+    pub upload_event_log: bool,
+    /// Where the client writes event logs (`buck-out/<isolation dir>/log`). Set by the daemon
+    /// when `upload_event_log` is on.
+    pub event_log_dir: Option<PathBuf>,
+    /// How long after `CommandEnd` the stream waits for the client to finish writing the log
+    /// before it attaches what has been written so far.
+    pub event_log_upload_timeout: Duration,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -132,6 +151,9 @@ impl Default for BesConfig {
             re_client_instance_name: None,
             bazel_artifact_uri_authority: None,
             bazel_artifact_upload_max_bytes: DEFAULT_BAZEL_ARTIFACT_UPLOAD_MAX_BYTES,
+            upload_event_log: false,
+            event_log_dir: None,
+            event_log_upload_timeout: Duration::from_secs(30),
         }
     }
 }
@@ -639,6 +661,43 @@ impl BazelArtifactUploader {
         Some((uri, format!("{hash}:{size}"), size))
     }
 
+    /// Writes the first `size` bytes of `path` to the CAS in requests of `chunk_size`, for a file
+    /// another process may still be appending to. Returns the URI, the hash and the size.
+    pub(crate) async fn upload_file_prefix(
+        &mut self,
+        path: &Path,
+        size: u64,
+        chunk_size: usize,
+    ) -> Result<(String, String, i64), Status> {
+        let size = i64::try_from(size).map_err(|e| Status::internal(e.to_string()))?;
+        // Off the sink's one runtime thread: a large log takes a moment to hash, and the
+        // other streams' acknowledgements are read on that thread.
+        let hash = {
+            let path = path.to_owned();
+            tokio::task::spawn_blocking(move || sha256_file_prefix(&path, size))
+                .await
+                .map_err(|e| Status::internal(e.to_string()))?
+                .map_err(map_io_status)?
+        };
+        let resource_name = upload_resource_name(&self.config.instance_name, &hash, size);
+        let response = self
+            .write_file_requests_chunked(resource_name, path, size, chunk_size)
+            .await?;
+        if response.committed_size != size && response.committed_size != -1 {
+            return Err(Status::data_loss(format!(
+                "the CAS committed {} of {size} bytes",
+                response.committed_size
+            )));
+        }
+        let uri = bytestream_uri(
+            &self.config.uri_authority,
+            &self.config.instance_name,
+            &hash,
+            size,
+        );
+        Ok((uri, hash, size))
+    }
+
     async fn write_request(
         &mut self,
         request: WriteRequest,
@@ -685,6 +744,18 @@ impl BazelArtifactUploader {
         size: i64,
     ) -> Result<google_grpc_proto::google::bytestream::WriteResponse, Status> {
         let chunk_size = self.config.max_bytes.max(1);
+        self.write_file_requests_chunked(resource_name, path, size, chunk_size)
+            .await
+    }
+
+    async fn write_file_requests_chunked(
+        &mut self,
+        resource_name: String,
+        path: &Path,
+        size: i64,
+        chunk_size: usize,
+    ) -> Result<google_grpc_proto::google::bytestream::WriteResponse, Status> {
+        let chunk_size = chunk_size.max(1);
 
         #[cfg(test)]
         if self.config.endpoint == "test://bytestream" {
@@ -732,6 +803,29 @@ fn sha256_file(path: &Path) -> Option<String> {
         hasher.update(&buffer[..bytes_read]);
     }
     Some(format!("{:x}", hasher.finalize()))
+}
+
+fn sha256_file_prefix(path: &Path, size: i64) -> std::io::Result<String> {
+    let file = std::fs::File::open(path)?;
+    let mut reader = file.take(u64::try_from(size).unwrap_or(0));
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0; 64 * 1024];
+    let mut read = 0i64;
+    loop {
+        let n = reader.read(&mut buffer)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buffer[..n]);
+        read += n as i64;
+    }
+    if read != size {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            format!("`{}` has {read} of {size} bytes", path.display()),
+        ));
+    }
+    Ok(format!("{:x}", hasher.finalize()))
 }
 
 fn file_write_stream(
@@ -1228,6 +1322,10 @@ struct WorkerState {
     /// commands being cancelled, are dropped rather than opening a second stream for an
     /// invocation the server already saw end.
     closed: bool,
+    /// Invocations closed as interrupted, newest last: events their cancelled commands still
+    /// send are dropped, since a second stream for an invocation preempts the first.
+    interrupted_invocations: VecDeque<String>,
+    client_gone_quiet: Duration,
 }
 
 impl WorkerState {
@@ -1239,6 +1337,8 @@ impl WorkerState {
             streams: HashMap::new(),
             credentials_rejected: false,
             closed: false,
+            interrupted_invocations: VecDeque::new(),
+            client_gone_quiet: CLIENT_GONE_QUIET,
         }
     }
 
@@ -1293,6 +1393,14 @@ impl WorkerState {
         if parsed.is_daemon_scoped {
             return Ok(None);
         }
+        if self
+            .interrupted_invocations
+            .iter()
+            .any(|id| *id == parsed.invocation_id)
+        {
+            self.counters.inc_dropped();
+            return Ok(None);
+        }
 
         if let Err(e) = self.ensure_stream_exists(&parsed) {
             self.counters.inc_failures_invalid_request();
@@ -1309,6 +1417,7 @@ impl WorkerState {
                 .get_mut(&parsed.invocation_id)
                 .expect("stream was inserted");
             abandoned = stream.abandoned;
+            stream.last_event_at = Instant::now();
             sequence_number = if abandoned {
                 self.counters.inc_dropped();
                 None
@@ -1439,11 +1548,20 @@ impl WorkerState {
             return Ok(());
         }
         let upload_config = BazelArtifactUploadConfig::from_bes(&self.config, &self.connection)?;
+        let event_log_upload = if self.config.upload_event_log {
+            self.config.event_log_dir.clone().map(|dir| EventLogUpload {
+                dir,
+                timeout: self.config.event_log_upload_timeout,
+            })
+        } else {
+            None
+        };
         let stream = StreamState::new(
             parsed,
             &self.config.build_metadata,
             upload_config,
             self.config.upload_successful_action_events,
+            event_log_upload,
         );
         self.streams.insert(parsed.invocation_id.clone(), stream);
         Ok(())
@@ -1682,10 +1800,34 @@ impl WorkerState {
 
     async fn close_due_streams(&mut self) {
         let now = Instant::now();
+        if self.config.event_format == BesEventFormat::Bazel {
+            let event_time: Option<Timestamp> = Some(SystemTime::now().into());
+            for (invocation_id, stream) in self.streams.iter_mut() {
+                if !stream.client_gone_without_command_end(now, self.client_gone_quiet) {
+                    continue;
+                }
+                tracing::info!(
+                    "The client of invocation {} is gone and its command sent no CommandEnd; ending its BES stream as interrupted",
+                    invocation_id,
+                );
+                stream.interrupt(event_time.clone());
+                stream.pending_close = Some(PendingClose {
+                    close_after: now,
+                    event_time: event_time.clone(),
+                });
+                if self.interrupted_invocations.len() >= INTERRUPTED_INVOCATIONS_KEPT {
+                    self.interrupted_invocations.pop_front();
+                }
+                self.interrupted_invocations
+                    .push_back(invocation_id.clone());
+            }
+        }
         let due = self
             .streams
             .iter()
             .filter(|(_, stream)| stream.backoff_remaining(now).is_none())
+            // Its last message waits on the event log; the poll comes back to it.
+            .filter(|(_, stream)| !stream.event_log_pending())
             .filter_map(|(invocation_id, stream)| {
                 stream.pending_close.as_ref().and_then(|pending_close| {
                     (pending_close.close_after <= now)
@@ -1709,7 +1851,11 @@ impl WorkerState {
         match self.streams.get(invocation_id) {
             None => return Ok(()),
             Some(stream) if stream.abandoned => {
-                self.streams.remove(invocation_id);
+                if let Some(mut stream) = self.streams.remove(invocation_id) {
+                    if let Some(held) = stream.held_build_tool_logs.take() {
+                        held.upload.abort();
+                    }
+                }
                 return Ok(());
             }
             Some(_) => {}
@@ -1720,6 +1866,7 @@ impl WorkerState {
                 .streams
                 .get_mut(invocation_id)
                 .expect("stream exists before close");
+            stream.release_build_tool_logs().await;
             if !stream.stream_finished_enqueued {
                 let finish_event = BuildEvent {
                     event_time: event_time.or_else(|| Some(SystemTime::now().into())),
@@ -1785,13 +1932,7 @@ impl WorkerState {
             let now: Option<Timestamp> = Some(SystemTime::now().into());
             for stream in self.streams.values_mut() {
                 if !stream.saw_command_end && !stream.stream_finished_enqueued {
-                    stream.enqueue_raw_event(BuildEvent {
-                        event_time: now.clone(),
-                        event: Some(build_event::Event::BazelEvent(encode_bep_event(
-                            &interrupted_finish_event(now.clone()),
-                        ))),
-                    });
-                    stream.saw_command_end = true;
+                    stream.interrupt(now.clone());
                 }
             }
         }
@@ -1911,6 +2052,96 @@ struct StreamState {
     /// The sequence number of the newest dropped copy. Until the server acknowledges it, a
     /// replay would leave a gap, so a failure abandons the stream instead of retrying.
     newest_dropped_replay_copy: i64,
+    /// Set by `[bes] upload_event_log`: where the client writes its event log.
+    event_log_upload: Option<EventLogUpload>,
+    /// The stream's last message, `BuildToolLogs`, held back from `CommandEnd` while the event
+    /// log is waited for and written to the CAS. The stream does not close while it is held.
+    held_build_tool_logs: Option<HeldBuildToolLogs>,
+    /// When the stream last took an event from the daemon.
+    last_event_at: Instant,
+    /// When `client_gone_without_command_end` may next look at the event log.
+    next_client_check_at: Instant,
+}
+
+#[derive(Clone, Debug)]
+struct EventLogUpload {
+    dir: PathBuf,
+    timeout: Duration,
+}
+
+struct HeldBuildToolLogs {
+    event: bazel_bep_proto::build_event_stream::BuildEvent,
+    event_time: Option<Timestamp>,
+    upload: tokio::task::JoinHandle<Option<bazel_bep_proto::build_event_stream::File>>,
+}
+
+/// Waits for the client to finish the event log of `trace_id`, writes it to the CAS and returns
+/// the `BuildToolLogs` entry naming it. Runs as its own task so that a slow client or a large log
+/// holds up only its own stream. Never fails the stream: without a log, `BuildToolLogs` goes
+/// out as it would have.
+async fn upload_event_log(
+    config: BazelArtifactUploadConfig,
+    upload: EventLogUpload,
+    trace_id: String,
+) -> Option<bazel_bep_proto::build_event_stream::File> {
+    use crate::sink::bes_event_log;
+
+    let Some(found) =
+        bes_event_log::wait_for_event_log(&upload.dir, &trace_id, upload.timeout).await
+    else {
+        tracing::warn!(
+            "No event log for invocation {} in `{}` after {:?}; BuildToolLogs goes without one",
+            trace_id,
+            upload.dir.display(),
+            upload.timeout,
+        );
+        return None;
+    };
+    if !found.complete {
+        tracing::warn!(
+            "The event log of invocation {} was still being written after {:?}; attaching its first {} bytes",
+            trace_id,
+            upload.timeout,
+            found.size,
+        );
+    }
+    let mut uploader = BazelArtifactUploader::new(config);
+    match uploader
+        .upload_file_prefix(
+            &found.path,
+            found.size,
+            bes_event_log::EVENT_LOG_UPLOAD_CHUNK_BYTES,
+        )
+        .await
+    {
+        Ok((uri, hash, length)) => Some(bazel_bep_proto::build_event_stream::File {
+            path_prefix: Vec::new(),
+            name: if found.complete {
+                bes_event_log::EVENT_LOG_FILE_NAME
+            } else {
+                bes_event_log::INCOMPLETE_EVENT_LOG_FILE_NAME
+            }
+            .to_owned(),
+            digest: hash,
+            length,
+            file: Some(bazel_bep_proto::build_event_stream::file::File::Uri(uri)),
+        }),
+        Err(status) => {
+            tracing::warn!(
+                "Writing the event log of invocation {} to the CAS failed: {}",
+                trace_id,
+                status,
+            );
+            None
+        }
+    }
+}
+
+fn is_build_tool_logs(event: &bazel_bep_proto::build_event_stream::BuildEvent) -> bool {
+    matches!(
+        event.payload,
+        Some(bazel_bep_proto::build_event_stream::build_event::Payload::BuildToolLogs(_))
+    )
 }
 
 struct PendingClose {
@@ -1931,7 +2162,10 @@ impl StreamState {
         build_metadata: &[(String, String)],
         bazel_artifact_upload_config: Option<BazelArtifactUploadConfig>,
         upload_successful_action_events: bool,
+        event_log_upload: Option<EventLogUpload>,
     ) -> Self {
+        // The log goes where the other files go; with no upload endpoint there is no digest.
+        let event_log_upload = event_log_upload.filter(|_| bazel_artifact_upload_config.is_some());
         Self {
             stream_id: StreamId {
                 build_id: parsed.build_id.clone(),
@@ -1957,7 +2191,99 @@ impl StreamState {
             abandoned: false,
             replay_copies_dropped: 0,
             newest_dropped_replay_copy: 0,
+            event_log_upload,
+            held_build_tool_logs: None,
+            last_event_at: Instant::now(),
+            next_client_check_at: Instant::now(),
         }
+    }
+
+    /// Ends a stream whose command never sent `CommandEnd`: the final `BuildFinished` the server
+    /// keys on, marked interrupted, and, under `upload_event_log`, a `BuildToolLogs` holding the
+    /// event log, which then comes last.
+    fn interrupt(&mut self, now: Option<Timestamp>) {
+        let mut finished = interrupted_finish_event(now.clone());
+        self.saw_command_end = true;
+        let upload = match (&self.event_log_upload, &self.bazel_artifact_uploader) {
+            (Some(upload), Some(uploader)) if self.held_build_tool_logs.is_none() => {
+                Some((upload.clone(), uploader.config.clone()))
+            }
+            _ => None,
+        };
+        if upload.is_some() {
+            finished.last_message = false;
+        }
+        self.enqueue_raw_event(BuildEvent {
+            event_time: now.clone(),
+            event: Some(build_event::Event::BazelEvent(encode_bep_event(&finished))),
+        });
+        if let Some((upload, config)) = upload {
+            let task = tokio::spawn(upload_event_log(
+                config,
+                upload,
+                self.stream_id.invocation_id.clone(),
+            ));
+            self.held_build_tool_logs = Some(HeldBuildToolLogs {
+                event: build_tool_logs_event(Vec::new()),
+                event_time: now,
+                upload: task,
+            });
+        }
+    }
+
+    /// Whether the client of a command that has not ended is gone: its event log is finished,
+    /// which happens only once the client's writer exits, and the daemon has sent nothing for
+    /// `quiet`. A command whose client was interrupted (CTRL-C) or killed never sends
+    /// `CommandEnd`, and without this its stream would stay open until the daemon exits.
+    fn client_gone_without_command_end(&mut self, now: Instant, quiet: Duration) -> bool {
+        let Some(upload) = &self.event_log_upload else {
+            return false;
+        };
+        if self.saw_command_end
+            || self.abandoned
+            || self.stream_finished_enqueued
+            || now.duration_since(self.last_event_at) < quiet
+            || now < self.next_client_check_at
+        {
+            return false;
+        }
+        self.next_client_check_at = now + CLIENT_GONE_CHECK_INTERVAL;
+        crate::sink::bes_event_log::find_event_log(&upload.dir, &self.stream_id.invocation_id)
+            .is_some_and(|path| {
+                matches!(
+                    crate::sink::bes_event_log::event_log_state(&path),
+                    crate::sink::bes_event_log::EventLogState::Finished { .. }
+                )
+            })
+    }
+
+    /// Whether the held `BuildToolLogs` still waits on its event log.
+    fn event_log_pending(&self) -> bool {
+        self.held_build_tool_logs
+            .as_ref()
+            .is_some_and(|held| !held.upload.is_finished())
+    }
+
+    /// Sends the held `BuildToolLogs`, with the event log if it was written. Waits for the
+    /// upload when it is still running, which only a stream closed early (the daemon shutting
+    /// down, a final record) does: the upload bounds itself by `event_log_upload_timeout`.
+    async fn release_build_tool_logs(&mut self) {
+        let Some(held) = self.held_build_tool_logs.take() else {
+            return;
+        };
+        let mut event = held.event;
+        if let Ok(Some(file)) = held.upload.await {
+            if let Some(bazel_bep_proto::build_event_stream::build_event::Payload::BuildToolLogs(
+                logs,
+            )) = event.payload.as_mut()
+            {
+                logs.log.push(file);
+            }
+        }
+        self.enqueue_raw_event(BuildEvent {
+            event_time: held.event_time,
+            event: Some(build_event::Event::BazelEvent(encode_bep_event(&event))),
+        });
     }
 
     /// How long until the stream may be retried, or `None` when it may be flushed now.
@@ -1995,6 +2321,23 @@ impl StreamState {
                 for mut event in events {
                     if let Some(uploader) = self.bazel_artifact_uploader.as_mut() {
                         uploader.upload_event_files(&mut event).await;
+                    }
+                    if is_build_tool_logs(&event) && self.held_build_tool_logs.is_none() {
+                        if let (Some(upload), Some(uploader)) =
+                            (&self.event_log_upload, &self.bazel_artifact_uploader)
+                        {
+                            let task = tokio::spawn(upload_event_log(
+                                uploader.config.clone(),
+                                upload.clone(),
+                                self.stream_id.invocation_id.clone(),
+                            ));
+                            self.held_build_tool_logs = Some(HeldBuildToolLogs {
+                                event,
+                                event_time: parsed.event_time,
+                                upload: task,
+                            });
+                            continue;
+                        }
                     }
                     last_sequence_number = Some(self.enqueue_raw_event(BuildEvent {
                         event_time: parsed.event_time,
@@ -2303,7 +2646,7 @@ fn map_transport_error(err: tonic::transport::Error) -> Status {
 /// The configured headers, then the credential helper's for `endpoint`. A helper header
 /// replaces a configured header of the same name, and a helper header with several values
 /// keeps all of them, as in the remote execution client.
-async fn attach_headers<T>(
+pub(crate) async fn attach_headers<T>(
     request: &mut tonic::Request<T>,
     headers: &[(String, String)],
     credential_helper: Option<&CredentialHelper>,
@@ -2336,7 +2679,11 @@ async fn attach_headers<T>(
     Ok(())
 }
 
-fn endpoint_for(uri: &str, connect_timeout: Duration, tls: &BesTls) -> Result<Endpoint, Status> {
+pub(crate) fn endpoint_for(
+    uri: &str,
+    connect_timeout: Duration,
+    tls: &BesTls,
+) -> Result<Endpoint, Status> {
     let mut endpoint = Endpoint::from_shared(uri.to_owned())
         .map_err(|e| Status::internal(e.to_string()))?
         .connect_timeout(connect_timeout);
@@ -2367,7 +2714,7 @@ fn read_pem(path: &str) -> Result<Vec<u8>, Status> {
     std::fs::read(&path).map_err(|e| Status::internal(format!("reading `{path}`: {e}")))
 }
 
-fn bes_backend(configured_endpoint: Option<&str>) -> buck2_error::Result<String> {
+pub(crate) fn bes_backend(configured_endpoint: Option<&str>) -> buck2_error::Result<String> {
     let endpoint = configured_endpoint
         .map(str::trim)
         .filter(|s| !s.is_empty())
@@ -2407,6 +2754,10 @@ fn bes_backend(configured_endpoint: Option<&str>) -> buck2_error::Result<String>
         ))
     }
 }
+
+#[cfg(test)]
+#[path = "bes_event_log_tests.rs"]
+mod bes_event_log_tests;
 
 #[cfg(test)]
 mod tests {
@@ -3030,7 +3381,7 @@ mod tests {
             command_start_data(),
         );
         let parsed = ParsedMessage::from_message(&message).expect("valid message");
-        let mut stream = StreamState::new(&parsed, &[], None, true);
+        let mut stream = StreamState::new(&parsed, &[], None, true, None);
 
         let last_sequence = stream.enqueue_event(&parsed, BesEventFormat::Bazel).await;
 
@@ -3740,7 +4091,7 @@ mod tests {
             command_start_data(),
         );
         let parsed = ParsedMessage::from_message(&message).expect("valid message");
-        let mut stream = StreamState::new(&parsed, &[], None, true);
+        let mut stream = StreamState::new(&parsed, &[], None, true, None);
         for _ in 0..10 {
             stream.enqueue_event(&parsed, BesEventFormat::Buck).await;
         }

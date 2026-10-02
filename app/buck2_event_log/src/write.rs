@@ -259,13 +259,17 @@ async fn start_persist_event_log_subprocess(
     bytes_written: Option<Arc<AtomicU64>>,
 ) -> buck2_error::Result<NamedEventLogWriter> {
     let current_exe = std::env::current_exe().buck_error_context("No current_exe")?;
-    let mut command = buck2_util::process::async_background_command(current_exe);
-    // @oss-disable: #[cfg(unix)]
-    #[cfg(all(tokio_unstable, unix))] // @oss-enable
+    let mut command = buck2_util::process::background_command(current_exe);
+    #[cfg(unix)]
     {
-        // Ensure that if we get CTRL-C, the persist-event-logs process does not get it.
+        // Ensure that if we get CTRL-C, the persist-event-logs process does not get it, and
+        // finishes writing the log. Set on the std command, where `process_group` is stable:
+        // tokio's needs `--cfg tokio_unstable`, which a buck2 build of buck2 does not pass to
+        // this crate, so in a release built that way it shared the CTRL-C of the client.
+        use std::os::unix::process::CommandExt;
         command.process_group(0);
     }
+    let mut command: tokio::process::Command = command.into();
     let manifold_name = &format!("{}{}", trace_id, path.extension());
     // TODO T184566736: detach subprocess
     command

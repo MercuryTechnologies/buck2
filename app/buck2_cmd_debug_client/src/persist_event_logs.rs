@@ -168,7 +168,15 @@ async fn create_log_file(local_path: String) -> Result<tokio::fs::File, buck2_er
                 local_path.display()
             )
         })?;
-    Ok(file)
+    // Held until this process exits, however it exits, and taken before the first byte: a
+    // reader that finds the file non-empty and unlocked knows the log is finished. The Build
+    // Event Service sink waits for that before it attaches the log to the invocation
+    // (`buck2_events::sink::bes_event_log`). Advisory only, so nothing else is kept out.
+    let file = file.into_std().await;
+    if let Err(e) = file.try_lock() {
+        tracing::debug!("Could not lock event log `{}`: {}", local_path.display(), e);
+    }
+    Ok(tokio::fs::File::from_std(file))
 }
 
 async fn upload_task(

@@ -490,6 +490,9 @@ impl ResourceControlConfig {
 pub enum LogDownloadMethod {
     Manifold,
     Curl(String),
+    /// The `BuildToolLogs` of the invocation on the Build Event Service backend, found through
+    /// `[bes] event_log_lookup` and read from the CAS by digest.
+    Bes,
     None,
 }
 
@@ -661,6 +664,16 @@ impl DaemonStartupConfig {
                     } else {
                         Ok(LogDownloadMethod::Curl(log_url.to_owned()))
                     }
+                } else if config
+                    .get(BuckconfigKeyRef {
+                        section: "bes",
+                        property: "event_log_lookup",
+                    })
+                    .is_some_and(|lookup| !lookup.trim().is_empty())
+                {
+                    // The lookup and the endpoints are read where the log is fetched, from the
+                    // same `[bes]` and `[buck2_re_client]` keys the daemon's sink reads.
+                    Ok(LogDownloadMethod::Bes)
                 } else {
                     Ok(LogDownloadMethod::None)
                 }
@@ -784,6 +797,38 @@ mod tests {
 
     use super::*;
     use crate::legacy_configs::configs::testing::parse;
+
+    #[test]
+    fn test_log_download_method_bes() -> buck2_error::Result<()> {
+        let bes = parse(
+            &[("config", "[bes]\nevent_log_lookup = buildbuddy_api\n")],
+            "config",
+        )?;
+        let curl = parse(
+            &[(
+                "config",
+                "[buck2]\nlog_url = https://logs.example\n[bes]\nevent_log_lookup = buildbuddy_api\n",
+            )],
+            "config",
+        )?;
+        let none = parse(&[("config", "[bes]\nevent_log_lookup =\n")], "config")?;
+        let method = |config| -> buck2_error::Result<LogDownloadMethod> {
+            Ok(
+                DaemonStartupConfig::new(config, &BuckSettings::empty(), false)?
+                    .log_download_method,
+            )
+        };
+        if !cfg!(fbcode_build) {
+            assert_eq!(method(&bes)?, LogDownloadMethod::Bes);
+            // A log store, where one is configured, still comes first.
+            assert_eq!(
+                method(&curl)?,
+                LogDownloadMethod::Curl("https://logs.example".to_owned())
+            );
+            assert_eq!(method(&none)?, LogDownloadMethod::None);
+        }
+        Ok(())
+    }
 
     #[test]
     fn test_daemon_idle_timeout_s_default() -> buck2_error::Result<()> {

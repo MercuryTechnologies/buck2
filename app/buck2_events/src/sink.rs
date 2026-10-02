@@ -13,7 +13,9 @@
 #[cfg(not(fbcode_build))]
 mod bazel_converter;
 #[cfg(not(fbcode_build))]
-mod bes_client;
+pub(crate) mod bes_client;
+#[cfg(not(fbcode_build))]
+pub mod bes_event_log;
 pub(crate) mod channel;
 pub mod error_on_event;
 pub mod null;
