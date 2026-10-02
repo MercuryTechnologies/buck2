@@ -32,7 +32,7 @@ load(
     "merge_shared_libraries",
     "traverse_shared_library_info",
 )
-load("@prelude//linking:stamp_build_info.bzl", "stamp_build_info")
+load("@prelude//linking:stamp_build_info.bzl", "cxx_stamp_build_info", "stamp_build_info")
 load("@prelude//os_lookup:defs.bzl", "Os", "OsLookup")
 load(
     "@prelude//utils:utils.bzl",
@@ -186,7 +186,16 @@ def link(
         file_extension = executable_extension
         use_shared_code = False  # non-PIC
     final_output_name = ctx.label.name + file_extension
-    output = ctx.actions.declare_output(ctx.label.name + "-tmp" + file_extension, has_content_based_path = True)
+
+    # The binary keeps a stable path rather than a content-based one, because tests find their
+    # resources beside it (8b2143ab38). It is written there once: by the link when it is not
+    # stamped, and by the stamp when it is. A copy to the stable path, as before, put two of
+    # every binary on disk, and a symlink would move os.Executable() away from the resources.
+    stamped = build_mode in [GoBuildMode("exe"), GoBuildMode("pie")] and cxx_stamp_build_info(ctx)
+    if stamped:
+        output = ctx.actions.declare_output(ctx.label.name + "-tmp" + file_extension, has_content_based_path = True)
+    else:
+        output = ctx.actions.declare_output(final_output_name, has_content_based_path = False)
 
     cmd = cmd_args()
 
@@ -329,13 +338,15 @@ def link(
         )
     )
 
-    # stamp only executable targets
-    if build_mode in [GoBuildMode("exe"), GoBuildMode("pie")]:
-        output = stamp_build_info(ctx, output, has_content_based_path = True)
+    if stamped:
+        output = stamp_build_info(
+            ctx,
+            output,
+            stamped_output = ctx.actions.declare_output(final_output_name, has_content_based_path = False),
+            has_content_based_path = True,
+        )
 
-    final_output = ctx.actions.copy_file(final_output_name, output, has_content_based_path = False)
-
-    return (final_output, executable_args.runtime_files, executable_args.external_debug_info)
+    return (output, executable_args.runtime_files, executable_args.external_debug_info)
 
 def _link_impl(
     actions: AnalysisActions,
