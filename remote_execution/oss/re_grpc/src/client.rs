@@ -9,6 +9,7 @@
  */
 
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::env::VarError;
 use std::io;
 use std::io::Cursor;
@@ -17,6 +18,8 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::LazyLock;
 use std::sync::Mutex;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 use std::time::Instant;
 
@@ -190,6 +193,10 @@ pub struct RERuntimeOpts {
     cas_ttl_secs: i64,
     /// Maximum number of digests per `FindMissingBlobs` RPC.
     find_missing_blobs_batch_size: usize,
+    /// Maximum number of `FindMissingBlobs` RPCs one call keeps in flight.
+    find_missing_blobs_concurrency: usize,
+    /// Maximum number of digests in flight in `FindMissingBlobs` RPCs across the client.
+    find_missing_blobs_max_digests_in_flight: usize,
 }
 
 struct InstanceName(Option<String>);
@@ -328,6 +335,11 @@ impl REClientBuilder {
         };
         let pool = ChannelPool::new(pool_config, channel_config);
 
+        let find_missing_blobs_max_digests_in_flight = opts
+            .find_missing_blobs_max_digests_in_flight
+            .unwrap_or(100_000)
+            .clamp(1, u32::MAX as usize);
+
         Ok(REClient::new(
             RERuntimeOpts {
                 use_fbcode_metadata: opts.use_fbcode_metadata,
@@ -335,7 +347,18 @@ impl REClientBuilder {
                 // NOTE: This is an arbitrary number because RBE does not return information
                 // on the TTL of the remote blob.
                 cas_ttl_secs: opts.cas_ttl_secs.unwrap_or(3 * 60 * 60),
-                find_missing_blobs_batch_size: opts.find_missing_blobs_batch_size.unwrap_or(100),
+                // 1000 SHA-256 digests are about 73 KB on the wire, far below a server's usual
+                // receive limit. A batch larger than the client-wide digest cap would be a request
+                // that exceeds it, so the cap also bounds the batch.
+                find_missing_blobs_batch_size: opts
+                    .find_missing_blobs_batch_size
+                    .unwrap_or(1000)
+                    .clamp(1, find_missing_blobs_max_digests_in_flight),
+                find_missing_blobs_concurrency: opts
+                    .find_missing_blobs_concurrency
+                    .unwrap_or(16)
+                    .max(1),
+                find_missing_blobs_max_digests_in_flight,
             },
             capabilities,
             instance_name,
@@ -486,6 +509,8 @@ pub struct REClient {
     instance_name: InstanceName,
     // buck2 calls find_missing for same blobs
     find_missing_cache: Mutex<FindMissingCache>,
+    /// One permit per digest in flight in a `FindMissingBlobs` RPC, shared by every call.
+    find_missing_permits: tokio::sync::Semaphore,
     bystream_compressor: Option<Compressor>,
     max_decoding_msg_size: usize,
     interceptor: InjectHeadersInterceptor,
@@ -666,6 +691,8 @@ impl REClient {
         engine_address: String,
         action_cache_address: String,
     ) -> Self {
+        let find_missing_permits =
+            tokio::sync::Semaphore::new(runtime_opts.find_missing_blobs_max_digests_in_flight);
         REClient {
             runtime_opts,
             pool,
@@ -676,6 +703,7 @@ impl REClient {
                 ttl: Duration::from_hours(12), // 12 hours TODO: Tune this parameter
                 last_check: Instant::now(),
             }),
+            find_missing_permits,
             bystream_compressor,
             max_decoding_msg_size,
             interceptor,
@@ -1019,68 +1047,73 @@ impl REClient {
         metadata: &RemoteExecutionMetadata,
         request: GetDigestsTtlRequest,
     ) -> anyhow::Result<GetDigestsTtlResponse> {
-        let mut remote_results: HashMap<TDigest, DigestRemoteState> = HashMap::new();
-        let mut digests_to_check: Vec<TDigest> = Vec::new();
-
         let batch_size = self.runtime_opts.find_missing_blobs_batch_size;
-        let mut digest_iter = request.digests.iter();
-        while digest_iter.len() > 0 {
-            // Sort our blobs based on what action we need to take
-            {
-                let mut find_missing_cache = self.find_missing_cache.lock().unwrap();
-                for digest in digest_iter.by_ref() {
-                    if let Some(rs) = find_missing_cache.get(digest) {
-                        // We have our final result already cached
-                        remote_results.insert(digest.clone(), rs);
-                    } else {
-                        // We can check this blob
-                        digests_to_check.push(digest.clone());
-                    }
-                    if digests_to_check.len() >= batch_size {
+        let mut remote_results: HashMap<TDigest, DigestRemoteState> = HashMap::new();
+        let mut cached_results: HashMap<TDigest, DigestRemoteState> = HashMap::new();
+        let mut seen: HashSet<&TDigest> = HashSet::new();
+        // The response has one entry per distinct digest, so a duplicate is sent once.
+        let mut unique_digests = request.digests.iter().filter(|digest| seen.insert(*digest));
+        // `buffer_unordered` cuts the first `find_missing_blobs_concurrency` batches at once, and
+        // each later one when a slot frees, after the batch that held it was recorded. A later
+        // batch therefore leaves out what other calls found present in the meantime.
+        let stop = AtomicBool::new(false);
+        let batches = std::iter::from_fn(|| {
+            if stop.load(Ordering::Relaxed) {
+                return None;
+            }
+            let mut find_missing_cache = self.find_missing_cache.lock().unwrap();
+            let mut batch = Vec::new();
+            for digest in unique_digests.by_ref() {
+                if let Some(rs) = find_missing_cache.get(digest) {
+                    // We have our final result already cached
+                    cached_results.insert(digest.clone(), rs);
+                } else {
+                    batch.push(digest.clone());
+                    if batch.len() >= batch_size {
                         break;
                     }
                 }
             }
+            (!batch.is_empty()).then_some(batch)
+        });
 
-            // Send a request and notify others of the result
-            if !digests_to_check.is_empty() {
-                tracing::debug!(num_digests = digests_to_check.len(), "FindMissingBlobs");
-                let blob_digests: Vec<_> = digests_to_check.map(tdigest_to);
-                let resp: FindMissingBlobsResponse = retry(|| async {
-                    let resp = self
-                        .cas_client()
-                        .await?
-                        .find_missing_blobs(with_re_metadata(
-                            FindMissingBlobsRequest {
-                                instance_name: self.instance_name.as_str().to_owned(),
-                                blob_digests: blob_digests.clone(),
-                                ..Default::default()
-                            },
-                            metadata,
-                            self.runtime_opts.use_fbcode_metadata,
-                        ))
-                        .await
-                        .context("Failed to request what blobs are not present on remote")?;
-                    Ok(resp.into_inner())
-                })
-                .await?;
-
-                // Update the results and the cache
-                let mut find_missing_cache = self.find_missing_cache.lock().unwrap();
-                for digest in &digests_to_check {
-                    remote_results.insert(digest.clone(), DigestRemoteState::ExistsOnRemote);
-                    find_missing_cache.put(digest.clone(), DigestRemoteState::ExistsOnRemote);
+        let mut responses = futures::stream::iter(batches)
+            .map(|batch| async move {
+                let resp = self.find_missing_blobs_batch(metadata, &batch).await?;
+                anyhow::Ok((batch, resp))
+            })
+            .buffer_unordered(self.runtime_opts.find_missing_blobs_concurrency);
+        // After a failure no batch is cut, but the ones in flight are awaited rather than
+        // dropped: a dropped request resets its stream on the shared CAS connection, and h2
+        // closes a connection once too many reset streams still receive frames.
+        let mut first_error = None;
+        while let Some(result) = responses.next().await {
+            match result {
+                Ok((batch, resp)) => {
+                    // Update the results and the cache
+                    let mut find_missing_cache = self.find_missing_cache.lock().unwrap();
+                    for digest in &batch {
+                        remote_results.insert(digest.clone(), DigestRemoteState::ExistsOnRemote);
+                        find_missing_cache.put(digest.clone(), DigestRemoteState::ExistsOnRemote);
+                    }
+                    for digest in &resp.missing_blob_digests.map(|d| tdigest_from(d.clone())) {
+                        // If it's present in the MissingBlobsResponse, it's expired on the remote
+                        // and needs to be refetched.
+                        remote_results.insert(digest.clone(), DigestRemoteState::Missing);
+                        find_missing_cache.put(digest.clone(), DigestRemoteState::Missing);
+                    }
                 }
-
-                for digest in &resp.missing_blob_digests.map(|d| tdigest_from(d.clone())) {
-                    // If it's present in the MissingBlobsResponse, it's expired on the remote and
-                    // needs to be refetched.
-                    remote_results.insert(digest.clone(), DigestRemoteState::Missing);
-                    find_missing_cache.put(digest.clone(), DigestRemoteState::Missing);
+                Err(e) => {
+                    stop.store(true, Ordering::Relaxed);
+                    first_error.get_or_insert(e);
                 }
-                digests_to_check.clear();
             }
         }
+        drop(responses);
+        if let Some(e) = first_error {
+            return Err(e);
+        }
+        remote_results.extend(cached_results);
 
         Ok(GetDigestsTtlResponse {
             digests_with_ttl: remote_results
@@ -1097,6 +1130,44 @@ impl REClient {
                 })
                 .collect::<Vec<DigestWithTtl>>(),
         })
+    }
+
+    /// Sends one `FindMissingBlobs` RPC, with its retries, while holding one client-wide permit
+    /// per digest.
+    async fn find_missing_blobs_batch(
+        &self,
+        metadata: &RemoteExecutionMetadata,
+        digests: &[TDigest],
+    ) -> anyhow::Result<FindMissingBlobsResponse> {
+        let permits = digests
+            .len()
+            .min(self.runtime_opts.find_missing_blobs_max_digests_in_flight);
+        let _permits = self
+            .find_missing_permits
+            .acquire_many(permits as u32)
+            .await
+            .context("FindMissingBlobs permits closed")?;
+
+        tracing::debug!(num_digests = digests.len(), "FindMissingBlobs");
+        let blob_digests: Vec<_> = digests.map(tdigest_to);
+        retry(|| async {
+            let resp = self
+                .cas_client()
+                .await?
+                .find_missing_blobs(with_re_metadata(
+                    FindMissingBlobsRequest {
+                        instance_name: self.instance_name.as_str().to_owned(),
+                        blob_digests: blob_digests.clone(),
+                        ..Default::default()
+                    },
+                    metadata,
+                    self.runtime_opts.use_fbcode_metadata,
+                ))
+                .await
+                .context("Failed to request what blobs are not present on remote")?;
+            Ok(resp.into_inner())
+        })
+        .await
     }
 
     pub async fn extend_digest_ttl(
@@ -1911,9 +1982,18 @@ fn substitute_env_vars_impl(
 mod tests {
     use core::sync::atomic::Ordering;
     use std::sync::atomic::AtomicU16;
+    use std::sync::atomic::AtomicUsize;
 
+    use re_grpc_proto::build::bazel::remote::execution::v2::GetTreeRequest;
+    use re_grpc_proto::build::bazel::remote::execution::v2::GetTreeResponse;
+    use re_grpc_proto::build::bazel::remote::execution::v2::SpliceBlobRequest;
+    use re_grpc_proto::build::bazel::remote::execution::v2::SpliceBlobResponse;
+    use re_grpc_proto::build::bazel::remote::execution::v2::SplitBlobRequest;
+    use re_grpc_proto::build::bazel::remote::execution::v2::SplitBlobResponse;
     use re_grpc_proto::build::bazel::remote::execution::v2::batch_read_blobs_response;
     use re_grpc_proto::build::bazel::remote::execution::v2::batch_update_blobs_response;
+    use re_grpc_proto::build::bazel::remote::execution::v2::content_addressable_storage_server::ContentAddressableStorage;
+    use re_grpc_proto::build::bazel::remote::execution::v2::content_addressable_storage_server::ContentAddressableStorageServer;
 
     use super::*;
 
@@ -2986,6 +3066,427 @@ mod tests {
         assert_eq!(substitute_env_vars_impl("foo", getter).unwrap(), "foo");
         assert_eq!(substitute_env_vars_impl("FOO", getter).unwrap(), "FOO");
         assert!(substitute_env_vars_impl("$FOO$BAZ", getter).is_err());
+    }
+
+    /// A CAS that answers only FindMissingBlobs. A digest whose hash starts with `0` is missing.
+    /// Each request is held until `release_at` requests have been in flight together, or until
+    /// `expected_requests` have arrived, and then for `LINGER` more, so a request the client
+    /// sends past its bound arrives while the others are still held and raises the peak. A
+    /// client that never reaches `release_at` waits out `HOLD_LIMIT` per request and then fails
+    /// the peak assertion. A request that lists `fail_hash` is refused at once, without being
+    /// held or counted in flight. One that lists a hash in `slow` is held `SLOW` longer.
+    struct FakeFindMissingCasState {
+        release_at: usize,
+        expected_requests: usize,
+        fail_hash: Option<String>,
+        slow: Vec<String>,
+        requests: Mutex<Vec<Vec<String>>>,
+        in_flight: AtomicUsize,
+        peak_in_flight: AtomicUsize,
+        answered: AtomicUsize,
+    }
+
+    impl FakeFindMissingCasState {
+        const HOLD_LIMIT: Duration = Duration::from_secs(2);
+        const LINGER: Duration = Duration::from_millis(100);
+        const SLOW: Duration = Duration::from_millis(500);
+
+        fn new(
+            release_at: usize,
+            expected_requests: usize,
+            fail_hash: Option<String>,
+            slow: Vec<String>,
+        ) -> Arc<Self> {
+            Arc::new(Self {
+                release_at,
+                expected_requests,
+                fail_hash,
+                slow,
+                requests: Mutex::new(Vec::new()),
+                in_flight: AtomicUsize::new(0),
+                peak_in_flight: AtomicUsize::new(0),
+                answered: AtomicUsize::new(0),
+            })
+        }
+
+        fn sent_hashes(&self) -> Vec<String> {
+            self.requests.lock().unwrap().concat()
+        }
+    }
+
+    struct FakeFindMissingCas(Arc<FakeFindMissingCasState>);
+
+    #[tonic::async_trait]
+    impl ContentAddressableStorage for FakeFindMissingCas {
+        async fn find_missing_blobs(
+            &self,
+            request: tonic::Request<FindMissingBlobsRequest>,
+        ) -> Result<tonic::Response<FindMissingBlobsResponse>, tonic::Status> {
+            let state = &self.0;
+            let request = request.into_inner();
+            state.requests.lock().unwrap().push(
+                request
+                    .blob_digests
+                    .iter()
+                    .map(|digest| digest.hash.clone())
+                    .collect(),
+            );
+            if let Some(fail_hash) = &state.fail_hash {
+                if request.blob_digests.iter().any(|d| &d.hash == fail_hash) {
+                    return Err(tonic::Status::invalid_argument("refused by the test"));
+                }
+            }
+            let in_flight = state.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+            state.peak_in_flight.fetch_max(in_flight, Ordering::SeqCst);
+            let deadline = Instant::now() + FakeFindMissingCasState::HOLD_LIMIT;
+            while state.peak_in_flight.load(Ordering::SeqCst) < state.release_at
+                && state.requests.lock().unwrap().len() < state.expected_requests
+                && Instant::now() < deadline
+            {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+            tokio::time::sleep(FakeFindMissingCasState::LINGER).await;
+            if request
+                .blob_digests
+                .iter()
+                .any(|d| state.slow.contains(&d.hash))
+            {
+                tokio::time::sleep(FakeFindMissingCasState::SLOW).await;
+            }
+            state.in_flight.fetch_sub(1, Ordering::SeqCst);
+            state.answered.fetch_add(1, Ordering::SeqCst);
+            Ok(tonic::Response::new(FindMissingBlobsResponse {
+                missing_blob_digests: request
+                    .blob_digests
+                    .into_iter()
+                    .filter(|digest| digest.hash.starts_with('0'))
+                    .collect(),
+            }))
+        }
+
+        async fn batch_update_blobs(
+            &self,
+            _request: tonic::Request<BatchUpdateBlobsRequest>,
+        ) -> Result<tonic::Response<BatchUpdateBlobsResponse>, tonic::Status> {
+            Err(tonic::Status::unimplemented("not used by this test"))
+        }
+
+        async fn batch_read_blobs(
+            &self,
+            _request: tonic::Request<BatchReadBlobsRequest>,
+        ) -> Result<tonic::Response<BatchReadBlobsResponse>, tonic::Status> {
+            Err(tonic::Status::unimplemented("not used by this test"))
+        }
+
+        type GetTreeStream =
+            Pin<Box<dyn Stream<Item = Result<GetTreeResponse, tonic::Status>> + Send + 'static>>;
+
+        async fn get_tree(
+            &self,
+            _request: tonic::Request<GetTreeRequest>,
+        ) -> Result<tonic::Response<Self::GetTreeStream>, tonic::Status> {
+            Err(tonic::Status::unimplemented("not used by this test"))
+        }
+
+        async fn split_blob(
+            &self,
+            _request: tonic::Request<SplitBlobRequest>,
+        ) -> Result<tonic::Response<SplitBlobResponse>, tonic::Status> {
+            Err(tonic::Status::unimplemented("not used by this test"))
+        }
+
+        async fn splice_blob(
+            &self,
+            _request: tonic::Request<SpliceBlobRequest>,
+        ) -> Result<tonic::Response<SpliceBlobResponse>, tonic::Status> {
+            Err(tonic::Status::unimplemented("not used by this test"))
+        }
+    }
+
+    async fn serve_fake_find_missing_cas(
+        state: Arc<FakeFindMissingCasState>,
+    ) -> anyhow::Result<(String, tokio::task::JoinHandle<()>)> {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let address = format!("grpc://{}", listener.local_addr()?);
+        let incoming = futures::stream::unfold(listener, |listener| async move {
+            let socket = listener.accept().await.map(|(socket, _)| socket);
+            Some((socket, listener))
+        });
+        let server = tokio::spawn(async move {
+            drop(
+                tonic::transport::Server::builder()
+                    .add_service(ContentAddressableStorageServer::new(FakeFindMissingCas(
+                        state,
+                    )))
+                    .serve_with_incoming(incoming)
+                    .await,
+            );
+        });
+        Ok((address, server))
+    }
+
+    /// Digest `i` of a test set; every third one is missing on the fake CAS.
+    fn find_missing_test_digest(i: usize) -> TDigest {
+        TDigest {
+            hash: format!("{}{:063x}", if i % 3 == 0 { '0' } else { '1' }, i),
+            size_in_bytes: 1,
+            ..Default::default()
+        }
+    }
+
+    /// A client whose engine, CAS and action cache are all the fake at `address`.
+    async fn find_missing_test_client(
+        address: String,
+        batch_size: usize,
+        concurrency: usize,
+        max_digests_in_flight: usize,
+    ) -> anyhow::Result<REClient> {
+        REClientBuilder::build_and_connect(&Buck2OssReConfiguration {
+            cas_address: Some(address.clone()),
+            engine_address: Some(address.clone()),
+            action_cache_address: Some(address),
+            tls: false,
+            capabilities: Some(false),
+            cas_ttl_secs: Some(1000),
+            find_missing_blobs_batch_size: Some(batch_size),
+            find_missing_blobs_concurrency: Some(concurrency),
+            find_missing_blobs_max_digests_in_flight: Some(max_digests_in_flight),
+            ..Default::default()
+        })
+        .await
+    }
+
+    #[tokio::test]
+    async fn get_digests_ttl_sends_batches_concurrently_up_to_the_bound() -> anyhow::Result<()> {
+        // 95 distinct digests in batches of 10 are 10 requests, 4 of them at a time.
+        let state = FakeFindMissingCasState::new(4, 10, None, Vec::new());
+        let (address, server) = serve_fake_find_missing_cas(state.clone()).await?;
+        let client = find_missing_test_client(address, 10, 4, 100_000).await?;
+
+        let unique = (0..95).map(find_missing_test_digest).collect::<Vec<_>>();
+        // Duplicates inside the first batch and far from their first occurrence.
+        let mut digests = unique.clone();
+        digests.insert(1, unique[0].clone());
+        digests.extend(unique[..20].iter().cloned());
+        let response = client
+            .get_digests_ttl(
+                &RemoteExecutionMetadata::default(),
+                GetDigestsTtlRequest {
+                    digests: digests.clone(),
+                    ..Default::default()
+                },
+            )
+            .await?;
+
+        let requests = state.requests.lock().unwrap().clone();
+        assert_eq!(requests.len(), 10);
+        assert!(requests.iter().all(|request| request.len() <= 10));
+        let mut sent = state.sent_hashes();
+        assert_eq!(sent.len(), 95, "no digest is sent twice");
+        sent.sort();
+        let mut expected = unique.iter().map(|d| d.hash.clone()).collect::<Vec<_>>();
+        expected.sort();
+        assert_eq!(sent, expected);
+        assert_eq!(state.peak_in_flight.load(Ordering::SeqCst), 4);
+
+        // One entry per distinct digest: 0 for the missing, the CAS TTL for the present.
+        let mut ttls = response
+            .digests_with_ttl
+            .iter()
+            .map(|d| (d.digest.hash.clone(), d.ttl))
+            .collect::<Vec<_>>();
+        ttls.sort();
+        let mut expected_ttls = unique
+            .iter()
+            .map(|d| {
+                (
+                    d.hash.clone(),
+                    if d.hash.starts_with('0') { 0 } else { 1000 },
+                )
+            })
+            .collect::<Vec<_>>();
+        expected_ttls.sort();
+        assert_eq!(ttls, expected_ttls);
+
+        // Every answer is cached, missing or present, so asking again sends nothing.
+        client
+            .get_digests_ttl(
+                &RemoteExecutionMetadata::default(),
+                GetDigestsTtlRequest {
+                    digests,
+                    ..Default::default()
+                },
+            )
+            .await?;
+        assert_eq!(state.requests.lock().unwrap().len(), 10);
+
+        server.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn get_digests_ttl_concurrent_calls_share_the_digest_bound() -> anyhow::Result<()> {
+        // A bound of 20 digests in flight lets two batches of 10 out at once, whatever the
+        // per-call concurrency, and however many calls there are.
+        let state = FakeFindMissingCasState::new(2, 9, None, Vec::new());
+        let (address, server) = serve_fake_find_missing_cas(state.clone()).await?;
+        let client = find_missing_test_client(address, 10, 8, 20).await?;
+
+        let metadata = RemoteExecutionMetadata::default();
+        let call = |range: std::ops::Range<usize>| {
+            client.get_digests_ttl(
+                &metadata,
+                GetDigestsTtlRequest {
+                    digests: range.map(find_missing_test_digest).collect(),
+                    ..Default::default()
+                },
+            )
+        };
+        let (first, second, third) = futures::join!(call(0..30), call(30..60), call(60..90));
+        assert_eq!(first?.digests_with_ttl.len(), 30);
+        assert_eq!(second?.digests_with_ttl.len(), 30);
+        assert_eq!(third?.digests_with_ttl.len(), 30);
+
+        assert_eq!(state.requests.lock().unwrap().len(), 9);
+        assert_eq!(state.peak_in_flight.load(Ordering::SeqCst), 2);
+
+        server.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn get_digests_ttl_fails_when_one_batch_fails() -> anyhow::Result<()> {
+        // 60 digests in batches of 10, 4 at a time. The third batch is refused at once while
+        // the other three are held.
+        let failing_hash = find_missing_test_digest(25).hash;
+        let state = FakeFindMissingCasState::new(3, 4, Some(failing_hash.clone()), Vec::new());
+        let (address, server) = serve_fake_find_missing_cas(state.clone()).await?;
+        let client = find_missing_test_client(address, 10, 4, 100_000).await?;
+
+        let Err(err) = client
+            .get_digests_ttl(
+                &RemoteExecutionMetadata::default(),
+                GetDigestsTtlRequest {
+                    digests: (0..60).map(find_missing_test_digest).collect(),
+                    ..Default::default()
+                },
+            )
+            .await
+        else {
+            anyhow::bail!("a call with a refused batch succeeded");
+        };
+        assert!(
+            format!("{err:#}").contains("Failed to request what blobs are not present on remote"),
+            "{err:#}"
+        );
+        // The call waited for the batches in flight instead of resetting their streams, and
+        // cut no batch after the failure.
+        assert_eq!(state.answered.load(Ordering::SeqCst), 3);
+        assert_eq!(state.requests.lock().unwrap().len(), 4);
+
+        // What the three answered batches found was recorded, so asking about them and the
+        // refused batch again sends only the refused batch's digests.
+        let refused = state.requests.lock().unwrap()[..]
+            .iter()
+            .find(|request| request.contains(&failing_hash))
+            .cloned()
+            .expect("the refused batch was sent");
+        let Err(_) = client
+            .get_digests_ttl(
+                &RemoteExecutionMetadata::default(),
+                GetDigestsTtlRequest {
+                    digests: (0..40).map(find_missing_test_digest).collect(),
+                    ..Default::default()
+                },
+            )
+            .await
+        else {
+            anyhow::bail!("the refused batch was not refused again");
+        };
+        let again = state.requests.lock().unwrap()[4..].to_vec();
+        assert_eq!(again, vec![refused]);
+
+        server.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn get_digests_ttl_later_batch_skips_what_another_call_found() -> anyhow::Result<()> {
+        // One batch at a time per call. The first call's first batch returns quickly and its
+        // second is slow; the second call's first batch is slow, so its second batch, which
+        // repeats the first call's first, is cut after that one returned and before the first
+        // call ends.
+        let state = FakeFindMissingCasState::new(
+            1,
+            1,
+            None,
+            vec![
+                find_missing_test_digest(100).hash,
+                find_missing_test_digest(200).hash,
+            ],
+        );
+        let (address, server) = serve_fake_find_missing_cas(state.clone()).await?;
+        let client = find_missing_test_client(address, 10, 1, 100_000).await?;
+
+        let metadata = RemoteExecutionMetadata::default();
+        let call = |digests: Vec<usize>| {
+            client.get_digests_ttl(
+                &metadata,
+                GetDigestsTtlRequest {
+                    digests: digests.into_iter().map(find_missing_test_digest).collect(),
+                    ..Default::default()
+                },
+            )
+        };
+        let (first, second) = futures::join!(
+            call((0..10).chain(200..210).collect()),
+            call((100..110).chain(0..10).collect()),
+        );
+        first?;
+        second?;
+
+        let shared = find_missing_test_digest(0).hash;
+        let asked = state
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|request| request.contains(&shared))
+            .map(|request| request.len())
+            .collect::<Vec<_>>();
+        // The first call's answer for 0..10, missing ones included, was cached before the
+        // second call cut its second batch, so that batch was never sent.
+        assert_eq!(asked, vec![10]);
+
+        server.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn get_digests_ttl_batch_never_exceeds_the_digest_bound() -> anyhow::Result<()> {
+        let state = FakeFindMissingCasState::new(1, 1, None, Vec::new());
+        let (address, server) = serve_fake_find_missing_cas(state.clone()).await?;
+        let client = find_missing_test_client(address, 10, 4, 5).await?;
+
+        client
+            .get_digests_ttl(
+                &RemoteExecutionMetadata::default(),
+                GetDigestsTtlRequest {
+                    digests: (0..20).map(find_missing_test_digest).collect(),
+                    ..Default::default()
+                },
+            )
+            .await?;
+
+        let requests = state.requests.lock().unwrap().clone();
+        assert_eq!(
+            requests.iter().map(|r| r.len()).collect::<Vec<_>>(),
+            vec![5, 5, 5, 5]
+        );
+        assert_eq!(state.peak_in_flight.load(Ordering::SeqCst), 1);
+
+        server.abort();
+        Ok(())
     }
 }
 

@@ -38,6 +38,17 @@ Keys supported include:
   interpolation syntax ($VAR). They will be substituted before reading the file.
 - `instance_name` - an instance name to pass on execution, action cache, and CAS
   requests.
+- `find_missing_blobs_batch_size` - the most digests Buck2 asks about in one
+  `FindMissingBlobs` request before an upload. Defaults to 1000, about 73 KB of
+  SHA-256 digests. A value above `find_missing_blobs_max_digests_in_flight` is
+  lowered to it.
+- `find_missing_blobs_concurrency` - how many `FindMissingBlobs` requests one
+  upload keeps in flight when its digests span several batches. Defaults to 16.
+- `find_missing_blobs_max_digests_in_flight` - the most digests in flight in
+  `FindMissingBlobs` requests across the whole daemon, shared by every upload.
+  Defaults to 100000. A request waits until there is room for all its digests.
+  The limit counts digests, not requests, so it bounds the server's work but not
+  the number of streams open on the CAS connection.
 
 Buck2 uses `SHA256` for all its hashing by default. If your RE engine requires
 something else, this can be configured in `.buckconfig` as follows:
