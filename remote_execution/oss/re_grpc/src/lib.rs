@@ -27,6 +27,12 @@ use std::sync::OnceLock;
 use std::sync::atomic::AtomicI64;
 use std::sync::atomic::Ordering;
 
+pub use casd_autostart::PID_HEADER;
+pub use casd_autostart::UPSTREAM_CREDENTIALS_HEADER;
+pub use casd_autostart::UPSTREAM_HEADER;
+pub use casd_autostart::UPSTREAM_INSTANCE_NAME_HEADER;
+pub use casd_autostart::UPSTREAM_TLS_HEADER;
+pub use casd_autostart::upstream_credentials_fingerprint;
 pub use client::*;
 pub use error::*;
 pub use grpc::*;
