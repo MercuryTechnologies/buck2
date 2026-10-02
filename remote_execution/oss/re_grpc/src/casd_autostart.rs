@@ -15,21 +15,45 @@
 //! it is started at most once and never stopped from here. Several buck2 daemons may notice it
 //! missing at the same time; a lock file in the cache directory makes one of them start it while
 //! the others wait.
+//!
+//! Sharing one daemon means sharing its upstream. A daemon some other buck2 daemon started may pass
+//! CAS traffic to another CAS than this one's (a remote that has since been replaced, or another
+//! project's), and every blob this daemon then asks for or uploads goes to the wrong place. So the
+//! daemon is asked which CAS it passes through to, when a client is built and again before every
+//! connection the client opens to it, and is used only if that is this client's own CAS.
 
+use std::collections::HashMap;
 use std::fmt;
 use std::fs::File;
 use std::net::Ipv4Addr;
 use std::net::SocketAddr;
 use std::path::Path;
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::process::Command;
 use std::process::Stdio;
+use std::sync::Arc;
+use std::sync::LazyLock;
+use std::sync::Mutex;
+use std::task::Poll;
 use std::time::Duration;
 use std::time::Instant;
 
 use anyhow::Context;
 use buck2_re_configuration::Buck2OssReConfiguration;
 use buck2_re_configuration::CASdAddress;
+use buck2_re_configuration::HttpHeader;
+use re_grpc_proto::build::bazel::remote::execution::v2::GetCapabilitiesRequest;
+use re_grpc_proto::build::bazel::remote::execution::v2::capabilities_client::CapabilitiesClient;
+use sha2::Digest;
+use sha2::Sha256;
+use tonic::metadata::MetadataMap;
+use tonic::transport::Endpoint;
+use tonic::transport::Uri;
+use tower::Service;
+
+use crate::client::substitute_env_vars;
+use crate::unix_socket::UnixConnector;
 
 /// How long to wait for a freshly started daemon, or one another process is starting.
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
@@ -38,6 +62,21 @@ const LOCK_FILE_NAME: &str = "autostart.lock";
 const LOG_FILE_NAME: &str = "buck2-casd.log";
 /// The socket the daemon listens on when no address is configured, inside its directory.
 pub const DEFAULT_SOCKET_NAME: &str = "buck2-casd.sock";
+/// How long a daemon found running has to say which CAS it passes through to.
+const UPSTREAM_QUERY_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Response metadata on the daemon's `GetCapabilities`: the `--upstream` address it passes
+/// through to, empty when it is a standalone CAS. A daemon that sends none predates the header.
+pub const UPSTREAM_HEADER: &str = "x-buck2-casd-upstream";
+/// `true` or `false` as the daemon was given `--upstream-tls`; absent when the scheme decides.
+pub const UPSTREAM_TLS_HEADER: &str = "x-buck2-casd-upstream-tls";
+/// The daemon's `--upstream-instance-name`; absent when it has none.
+pub const UPSTREAM_INSTANCE_NAME_HEADER: &str = "x-buck2-casd-upstream-instance-name";
+/// [`upstream_credentials_fingerprint`] of the daemon's upstream headers and client
+/// certificate; absent when it has neither.
+pub const UPSTREAM_CREDENTIALS_HEADER: &str = "x-buck2-casd-upstream-credentials";
+/// The daemon's process id, so that a warning can say which process to stop.
+pub const PID_HEADER: &str = "x-buck2-casd-pid";
 
 /// Where the daemon listens.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -199,6 +238,411 @@ pub async fn ensure_running(
     Ok(())
 }
 
+/// Which CAS a configuration reaches, reduced to what decides where its blobs go: the host and
+/// port the channel dials, whether it uses TLS, the instance name requests carry, and the
+/// credentials they carry.
+///
+/// The address is read the way the channel reads it (`prepare_uri` in client.rs): the scheme
+/// only says whether to use TLS, `tls` overrides it, and a missing port is the default of the
+/// TLS that results, 443 with it and 80 without, as tonic infers it. So
+/// `grpc://cas.example.com:443` with `tls = true`, `grpcs://cas.example.com` and
+/// `cas.example.com:443` are the same CAS. The host is compared without case, as DNS does (RFC
+/// 4343). An address that does not parse that way, such as a `unix://` socket, is compared as
+/// written. The credentials are compared by fingerprint ([`upstream_credentials_fingerprint`]),
+/// because on a multi-tenant remote the API key in a header picks the organisation, and the
+/// organisation partitions the CAS.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct CasIdentity {
+    endpoint: String,
+    tls: Option<bool>,
+    instance_name: Option<String>,
+    credentials: Option<String>,
+}
+
+impl CasIdentity {
+    /// `address` with any `$VAR` already substituted.
+    pub(crate) fn new(
+        address: &str,
+        tls: Option<bool>,
+        instance_name: Option<&str>,
+        credentials: Option<String>,
+    ) -> Self {
+        let parsed = address
+            .parse::<Uri>()
+            .ok()
+            .and_then(|uri| crate::client::prepare_uri(uri, tls).ok())
+            .and_then(|(uri, tls)| {
+                let host = uri.host().filter(|h| !h.is_empty())?.to_ascii_lowercase();
+                let port = uri.port_u16().unwrap_or(if tls { 443 } else { 80 });
+                Some((format!("{host}:{port}"), Some(tls)))
+            });
+        // A `unix://` remote never uses TLS, whatever `tls` says.
+        let (endpoint, tls) = parsed.unwrap_or_else(|| (address.to_owned(), None));
+        Self {
+            endpoint,
+            tls,
+            instance_name: instance_name.map(str::to_owned),
+            credentials,
+        }
+    }
+
+    /// The CAS `opts` sends its blobs to, or `None` when it has no remote CAS and the daemon is
+    /// the CAS, whatever it passes on to.
+    pub(crate) fn of(opts: &Buck2OssReConfiguration) -> anyhow::Result<Option<Self>> {
+        let Some(cas_address) = &opts.cas_address else {
+            return Ok(None);
+        };
+        Ok(Some(Self::new(
+            &substitute_env_vars(cas_address).context("Invalid `cas_address`")?,
+            opts.tls,
+            opts.instance_name.as_deref(),
+            upstream_credentials_fingerprint(&opts.http_headers, opts.tls_client_cert.as_deref())?,
+        )))
+    }
+}
+
+impl fmt::Display for CasIdentity {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "`{}`", self.endpoint)?;
+        match self.tls {
+            Some(true) => f.write_str(" over TLS")?,
+            Some(false) => f.write_str(" without TLS")?,
+            None => {}
+        }
+        if let Some(instance) = &self.instance_name {
+            write!(f, ", instance `{instance}`")?;
+        }
+        match &self.credentials {
+            Some(credentials) => write!(
+                f,
+                ", credentials fingerprint `{}`",
+                &credentials[..credentials.len().min(12)]
+            ),
+            None => f.write_str(", no credentials"),
+        }
+    }
+}
+
+/// A fingerprint of the credentials a configuration sends its CAS, or `None` when it sends
+/// none: the SHA-256 of its `http_headers`, with `$VAR` substituted from this process's
+/// environment, and of the path of its TLS client certificate, made absolute against this
+/// process's working directory. Only the digest leaves the process, never a header value.
+///
+/// buck2-casd computes it from its own configuration in its own environment, which it inherited
+/// from the buck2 daemon that started it, so the two agree only when the daemon would send what
+/// the client would. The certificate goes in by path, not content, so that renewing it in place
+/// does not turn every client away. A CA bundle is left out: it decides which servers to trust,
+/// not whose CAS the requests reach.
+pub fn upstream_credentials_fingerprint(
+    http_headers: &[HttpHeader],
+    tls_client_cert: Option<&str>,
+) -> anyhow::Result<Option<String>> {
+    let mut lines = http_headers
+        .iter()
+        .map(|h| {
+            // Header names are case-insensitive (RFC 9110, section 5.1).
+            let key = substitute_env_vars(&h.key)?.to_ascii_lowercase();
+            let value = substitute_env_vars(&h.value)?;
+            anyhow::Ok(format!("header {key}: {value}"))
+        })
+        .collect::<anyhow::Result<Vec<_>>>()
+        .context("Invalid `http_headers`")?;
+    if let Some(cert) = tls_client_cert {
+        let cert = substitute_env_vars(cert).context("Invalid `tls_client_cert`")?;
+        let cert =
+            std::path::absolute(&cert).with_context(|| format!("Error resolving `{cert}`"))?;
+        lines.push(format!("tls_client_cert {}", cert.display()));
+    }
+    if lines.is_empty() {
+        return Ok(None);
+    }
+    lines.sort();
+    let mut hasher = Sha256::new();
+    for line in &lines {
+        hasher.update(line.as_bytes());
+        hasher.update(b"\n");
+    }
+    Ok(Some(format!("{:x}", hasher.finalize())))
+}
+
+/// What a running daemon says about its upstream.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum ReportedUpstream {
+    Cas(CasIdentity),
+    /// It is a standalone CAS and passes nothing on.
+    Standalone,
+    /// It sends no upstream header: a daemon from before buck2 asked, the kind found serving a
+    /// replaced remote, or one whose upstream cannot be written as a header.
+    Unreported,
+}
+
+impl fmt::Display for ReportedUpstream {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Cas(cas) => write!(f, "passes CAS traffic to {cas}"),
+            Self::Standalone => f.write_str("is a standalone CAS with no upstream"),
+            Self::Unreported => write!(
+                f,
+                "does not say which CAS it passes traffic to (it sends no `{UPSTREAM_HEADER}`)"
+            ),
+        }
+    }
+}
+
+/// A daemon's answer to the question of which CAS it passes traffic to.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Answer {
+    upstream: ReportedUpstream,
+    pid: Option<String>,
+}
+
+impl Answer {
+    pub(crate) fn from_metadata(metadata: &MetadataMap) -> Self {
+        let header = |name| metadata.get(name).and_then(|v| v.to_str().ok());
+        let upstream = match header(UPSTREAM_HEADER) {
+            None => ReportedUpstream::Unreported,
+            Some("") => ReportedUpstream::Standalone,
+            Some(address) => ReportedUpstream::Cas(CasIdentity::new(
+                address,
+                header(UPSTREAM_TLS_HEADER).and_then(|v| v.parse().ok()),
+                header(UPSTREAM_INSTANCE_NAME_HEADER),
+                header(UPSTREAM_CREDENTIALS_HEADER).map(str::to_owned),
+            )),
+        };
+        Self {
+            upstream,
+            pid: header(PID_HEADER).map(str::to_owned),
+        }
+    }
+
+    fn serves(&self, ours: &CasIdentity) -> bool {
+        matches!(&self.upstream, ReportedUpstream::Cas(theirs) if theirs == ours)
+    }
+
+    /// The daemon as a message names it.
+    fn daemon(&self, address: &DaemonAddress) -> String {
+        match &self.pid {
+            Some(pid) => format!("the buck2-casd at {address} (pid {pid})"),
+            None => format!("the buck2-casd at {address}"),
+        }
+    }
+}
+
+/// A daemon this buck2 daemon has refused, and whether the warning has reached a console yet.
+struct Refusal {
+    warning: String,
+    shown: bool,
+}
+
+/// The daemons this process has refused, by address and the CAS it refused each for. Only a
+/// definite answer is kept: another upstream, none, or no header. A refusal holds for the life
+/// of the buck2 daemon, because buck2 builds a new client for a command when no other command
+/// holds one (buck2_execute's re/manager.rs), and those clients must not switch back to the
+/// shared daemon halfway through a session.
+///
+/// Process-wide, so tests that share a binary stay apart only by using distinct addresses.
+static REFUSED: LazyLock<Mutex<HashMap<(String, CasIdentity), Refusal>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Whether this client should send its CAS traffic through the daemon at `address`: whether the
+/// daemon says it passes that traffic to this client's own CAS. It is asked whoever started it,
+/// since a daemon this client just spawned may have lost the address to another one.
+///
+/// A daemon that says otherwise, or says nothing (one from before buck2 asked), is refused for
+/// the life of this buck2 daemon and left running, because other buck2 daemons may be using it
+/// correctly. A daemon that cannot be asked is not used by this client, and the next client
+/// asks again: one that is busy or restarting is not one that serves another CAS.
+pub(crate) async fn serves_this_cas(
+    opts: &Buck2OssReConfiguration,
+    address: &DaemonAddress,
+) -> anyhow::Result<bool> {
+    let Some(ours) = CasIdentity::of(opts)? else {
+        return Ok(true);
+    };
+    let key = (address.pool_address(), ours.clone());
+    if REFUSED.lock().unwrap().contains_key(&key) {
+        tracing::debug!("Not using buck2-casd at {address}, refused earlier");
+        show_refusal(&key);
+        return Ok(false);
+    }
+
+    match query_upstream(address).await {
+        Ok(answer) if answer.serves(&ours) => Ok(true),
+        Ok(answer) => {
+            let warning = refusal_warning(address, &ours, &answer);
+            REFUSED
+                .lock()
+                .unwrap()
+                .entry(key.clone())
+                .or_insert_with(|| {
+                    tracing::warn!("{warning}");
+                    Refusal {
+                        warning,
+                        shown: false,
+                    }
+                });
+            show_refusal(&key);
+            Ok(false)
+        }
+        Err(e) => {
+            let warning = format!(
+                "Not using the shared CAS cache for now: asking the buck2-casd at {address} \
+                 which CAS it passes traffic to failed ({e:#}). buck2 talks to {ours} directly, \
+                 and asks the buck2-casd again for a later command."
+            );
+            tracing::warn!("{warning}");
+            if let Some(dispatcher) = buck2_events::dispatch::get_dispatcher_opt() {
+                dispatcher.console_warning(warning);
+            }
+            Ok(false)
+        }
+    }
+}
+
+/// Puts a refusal on the console the first time a client is built inside a command. A client
+/// built outside one (the materializer can be first) has no console to show it on.
+fn show_refusal(key: &(String, CasIdentity)) {
+    let mut refused = REFUSED.lock().unwrap();
+    let Some(refusal) = refused.get_mut(key) else {
+        return;
+    };
+    if refusal.shown {
+        return;
+    }
+    if let Some(dispatcher) = buck2_events::dispatch::get_dispatcher_opt() {
+        dispatcher.console_warning(refusal.warning.clone());
+        refusal.shown = true;
+    }
+}
+
+const REMEDY: &str = "To share the cache again, stop that buck2-casd and run `buck2 kill`, or set \
+                      `cas_shared_cache_address` to another socket.";
+
+fn refusal_warning(address: &DaemonAddress, ours: &CasIdentity, theirs: &Answer) -> String {
+    format!(
+        "Not using the shared CAS cache: {} {}, but this daemon's CAS is {ours}. This buck2 \
+         daemon talks to its CAS directly until it restarts. {REMEDY}",
+        theirs.daemon(address),
+        theirs.upstream,
+    )
+}
+
+/// Asks the daemon, before every connection a client opens to it, whether it still passes
+/// traffic to the client's CAS. The question at build time does not cover the life of the
+/// client: a tonic channel redials its connector by itself when a connection breaks (tonic's
+/// transport/channel/service/reconnect.rs), as `GRPCClients::reconnect` does after starting a
+/// successor, and the daemon that answers then may be one another buck2 daemon started for
+/// another CAS.
+#[derive(Clone, Debug)]
+pub(crate) struct UpstreamCheck {
+    address: DaemonAddress,
+    ours: CasIdentity,
+}
+
+impl UpstreamCheck {
+    pub(crate) fn new(
+        opts: &Buck2OssReConfiguration,
+        address: &DaemonAddress,
+    ) -> anyhow::Result<Option<Self>> {
+        Ok(CasIdentity::of(opts)?.map(|ours| Self {
+            address: address.clone(),
+            ours,
+        }))
+    }
+
+    /// A `FAILED_PRECONDITION` status when the daemon serves another CAS, which tonic hands to
+    /// the request that needed the connection (it looks for a `Status` among an error's
+    /// sources), so that the build fails naming both CASes and is not retried.
+    async fn verify(&self) -> Result<(), tonic::Status> {
+        let answer = query_upstream(&self.address)
+            .await
+            .map_err(|e| tonic::Status::unavailable(format!("{e:#}")))?;
+        if answer.serves(&self.ours) {
+            return Ok(());
+        }
+        let message = format!(
+            "Not sending CAS traffic through {}: it {}, but this daemon's CAS is {}. It is not \
+             the buck2-casd this client started with. {REMEDY}",
+            answer.daemon(&self.address),
+            answer.upstream,
+            self.ours,
+        );
+        tracing::warn!("{message}");
+        Err(tonic::Status::failed_precondition(message))
+    }
+}
+
+/// A connector that runs an [`UpstreamCheck`] before each connection it makes, if it has one.
+#[derive(Clone)]
+pub(crate) struct CheckedConnector<C> {
+    inner: C,
+    check: Option<Arc<UpstreamCheck>>,
+}
+
+impl<C> CheckedConnector<C> {
+    pub(crate) fn new(inner: C, check: Option<Arc<UpstreamCheck>>) -> Self {
+        Self { inner, check }
+    }
+}
+
+impl<C> Service<Uri> for CheckedConnector<C>
+where
+    C: Service<Uri> + Clone + Send + 'static,
+    C::Future: Send + 'static,
+    C::Error: Into<tonic::codegen::StdError>,
+{
+    type Response = C::Response;
+    type Error = tonic::codegen::StdError;
+    type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+
+    fn poll_ready(&mut self, cx: &mut std::task::Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx).map_err(Into::into)
+    }
+
+    fn call(&mut self, uri: Uri) -> Self::Future {
+        // The instance polled ready makes the call; the clone waits for the next one.
+        let clone = self.inner.clone();
+        let mut inner = std::mem::replace(&mut self.inner, clone);
+        let check = self.check.clone();
+        Box::pin(async move {
+            if let Some(check) = check {
+                check.verify().await?;
+            }
+            inner.call(uri).await.map_err(Into::into)
+        })
+    }
+}
+
+async fn query_upstream(address: &DaemonAddress) -> anyhow::Result<Answer> {
+    tokio::time::timeout(UPSTREAM_QUERY_TIMEOUT, query_capabilities_metadata(address))
+        .await
+        .with_context(|| {
+            format!("buck2-casd at {address} did not answer within {UPSTREAM_QUERY_TIMEOUT:?}")
+        })?
+        .with_context(|| format!("Error asking buck2-casd at {address} for its upstream"))
+        .map(|metadata| Answer::from_metadata(&metadata))
+}
+
+async fn query_capabilities_metadata(address: &DaemonAddress) -> anyhow::Result<MetadataMap> {
+    let channel = match address {
+        DaemonAddress::Unix(path) => {
+            // The URI only fills the `:authority` header; the connector ignores it.
+            Endpoint::from_static("http://unix.invalid/")
+                .connect_with_connector(UnixConnector::new(Arc::new(path.clone())))
+                .await?
+        }
+        DaemonAddress::Loopback(port) => {
+            Endpoint::from_shared(format!("http://127.0.0.1:{port}"))?
+                .connect()
+                .await?
+        }
+    };
+    let response = CapabilitiesClient::new(channel)
+        .get_capabilities(GetCapabilitiesRequest::default())
+        .await?;
+    Ok(response.metadata().clone())
+}
+
 /// Works out the binary and arguments for the daemon from the same configuration this client
 /// uses, so the daemon talks to the same upstream the same way.
 pub fn plan_launch(
@@ -230,12 +674,18 @@ pub fn plan_launch(
         args.push(cap.to_string());
     }
     if let Some(upstream) = &opts.cas_address {
+        // Substituted here, unlike the headers, so that the daemon reports the address it
+        // dials and a client with the same configuration recognises it as its own.
         args.push("--upstream".to_owned());
-        args.push(upstream.clone());
+        args.push(substitute_env_vars(upstream).context("Invalid `cas_address`")?);
         // Without the flag the daemon lets the address scheme decide, as buck2 does when
-        // `tls` is unset.
-        if opts.tls == Some(true) {
-            args.push("--upstream-tls".to_owned());
+        // `tls` is unset. `false` is spelled out, or a `grpcs://` address would have the daemon
+        // dial TLS on port 443 where buck2 dials plaintext on port 80. `true` stays the bare
+        // flag, which every buck2-casd accepts.
+        match opts.tls {
+            Some(true) => args.push("--upstream-tls".to_owned()),
+            Some(false) => args.push("--upstream-tls=false".to_owned()),
+            None => {}
         }
         if let Some(ca) = &opts.tls_ca_certs {
             args.push("--upstream-tls-ca-certs".to_owned());
@@ -434,6 +884,200 @@ mod tests {
             launch.http_headers_env.as_deref(),
             Some("Authorization: Bearer $TOKEN")
         );
+        Ok(())
+    }
+
+    #[test]
+    fn test_plan_launch_substitutes_the_upstream_but_not_the_headers() -> anyhow::Result<()> {
+        let opts = Buck2OssReConfiguration {
+            cas_address: Some("grpc://$CAS_HOST:443".to_owned()),
+            http_headers: vec![HttpHeader {
+                key: "x-api-key".to_owned(),
+                value: "$API_KEY".to_owned(),
+            }],
+            cas_shared_cache_binary: Some("buck2-casd".to_owned()),
+            ..Default::default()
+        };
+        let subst = |s: &str| Ok(s.replace("$CAS_HOST", "cas.example.com"));
+        let launch = plan_launch(&opts, &DaemonAddress::Loopback(1), Path::new("/c"), &subst)?;
+        assert_eq!(
+            launch.args[launch.args.len() - 2..],
+            ["--upstream", "grpc://cas.example.com:443"]
+        );
+        // The daemon substitutes the headers itself, from the environment it inherits.
+        assert_eq!(
+            launch.http_headers_env.as_deref(),
+            Some("x-api-key: $API_KEY")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_plan_launch_spells_out_tls_false() -> anyhow::Result<()> {
+        let opts = Buck2OssReConfiguration {
+            cas_address: Some("grpcs://cas.example.com".to_owned()),
+            tls: Some(false),
+            cas_shared_cache_binary: Some("buck2-casd".to_owned()),
+            ..Default::default()
+        };
+        let launch = plan_launch(
+            &opts,
+            &DaemonAddress::Loopback(1),
+            Path::new("/c"),
+            &no_subst,
+        )?;
+        assert_eq!(
+            launch.args[launch.args.len() - 3..],
+            [
+                "--upstream",
+                "grpcs://cas.example.com",
+                "--upstream-tls=false"
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_cas_identity_compares_what_the_channel_dials() {
+        let id = |address, tls, instance| CasIdentity::new(address, tls, instance, None);
+        let cas = id("grpc://cas.example.com:443", Some(true), None);
+        // The scheme only selects TLS, and the default port follows the TLS that results.
+        assert_eq!(id("grpcs://cas.example.com", None, None), cas);
+        assert_eq!(id("https://cas.example.com:443/", None, None), cas);
+        assert_eq!(id("grpc://cas.example.com", Some(true), None), cas);
+        assert_eq!(id("cas.example.com:443", None, None), cas);
+        assert_eq!(id("grpc://CAS.Example.com:443", Some(true), None), cas);
+        assert_eq!(
+            id("grpcs://cas.example.com", Some(false), None),
+            id("grpc://cas.example.com:80", None, None),
+            "`tls = false` wins over the scheme, port and all"
+        );
+
+        assert_ne!(
+            id("grpc://cas.example.com:443", None, None),
+            cas,
+            "plaintext to the port"
+        );
+        assert_ne!(id("grpc://other.example.com:443", Some(true), None), cas);
+        assert_ne!(id("grpc://cas.example.com:8443", Some(true), None), cas);
+        assert_ne!(id("grpc://cas.example.com", None, None), cas, "port 80");
+        assert_ne!(
+            id("grpc://cas.example.com:443", Some(true), Some("main")),
+            cas
+        );
+        assert_ne!(
+            id("grpc://cas.example.com:443", None, Some("main")),
+            id("grpc://cas.example.com:443", None, Some("other"))
+        );
+        assert_ne!(
+            CasIdentity::new("grpcs://cas.example.com", None, None, Some("k1".to_owned())),
+            CasIdentity::new("grpcs://cas.example.com", None, None, Some("k2".to_owned())),
+            "another organisation's key"
+        );
+        assert_ne!(
+            CasIdentity::new("grpcs://cas.example.com", None, None, Some("k1".to_owned())),
+            cas
+        );
+
+        // What does not parse as a gRPC address is compared as written.
+        assert_eq!(
+            id("unix:///run/cas.sock", Some(false), None),
+            id("unix:///run/cas.sock", None, None)
+        );
+        assert_ne!(
+            id("unix:///run/cas.sock", None, None),
+            id("unix:///run/other.sock", None, None)
+        );
+        assert_eq!(
+            cas.to_string(),
+            "`cas.example.com:443` over TLS, no credentials"
+        );
+    }
+
+    #[test]
+    fn test_credentials_fingerprint() -> anyhow::Result<()> {
+        let header = |key: &str, value: &str| HttpHeader {
+            key: key.to_owned(),
+            value: value.to_owned(),
+        };
+        let fingerprint =
+            |headers: &[HttpHeader], cert| upstream_credentials_fingerprint(headers, cert).unwrap();
+        assert_eq!(fingerprint(&[], None), None);
+
+        let key = fingerprint(&[header("x-api-key", "k1"), header("x-other", "v")], None);
+        let digest = key.as_deref().expect("headers are credentials");
+        assert_eq!(digest.len(), 64);
+        assert!(!digest.contains("k1"));
+        // Neither the order of the headers nor the case of their names matters.
+        assert_eq!(
+            fingerprint(&[header("x-other", "v"), header("X-Api-Key", "k1")], None),
+            key
+        );
+        assert_ne!(fingerprint(&[header("x-api-key", "k2")], None), key);
+        assert_ne!(
+            fingerprint(&[header("x-api-key", "k1")], None),
+            key,
+            "a header fewer"
+        );
+
+        // A relative certificate path is the file it names from this working directory.
+        let cwd = std::env::current_dir()?;
+        let cert = fingerprint(&[], Some("client.pem"));
+        assert!(cert.is_some());
+        let absolute = cwd.join("client.pem");
+        assert_eq!(fingerprint(&[], Some(absolute.to_str().unwrap())), cert);
+        assert_ne!(fingerprint(&[], Some("/etc/other.pem")), cert);
+        Ok(())
+    }
+
+    #[test]
+    fn test_answer_from_metadata() -> anyhow::Result<()> {
+        let mut metadata = MetadataMap::new();
+        let ours = CasIdentity::new("grpcs://cas.example.com", None, Some("main"), None);
+        let answer = Answer::from_metadata(&metadata);
+        assert_eq!(answer.upstream, ReportedUpstream::Unreported);
+        assert!(
+            !answer.serves(&ours),
+            "a daemon that does not say is refused"
+        );
+
+        metadata.insert(UPSTREAM_HEADER, "".parse()?);
+        assert_eq!(
+            Answer::from_metadata(&metadata).upstream,
+            ReportedUpstream::Standalone
+        );
+
+        metadata.insert(UPSTREAM_HEADER, "grpc://cas.example.com".parse()?);
+        metadata.insert(UPSTREAM_TLS_HEADER, "true".parse()?);
+        metadata.insert(UPSTREAM_INSTANCE_NAME_HEADER, "main".parse()?);
+        metadata.insert(PID_HEADER, "4242".parse()?);
+        let answer = Answer::from_metadata(&metadata);
+        assert!(answer.serves(&ours));
+        assert_eq!(answer.pid.as_deref(), Some("4242"));
+
+        metadata.insert(UPSTREAM_CREDENTIALS_HEADER, "abc".parse()?);
+        assert!(!Answer::from_metadata(&metadata).serves(&ours));
+        metadata.insert(UPSTREAM_TLS_HEADER, "false".parse()?);
+        metadata.remove(UPSTREAM_CREDENTIALS_HEADER);
+        assert!(!Answer::from_metadata(&metadata).serves(&ours));
+        Ok(())
+    }
+
+    #[test]
+    fn test_refusal_warning_names_both_upstreams_and_the_daemon() -> anyhow::Result<()> {
+        let mut metadata = MetadataMap::new();
+        metadata.insert(UPSTREAM_HEADER, "grpcs://ns.example.com".parse()?);
+        metadata.insert(PID_HEADER, "4242".parse()?);
+        let warning = refusal_warning(
+            &DaemonAddress::Unix(PathBuf::from("/c/buck2-casd.sock")),
+            &CasIdentity::new("grpc://bb.example.com:443", Some(true), None, None),
+            &Answer::from_metadata(&metadata),
+        );
+        assert!(warning.contains("unix:///c/buck2-casd.sock"), "{warning}");
+        assert!(warning.contains("pid 4242"), "{warning}");
+        assert!(warning.contains("`bb.example.com:443`"), "{warning}");
+        assert!(warning.contains("`ns.example.com:443`"), "{warning}");
+        assert!(warning.contains("cas_shared_cache_address"), "{warning}");
         Ok(())
     }
 

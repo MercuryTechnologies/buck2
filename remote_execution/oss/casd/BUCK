@@ -13,6 +13,9 @@ rust_library(
     ),
     test_deps = [
         "fbsource//third-party/rust:tempfile",
+        "//buck2/app/buck2_data:buck2_data",
+        "//buck2/app/buck2_events:buck2_events",
+        "//buck2/app/buck2_wrapper_common:buck2_wrapper_common",
     ],
     deps = [
         "fbsource//third-party/rust:anyhow",

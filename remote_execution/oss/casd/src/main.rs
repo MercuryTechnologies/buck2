@@ -56,9 +56,16 @@ struct Args {
     #[arg(long)]
     upstream: Option<String>,
 
-    /// Use TLS for the upstream connection.
-    #[arg(long, default_value_t = false)]
-    upstream_tls: bool,
+    /// Use TLS for the upstream connection, or not with `--upstream-tls=false`, whatever the
+    /// scheme of `--upstream` says. Without it the scheme decides, as it does for buck2 when
+    /// `[buck2_re_client] tls` is unset.
+    #[arg(
+        long,
+        num_args = 0..=1,
+        require_equals = true,
+        default_missing_value = "true"
+    )]
+    upstream_tls: Option<bool>,
 
     /// PEM bundle of CA certificates for the upstream connection.
     #[arg(long)]

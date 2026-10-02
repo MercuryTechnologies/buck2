@@ -35,12 +35,25 @@ use crate::digest::DigestFunction;
 pub struct UpstreamConfig {
     /// gRPC address of the remote CAS, e.g. `grpc://cas.example.com:443`; TLS is a separate flag.
     pub address: String,
-    pub tls: bool,
+    /// Overrides the scheme, as `[buck2_re_client] tls` does; unset lets the scheme decide.
+    pub tls: Option<bool>,
     pub tls_ca_certs: Option<String>,
     pub tls_client_cert: Option<String>,
     /// `Header: value` pairs added to every upstream request.
     pub http_headers: Vec<String>,
     pub instance_name: Option<String>,
+}
+
+impl UpstreamConfig {
+    pub fn parsed_http_headers(&self) -> anyhow::Result<Vec<HttpHeader>> {
+        self.http_headers
+            .iter()
+            .map(|h| {
+                h.parse::<HttpHeader>()
+                    .map_err(|e| anyhow::anyhow!("Invalid upstream header `{h}`: {e}"))
+            })
+            .collect()
+    }
 }
 
 pub struct Upstream {
@@ -53,20 +66,12 @@ impl Upstream {
         config: &UpstreamConfig,
         digest_function: DigestFunction,
     ) -> anyhow::Result<Self> {
-        let http_headers = config
-            .http_headers
-            .iter()
-            .map(|h| {
-                h.parse::<HttpHeader>()
-                    .map_err(|e| anyhow::anyhow!("Invalid upstream header `{h}`: {e}"))
-            })
-            .collect::<anyhow::Result<Vec<_>>>()?;
+        let http_headers = config.parsed_http_headers()?;
         let opts = Buck2OssReConfiguration {
             cas_address: Some(config.address.clone()),
             engine_address: Some(config.address.clone()),
             action_cache_address: Some(config.address.clone()),
-            // Unset lets the address scheme decide, as it does for buck2 without `tls`.
-            tls: config.tls.then_some(true),
+            tls: config.tls,
             tls_ca_certs: config.tls_ca_certs.clone(),
             tls_client_cert: config.tls_client_cert.clone(),
             http_headers,

@@ -33,6 +33,11 @@ use re_grpc_proto::build::bazel::semver::SemVer;
 use re_grpc_proto::google::bytestream as bs;
 use re_grpc_proto::google::bytestream::byte_stream_server::ByteStream;
 use re_grpc_proto::google::rpc;
+use remote_execution::PID_HEADER;
+use remote_execution::UPSTREAM_CREDENTIALS_HEADER;
+use remote_execution::UPSTREAM_HEADER;
+use remote_execution::UPSTREAM_INSTANCE_NAME_HEADER;
+use remote_execution::UPSTREAM_TLS_HEADER;
 use tokio::io::AsyncBufRead;
 use tokio::io::AsyncRead;
 use tokio::io::AsyncReadExt;
@@ -44,11 +49,15 @@ use tonic::Request;
 use tonic::Response;
 use tonic::Status;
 use tonic::Streaming;
+use tonic::metadata::Ascii;
+use tonic::metadata::MetadataMap;
+use tonic::metadata::MetadataValue;
 
 use crate::digest::Digest;
 use crate::store::CommitError;
 use crate::store::Store;
 use crate::upstream::Upstream;
+use crate::upstream::UpstreamConfig;
 
 /// Largest `BatchReadBlobs`/`BatchUpdateBlobs` payload we advertise.
 pub const MAX_BATCH_TOTAL_SIZE_BYTES: usize = 4 * 1024 * 1024;
@@ -63,12 +72,23 @@ pub struct Cas {
 struct Inner {
     store: Arc<Store>,
     upstream: Option<Arc<Upstream>>,
+    /// Sent with every `GetCapabilities` answer, so that a buck2 client that finds this daemon
+    /// already running can tell whether its upstream is the client's own CAS.
+    upstream_metadata: MetadataMap,
 }
 
 impl Cas {
-    pub fn new(store: Arc<Store>, upstream: Option<Arc<Upstream>>) -> Self {
+    pub fn new(
+        store: Arc<Store>,
+        upstream: Option<Arc<Upstream>>,
+        upstream_config: Option<&UpstreamConfig>,
+    ) -> Self {
         Self {
-            inner: Arc::new(Inner { store, upstream }),
+            inner: Arc::new(Inner {
+                store,
+                upstream,
+                upstream_metadata: upstream_metadata(upstream_config),
+            }),
         }
     }
 
@@ -428,7 +448,7 @@ impl Capabilities for Cas {
         &self,
         _request: Request<re::GetCapabilitiesRequest>,
     ) -> Result<Response<re::ServerCapabilities>, Status> {
-        Ok(Response::new(re::ServerCapabilities {
+        let mut response = Response::new(re::ServerCapabilities {
             cache_capabilities: Some(re::CacheCapabilities {
                 digest_functions: vec![self.store().digest_function().proto_value() as i32],
                 action_cache_update_capabilities: Some(re::ActionCacheUpdateCapabilities {
@@ -455,8 +475,60 @@ impl Capabilities for Cas {
                 ..Default::default()
             }),
             ..Default::default()
-        }))
+        });
+        *response.metadata_mut() = self.inner.upstream_metadata.clone();
+        Ok(response)
     }
+}
+
+/// The upstream as buck2's `casd_autostart` reads it back: the address as given, empty for a
+/// standalone CAS, and the TLS setting, instance name and credentials that change which server
+/// and whose CAS in it the blobs go to; and this process, for the warning a refused client
+/// prints.
+///
+/// An upstream that cannot be written as headers (a value outside visible ASCII) is left out
+/// whole and logged, rather than stopping the daemon: clients then see a daemon that does not
+/// say, and go to their CAS directly.
+fn upstream_metadata(upstream: Option<&UpstreamConfig>) -> MetadataMap {
+    let mut metadata = MetadataMap::new();
+    metadata.insert(PID_HEADER, MetadataValue::from(std::process::id()));
+    match upstream_headers(upstream) {
+        Ok(headers) => {
+            for (name, value) in headers {
+                metadata.insert(name, value);
+            }
+        }
+        Err(e) => tracing::warn!(
+            "Not reporting the upstream to clients, which will not use this daemon: {e:#}"
+        ),
+    }
+    metadata
+}
+
+fn upstream_headers(
+    upstream: Option<&UpstreamConfig>,
+) -> anyhow::Result<Vec<(&'static str, MetadataValue<Ascii>)>> {
+    let value = |v: &str| {
+        MetadataValue::try_from(v).with_context(|| format!("`{v}` cannot be sent as a header"))
+    };
+    let Some(upstream) = upstream else {
+        return Ok(vec![(UPSTREAM_HEADER, value("")?)]);
+    };
+    let mut headers = vec![(UPSTREAM_HEADER, value(&upstream.address)?)];
+    if let Some(tls) = upstream.tls {
+        headers.push((UPSTREAM_TLS_HEADER, value(&tls.to_string())?));
+    }
+    if let Some(instance) = &upstream.instance_name {
+        headers.push((UPSTREAM_INSTANCE_NAME_HEADER, value(instance)?));
+    }
+    let credentials = remote_execution::upstream_credentials_fingerprint(
+        &upstream.parsed_http_headers()?,
+        upstream.tls_client_cert.as_deref(),
+    )?;
+    if let Some(credentials) = credentials {
+        headers.push((UPSTREAM_CREDENTIALS_HEADER, value(&credentials)?));
+    }
+    Ok(headers)
 }
 
 /// Drains a ByteStream write into `tmp`, returning the number of bytes received on the wire.

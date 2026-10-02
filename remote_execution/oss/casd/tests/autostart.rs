@@ -131,6 +131,18 @@ async fn client_autostarts_the_daemon() -> anyhow::Result<()> {
                 .lookup_for_test(&digest.hash, digest.size_in_bytes)
                 .await?
         );
+        // Through the daemon, which the client asked for its upstream although it had just
+        // started it, and was not turned away by its own configuration.
+        let stored = |d: &TDigest| {
+            casd_dir
+                .join("blobs")
+                .join(&d.hash[..2])
+                .join(format!("{}-{}", d.hash, d.size_in_bytes))
+        };
+        assert!(
+            stored(&digest).exists(),
+            "the upload went through buck2-casd"
+        );
 
         // A second client sees the daemon already running and reuses it.
         let again = REClientBuilder::build_and_connect(&opts).await?;
@@ -196,6 +208,7 @@ async fn client_autostarts_the_daemon() -> anyhow::Result<()> {
                 .await?,
             "the upload went through a new daemon to the origin"
         );
+        assert!(stored(&more_digest).exists(), "and through the new daemon");
         let new_pid: u32 = std::fs::read_to_string(&pid_file)?
             .lines()
             .next()
