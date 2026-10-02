@@ -126,6 +126,7 @@ use tonic::transport::Uri;
 use tonic::transport::channel::ClientTlsConfig;
 use uuid::Uuid;
 
+use crate::casd_autostart::CheckedConnector;
 use crate::casd_autostart::DaemonAddress;
 use crate::error::*;
 use crate::metadata::*;
@@ -1237,7 +1238,7 @@ async fn create_tls_config(settings: &GrpcTlsSettings) -> anyhow::Result<ClientT
     Ok(config)
 }
 
-fn prepare_uri(uri: Uri, tls_override: Option<bool>) -> anyhow::Result<(Uri, bool)> {
+pub(crate) fn prepare_uri(uri: Uri, tls_override: Option<bool>) -> anyhow::Result<(Uri, bool)> {
     // Now do some awkward things with the protocol. Why do we do all this? The reason is
     // because we'd like our configuration to not be super confusing. We don't want to e.g.
     // allow setting the address to `https://foobar`; instead we infer TLS from the source
@@ -2457,6 +2458,15 @@ impl REClientBuilder {
             "`remote_cache_chunking` cannot be combined with `cas_shared_cache`: buck2-casd does \
              not implement SplitBlob or SpliceBlob"
         );
+        // buck2-casd reaches the remote CAS with its own client, which has no credential helper,
+        // so the helper's credentials would stop at the daemon. Checked against the configured
+        // address, before the daemon is asked for its upstream: a refusal below clears
+        // `daemon_address`, but the configuration is wrong whenever the daemon would be used.
+        anyhow::ensure!(
+            daemon_address.is_none() || credential_helper.is_none(),
+            "`credential_helper` cannot be combined with `cas_shared_cache`: buck2-casd does not \
+             call the helper for its upstream requests"
+        );
         // The channels below connect eagerly, so the daemon has to answer first.
         let cas_daemon = match (&daemon_address, &shared_cache_dir) {
             (Some(address), Some(dir)) if opts.cas_shared_cache_autostart.unwrap_or(true) => {
@@ -2473,6 +2483,25 @@ impl REClientBuilder {
             }
             _ => None,
         };
+        // The daemon answering may have been started for another CAS, even right after this
+        // client spawned one, and using it would send every blob there. If so, the client goes
+        // to its own CAS directly, and leaves the directory alone too.
+        let refused = match &daemon_address {
+            Some(address) => !crate::casd_autostart::serves_this_cas(opts, address).await?,
+            None => false,
+        };
+        let (daemon_address, shared_cache_dir, cas_daemon) = if refused {
+            (None, None, None)
+        } else {
+            (daemon_address, shared_cache_dir, cas_daemon)
+        };
+        // Asked again before each connection to the daemon, for as long as the client lives.
+        let upstream_check = match &daemon_address {
+            Some(address) => {
+                crate::casd_autostart::UpstreamCheck::new(opts, address)?.map(Arc::new)
+            }
+            None => None,
+        };
         let cas_address = match &daemon_address {
             Some(address) => Some(address.pool_address()),
             None => opts.cas_address.clone(),
@@ -2488,13 +2517,6 @@ impl REClientBuilder {
             ),
             _ => None,
         };
-        // buck2-casd reaches the remote CAS with its own client, which has no credential helper,
-        // so the helper's credentials would stop at the daemon.
-        anyhow::ensure!(
-            daemon_address.is_none() || credential_helper.is_none(),
-            "`credential_helper` cannot be combined with `cas_shared_cache`: buck2-casd does not \
-             call the helper for its upstream requests"
-        );
 
         let cas_connector = GrpcChannelConnector::new(
             cas_address.clone(),
@@ -2502,7 +2524,8 @@ impl REClientBuilder {
             tls_config.clone(),
             credential_helper.clone(),
         )
-        .plaintext(daemon_address.is_some());
+        .plaintext(daemon_address.is_some())
+        .upstream_check(upstream_check.clone());
         let execution_connector = GrpcChannelConnector::new(
             opts.engine_address.clone(),
             channel_settings.clone(),
@@ -2521,7 +2544,8 @@ impl REClientBuilder {
             tls_config.clone(),
             credential_helper.clone(),
         )
-        .plaintext(daemon_address.is_some());
+        .plaintext(daemon_address.is_some())
+        .upstream_check(upstream_check);
         let capabilities_connector = GrpcChannelConnector::new(
             opts.engine_address.clone(),
             channel_settings,
@@ -3009,6 +3033,8 @@ struct GrpcChannelConnector {
     /// daemon, a Unix socket or a loopback port, which must stay reachable when the remote
     /// services require TLS.
     plaintext: bool,
+    /// Set for the machine-local CAS daemon: what each new connection to it checks first.
+    upstream_check: Option<Arc<crate::casd_autostart::UpstreamCheck>>,
 }
 
 impl GrpcChannelConnector {
@@ -3024,11 +3050,22 @@ impl GrpcChannelConnector {
             tls_config,
             credential_helper,
             plaintext: false,
+            upstream_check: None,
         }
     }
 
     fn plaintext(self, plaintext: bool) -> Self {
         Self { plaintext, ..self }
+    }
+
+    fn upstream_check(
+        self,
+        upstream_check: Option<Arc<crate::casd_autostart::UpstreamCheck>>,
+    ) -> Self {
+        Self {
+            upstream_check,
+            ..self
+        }
     }
 
     fn address(&self) -> anyhow::Result<String> {
@@ -3084,8 +3121,10 @@ impl GrpcChannelConnector {
             // The URI only fills the `:authority` header; the connector ignores it.
             let endpoint =
                 self.with_keepalive(Channel::builder(Uri::from_static("http://unix.invalid/")));
-            let connector =
-                CountingConnector::new(UnixConnector::new(Arc::new(PathBuf::from(path))));
+            let connector = CountingConnector::new(CheckedConnector::new(
+                UnixConnector::new(Arc::new(PathBuf::from(path))),
+                self.upstream_check.clone(),
+            ));
             return endpoint
                 .connect_with_connector(connector)
                 .await
@@ -3117,7 +3156,8 @@ impl GrpcChannelConnector {
         if let Some(tcp_keepalive_secs) = self.settings.tcp_keepalive_secs {
             http.set_keepalive(Some(Duration::from_secs(tcp_keepalive_secs)));
         }
-        let connector = CountingConnector::new(http);
+        let connector =
+            CountingConnector::new(CheckedConnector::new(http, self.upstream_check.clone()));
 
         endpoint
             .connect_with_connector(connector)
@@ -3373,7 +3413,8 @@ impl GRPCClients {
     async fn reconnect(&self, kind: GrpcClientKind) -> anyhow::Result<()> {
         // A broken connection to buck2-casd most likely means the daemon is gone, and redialing
         // a socket nobody listens on only fails again. Start a successor at the same address
-        // first.
+        // first. Whoever answers there then, a successor or a daemon another buck2 daemon
+        // started, is asked for its upstream by the connector before it gets any traffic.
         if let (GrpcClientKind::Cas | GrpcClientKind::ByteStream, Some(daemon)) =
             (kind, &self.cas_daemon)
         {
@@ -7303,7 +7344,7 @@ fn with_re_metadata_timeout<T>(
 }
 
 /// Replace occurrences of $FOO in a string with the value of the env var $FOO.
-fn substitute_env_vars(s: &str) -> anyhow::Result<String> {
+pub(crate) fn substitute_env_vars(s: &str) -> anyhow::Result<String> {
     substitute_env_vars_impl(s, |v| std::env::var(v))
 }
 

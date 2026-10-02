@@ -193,7 +193,7 @@ pub async fn start(config: Config) -> anyhow::Result<Running> {
         )),
         None => None,
     };
-    let cas = Cas::new(Arc::clone(&store), upstream);
+    let cas = Cas::new(Arc::clone(&store), upstream, config.upstream.as_ref());
 
     let (address, incoming) = bind(&config.listen).await?;
 
