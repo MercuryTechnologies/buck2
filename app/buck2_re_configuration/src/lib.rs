@@ -518,12 +518,19 @@ pub struct Buck2OssReConfiguration {
     /// Maximum number of concurrent upload requests for each action.
     pub max_concurrent_uploads_per_action: Option<usize>,
     /// Maximum number of digests to ask about in a single
-    /// `FindMissingBlobs` (a.k.a. `GetDigestsTtl`) RPC. Larger values
-    /// reduce per-call wall-clock latency by issuing fewer round-trips,
-    /// at the cost of bigger requests and more concurrent server load
-    /// when many actions issue independent calls. Recommended to raise
-    /// only in combination with `[buck2] deduplicate_get_digests_ttl_calls`.
+    /// `FindMissingBlobs` (a.k.a. `GetDigestsTtl`) RPC. Defaults to 1000,
+    /// about 73 KB of SHA-256 digests on the wire.
     pub find_missing_blobs_batch_size: Option<usize>,
+    /// Maximum number of `FindMissingBlobs` RPCs one call keeps in flight
+    /// when its digests span several batches. Defaults to 16.
+    pub find_missing_blobs_concurrency: Option<usize>,
+    /// Maximum number of digests in flight in `FindMissingBlobs` RPCs across
+    /// the whole client, so that many concurrent calls cannot multiply the
+    /// per-call bound without limit. Defaults to 100000. It also caps
+    /// `find_missing_blobs_batch_size`, so no one request exceeds it. It
+    /// counts digests, not requests, so it does not bound the number of
+    /// streams open on the CAS connection.
+    pub find_missing_blobs_max_digests_in_flight: Option<usize>,
     /// Time that digests are assumed to live in CAS after being touched.
     pub cas_ttl_secs: Option<i64>,
     /// Whether to chunk large remote-cache blobs using FastCDC 2020 and SpliceBlob.
@@ -725,6 +732,14 @@ impl Buck2OssReConfiguration {
                 section: BUCK2_RE_CLIENT_CFG_SECTION,
                 property: "find_missing_blobs_batch_size",
             })?,
+            find_missing_blobs_concurrency: legacy_config.parse(BuckconfigKeyRef {
+                section: BUCK2_RE_CLIENT_CFG_SECTION,
+                property: "find_missing_blobs_concurrency",
+            })?,
+            find_missing_blobs_max_digests_in_flight: legacy_config.parse(BuckconfigKeyRef {
+                section: BUCK2_RE_CLIENT_CFG_SECTION,
+                property: "find_missing_blobs_max_digests_in_flight",
+            })?,
             cas_ttl_secs: legacy_config.parse(BuckconfigKeyRef {
                 section: BUCK2_RE_CLIENT_CFG_SECTION,
                 property: "cas_ttl_secs",
@@ -918,6 +933,29 @@ mod tests {
                 .queued_operation_timeout_secs,
             Some(0)
         );
+        Ok(())
+    }
+
+    #[test]
+    fn oss_config_parses_find_missing_blobs_keys() -> buck2_error::Result<()> {
+        let unset = parse(&[("config", "")], "config")?;
+        let set = parse(
+            &[(
+                "config",
+                "[buck2_re_client]\nfind_missing_blobs_batch_size = 2000\nfind_missing_blobs_concurrency = 8\nfind_missing_blobs_max_digests_in_flight = 50000\n",
+            )],
+            "config",
+        )?;
+
+        let unset = Buck2OssReConfiguration::from_legacy_config(&unset, Vec::new())?;
+        assert_eq!(unset.find_missing_blobs_batch_size, None);
+        assert_eq!(unset.find_missing_blobs_concurrency, None);
+        assert_eq!(unset.find_missing_blobs_max_digests_in_flight, None);
+
+        let set = Buck2OssReConfiguration::from_legacy_config(&set, Vec::new())?;
+        assert_eq!(set.find_missing_blobs_batch_size, Some(2000));
+        assert_eq!(set.find_missing_blobs_concurrency, Some(8));
+        assert_eq!(set.find_missing_blobs_max_digests_in_flight, Some(50000));
         Ok(())
     }
 
