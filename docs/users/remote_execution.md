@@ -188,10 +188,34 @@ The daemon then runs until `buck2 killall`, which stops it along with the buck2
 daemons, or a reboot. If it goes away under a running buck2 daemon (killed,
 crashed, or its directory removed) it takes its socket file with it, and the
 next CAS call starts a new one; a client mid-request may see that one request
-fail. The protocol between buck2 and the daemon is the remote execution API, so
-an older daemon keeps working with a newer buck2; to pick up a new daemon
-binary after upgrading buck2, run `buck2 killall`. To run it under a service
-manager instead, start it yourself and set `cas_shared_cache_autostart = false`:
+fail. The protocol between buck2 and the daemon is the remote execution API; to
+pick up a new daemon binary after upgrading buck2, run `buck2 killall`.
+
+Every buck2 daemon on the machine shares the one `buck2-casd`, and with it the
+upstream it was started with. So buck2 asks the daemon which CAS it passes
+traffic to, when it builds a client and again before every connection it opens
+to the daemon, and uses it only if that is its own CAS: the same host and port
+once the scheme and `tls` have been applied, the same TLS, the same instance
+name, and the same `http_headers` and `tls_client_cert` path. The headers are
+compared after `$VAR` substitution, by a SHA-256 digest that the daemon
+reports in place of their values, because on a remote such as BuildBuddy the
+API key picks the organisation whose CAS the blobs go to. The CA bundle is not
+compared.
+
+When a client is built and the daemon serves another CAS, as when it was
+started for a remote that has since been replaced, buck2 prints one warning
+naming both and the daemon's pid, leaves that daemon running for whoever else
+uses it, and sends CAS traffic to `cas_address` directly, without the
+directory, until the buck2 daemon restarts. A daemon from before buck2 asked
+does not say and is treated the same way. Stop it and run `buck2 kill`, or
+point `cas_shared_cache_address` at another socket. A daemon that does not
+answer the question is skipped by that client only, and the next client asks
+again. If the daemon a client uses is replaced by one for another CAS while
+the client lives, CAS requests fail with an error naming both, rather than
+reaching the other CAS.
+
+To run the daemon under a service manager instead, start it yourself and set
+`cas_shared_cache_autostart = false`:
 
 ```sh
 $ buck2-casd --dir /var/cache/buck2-casd \
