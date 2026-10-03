@@ -106,14 +106,19 @@ mod state_machine {
     use assert_matches::assert_matches;
     use buck2_common::file_ops::metadata::Symlink;
     use buck2_core::fs::project::ProjectRootTemp;
+    use buck2_directory::directory::directory::Directory;
+    use buck2_directory::directory::directory_iterator::DirectoryIterator;
     use buck2_error::BuckErrorContext;
     use buck2_error::buck2_error;
     use buck2_events::daemon_id::DaemonId;
     use buck2_events::source::ChannelEventSource;
+    use buck2_execute::digest::CasDigestToReExt;
     use buck2_execute::directory::ActionDirectoryEntry;
     use buck2_execute::directory::ActionSharedDirectory;
     use buck2_execute::directory::INTERNER;
     use buck2_execute::execute::blocking::IoRequest;
+    use buck2_execute::re::uploader::UploadContents;
+    use buck2_execute::re::uploader::Uploader;
     use buck2_fs::fs_util::ReadDir;
     use buck2_fs::fs_util::uncategorized as fs_util;
     use buck2_fs::paths::RelativePathBuf;
@@ -2069,6 +2074,250 @@ mod state_machine {
                 Priority::High,
                 "Direct symlink-dep target should be promoted to High along with its parent",
             );
+            Ok(())
+        })
+        .await
+    }
+
+    struct DeclaredWrite {
+        path: ProjectRelativePathBuf,
+        content: Vec<u8>,
+        meta: FileMetadata,
+    }
+
+    async fn declare_writes(
+        dm: &DeferredMaterializerAccessor<StubIoHandler>,
+        writes: Vec<(&str, Vec<u8>, bool)>,
+    ) -> buck2_error::Result<Vec<DeclaredWrite>> {
+        let requests: Vec<WriteRequest> = writes
+            .iter()
+            .map(|(path, content, is_executable)| WriteRequest {
+                path: make_path(path),
+                content: content.clone(),
+                is_executable: *is_executable,
+                configuration_path: None,
+            })
+            .collect();
+        let values = dm.declare_write(Box::new(move || Ok(requests))).await?;
+        Ok(std::iter::zip(writes, values)
+            .map(|((path, content, _), value)| {
+                let meta = match value.entry() {
+                    DirectoryEntry::Leaf(ActionDirectoryMember::File(meta)) => meta.dupe(),
+                    entry => panic!("A write declared {entry:?}"),
+                };
+                DeclaredWrite {
+                    path: make_path(path),
+                    content,
+                    meta,
+                }
+            })
+            .collect())
+    }
+
+    /// What an RE upload of an action whose inputs are `inputs` would send if
+    /// the CAS had none of their files.
+    async fn upload_contents_for(
+        dm: &DeferredMaterializerAccessor<StubIoHandler>,
+        inputs: Vec<(ProjectRelativePathBuf, FileMetadata)>,
+    ) -> buck2_error::Result<UploadContents> {
+        let mut builder = ActionDirectoryBuilder::empty();
+        for (path, meta) in inputs {
+            insert_file(&mut builder, path, meta)?;
+        }
+        let input_dir = builder.fingerprint(dm.io.digest_config().as_directory_serializer());
+        let missing_digests = input_dir
+            .unordered_walk_leaves()
+            .without_paths()
+            .filter_map(|leaf| match leaf {
+                ActionDirectoryMember::File(meta) => Some(&meta.digest),
+                _ => None,
+            })
+            .collect();
+        Uploader::collect_upload_contents(
+            dm.io.fs(),
+            dm,
+            ProjectRelativePath::empty(),
+            &input_dir,
+            Vec::new(),
+            missing_digests,
+        )
+        .await
+    }
+
+    fn uploaded_blob<'a>(contents: &'a UploadContents, meta: &FileMetadata) -> Option<&'a [u8]> {
+        contents
+            .blobs
+            .iter()
+            .find(|blob| blob.digest == meta.digest.to_re())
+            .map(|blob| blob.blob.as_slice())
+    }
+
+    #[tokio::test]
+    async fn test_upload_sends_write_from_memory() -> buck2_error::Result<()> {
+        ignore_stack_overflow_checks_for_future(async {
+            let io = Arc::new(StubIoHandler::new(temp_root()));
+            let (dm, _handle, _events) = make_materializer(io.dupe(), None).await;
+
+            let writes = declare_writes(
+                &dm,
+                vec![
+                    ("out/link.argsfile", b"-o\nout/bin\n-lfoo\n".to_vec(), false),
+                    ("out/run.sh", b"#!/bin/sh\nexec true\n".to_vec(), true),
+                    ("out/empty.txt", Vec::new(), false),
+                ],
+            )
+            .await?;
+
+            let contents = upload_contents_for(
+                &dm,
+                writes
+                    .iter()
+                    .map(|w| (w.path.clone(), w.meta.dupe()))
+                    .collect(),
+            )
+            .await?;
+
+            assert_eq!(
+                contents.files.iter().map(|f| &f.name).collect::<Vec<_>>(),
+                Vec::<&String>::new()
+            );
+            for write in &writes {
+                assert!(
+                    !io.fs().resolve(&write.path).exists(),
+                    "{} was written to disk for its upload",
+                    write.path
+                );
+                assert_eq!(
+                    uploaded_blob(&contents, &write.meta),
+                    Some(write.content.as_slice()),
+                    "{}",
+                    write.path
+                );
+                assert_eq!(
+                    TrackedFileDigest::from_content(
+                        &write.content,
+                        io.digest_config().cas_digest_config()
+                    )
+                    .to_re(),
+                    write.meta.digest.to_re(),
+                );
+            }
+
+            let argsfile = &contents.stats.by_extension["argsfile"];
+            assert_eq!(argsfile.digests_uploaded, 1);
+            assert_eq!(argsfile.bytes_uploaded, writes[0].content.len() as u64);
+            assert_eq!(contents.stats.by_extension["sh"].digests_uploaded, 1);
+            assert_eq!(contents.stats.by_extension["txt"].bytes_uploaded, 0);
+            assert_eq!(contents.stats.total.digests_uploaded, 3);
+            assert_eq!(
+                contents.stats.total.bytes_uploaded,
+                contents
+                    .blobs
+                    .iter()
+                    .map(|blob| blob.digest.size_in_bytes as u64)
+                    .sum::<u64>(),
+            );
+
+            // The upload left them declared, so a local consumer still gets them.
+            dm.ensure_materialized(
+                writes.iter().map(|w| w.path.clone()).collect(),
+                MaterializationPurpose::IntermediateOnly,
+            )
+            .await?;
+            for write in &writes {
+                let on_disk = fs_util::read(io.fs().resolve(&write.path))?;
+                assert_eq!(on_disk, write.content, "{}", write.path);
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mode = std::fs::metadata(io.fs().resolve(&writes[1].path))?
+                    .permissions()
+                    .mode();
+                assert_ne!(mode & 0o111, 0, "run.sh lost its executable bit");
+            }
+
+            dm.abort();
+            Ok(())
+        })
+        .await
+    }
+
+    #[tokio::test]
+    async fn test_upload_sends_copy_of_write_from_memory() -> buck2_error::Result<()> {
+        ignore_stack_overflow_checks_for_future(async {
+            let io = Arc::new(StubIoHandler::new(temp_root()));
+            let (dm, _handle, _events) = make_materializer(io.dupe(), None).await;
+
+            let writes =
+                declare_writes(&dm, vec![("out/link.argsfile", b"-lfoo\n".to_vec(), false)])
+                    .await?;
+            let write = &writes[0];
+            let copy = make_path("copy/link.argsfile");
+            let copy_value = ArtifactValue::file(write.meta.dupe());
+            (&dm as &dyn Materializer)
+                .declare_copy(
+                    copy.clone(),
+                    copy_value.dupe(),
+                    vec![CopiedArtifact::new(
+                        write.path.clone(),
+                        copy.clone(),
+                        copy_value.entry().dupe().map_dir(|d| d.as_immutable()),
+                        None,
+                    )],
+                    None,
+                )
+                .await?;
+
+            let contents =
+                upload_contents_for(&dm, vec![(copy.clone(), write.meta.dupe())]).await?;
+
+            assert_eq!(
+                contents.files.iter().map(|f| &f.name).collect::<Vec<_>>(),
+                Vec::<&String>::new()
+            );
+            assert_eq!(
+                uploaded_blob(&contents, &write.meta),
+                Some(write.content.as_slice())
+            );
+            assert!(!io.fs().resolve(&write.path).exists());
+            assert!(!io.fs().resolve(&copy).exists());
+            assert_eq!(contents.stats.by_extension["argsfile"].digests_uploaded, 1);
+
+            dm.abort();
+            Ok(())
+        })
+        .await
+    }
+
+    #[tokio::test]
+    async fn test_upload_writes_large_write_to_disk() -> buck2_error::Result<()> {
+        ignore_stack_overflow_checks_for_future(async {
+            let io = Arc::new(StubIoHandler::new(temp_root()));
+            let (dm, _handle, _events) = make_materializer(io.dupe(), None).await;
+
+            let writes = declare_writes(
+                &dm,
+                vec![("out/big.argsfile", vec![b'x'; 64 * 1024 * 1024 + 1], false)],
+            )
+            .await?;
+            let write = &writes[0];
+
+            let contents =
+                upload_contents_for(&dm, vec![(write.path.clone(), write.meta.dupe())]).await?;
+
+            assert_eq!(uploaded_blob(&contents, &write.meta), None);
+            assert_eq!(contents.files.len(), 1);
+            assert_eq!(
+                contents.files[0].name,
+                io.fs().resolve(&write.path).as_maybe_relativized_str()?
+            );
+            assert_eq!(
+                fs_util::read(io.fs().resolve(&write.path))?.len(),
+                write.content.len()
+            );
+
+            dm.abort();
             Ok(())
         })
         .await

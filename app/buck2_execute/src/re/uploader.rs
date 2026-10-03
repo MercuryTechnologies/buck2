@@ -77,6 +77,17 @@ pub struct UploadStats {
     pub by_extension: IntentionallyStdHashMap<String, ReUploadMetrics>,
 }
 
+/// Files the materializer holds in memory are sent from there when they are
+/// at most this large. A larger one is written to disk and streamed from the
+/// file, so an upload never holds a big decompressed copy in memory.
+const MAX_IN_MEMORY_UPLOAD_BYTES: u64 = 64 * 1024 * 1024;
+
+pub struct UploadContents {
+    pub files: Vec<NamedDigest>,
+    pub blobs: Vec<InlinedBlobWithDigest>,
+    pub stats: UploadStats,
+}
+
 pub struct Uploader {}
 
 impl Uploader {
@@ -239,38 +250,25 @@ impl Uploader {
         Ok((upload_blobs, missing_digests))
     }
 
-    pub async fn upload(
+    /// Separate from `upload`, and public, so that the deferred materializer's
+    /// tests can see what an upload would send without an RE client.
+    pub async fn collect_upload_contents<'a>(
         fs: &ProjectRoot,
-        client: &RemoteExecutionClient,
         materializer: &dyn Materializer,
         dir_path: &ProjectRelativePath,
-        input_dir: &ActionImmutableDirectory,
-        blobs: &ActionBlobs,
-        use_case: RemoteExecutorUseCase,
-        identity: Option<&ReActionIdentity<'_>>,
-        digest_config: DigestConfig,
-        deduplicate_get_digests_ttl_calls: bool,
-    ) -> buck2_error::Result<UploadStats> {
-        let (mut upload_blobs, mut missing_digests) = Self::find_missing(
-            client,
-            input_dir,
-            blobs,
-            &use_case,
-            identity,
-            digest_config,
-            deduplicate_get_digests_ttl_calls,
-        )
-        .await?;
-
-        if upload_blobs.is_empty() && missing_digests.is_empty() {
-            return Ok(UploadStats::default());
-        }
-
+        input_dir: &'a ActionImmutableDirectory,
+        mut upload_blobs: Vec<InlinedBlobWithDigest>,
+        mut missing_digests: StdBuckHashSet<&'a TrackedFileDigest>,
+    ) -> buck2_error::Result<UploadContents> {
         // Find the file paths and directory blobs that need to be uploaded
         let mut upload_files = Vec::new();
 
         // Track what files should be materialized before we upload.
         let mut paths_to_materialize = Vec::new();
+
+        // Files whose contents the materializer holds in memory, sent as blobs
+        // so they need not be written to disk first.
+        let mut in_memory_files = Vec::new();
 
         if !missing_digests.is_empty() {
             let mut upload_file_paths = Vec::new();
@@ -409,6 +407,19 @@ impl Uploader {
                         });
                         paths_to_materialize.push((path, None));
                     }
+                    Err(ArtifactNotMaterializedReason::InMemoryWrite { path, content }) => {
+                        let name = fs.resolve(&path).as_maybe_relativized_str()?.to_owned();
+                        if content.size_bytes() <= MAX_IN_MEMORY_UPLOAD_BYTES {
+                            in_memory_files.push((name, digest, content));
+                        } else {
+                            upload_files.push(NamedDigest {
+                                name,
+                                digest,
+                                ..Default::default()
+                            });
+                            paths_to_materialize.push((path, None));
+                        }
+                    }
                     Err(
                         ref err @ ArtifactNotMaterializedReason::DeferredMaterializerCorruption {
                             ..
@@ -434,21 +445,58 @@ impl Uploader {
             }
         }
 
+        let mut in_memory_file_sizes = Vec::with_capacity(in_memory_files.len());
+        for (name, digest, content) in in_memory_files {
+            let blob = content
+                .read()
+                .with_buck_error_context(|| format!("Error reading `{name}` for upload"))?;
+            if i64::try_from(blob.len()).ok() != Some(digest.size_in_bytes) {
+                return Err(internal_error!(
+                    "In-memory contents of `{}` are {} bytes, but its digest is {}",
+                    name,
+                    blob.len(),
+                    digest
+                ));
+            }
+            in_memory_file_sizes.push((name, blob.len() as u64));
+            upload_blobs.push(InlinedBlobWithDigest {
+                blob,
+                digest,
+                ..Default::default()
+            });
+        }
+
         // Compute stats of digests we're about to upload so we can report them
-        // to the span end event of this stage of execution.
+        // to the span end event of this stage of execution. Files sent from
+        // memory are counted by their extension as well as among the blobs.
         let stats = {
             let mut stats_by_extension = IntentionallyStdHashMap::new();
-            let mut named_digest_byte_count: u64 = 0;
-            for nd in &upload_files {
+            let named_files = upload_files
+                .iter()
+                .map(|nd| {
+                    let byte_count: u64 = nd.digest.size_in_bytes.try_into().unwrap_or_default();
+                    (nd.name.as_str(), byte_count)
+                })
+                .chain(
+                    in_memory_file_sizes
+                        .iter()
+                        .map(|(name, byte_count)| (name.as_str(), *byte_count)),
+                );
+            for (name, byte_count) in named_files {
                 // Aggregate metrics by file extension.
-                let byte_count: u64 = nd.digest.size_in_bytes.try_into().unwrap_or_default();
-                let extension = extract_file_extension(&nd.name);
+                let extension = extract_file_extension(name);
                 let ext_stats: &mut ReUploadMetrics =
                     stats_by_extension.entry(extension).or_default();
                 ext_stats.digests_uploaded += 1;
                 ext_stats.bytes_uploaded += byte_count;
-                named_digest_byte_count += byte_count;
             }
+            let named_digest_byte_count: u64 = upload_files
+                .iter()
+                .map(|nd| {
+                    let byte_count: u64 = nd.digest.size_in_bytes.try_into().unwrap_or_default();
+                    byte_count
+                })
+                .sum();
             let blob_byte_count: u64 = upload_blobs
                 .iter()
                 .map(|blob| {
@@ -466,7 +514,54 @@ impl Uploader {
             }
         };
 
-        // Upload
+        Ok(UploadContents {
+            files: upload_files,
+            blobs: upload_blobs,
+            stats,
+        })
+    }
+
+    pub async fn upload(
+        fs: &ProjectRoot,
+        client: &RemoteExecutionClient,
+        materializer: &dyn Materializer,
+        dir_path: &ProjectRelativePath,
+        input_dir: &ActionImmutableDirectory,
+        blobs: &ActionBlobs,
+        use_case: RemoteExecutorUseCase,
+        identity: Option<&ReActionIdentity<'_>>,
+        digest_config: DigestConfig,
+        deduplicate_get_digests_ttl_calls: bool,
+    ) -> buck2_error::Result<UploadStats> {
+        let (upload_blobs, missing_digests) = Self::find_missing(
+            client,
+            input_dir,
+            blobs,
+            &use_case,
+            identity,
+            digest_config,
+            deduplicate_get_digests_ttl_calls,
+        )
+        .await?;
+
+        if upload_blobs.is_empty() && missing_digests.is_empty() {
+            return Ok(UploadStats::default());
+        }
+
+        let UploadContents {
+            files: upload_files,
+            blobs: upload_blobs,
+            stats,
+        } = Self::collect_upload_contents(
+            fs,
+            materializer,
+            dir_path,
+            input_dir,
+            upload_blobs,
+            missing_digests,
+        )
+        .await?;
+
         if !upload_files.is_empty() || !upload_blobs.is_empty() {
             let mut metadata = use_case.metadata(identity);
             if let Some(id) = identity.and_then(|id| id.action_id.clone()) {

@@ -63,6 +63,7 @@ use buck2_execute::materialize::materializer::DeclareMatchOutcome;
 use buck2_execute::materialize::materializer::DeferredMaterializerExtensions;
 use buck2_execute::materialize::materializer::EagerMaterializationGuard;
 use buck2_execute::materialize::materializer::HttpDownloadInfo;
+use buck2_execute::materialize::materializer::InMemoryFileContent;
 use buck2_execute::materialize::materializer::MaterializationError;
 use buck2_execute::materialize::materializer::MaterializationPurpose;
 use buck2_execute::materialize::materializer::Materializer;
@@ -913,4 +914,15 @@ pub struct WriteFile {
     compressed_data: Box<[u8]>,
     decompressed_size: usize,
     is_executable: bool,
+}
+
+impl InMemoryFileContent for WriteFile {
+    fn size_bytes(&self) -> u64 {
+        self.decompressed_size as u64
+    }
+
+    fn read(&self) -> buck2_error::Result<Vec<u8>> {
+        zstd::bulk::decompress(&self.compressed_data, self.decompressed_size)
+            .buck_error_context("Error decompressing data")
+    }
 }
