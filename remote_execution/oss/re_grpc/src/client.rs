@@ -793,6 +793,20 @@ fn can_retry_execute(retry_attempts: usize, retries: usize) -> bool {
     retry_attempts < retries
 }
 
+/// How many times an action the OOM killer ended is executed again. BuildBuddy runs every
+/// attempt at the same task size, so the same `memory.max` (v2.310.0, ociruntime.go), and does
+/// not retry an OOM-killed task for a non-CI client (executor.go, `shouldRetry`): a second
+/// attempt rescues a kill caused by neighbours' pressure, and the next ones only repeat a
+/// compile that does not fit. Concurrent builds merged onto the action share each attempt.
+const OOM_KILLED_RETRIES: usize = 1;
+
+/// BuildBuddy reports an action its executor's OOM killer ended as UNAVAILABLE with this
+/// message (v2.310.0, containers/ociruntime/ociruntime.go, from the task cgroup's
+/// memory.events `oom_kill`).
+fn is_oom_killed(status: &Status) -> bool {
+    TCode(status.code) == TCode::UNAVAILABLE && status.message.contains("killed by oom killer")
+}
+
 /// A number in [0, 1].
 fn random_unit() -> f64 {
     let random_bytes = Uuid::new_v4().into_bytes();
@@ -1074,6 +1088,9 @@ struct OperationStream {
     stream: tonic::Streaming<Operation>,
     operation_name: Option<String>,
     execute_retry_attempts: usize,
+    /// Re-Executes after the executor's OOM killer ended the action, counted apart from
+    /// `execute_retry_attempts` because they are capped at OOM_KILLED_RETRIES.
+    oom_killed_retries: usize,
     /// Resumptions with WaitExecution in a row that the operation said nothing new after.
     stalled_resumes: usize,
     /// The stream is a resumption that has sent nothing yet past its first message, which is the
@@ -4347,6 +4364,7 @@ impl REClient {
                 stream,
                 operation_name: None,
                 execute_retry_attempts: 0,
+                oom_killed_retries: 0,
                 stalled_resumes: 0,
                 resumed: false,
                 queued: QueuedDeadline::new(self.runtime_opts.queued_operation_timeout),
@@ -4362,6 +4380,7 @@ impl REClient {
                         mut stream,
                         mut operation_name,
                         mut execute_retry_attempts,
+                        mut oom_killed_retries,
                         mut stalled_resumes,
                         mut resumed,
                         mut queued,
@@ -4663,11 +4682,23 @@ impl REClient {
 
                                     let execute_response_status =
                                         execute_response_grpc.status.unwrap_or_default();
-                                    if should_retry_execute_after_execute_response_status(
+                                    let oom_killed = is_oom_killed(&execute_response_status);
+                                    if oom_killed && oom_killed_retries >= OOM_KILLED_RETRIES {
+                                        warn_re_execution_retry(format!(
+                                            "Not executing RE action {} again: operation `{}` was killed by the OOM killer again, after {oom_killed_retries} re-Execute at the same size",
+                                            execute_request_action(&grpc_request),
+                                            operation_name.as_deref().unwrap_or(""),
+                                        ));
+                                    } else if should_retry_execute_after_execute_response_status(
                                         &execute_response_status,
-                                    ) && can_retry_execute(execute_retry_attempts, retries)
-                                    {
+                                    ) && can_retry_execute(
+                                        execute_retry_attempts,
+                                        retries,
+                                    ) {
                                         execute_retry_attempts += 1;
+                                        if oom_killed {
+                                            oom_killed_retries += 1;
+                                        }
                                         warn_re_execution_retry(format!(
                                             "Executing RE action {} again (re-Execute {execute_retry_attempts}/{retries}): operation `{}` returned code {}: {}",
                                             execute_request_action(&grpc_request),
@@ -4757,6 +4788,7 @@ impl REClient {
                                 stream,
                                 operation_name,
                                 execute_retry_attempts,
+                                oom_killed_retries,
                                 stalled_resumes,
                                 resumed,
                                 queued,
@@ -10122,6 +10154,98 @@ mod tests {
             })),
             ..Default::default()
         }
+    }
+
+    /// A finished operation whose ExecuteResponse carries `code` and `message`, as BuildBuddy
+    /// reports an action its executor could not run.
+    fn failed_operation(code: i32, message: &str) -> Operation {
+        let response = GExecuteResponse {
+            status: Some(Status {
+                code,
+                message: message.to_owned(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        Operation {
+            name: "operations/failed".to_owned(),
+            done: true,
+            result: Some(OpResult::Response(prost_types::Any {
+                type_url: "type.googleapis.com/build.bazel.remote.execution.v2.ExecuteResponse"
+                    .to_owned(),
+                value: response.encode_to_vec(),
+            })),
+            ..Default::default()
+        }
+    }
+
+    /// Runs one action against a server that fails every Execute with `code` and `message`,
+    /// and returns how many Execute requests the client sent and how it ended.
+    async fn executes_until_failure(
+        code: i32,
+        message: &'static str,
+        retries: usize,
+    ) -> anyhow::Result<(usize, anyhow::Result<ExecuteResponse>)> {
+        let executes = Arc::new(AtomicUsize::new(0));
+        let counted = executes.clone();
+        let (address, _log, server) = serve_raw_h2(move |_| {
+            counted.fetch_add(1, Ordering::SeqCst);
+            RawReply::Operation(
+                failed_operation(code, message),
+                RawTrailers::After(Duration::ZERO),
+            )
+        })
+        .await?;
+        let client = raw_h2_client(address, retries).await?;
+        let result = execute_raw_h2_action(&client).await;
+        server.abort();
+        Ok((executes.load(Ordering::SeqCst), result))
+    }
+
+    const OOM_KILLED: &str = "task process or child process killed by oom killer";
+
+    #[tokio::test]
+    async fn an_oom_killed_action_is_executed_again_only_once() -> anyhow::Result<()> {
+        let (executes, result) =
+            executes_until_failure(TCode::UNAVAILABLE.0, OOM_KILLED, 5).await?;
+        assert_eq!(
+            executes,
+            1 + OOM_KILLED_RETRIES,
+            "the first attempt and one re-Execute"
+        );
+        let Err(err) = result else {
+            panic!("the second OOM kill must fail the action");
+        };
+        let err = format!("{err:#}");
+        assert!(err.contains("killed by oom killer"), "{err}");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn other_unavailable_responses_keep_every_retry() -> anyhow::Result<()> {
+        let (executes, result) =
+            executes_until_failure(TCode::UNAVAILABLE.0, "executor went away", 5).await?;
+        assert_eq!(executes, 6, "the first attempt and five re-Executes");
+        assert!(result.is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn only_unavailable_with_the_oom_killer_message_is_an_oom_kill() {
+        let status = |code: TCode, message: &str| Status {
+            code: code.0,
+            message: message.to_owned(),
+            ..Default::default()
+        };
+        assert!(is_oom_killed(&status(TCode::UNAVAILABLE, OOM_KILLED)));
+        assert!(!is_oom_killed(&status(
+            TCode::UNAVAILABLE,
+            "executor went away"
+        )));
+        assert!(!is_oom_killed(&status(
+            TCode::RESOURCE_EXHAUSTED,
+            OOM_KILLED
+        )));
     }
 
     /// A client whose engine, CAS and action cache are all `address`, over one connection.
