@@ -16,6 +16,7 @@ clap.workspace = true
 futures.workspace = true
 host_sharing.workspace = true
 parking_lot.workspace = true
+sorted_vector_map.workspace = true
 tokio.workspace = true
 
 [lints]
