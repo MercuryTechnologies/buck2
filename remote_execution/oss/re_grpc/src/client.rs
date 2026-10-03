@@ -848,6 +848,34 @@ fn error_rejects_credentials(err: &anyhow::Error) -> bool {
             .is_some_and(buck2_credential_helper::status_rejects_credentials)
 }
 
+/// tonic ends a request that outlives its `grpc-timeout` on the client's side with
+/// CANCELLED "Timeout expired" (tonic 0.14.6 transport/service/grpc_timeout.rs, status.rs
+/// `TimeoutExpired`): the server never answered, which for a read says nothing about the answer.
+fn is_client_timeout(err: &anyhow::Error) -> bool {
+    let timed_out = |status: &tonic::Status| {
+        status.code() == tonic::Code::Cancelled && status.message() == "Timeout expired"
+    };
+    err.downcast_ref::<tonic::Status>().is_some_and(timed_out)
+        || err
+            .downcast_ref::<io::Error>()
+            .and_then(tonic_status_from_io_error)
+            .is_some_and(timed_out)
+}
+
+/// A read that timed out on the client's side, after its retries, as the DEADLINE_EXCEEDED it
+/// amounts to, so a caller that skips an unavailable cache treats it as one (buck2_execute_impl
+/// executors/action_cache.rs, `is_remote_cache_unavailable`).
+fn client_timeout_as_deadline_exceeded(err: anyhow::Error) -> anyhow::Error {
+    if !is_client_timeout(&err) {
+        return err;
+    }
+    anyhow::Error::from(REClientError {
+        code: TCode::DEADLINE_EXCEEDED,
+        message: format!("the request timed out on the client's side: {err:#}"),
+        group: TCodeReasonGroup::UNKNOWN,
+    })
+}
+
 /// `recover` is asked to reconnect after a broken connection, as before, and to refresh
 /// credentials after UNAUTHENTICATED. A refresh it confirms is followed by one attempt at once,
 /// outside the retry budget and the code's retry policy, and only once per call: a remote that
@@ -855,8 +883,26 @@ fn error_rejects_credentials(err: &anyhow::Error) -> bool {
 async fn retry_grpc_request_with_recovery<T, Fut, F, RFut, R>(
     retries: usize,
     retry_max_delay: Duration,
+    request: F,
+    recover: R,
+) -> anyhow::Result<T>
+where
+    Fut: Future<Output = anyhow::Result<T>>,
+    F: FnMut() -> Fut,
+    RFut: Future<Output = bool>,
+    R: FnMut(Recovery) -> RFut,
+{
+    retry_grpc_request_with_policy(retries, retry_max_delay, request, recover, false).await
+}
+
+/// `retry_client_timeouts` is for idempotent reads only. An Execute that timed out on the
+/// client's side may still be running, and executing it again would run it twice.
+async fn retry_grpc_request_with_policy<T, Fut, F, RFut, R>(
+    retries: usize,
+    retry_max_delay: Duration,
     mut request: F,
     mut recover: R,
+    retry_client_timeouts: bool,
 ) -> anyhow::Result<T>
 where
     Fut: Future<Output = anyhow::Result<T>>,
@@ -883,15 +929,25 @@ where
 
                 // Refused credentials that could not be refreshed would be refused again: a proxy's
                 // 401 reads as INTERNAL, which the retry policy would otherwise repeat.
+                let client_timeout = retry_client_timeouts && is_client_timeout(&err);
                 if retry_attempt >= retries
-                    || !is_retryable_grpc_error(&err)
+                    || !(is_retryable_grpc_error(&err) || client_timeout)
                     || recovery == Recovery::RefreshCredentials
                 {
+                    if client_timeout {
+                        return Err(client_timeout_as_deadline_exceeded(err));
+                    }
                     return Err(normalize_grpc_error(err));
                 }
 
-                if recovery == Recovery::Reconnect {
-                    recover(recovery).await;
+                // A read that timed out is treated as a broken connection too. On 2026-10-03 one
+                // HTTP/2 connection to the action cache answered nothing for 96 s after the
+                // execution connection broke, while CAS and Execute recovered within 40 s, so a
+                // retry on the same connection would only have waited again. Reconnects are rate
+                // limited per client (RECONNECT_MIN_INTERVAL), so many reads timing out together
+                // redial once a second at most.
+                if recovery == Recovery::Reconnect || client_timeout {
+                    recover(Recovery::Reconnect).await;
                 }
 
                 let delay = grpc_error_retry_delay(&err)
@@ -926,6 +982,32 @@ where
         let grpc_clients = grpc_clients.clone();
         async move { grpc_clients.recover(kind, recovery).await }
     })
+    .await
+}
+
+/// `retry_grpc_request_with_client_reconnect` for an idempotent read, GetActionResult or
+/// FindMissingBlobs, which also retries a request that timed out on the client's side.
+async fn retry_idempotent_read_with_client_reconnect<T, Fut, F>(
+    grpc_clients: Arc<GRPCClients>,
+    kind: GrpcClientKind,
+    retries: usize,
+    retry_max_delay: Duration,
+    request: F,
+) -> anyhow::Result<T>
+where
+    Fut: Future<Output = anyhow::Result<T>>,
+    F: FnMut() -> Fut,
+{
+    retry_grpc_request_with_policy(
+        retries,
+        retry_max_delay,
+        request,
+        |recovery| {
+            let grpc_clients = grpc_clients.clone();
+            async move { grpc_clients.recover(kind, recovery).await }
+        },
+        true,
+    )
     .await
 }
 
@@ -4173,7 +4255,7 @@ impl REClient {
                 metadata,
                 Some(grpc_digest_string(&action_digest)),
             ),
-            retry_grpc_request_with_client_reconnect(
+            retry_idempotent_read_with_client_reconnect(
                 self.grpc_clients.clone(),
                 GrpcClientKind::ActionCache,
                 self.runtime_opts.retries,
@@ -5870,7 +5952,7 @@ impl REClient {
                 start.bytes = Some(bytes);
                 let missing_blobs = remote_request_span(
                     start,
-                    retry_grpc_request_with_client_reconnect(
+                    retry_idempotent_read_with_client_reconnect(
                         self.grpc_clients.clone(),
                         GrpcClientKind::Cas,
                         self.runtime_opts.retries,
@@ -9538,6 +9620,30 @@ mod tests {
         assert_eq!(attempts.load(Ordering::Relaxed), 1);
     }
 
+    /// Execute takes this path, and an Execute that timed out on the client's side may still be
+    /// running, so it is not sent again.
+    #[tokio::test]
+    async fn retry_grpc_request_does_not_retry_a_client_timeout_outside_idempotent_reads() {
+        let attempts = AtomicU16::new(0);
+        let result: anyhow::Result<()> = retry_grpc_request_with_recovery(
+            3,
+            Duration::from_millis(1),
+            || async {
+                attempts.fetch_add(1, Ordering::Relaxed);
+                Err(anyhow::Error::from(tonic::Status::cancelled(
+                    "Timeout expired",
+                )))
+            },
+            |_| async { false },
+        )
+        .await;
+
+        let err = result.unwrap_err();
+        let err = err.downcast_ref::<REClientError>().expect("REClientError");
+        assert_eq!(err.code, TCode::CANCELLED);
+        assert_eq!(attempts.load(Ordering::Relaxed), 1);
+    }
+
     struct FakeActionCacheState {
         expected_token: Mutex<String>,
         seen_tokens: Mutex<Vec<String>>,
@@ -10178,6 +10284,61 @@ mod tests {
         Err(anyhow::anyhow!(
             "the stream ended without an ExecuteResponse"
         ))
+    }
+
+    /// A cache that never answers: tonic ends each attempt at the request timeout with CANCELLED
+    /// "Timeout expired", each retry goes out on a new connection, and the last one comes back as the DEADLINE_EXCEEDED an executor with
+    /// `remote_cache_unavailable_fallback` skips.
+    #[tokio::test]
+    async fn a_cache_lookup_that_times_out_on_the_client_is_retried_then_deadline_exceeded()
+    -> anyhow::Result<()> {
+        let requests = Arc::new(AtomicUsize::new(0));
+        let (address, log, server) = serve_raw_h2({
+            let requests = requests.clone();
+            move |_| {
+                requests.fetch_add(1, Ordering::SeqCst);
+                RawReply::Nothing
+            }
+        })
+        .await?;
+        let client = raw_h2_client_with(
+            address,
+            Buck2OssReConfiguration {
+                retries: Some(2),
+                grpc_request_timeout_secs: Some(1),
+                ..Default::default()
+            },
+        )
+        .await?;
+        let connections_before = log.connections.load(Ordering::SeqCst);
+
+        let err = client
+            .get_action_result(
+                &RemoteExecutionMetadata::default(),
+                ActionResultRequest {
+                    digest: TDigest {
+                        hash: "ab".repeat(32),
+                        size_in_bytes: 1,
+                        _dot_dot: (),
+                    },
+                    platform: None,
+                    _dot_dot: (),
+                },
+            )
+            .await
+            .err()
+            .expect("a lookup the cache never answers fails");
+
+        let err = err.downcast_ref::<REClientError>().expect("REClientError");
+        assert_eq!(err.code, TCode::DEADLINE_EXCEEDED, "{}", err.message);
+        assert_eq!(requests.load(Ordering::SeqCst), 3);
+        // Each retry redials rather than waiting on the connection that did not answer.
+        assert!(
+            log.connections.load(Ordering::SeqCst) - connections_before >= 2,
+            "a retry after a timeout reconnects first"
+        );
+        server.abort();
+        Ok(())
     }
 
     /// Without the drain, the 1500 dropped streams provoke h2's GOAWAY ENHANCE_YOUR_CALM

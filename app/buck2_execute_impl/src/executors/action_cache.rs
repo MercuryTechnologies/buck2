@@ -125,14 +125,8 @@ async fn query_action_cache_and_download_result(
     .await;
 
     if let Err(e) = &action_cache_response
-        && remote_cache_unavailable_fallback
-        && is_remote_cache_unavailable(e)
+        && skips_unavailable_cache(remote_cache_unavailable_fallback, &digest, e)
     {
-        tracing::info!(
-            "Ignoring unavailable remote cache for action `{}` and continuing execution: {:#}",
-            digest,
-            e
-        );
         return ControlFlow::Continue(manager);
     }
 
@@ -391,6 +385,30 @@ impl PreparedCommandOptionalExecutor for RemoteDepFileCacheChecker {
     }
 }
 
+fn skips_unavailable_cache(
+    remote_cache_unavailable_fallback: bool,
+    digest: &ActionDigest,
+    error: &buck2_error::Error,
+) -> bool {
+    if !remote_cache_unavailable_fallback || !is_remote_cache_unavailable(error) {
+        return false;
+    }
+    tracing::info!(
+        "Ignoring unavailable remote cache for action `{}` and continuing execution: {:#}",
+        digest,
+        error
+    );
+    // A skipped lookup turns a cache outage into a slower, costlier build, so it is a warning on
+    // the console, in the event log, and in BuildBuddy's build log through the BES converter's
+    // Progress events, not only a line in the daemon's log.
+    if let Some(dispatcher) = buck2_events::dispatch::get_dispatcher_opt() {
+        dispatcher.console_warning(format!(
+            "Remote cache lookup skipped for action {digest}: the remote cache is unavailable, so the action is executed instead ({error:#})"
+        ));
+    }
+    true
+}
+
 fn is_remote_cache_unavailable(error: &buck2_error::Error) -> bool {
     error.has_tag(ErrorTag::ReUnavailable)
         || error.has_tag(ErrorTag::ReDeadlineExceeded)
@@ -408,7 +426,13 @@ fn is_remote_cache_unavailable(error: &buck2_error::Error) -> bool {
 #[cfg(test)]
 #[allow(clippy::items_after_test_module)]
 mod tests {
+    use buck2_events::Event;
+    use buck2_events::create_source_sink_pair;
+    use buck2_events::daemon_id::DaemonId;
+    use buck2_events::dispatch::EventDispatcher;
+    use buck2_events::dispatch::with_dispatcher;
     use buck2_execute::re::error::test_re_error;
+    use buck2_wrapper_common::invocation_id::TraceId;
 
     use super::*;
 
@@ -449,6 +473,51 @@ mod tests {
         assert!(is_remote_cache_unavailable(&unavailable));
         assert!(is_remote_cache_unavailable(&deadline));
         assert!(is_remote_cache_unavailable(&connection));
+    }
+
+    /// re_grpc reports a read that timed out on the client's side, once its retries are spent,
+    /// as DEADLINE_EXCEEDED; before, the CANCELLED it arrived as failed the action.
+    #[test]
+    fn skips_a_cache_lookup_that_timed_out_on_the_client_and_warns() {
+        let digest = ActionDigest::new_sha256([7; 32], 1);
+        let timed_out = test_re_error(
+            "the request timed out on the client's side: status: Cancelled, message: \"Timeout expired\"",
+            TCode::DEADLINE_EXCEEDED,
+        );
+        let cancelled = test_re_error(
+            "status: Cancelled, message: \"Timeout expired\"",
+            TCode::CANCELLED,
+        );
+        let (mut events, sink) = create_source_sink_pair();
+        let dispatcher = EventDispatcher::new(TraceId::new(), DaemonId::new(), sink);
+
+        let skipped = with_dispatcher(dispatcher, || {
+            (
+                skips_unavailable_cache(true, &digest, &timed_out),
+                skips_unavailable_cache(false, &digest, &timed_out),
+                skips_unavailable_cache(true, &digest, &cancelled),
+            )
+        });
+
+        assert_eq!(skipped, (true, false, false));
+        let mut warnings = Vec::new();
+        while let Some(event) = events.try_receive() {
+            if let Event::Buck(event) = event
+                && let buck2_data::buck_event::Data::Instant(instant) = event.data()
+                && let Some(buck2_data::instant_event::Data::ConsoleWarning(warning)) =
+                    &instant.data
+            {
+                warnings.push(warning.message.clone());
+            }
+        }
+        assert_eq!(warnings.len(), 1, "{warnings:#?}");
+        assert!(
+            warnings[0].starts_with(&format!(
+                "Remote cache lookup skipped for action {digest}: "
+            )),
+            "{}",
+            warnings[0]
+        );
     }
 }
 
