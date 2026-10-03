@@ -357,6 +357,10 @@ fn should_send_event_data(
                 Some(Data::TestDiscovery(..)) => true,
                 #[cfg(not(fbcode_build))]
                 Some(Data::TestResult(..)) => true,
+                // The Bazel converter holds a test run's TestResult and TestSummary until the
+                // run's per-test results arrive, and sends whatever is held at this one.
+                #[cfg(not(fbcode_build))]
+                Some(Data::EndOfTestResults(..)) => true,
                 #[cfg(not(fbcode_build))]
                 Some(Data::TargetPatterns(..)) => true,
                 #[cfg(not(fbcode_build))]

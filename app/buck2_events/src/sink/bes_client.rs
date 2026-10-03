@@ -3243,6 +3243,8 @@ mod tests {
     struct BesThatAcksAtEof {
         fail_first_stream_at: Option<i64>,
         streams: Arc<std::sync::Mutex<Vec<Vec<i64>>>>,
+        /// The Bazel build events the streams carried, decoded, in arrival order.
+        bazel_events: Arc<std::sync::Mutex<Vec<bazel_bep_proto::build_event_stream::BuildEvent>>>,
     }
 
     #[tonic::async_trait]
@@ -3270,12 +3272,25 @@ mod tests {
             };
             let fail_at = self.fail_first_stream_at.filter(|_| index == 0);
             let streams = self.streams.clone();
+            let bazel_events = self.bazel_events.clone();
             tokio::spawn(async move {
                 let mut stream_id = None;
                 loop {
                     match inbound.message().await {
                         Ok(Some(request)) => {
                             let sequence_number = request_sequence_number(&request);
+                            if let Some(build_event::Event::BazelEvent(any)) = request
+                                .ordered_build_event
+                                .as_ref()
+                                .and_then(|ordered| ordered.event.as_ref())
+                                .and_then(|event| event.event.as_ref())
+                                && let Ok(event) =
+                                    bazel_bep_proto::build_event_stream::BuildEvent::decode(
+                                        any.value.as_slice(),
+                                    )
+                            {
+                                bazel_events.lock().unwrap().push(event);
+                            }
                             stream_id = request
                                 .ordered_build_event
                                 .and_then(|ordered| ordered.stream_id);
@@ -3314,20 +3329,34 @@ mod tests {
     async fn serve_bes_that_acks_at_eof(
         fail_first_stream_at: Option<i64>,
     ) -> (String, Arc<std::sync::Mutex<Vec<Vec<i64>>>>) {
+        let (endpoint, streams, _bazel_events) =
+            serve_bes_that_acks_at_eof_keeping_bazel_events(fail_first_stream_at).await;
+        (endpoint, streams)
+    }
+
+    async fn serve_bes_that_acks_at_eof_keeping_bazel_events(
+        fail_first_stream_at: Option<i64>,
+    ) -> (
+        String,
+        Arc<std::sync::Mutex<Vec<Vec<i64>>>>,
+        Arc<std::sync::Mutex<Vec<bazel_bep_proto::build_event_stream::BuildEvent>>>,
+    ) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind");
         let endpoint = format!("http://{}", listener.local_addr().expect("local addr"));
         let streams = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let bazel_events = Arc::new(std::sync::Mutex::new(Vec::new()));
         tokio::spawn(
             tonic::transport::Server::builder()
                 .add_service(PublishBuildEventServer::new(BesThatAcksAtEof {
                     fail_first_stream_at,
                     streams: streams.clone(),
+                    bazel_events: bazel_events.clone(),
                 }))
                 .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener)),
         );
-        (endpoint, streams)
+        (endpoint, streams, bazel_events)
     }
 
     /// Acknowledges each event up to sequence number `acks` as it arrives, then keeps the stream
@@ -3402,6 +3431,27 @@ mod tests {
             data: Some(buck2_data::CommandEnd::default().into()),
             ..Default::default()
         })
+    }
+
+    /// A worker that sends Bazel build events, as lab's `[bes] event_format = bazel` does,
+    /// without the artifact upload, which needs a CAS.
+    fn bazel_worker_for(endpoint: String) -> WorkerState {
+        let config = BesConfig {
+            buffer_size: 3,
+            retry_backoff: Duration::from_millis(20),
+            retry_window: Duration::from_secs(5),
+            grpc_timeout: Duration::from_secs(2),
+            event_format: BesEventFormat::Bazel,
+            bazel_artifact_upload: false,
+            ..BesConfig::default()
+        };
+        let connection = ConnectionConfig {
+            endpoint,
+            headers: Vec::new(),
+            tls: BesTls::default(),
+            credential_helper: None,
+        };
+        WorkerState::new(config, connection, Arc::new(CounterState::default()))
     }
 
     fn worker_for(endpoint: String) -> (WorkerState, Arc<CounterState>) {
@@ -3529,6 +3579,156 @@ mod tests {
             assert_eq!(counters.snapshot().dropped, 0, "fail_fast={fail_fast}");
             assert_eq!(failures(&counters), 0, "fail_fast={fail_fast}");
         }
+    }
+
+    /// A `buck2 test //pkg/...` in Bazel format: the second test target is discovered after the
+    /// first target's results set off the PatternExpanded, and its per-test result follows its
+    /// run's span end, as buck2's test runner sends them. BuildBuddy's target tracker reads only
+    /// announced targets (target_tracker.go at v2.310.0), so the server must see the late target
+    /// announced before its TargetConfigured, and its TestSummary.
+    #[tokio::test]
+    async fn a_late_test_target_reaches_the_server_announced_with_its_summary() {
+        let (endpoint, _streams, bazel_events) =
+            serve_bes_that_acks_at_eof_keeping_bazel_events(None).await;
+        let mut worker = bazel_worker_for(endpoint);
+        let trace_id = TraceId::new().to_string();
+        let target = |name: &str| buck2_data::ConfiguredTargetLabel {
+            label: Some(buck2_data::TargetLabel {
+                package: "root//pkg".to_owned(),
+                name: name.to_owned(),
+            }),
+            configuration: Some(buck2_data::Configuration {
+                full_name: "cfg".to_owned(),
+            }),
+            execution_configuration: None,
+        };
+        let discovery = |name: &str| {
+            buck2_data::buck_event::Data::SpanStart(buck2_data::SpanStartEvent {
+                data: Some(buck2_data::span_start_event::Data::TestDiscovery(
+                    buck2_data::TestDiscoveryStart {
+                        suite_name: name.to_owned(),
+                        target_label: Some(target(name)),
+                        labels: Vec::new(),
+                    },
+                )),
+            })
+        };
+        let run_end = |name: &str| {
+            buck2_data::buck_event::Data::SpanEnd(buck2_data::SpanEndEvent {
+                data: Some(buck2_data::span_end_event::Data::TestRun(
+                    buck2_data::TestRunEnd {
+                        suite: Some(buck2_data::TestSuite {
+                            suite_name: name.to_owned(),
+                            test_names: Vec::new(),
+                            target_label: Some(target(name)),
+                            labels: Vec::new(),
+                        }),
+                        command_report: Some(buck2_data::CommandExecution {
+                            details: Some(buck2_data::CommandExecutionDetails {
+                                signed_exit_code: Some(0),
+                                ..Default::default()
+                            }),
+                            status: Some(buck2_data::command_execution::Status::Success(
+                                buck2_data::command_execution::Success {},
+                            )),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    },
+                )),
+                ..Default::default()
+            })
+        };
+        let case = |name: &str| {
+            buck2_data::buck_event::Data::Instant(buck2_data::InstantEvent {
+                data: Some(buck2_data::instant_event::Data::TestResult(
+                    buck2_data::TestResult {
+                        name: format!("root//pkg:{name}"),
+                        status: buck2_data::TestStatus::Pass as i32,
+                        target_label: Some(target(name)),
+                        ..Default::default()
+                    },
+                )),
+            })
+        };
+
+        send_queued_ok(
+            &mut worker,
+            &trace_id,
+            buck2_data::buck_event::Data::SpanStart(buck2_data::SpanStartEvent {
+                data: Some(buck2_data::span_start_event::Data::Command(
+                    buck2_data::CommandStart {
+                        cli_args: vec![
+                            "buck2".to_owned(),
+                            "test".to_owned(),
+                            "//pkg/...".to_owned(),
+                        ],
+                        data: Some(buck2_data::command_start::Data::Test(
+                            buck2_data::TestCommandStart {},
+                        )),
+                        ..Default::default()
+                    },
+                )),
+            }),
+        )
+        .await;
+        for data in [
+            buck2_data::buck_event::Data::Instant(buck2_data::InstantEvent {
+                data: Some(buck2_data::instant_event::Data::TargetPatterns(
+                    buck2_data::ParsedTargetPatterns {
+                        target_patterns: vec![buck2_data::TargetPattern {
+                            value: "//pkg/...".to_owned(),
+                        }],
+                    },
+                )),
+            }),
+            discovery("first"),
+            run_end("first"),
+            case("first"),
+            discovery("second"),
+            run_end("second"),
+            case("second"),
+            buck2_data::buck_event::Data::Instant(buck2_data::InstantEvent {
+                data: Some(buck2_data::instant_event::Data::EndOfTestResults(
+                    buck2_data::EndOfTestResults::default(),
+                )),
+            }),
+            command_end_data(),
+            invocation_record_data(),
+        ] {
+            send_queued_ok(&mut worker, &trace_id, data).await;
+        }
+        let waited = tokio::time::timeout(Duration::from_secs(5), async {
+            while worker.streams.contains_key(&trace_id) {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+        assert!(waited.is_ok(), "the stream did not close");
+
+        use bazel_bep_proto::build_event_stream::build_event::Payload;
+        use bazel_bep_proto::build_event_stream::build_event_id::Id;
+        let events = bazel_events.lock().unwrap().clone();
+        let configured_second = |id: &bazel_bep_proto::build_event_stream::BuildEventId| matches!(id.id.as_ref(), Some(Id::TargetConfigured(c)) if c.label.ends_with(":second"));
+        let announced = events
+            .iter()
+            .position(|e| {
+                matches!(e.payload, Some(Payload::Expanded(_)))
+                    && e.children.iter().any(configured_second)
+            })
+            .expect("a PatternExpanded announcing the second test target");
+        let configured = events
+            .iter()
+            .position(|e| e.id.as_ref().is_some_and(configured_second))
+            .expect("the second target's TargetConfigured");
+        assert!(announced < configured);
+        assert!(
+            events.iter().any(|e| matches!(
+                e.id.as_ref().and_then(|id| id.id.as_ref()),
+                Some(Id::TestSummary(summary)) if summary.label.ends_with(":second")
+            )),
+            "no TestSummary for the second test target reached the server"
+        );
     }
 
     #[tokio::test]
