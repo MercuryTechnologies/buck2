@@ -34,6 +34,7 @@ use buck2_build_api::interpreter::rule_defs::provider::builtin::worker_run_info:
 use buck2_core::category::CategoryRef;
 use buck2_core::deferred::base_deferred_key::BaseDeferredKey;
 use buck2_core::execution_types::executor_config::ReGangWorker;
+use buck2_core::execution_types::executor_config::RePlatformFields;
 use buck2_core::execution_types::executor_config::RemoteExecutorDependency;
 use buck2_error::BuckErrorContext;
 use buck2_error::conversion::from_any_with_tag;
@@ -203,6 +204,12 @@ pub(crate) fn analysis_actions_methods_run(methods: &mut MethodsBuilder) {
     ///     * `drop_host_mount_globs`: list of strings containing file
     ///     globs. Any mounts globs specified will not be bind mounted
     ///     from the host.
+    /// * `remote_execution_properties`: a dictionary of remote execution platform
+    ///   properties for this action alone, such as `{"EstimatedMemory": "12GB"}`.
+    ///   Each key replaces the execution platform's value for the same key, and
+    ///   the merged properties are what the action is keyed and scheduled with,
+    ///   so an action that sets one has its own action digest. Ignored when the
+    ///   executor has no remote execution platform.
     /// * `timeout_seconds`: an optional timeout for the action, in seconds. If
     ///   the action takes longer than this, it will be cancelled and behave as if
     ///   it has failed. Must be a positive number. The default is no timeout.
@@ -305,6 +312,9 @@ pub(crate) fn analysis_actions_methods_run(methods: &mut MethodsBuilder) {
             ListType<DictType<StarlarkStr, StarlarkStr>>,
         >,
         #[starlark(default = NoneOr::None, require = named)] remote_execution_dynamic_image: NoneOr<
+            DictRef<'v>,
+        >,
+        #[starlark(require = named, default = NoneOr::None)] remote_execution_properties: NoneOr<
             DictRef<'v>,
         >,
         #[starlark(require = named, default = NoneOr::None)] timeout_seconds: NoneOr<u32>,
@@ -645,6 +655,37 @@ pub(crate) fn analysis_actions_methods_run(methods: &mut MethodsBuilder) {
         let extra_params =
             parse_meta_internal_extra_params(meta_internal_extra_params.into_option())?;
 
+        let remote_execution_properties = remote_execution_properties
+            .into_option()
+            .map(|properties| {
+                properties
+                    .iter()
+                    .map(|(name, value)| {
+                        match (name.unpack_str(), value.unpack_str()) {
+                            (Some(name), Some(value)) => Ok((name, value)),
+                            _ => Err(buck2_error::buck2_error!(
+                                buck2_error::ErrorTag::Input,
+                                "remote_execution_properties must map strings to strings, got `{}`: `{}`",
+                                name,
+                                value
+                            )),
+                        }
+                    })
+                    .collect::<buck2_error::Result<Vec<_>>>()
+            })
+            .transpose()?
+            .filter(|properties| !properties.is_empty())
+            .map(|properties| {
+                Box::new(RePlatformFields {
+                    properties: Arc::new(
+                        properties
+                            .into_iter()
+                            .map(|(name, value)| (name.to_owned(), vec![value.to_owned()]))
+                            .collect(),
+                    ),
+                })
+            });
+
         let timeout = match timeout_seconds.into_option() {
             Some(t) => {
                 if t == 0 {
@@ -687,6 +728,7 @@ pub(crate) fn analysis_actions_methods_run(methods: &mut MethodsBuilder) {
             remote_execution_dependencies: re_dependencies,
             re_gang_workers,
             remote_execution_custom_image: re_custom_image,
+            remote_execution_properties,
             meta_internal_extra_params: extra_params,
             expected_eligible_for_dedupe: expect_eligible_for_dedupe.into_option(),
             timeout,
