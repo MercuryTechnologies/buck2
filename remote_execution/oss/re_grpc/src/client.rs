@@ -384,6 +384,16 @@ struct PreconditionFailureViolation {
 const RETRY_INFO_TYPE_URL: &str = "type.googleapis.com/google.rpc.RetryInfo";
 const PRECONDITION_FAILURE_TYPE_URL: &str = "type.googleapis.com/google.rpc.PreconditionFailure";
 
+#[derive(Clone, PartialEq, ::prost::Message)]
+struct ErrorInfoDetail {
+    #[prost(string, tag = "1")]
+    reason: String,
+    #[prost(string, tag = "2")]
+    domain: String,
+}
+
+const ERROR_INFO_TYPE_URL: &str = "type.googleapis.com/google.rpc.ErrorInfo";
+
 fn check_status(status: Status) -> Result<(), REClientError> {
     if status.code == 0 {
         return Ok(());
@@ -800,11 +810,21 @@ fn can_retry_execute(retry_attempts: usize, retries: usize) -> bool {
 /// compile that does not fit. Concurrent builds merged onto the action share each attempt.
 const OOM_KILLED_RETRIES: usize = 1;
 
-/// BuildBuddy reports an action its executor's OOM killer ended as UNAVAILABLE with this
-/// message (v2.310.0, containers/ociruntime/ociruntime.go, from the task cgroup's
-/// memory.events `oom_kill`).
+/// BuildBuddy reports an action killed for memory as UNAVAILABLE in one of two ways (v2.310.0):
+/// a kill at the task cgroup's memory.max carries only the message below
+/// (containers/ociruntime/ociruntime.go, from memory.events `oom_kill`), and the executor's own
+/// OOM killer attaches ErrorInfo reason EXECUTOR_OOM_KILL in domain buildbuddy.io
+/// (remote_execution/oom/oom.go), which is also what lets measured task sizing run the next
+/// attempt larger.
 fn is_oom_killed(status: &Status) -> bool {
-    TCode(status.code) == TCode::UNAVAILABLE && status.message.contains("killed by oom killer")
+    TCode(status.code) == TCode::UNAVAILABLE
+        && (status.message.contains("killed by oom killer")
+            || status.details.iter().any(|detail| {
+                detail.type_url == ERROR_INFO_TYPE_URL
+                    && ErrorInfoDetail::decode(detail.value.as_slice()).is_ok_and(|info| {
+                        info.reason == "EXECUTOR_OOM_KILL" && info.domain == "buildbuddy.io"
+                    })
+            }))
 }
 
 /// A number in [0, 1].
@@ -10231,13 +10251,28 @@ mod tests {
     }
 
     #[test]
-    fn only_unavailable_with_the_oom_killer_message_is_an_oom_kill() {
+    fn oom_kills_are_unavailable_with_the_cgroup_message_or_the_oom_killers_error_info() {
         let status = |code: TCode, message: &str| Status {
             code: code.0,
             message: message.to_owned(),
             ..Default::default()
         };
         assert!(is_oom_killed(&status(TCode::UNAVAILABLE, OOM_KILLED)));
+        let executor_oom_killer = Status {
+            details: vec![prost_types::Any {
+                type_url: ERROR_INFO_TYPE_URL.to_owned(),
+                value: ErrorInfoDetail {
+                    reason: "EXECUTOR_OOM_KILL".to_owned(),
+                    domain: "buildbuddy.io".to_owned(),
+                }
+                .encode_to_vec(),
+            }],
+            ..status(TCode::UNAVAILABLE, "executor OOM killer terminated task")
+        };
+        assert!(
+            is_oom_killed(&executor_oom_killer),
+            "the executor OOM killer's ErrorInfo"
+        );
         assert!(!is_oom_killed(&status(
             TCode::UNAVAILABLE,
             "executor went away"
