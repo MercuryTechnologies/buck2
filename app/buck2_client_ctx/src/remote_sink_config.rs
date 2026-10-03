@@ -17,6 +17,8 @@ use buck2_error::ErrorTag;
 use buck2_events::sink::remote::BesEventFormat;
 use buck2_events::sink::remote::RemoteEventConfig;
 #[cfg(not(fbcode_build))]
+use buck2_events::sink::remote::BesChannelSettings;
+#[cfg(not(fbcode_build))]
 use buck2_events::sink::remote::BesTls;
 
 #[cfg(not(fbcode_build))]
@@ -36,6 +38,7 @@ struct BuckconfigBesSettings {
     bazel_artifact_uri_authority: Option<String>,
     bazel_artifact_upload_max_bytes: Option<usize>,
     bes_results_url: Option<String>,
+    channel: BesChannelSettings,
 }
 
 #[cfg(not(fbcode_build))]
@@ -80,6 +83,7 @@ pub fn with_buckconfig_overrides(
             if let Some(max_bytes) = settings.bazel_artifact_upload_max_bytes {
                 config.bazel_artifact_upload_max_bytes = max_bytes;
             }
+            config.channel = settings.channel;
             config
         }
         Err(e) => {
@@ -143,6 +147,7 @@ fn read_buckconfig_bes_settings(
             bazel_artifact_uri_authority: None,
             bazel_artifact_upload_max_bytes: None,
             bes_results_url: None,
+            channel: BesChannelSettings::default(),
         });
     };
     let fs = paths.project_root();
@@ -302,6 +307,28 @@ fn read_buckconfig_bes_settings(
             property: "bazel_artifact_upload_max_bytes",
         })?,
         bes_results_url,
+        channel: BesChannelSettings {
+            grpc_keepalive_time_secs: root_config.parse(BuckconfigKeyRef {
+                section: "buck2_re_client",
+                property: "grpc_keepalive_time_secs",
+            })?,
+            grpc_keepalive_timeout_secs: root_config.parse(BuckconfigKeyRef {
+                section: "buck2_re_client",
+                property: "grpc_keepalive_timeout_secs",
+            })?,
+            grpc_keepalive_while_idle: root_config.parse(BuckconfigKeyRef {
+                section: "buck2_re_client",
+                property: "grpc_keepalive_while_idle",
+            })?,
+            tcp_keepalive_secs: root_config.parse(BuckconfigKeyRef {
+                section: "buck2_re_client",
+                property: "tcp_keepalive_secs",
+            })?,
+            bytestream_progress_timeout_secs: root_config.parse(BuckconfigKeyRef {
+                section: "buck2_re_client",
+                property: "bytestream_progress_timeout_secs",
+            })?,
+        },
     })
 }
 

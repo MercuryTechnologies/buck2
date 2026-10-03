@@ -547,6 +547,29 @@ impl DaemonState {
                     property: "bazel_artifact_upload_max_bytes",
                 })?
                 .unwrap_or(10 * 1024 * 1024);
+            #[cfg(not(fbcode_build))]
+            let bes_channel = buck2_events::sink::remote::BesChannelSettings {
+                grpc_keepalive_time_secs: root_config.parse(BuckconfigKeyRef {
+                    section: "buck2_re_client",
+                    property: "grpc_keepalive_time_secs",
+                })?,
+                grpc_keepalive_timeout_secs: root_config.parse(BuckconfigKeyRef {
+                    section: "buck2_re_client",
+                    property: "grpc_keepalive_timeout_secs",
+                })?,
+                grpc_keepalive_while_idle: root_config.parse(BuckconfigKeyRef {
+                    section: "buck2_re_client",
+                    property: "grpc_keepalive_while_idle",
+                })?,
+                tcp_keepalive_secs: root_config.parse(BuckconfigKeyRef {
+                    section: "buck2_re_client",
+                    property: "tcp_keepalive_secs",
+                })?,
+                bytestream_progress_timeout_secs: root_config.parse(BuckconfigKeyRef {
+                    section: "buck2_re_client",
+                    property: "bytestream_progress_timeout_secs",
+                })?,
+            };
             tracing::info!("Initializing scribe sink...");
             let scribe_sink = Self::init_scribe_sink(
                 fb,
@@ -589,6 +612,8 @@ impl DaemonState {
                     bazel_artifact_uri_authority,
                     #[cfg(not(fbcode_build))]
                     bazel_artifact_upload_max_bytes,
+                    #[cfg(not(fbcode_build))]
+                    channel: bes_channel,
                 },
             )
             .buck_error_context("failed to init scribe sink")?;

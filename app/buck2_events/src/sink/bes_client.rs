@@ -73,6 +73,18 @@ const MIN_CLOSE_ACK_TIMEOUT: Duration = Duration::from_secs(30);
 const COMMAND_END_CLOSE_GRACE: Duration = Duration::from_millis(500);
 const COMMAND_END_CLOSE_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const DEFAULT_BAZEL_ARTIFACT_UPLOAD_MAX_BYTES: usize = 10 * 1024 * 1024;
+// The remote execution client's defaults for the same `[buck2_re_client]` keys
+// (remote_execution/oss/re_grpc/src/client.rs:146-150). The artifact uploads go to that client's
+// CAS unless `[bes] bazel_artifact_upload_backend` names another, and the BES endpoint is usually
+// the same server, so a connection the client gives up on is one the sink gives up on too.
+// The 20 s timeout is gRPC's own client default (https://grpc.io/docs/guides/keepalive/, where
+// the interval is off by default). An interval under 10 s draws GOAWAY too_many_pings from
+// BuildBuddy, whose KeepaliveEnforcementPolicy has MinTime 10 s (v2.310.0
+// server/util/grpc_server/grpc_server.go:253-256).
+const DEFAULT_GRPC_KEEPALIVE_TIME_SECS: u64 = 60;
+const DEFAULT_GRPC_KEEPALIVE_TIMEOUT_SECS: u64 = 20;
+const DEFAULT_GRPC_KEEPALIVE_WHILE_IDLE: bool = false;
+const DEFAULT_BYTESTREAM_PROGRESS_TIMEOUT_SECS: u64 = 60;
 
 #[derive(Clone, Debug)]
 pub struct BesConfig {
@@ -100,6 +112,51 @@ pub struct BesConfig {
     pub re_client_instance_name: Option<String>,
     pub bazel_artifact_uri_authority: Option<String>,
     pub bazel_artifact_upload_max_bytes: usize,
+    pub channel: BesChannelSettings,
+}
+
+/// The `[buck2_re_client]` keys that bound how long the sink's connections may go unanswered.
+/// Unset keys take the remote execution client's defaults. The sink has one worker thread, and
+/// before these bounds a connection to a server that stopped answering held it, and every
+/// command that waited on it, for as long as TCP took to give up: a quarter of an hour or more.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct BesChannelSettings {
+    pub grpc_keepalive_time_secs: Option<u64>,
+    pub grpc_keepalive_timeout_secs: Option<u64>,
+    pub grpc_keepalive_while_idle: Option<bool>,
+    pub tcp_keepalive_secs: Option<u64>,
+    /// How long an artifact upload may go without the transport taking a chunk or the server
+    /// answering. The key's documentation speaks of downloads, the only use the remote
+    /// execution client makes of it; an upload is the same wait in the other direction.
+    pub bytestream_progress_timeout_secs: Option<u64>,
+}
+
+impl BesChannelSettings {
+    /// HTTP/2 pings find a peer that stopped answering on a connection whose TCP session looks
+    /// alive, which only the kernel's retransmission timeout would otherwise end.
+    fn apply(&self, endpoint: Endpoint) -> Endpoint {
+        endpoint
+            .http2_keep_alive_interval(Duration::from_secs(
+                self.grpc_keepalive_time_secs
+                    .unwrap_or(DEFAULT_GRPC_KEEPALIVE_TIME_SECS),
+            ))
+            .keep_alive_timeout(Duration::from_secs(
+                self.grpc_keepalive_timeout_secs
+                    .unwrap_or(DEFAULT_GRPC_KEEPALIVE_TIMEOUT_SECS),
+            ))
+            .keep_alive_while_idle(
+                self.grpc_keepalive_while_idle
+                    .unwrap_or(DEFAULT_GRPC_KEEPALIVE_WHILE_IDLE),
+            )
+            .tcp_keepalive(self.tcp_keepalive_secs.map(Duration::from_secs))
+    }
+
+    fn bytestream_progress_timeout(&self) -> Duration {
+        Duration::from_secs(
+            self.bytestream_progress_timeout_secs
+                .unwrap_or(DEFAULT_BYTESTREAM_PROGRESS_TIMEOUT_SECS),
+        )
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -132,6 +189,7 @@ impl Default for BesConfig {
             re_client_instance_name: None,
             bazel_artifact_uri_authority: None,
             bazel_artifact_upload_max_bytes: DEFAULT_BAZEL_ARTIFACT_UPLOAD_MAX_BYTES,
+            channel: BesChannelSettings::default(),
         }
     }
 }
@@ -171,7 +229,31 @@ struct SendNowRequest {
     wait_for_acks: bool,
     /// Close every stream after sending: the daemon is shutting down.
     close_all: bool,
-    done: oneshot::Sender<buck2_error::Result<()>>,
+    done: SendNowReply,
+}
+
+/// Where the worker reports a priority send: to an awaiting task, or to a thread that waits
+/// with a deadline and may have gone on without the answer.
+enum SendNowReply {
+    Await(oneshot::Sender<buck2_error::Result<()>>),
+    Block(crossbeam_channel::Sender<buck2_error::Result<()>>),
+}
+
+impl SendNowReply {
+    fn send(self, result: buck2_error::Result<()>) {
+        match self {
+            Self::Await(done) => drop(done.send(result)),
+            Self::Block(done) => drop(done.try_send(result)),
+        }
+    }
+}
+
+pub enum PrioritySend {
+    Done(buck2_error::Result<()>),
+    /// The worker did not answer within the deadline. The events stay first in its priority
+    /// lane, which it drains before any event queued after them, and are sent when it gets to
+    /// them.
+    StillQueued,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -306,6 +388,7 @@ struct BazelArtifactUploadConfig {
     uri_authority: String,
     max_bytes: usize,
     grpc_timeout: Duration,
+    channel: BesChannelSettings,
 }
 
 impl BazelArtifactUploadConfig {
@@ -352,13 +435,18 @@ impl BazelArtifactUploadConfig {
             uri_authority,
             max_bytes: config.bazel_artifact_upload_max_bytes,
             grpc_timeout: config.grpc_timeout,
+            channel: config.channel.clone(),
         }))
     }
 }
 
 struct BazelArtifactUploader {
     config: BazelArtifactUploadConfig,
+    counters: Arc<CounterState>,
     client: Option<ByteStreamClient<Channel>>,
+    /// An upload of this stream's ran out of time. The rest of its files are not uploaded: each
+    /// would hold the worker, and every event queued behind it, for as long again.
+    timed_out: bool,
     repo_path: Option<PathBuf>,
     directory_outputs: HashSet<BepFileIdentity>,
     #[cfg(test)]
@@ -385,10 +473,12 @@ impl BepFileIdentity {
 }
 
 impl BazelArtifactUploader {
-    fn new(config: BazelArtifactUploadConfig) -> Self {
+    fn new(config: BazelArtifactUploadConfig, counters: Arc<CounterState>) -> Self {
         Self {
             config,
+            counters,
             client: None,
+            timed_out: false,
             repo_path: None,
             directory_outputs: HashSet::new(),
             #[cfg(test)]
@@ -660,22 +750,7 @@ impl BazelArtifactUploader {
             return Ok(google_grpc_proto::google::bytestream::WriteResponse { committed_size });
         }
 
-        if self.client.is_none() {
-            let endpoint = endpoint_for(&self.config.endpoint, self.config.grpc_timeout, &self.config.tls)?;
-            let channel = endpoint.connect().await.map_err(map_transport_error)?;
-            self.client = Some(ByteStreamClient::new(channel));
-        }
-        let client = self.client.as_mut().expect("client was initialized");
-        let outbound = tokio_stream::iter(requests);
-        let mut request = tonic::Request::new(outbound);
-        attach_headers(
-            &mut request,
-            &self.config.headers,
-            self.config.credential_helper.as_deref(),
-            &self.config.endpoint,
-        )
-        .await?;
-        Ok(client.write(request).await?.into_inner())
+        self.write(tokio_stream::iter(requests)).await
     }
 
     async fn write_file_requests(
@@ -692,13 +767,71 @@ impl BazelArtifactUploader {
             return self.write_requests(requests).await;
         }
 
-        if self.client.is_none() {
-            let endpoint = endpoint_for(&self.config.endpoint, self.config.grpc_timeout, &self.config.tls)?;
-            let channel = endpoint.connect().await.map_err(map_transport_error)?;
-            self.client = Some(ByteStreamClient::new(channel));
+        self.write(file_write_stream(resource_name, path, size, chunk_size)?)
+            .await
+    }
+
+    /// One ByteStream Write, given up once neither the transport takes a chunk nor the server
+    /// answers for `bytestream_progress_timeout_secs`. A bound on the whole Write would cut off
+    /// a large file on a slow link; this one only ends a Write that stopped moving.
+    async fn write(
+        &mut self,
+        outbound: impl futures::Stream<Item = WriteRequest> + Send + 'static,
+    ) -> Result<google_grpc_proto::google::bytestream::WriteResponse, Status> {
+        if self.timed_out {
+            return Err(Status::deadline_exceeded(
+                "an earlier artifact upload of this stream timed out",
+            ));
         }
-        let client = self.client.as_mut().expect("client was initialized");
-        let outbound = file_write_stream(resource_name, path, size, chunk_size)?;
+        let result = self.write_with_progress_timeout(outbound).await;
+        if let Err(status) = &result
+            && status.code() == tonic::Code::DeadlineExceeded
+        {
+            self.timed_out = true;
+            // The cached channel may be the one that went quiet. A later stream dials again.
+            self.client = None;
+            self.counters.inc_failures_timed_out();
+            tracing::warn!(
+                "BES sink: artifact upload to {} gave up, and this stream uploads no more: {}",
+                self.config.endpoint,
+                status.message()
+            );
+        }
+        result
+    }
+
+    async fn write_with_progress_timeout(
+        &mut self,
+        outbound: impl futures::Stream<Item = WriteRequest> + Send + 'static,
+    ) -> Result<google_grpc_proto::google::bytestream::WriteResponse, Status> {
+        let progress_timeout = self.config.channel.bytestream_progress_timeout();
+        let mut client = match &self.client {
+            Some(client) => client.clone(),
+            None => {
+                let endpoint = endpoint_for(
+                    &self.config.endpoint,
+                    self.config.grpc_timeout,
+                    &self.config.tls,
+                    &self.config.channel,
+                )?;
+                let client = ByteStreamClient::new(
+                    connect_within(&endpoint, self.config.grpc_timeout).await?,
+                );
+                self.client = Some(client.clone());
+                client
+            }
+        };
+        let started = tokio::time::Instant::now();
+        let last_progress_millis = Arc::new(AtomicU64::new(0));
+        let outbound = {
+            let last_progress_millis = last_progress_millis.clone();
+            futures::StreamExt::inspect(outbound, move |_| {
+                last_progress_millis.store(
+                    u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                    Ordering::Relaxed,
+                );
+            })
+        };
         let mut request = tonic::Request::new(outbound);
         attach_headers(
             &mut request,
@@ -707,7 +840,26 @@ impl BazelArtifactUploader {
             &self.config.endpoint,
         )
         .await?;
-        Ok(client.write(request).await?.into_inner())
+        let write = client.write(request);
+        tokio::pin!(write);
+        loop {
+            let deadline = started
+                + Duration::from_millis(last_progress_millis.load(Ordering::Relaxed))
+                + progress_timeout;
+            tokio::select! {
+                response = &mut write => return Ok(response?.into_inner()),
+                () = tokio::time::sleep_until(deadline) => {
+                    let deadline = started
+                        + Duration::from_millis(last_progress_millis.load(Ordering::Relaxed))
+                        + progress_timeout;
+                    if tokio::time::Instant::now() >= deadline {
+                        return Err(Status::deadline_exceeded(format!(
+                            "ByteStream Write made no progress for {progress_timeout:?}"
+                        )));
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -1074,7 +1226,7 @@ impl BesClient {
                 messages,
                 wait_for_acks,
                 close_all: false,
-                done: done_tx,
+                done: SendNowReply::Await(done_tx),
             })
             .map_err(|_| {
                 buck2_error::buck2_error!(
@@ -1098,11 +1250,39 @@ impl BesClient {
         self.send_messages_with_priority(messages, true).await
     }
 
-    pub async fn send_messages_without_waiting_for_acks(
-        &self,
-        messages: Vec<Message>,
-    ) -> buck2_error::Result<()> {
-        self.send_messages_with_priority(messages, false).await
+    /// Sends ahead of the queue without waiting for acknowledgements, and waits for the worker
+    /// at most `deadline`. For a caller that must not stall: the worker has one thread, and an
+    /// earlier event can hold it for as long as its connection takes to fail.
+    pub fn send_messages_within(&self, messages: Vec<Message>, deadline: Duration) -> PrioritySend {
+        if messages.is_empty() {
+            return PrioritySend::Done(Ok(()));
+        }
+        let (done_tx, done_rx) = crossbeam_channel::bounded(1);
+        if self
+            .send_now_tx
+            .send(SendNowRequest {
+                messages,
+                wait_for_acks: false,
+                close_all: false,
+                done: SendNowReply::Block(done_tx),
+            })
+            .is_err()
+        {
+            return PrioritySend::Done(Err(buck2_error::buck2_error!(
+                ErrorTag::Tier0,
+                "Failed to enqueue BES priority send request"
+            )));
+        }
+        match done_rx.recv_timeout(deadline) {
+            Ok(result) => PrioritySend::Done(result),
+            Err(crossbeam_channel::RecvTimeoutError::Timeout) => PrioritySend::StillQueued,
+            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+                PrioritySend::Done(Err(buck2_error::buck2_error!(
+                    ErrorTag::Tier0,
+                    "BES worker dropped priority send response channel"
+                )))
+            }
+        }
     }
 
     pub fn export_counters(&self) -> Counters {
@@ -1119,7 +1299,7 @@ impl BesClient {
                 messages: Vec::new(),
                 wait_for_acks: true,
                 close_all: true,
-                done: done_tx,
+                done: SendNowReply::Await(done_tx),
             })
             .map_err(|_| {
                 buck2_error::buck2_error!(ErrorTag::Tier0, "Failed to enqueue BES close request")
@@ -1159,7 +1339,7 @@ fn process_send_now_request(
 ) {
     if request.close_all {
         runtime.block_on(worker.close_all_streams_for_shutdown());
-        drop(request.done.send(Ok(())));
+        request.done.send(Ok(()));
         return;
     }
     // Desired behavior for the ACK-waiting path (mirroring Bazel's BES
@@ -1213,7 +1393,7 @@ fn process_send_now_request(
             ));
         }
     }
-    drop(request.done.send(result));
+    request.done.send(result);
 }
 
 struct WorkerState {
@@ -1453,12 +1633,26 @@ impl WorkerState {
             &self.config.build_metadata,
             upload_config,
             self.config.upload_successful_action_events,
+            self.counters.clone(),
         );
         self.streams.insert(parsed.invocation_id.clone(), stream);
         Ok(())
     }
 
     async fn flush_stream(&mut self, invocation_id: &str) -> Result<(), Status> {
+        // The Bazel converter holds back events that come before a command's start, and an
+        // invocation's events that arrive after its stream closed start a new stream with only
+        // those. A transport opened for no event is a stream the server sees open with no
+        // first event: BuildBuddy cannot end one at shutdown (v2.310.0 server/build_event_protocol/
+        // build_event_server/build_event_server.go:188-202), so it holds a replica's drain to
+        // its deadline.
+        if self
+            .streams
+            .get(invocation_id)
+            .is_some_and(|stream| stream.sender.is_none() && !stream.has_unsent_events())
+        {
+            return Ok(());
+        }
         self.ensure_stream_transport(invocation_id).await?;
         let Some(stream) = self.streams.get_mut(invocation_id) else {
             return Err(Status::unavailable(format!(
@@ -1662,38 +1856,43 @@ impl WorkerState {
                 .expect("stream still exists before reopen");
             stream.last_acked_sequence_number.clone()
         };
-        let (sender, ack_task) = self
+        let transport = self
             .open_stream_transport(last_acked_sequence_number)
             .await?;
         let stream = self
             .streams
             .get_mut(invocation_id)
             .expect("stream still exists after reopen");
-        stream.attach_transport(sender, ack_task);
+        stream.attach_transport(transport);
         Ok(())
     }
 
     async fn open_stream_transport(
         &self,
         last_acked_sequence_number: Arc<AtomicI64>,
-    ) -> Result<
-        (
-            mpsc::Sender<PublishBuildToolEventStreamRequest>,
-            tokio::task::JoinHandle<Result<(), Status>>,
-        ),
-        Status,
-    > {
+    ) -> Result<StreamTransport, Status> {
         // Keep stream RPCs open for the duration of the build; use this value
         // only to bound connection establishment.
         let endpoint = endpoint_for(
             &self.connection.endpoint,
             self.config.grpc_timeout,
             &self.connection.tls,
+            &self.config.channel,
         )?;
-        let channel = endpoint.connect().await.map_err(map_transport_error)?;
+        let channel = connect_within(&endpoint, self.config.grpc_timeout).await?;
         let mut client = PublishBuildEventClient::new(channel);
         let (tx, rx) = mpsc::channel(self.config.buffer_size.max(1));
-        let outbound = ReceiverStream::new(rx);
+        let progress = Arc::new(TransportProgress {
+            opened_at: Instant::now(),
+            taken_sequence_number: AtomicI64::new(0),
+            taken_at_millis: AtomicU64::new(0),
+        });
+        let outbound = {
+            let progress = progress.clone();
+            futures::StreamExt::inspect(ReceiverStream::new(rx), move |request| {
+                progress.take(request_sequence_number(request));
+            })
+        };
         let mut request = tonic::Request::new(outbound);
         attach_headers(
             &mut request,
@@ -1725,10 +1924,15 @@ impl WorkerState {
             }
         });
 
-        Ok((tx, ack_task))
+        Ok(StreamTransport {
+            sender: tx,
+            ack_task,
+            progress,
+        })
     }
 
     async fn close_due_streams(&mut self) {
+        self.fail_stalled_streams();
         let now = Instant::now();
         let due = self
             .streams
@@ -1746,6 +1950,32 @@ impl WorkerState {
             if let Err(status) = self.close_stream(&invocation_id, event_time).await {
                 self.stream_failed(&invocation_id, &status);
             }
+        }
+    }
+
+    /// A stream whose connection takes no event for `grpc_timeout` is reset and later replayed
+    /// on a new connection, like a stream the server ended. Waiting longer would hold the stream
+    /// open on the server with events it never gets, until the command ended and then for
+    /// `close_ack_timeout` more.
+    fn fail_stalled_streams(&mut self) {
+        let now = Instant::now();
+        let bound = self.config.grpc_timeout;
+        let stalled = self
+            .streams
+            .iter()
+            .filter(|(_, stream)| stream.transport_stalled(now, bound))
+            .map(|(invocation_id, _)| invocation_id.clone())
+            .collect::<Vec<_>>();
+        for invocation_id in stalled {
+            tracing::warn!(
+                "BES sink: the stream of invocation {} took no event for {:?}; resetting it",
+                invocation_id,
+                bound
+            );
+            self.stream_failed(
+                &invocation_id,
+                &Status::deadline_exceeded(format!("BES stream took no event for {bound:?}")),
+            );
         }
     }
 
@@ -1800,12 +2030,16 @@ impl WorkerState {
         drop(stream.sender.take());
 
         let close_timeout = close_ack_timeout(self.config.grpc_timeout);
-        let Some(ack_task) = stream.ack_task.take() else {
+        let Some(mut ack_task) = stream.ack_task.take() else {
             return Err(Status::unavailable(
                 "BES stream was closed before finish acknowledgement",
             ));
         };
-        match tokio::time::timeout(close_timeout, ack_task).await {
+        let joined = tokio::time::timeout(close_timeout, &mut ack_task).await;
+        // Dropping the handle would leave the task, and the RPC with it, running: the server
+        // would keep the stream open.
+        ack_task.abort();
+        match joined {
             Ok(joined) => match joined {
                 Ok(Ok(())) => Ok(()),
                 Ok(Err(status)) => Err(status),
@@ -1941,6 +2175,8 @@ struct StreamState {
     last_acked_sequence_number: Arc<AtomicI64>,
     sender: Option<mpsc::Sender<PublishBuildToolEventStreamRequest>>,
     ack_task: Option<tokio::task::JoinHandle<Result<(), Status>>>,
+    progress: Option<Arc<TransportProgress>>,
+    oldest_untaken_handed_at: Option<Instant>,
     project_id: String,
     pending_unacked: VecDeque<PublishBuildToolEventStreamRequest>,
     bazel_converter: BazelEventConverter,
@@ -1961,6 +2197,37 @@ struct StreamState {
     newest_dropped_replay_copy: i64,
 }
 
+/// What the HTTP/2 transport has taken from a stream's channel. hyper takes the next event
+/// only once the previous one is on the wire, keeping one in hand while it waits for send
+/// window (hyper 1.11.1 src/proto/h2/mod.rs:157-186), so an event left untaken means the
+/// connection stopped carrying the stream.
+struct TransportProgress {
+    opened_at: Instant,
+    taken_sequence_number: AtomicI64,
+    taken_at_millis: AtomicU64,
+}
+
+impl TransportProgress {
+    fn take(&self, sequence_number: i64) {
+        self.taken_sequence_number
+            .store(sequence_number, Ordering::Relaxed);
+        self.taken_at_millis.store(
+            u64::try_from(self.opened_at.elapsed().as_millis()).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
+    }
+
+    fn taken_at(&self) -> Instant {
+        self.opened_at + Duration::from_millis(self.taken_at_millis.load(Ordering::Relaxed))
+    }
+}
+
+struct StreamTransport {
+    sender: mpsc::Sender<PublishBuildToolEventStreamRequest>,
+    ack_task: tokio::task::JoinHandle<Result<(), Status>>,
+    progress: Arc<TransportProgress>,
+}
+
 struct PendingClose {
     close_after: Instant,
     event_time: Option<Timestamp>,
@@ -1979,6 +2246,7 @@ impl StreamState {
         build_metadata: &[(String, String)],
         bazel_artifact_upload_config: Option<BazelArtifactUploadConfig>,
         upload_successful_action_events: bool,
+        counters: Arc<CounterState>,
     ) -> Self {
         Self {
             stream_id: StreamId {
@@ -1990,13 +2258,16 @@ impl StreamState {
             last_acked_sequence_number: Arc::new(AtomicI64::new(0)),
             sender: None,
             ack_task: None,
+            progress: None,
+            oldest_untaken_handed_at: None,
             project_id: parsed.project_id.clone(),
             pending_unacked: VecDeque::new(),
             bazel_converter: BazelEventConverter::new_with_options(
                 build_metadata.iter().cloned(),
                 upload_successful_action_events,
             ),
-            bazel_artifact_uploader: bazel_artifact_upload_config.map(BazelArtifactUploader::new),
+            bazel_artifact_uploader: bazel_artifact_upload_config
+                .map(|config| BazelArtifactUploader::new(config, counters)),
             last_sent_sequence_number: 0,
             saw_command_end: false,
             pending_close: None,
@@ -2084,18 +2355,36 @@ impl StreamState {
         }
     }
 
-    fn attach_transport(
-        &mut self,
-        sender: mpsc::Sender<PublishBuildToolEventStreamRequest>,
-        ack_task: tokio::task::JoinHandle<Result<(), Status>>,
-    ) {
-        self.sender = Some(sender);
-        self.ack_task = Some(ack_task);
+    fn attach_transport(&mut self, transport: StreamTransport) {
+        self.sender = Some(transport.sender);
+        self.ack_task = Some(transport.ack_task);
+        self.progress = Some(transport.progress);
+        self.oldest_untaken_handed_at = None;
         self.prune_acked_requests();
         self.last_sent_sequence_number = self.last_acked_sequence_number();
     }
 
+    fn has_unsent_events(&self) -> bool {
+        self.pending_unacked
+            .back()
+            .is_some_and(|request| request_sequence_number(request) > self.last_sent_sequence_number)
+    }
+
+    fn transport_stalled(&self, now: Instant, bound: Duration) -> bool {
+        let (Some(progress), Some(oldest_untaken_handed_at)) = (&self.progress, self.oldest_untaken_handed_at) else {
+            return false;
+        };
+        if progress.taken_sequence_number.load(Ordering::Relaxed)
+            >= self.last_sent_sequence_number
+        {
+            return false;
+        }
+        now.duration_since(oldest_untaken_handed_at.max(progress.taken_at())) >= bound
+    }
+
     fn discard_transport(&mut self) {
+        self.progress = None;
+        self.oldest_untaken_handed_at = None;
         drop(self.sender.take());
         if let Some(ack_task) = self.ack_task.take() {
             if !ack_task.is_finished() {
@@ -2124,6 +2413,13 @@ impl StreamState {
             .collect::<Vec<_>>();
         for request in pending {
             let sequence_number = request_sequence_number(&request);
+            let caught_up = self.progress.as_ref().is_none_or(|progress| {
+                progress.taken_sequence_number.load(Ordering::Relaxed)
+                    >= self.last_sent_sequence_number
+            });
+            if caught_up || self.oldest_untaken_handed_at.is_none() {
+                self.oldest_untaken_handed_at = Some(Instant::now());
+            }
             // A server that stays connected but stops reading fills the channel; without a
             // bound the worker thread would wait here for the rest of the daemon's life.
             match tokio::time::timeout(send_timeout, sender.send(request)).await {
@@ -2384,10 +2680,17 @@ async fn attach_headers<T>(
     Ok(())
 }
 
-fn endpoint_for(uri: &str, connect_timeout: Duration, tls: &BesTls) -> Result<Endpoint, Status> {
-    let mut endpoint = Endpoint::from_shared(uri.to_owned())
-        .map_err(|e| Status::internal(e.to_string()))?
-        .connect_timeout(connect_timeout);
+fn endpoint_for(
+    uri: &str,
+    connect_timeout: Duration,
+    tls: &BesTls,
+    channel: &BesChannelSettings,
+) -> Result<Endpoint, Status> {
+    let mut endpoint = channel.apply(
+        Endpoint::from_shared(uri.to_owned())
+            .map_err(|e| Status::internal(e.to_string()))?
+            .connect_timeout(connect_timeout),
+    );
     if uri
         .split_once("://")
         .is_some_and(|(scheme, _)| scheme.eq_ignore_ascii_case("https"))
@@ -2407,6 +2710,28 @@ fn endpoint_for(uri: &str, connect_timeout: Duration, tls: &BesTls) -> Result<En
             .map_err(|e| Status::internal(e.to_string()))?;
     }
     Ok(endpoint)
+}
+
+/// Tonic hands `connect_timeout` to the TCP connector alone (tonic 0.14.6
+/// src/transport/channel/endpoint.rs:547), so a peer that accepts the connection and then says
+/// nothing holds the TLS handshake for as long as TCP stays up. The whole connection gets the
+/// same bound here.
+async fn connect_within(endpoint: &Endpoint, timeout: Duration) -> Result<Channel, Status> {
+    match tokio::time::timeout(timeout, endpoint.connect()).await {
+        Ok(connected) => connected.map_err(map_transport_error),
+        Err(_) => {
+            tracing::warn!(
+                "BES sink: no connection to {} within {:?}",
+                endpoint.uri(),
+                timeout
+            );
+            Err(Status::deadline_exceeded(format!(
+                "No connection to {} within {:?}",
+                endpoint.uri(),
+                timeout
+            )))
+        }
+    }
 }
 
 fn read_pem(path: &str) -> Result<Vec<u8>, Status> {
@@ -2463,6 +2788,13 @@ mod tests {
     use bes_grpc_proto::google::devtools::build::v1::PublishLifecycleEventRequest;
     use bes_grpc_proto::google::devtools::build::v1::publish_build_event_server::PublishBuildEvent;
     use bes_grpc_proto::google::devtools::build::v1::publish_build_event_server::PublishBuildEventServer;
+    use google_grpc_proto::google::bytestream::QueryWriteStatusRequest;
+    use google_grpc_proto::google::bytestream::QueryWriteStatusResponse;
+    use google_grpc_proto::google::bytestream::ReadRequest;
+    use google_grpc_proto::google::bytestream::ReadResponse;
+    use google_grpc_proto::google::bytestream::WriteResponse;
+    use google_grpc_proto::google::bytestream::byte_stream_server::ByteStream;
+    use google_grpc_proto::google::bytestream::byte_stream_server::ByteStreamServer;
     use buck2_wrapper_common::invocation_id::TraceId;
 
     use super::*;
@@ -2743,13 +3075,14 @@ mod tests {
             uri_authority: "localhost:1985".to_owned(),
             max_bytes: 1024,
             grpc_timeout: Duration::from_secs(1),
+            channel: BesChannelSettings::default(),
         }
     }
 
     #[tokio::test]
     async fn upload_event_files_adds_named_set_uris_from_digest() {
         let hash = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
-        let mut uploader = BazelArtifactUploader::new(test_artifact_upload_config());
+        let mut uploader = BazelArtifactUploader::new(test_artifact_upload_config(), Arc::default());
         let mut event = bazel_bep_proto::build_event_stream::BuildEvent {
             id: None,
             children: Vec::new(),
@@ -2796,7 +3129,7 @@ mod tests {
             digest: "tree-digest:42".to_owned(),
             length: 42,
         };
-        let mut uploader = BazelArtifactUploader::new(test_artifact_upload_config());
+        let mut uploader = BazelArtifactUploader::new(test_artifact_upload_config(), Arc::default());
         uploader.observe_bazel_events(&[bazel_bep_proto::build_event_stream::BuildEvent {
             id: None,
             children: Vec::new(),
@@ -2848,7 +3181,7 @@ mod tests {
         let output_path = repo_path.join("buck-out/gen/root/main");
         std::fs::create_dir_all(output_path.parent().unwrap()).unwrap();
         std::fs::write(&output_path, contents).unwrap();
-        let mut uploader = BazelArtifactUploader::new(test_artifact_upload_config());
+        let mut uploader = BazelArtifactUploader::new(test_artifact_upload_config(), Arc::default());
         let mut metadata = HashMap::new();
         metadata.insert(
             "REPO_ROOT".to_owned(),
@@ -2931,7 +3264,7 @@ mod tests {
         std::fs::write(&output_path, contents).unwrap();
         let mut config = test_artifact_upload_config();
         config.max_bytes = 4;
-        let mut uploader = BazelArtifactUploader::new(config);
+        let mut uploader = BazelArtifactUploader::new(config, Arc::default());
         uploader.repo_path = Some(repo_path.clone());
         let mut event = bazel_bep_proto::build_event_stream::BuildEvent {
             id: None,
@@ -2992,7 +3325,7 @@ mod tests {
         let repo_path =
             std::env::temp_dir().join(format!("buck2-bes-client-test-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&repo_path).unwrap();
-        let mut uploader = BazelArtifactUploader::new(test_artifact_upload_config());
+        let mut uploader = BazelArtifactUploader::new(test_artifact_upload_config(), Arc::default());
         uploader.repo_path = Some(repo_path.clone());
         let mut event = bazel_bep_proto::build_event_stream::BuildEvent {
             id: None,
@@ -3078,7 +3411,7 @@ mod tests {
             command_start_data(),
         );
         let parsed = ParsedMessage::from_message(&message).expect("valid message");
-        let mut stream = StreamState::new(&parsed, &[], None, true);
+        let mut stream = StreamState::new(&parsed, &[], None, true, Arc::default());
 
         let last_sequence = stream.enqueue_event(&parsed, BesEventFormat::Bazel).await;
 
@@ -3155,7 +3488,15 @@ mod tests {
                 .streams
                 .get_mut(&parsed.invocation_id)
                 .expect("stream inserted");
-            stream.attach_transport(sender, ack_task);
+            stream.attach_transport(StreamTransport {
+                sender,
+                ack_task,
+                progress: Arc::new(TransportProgress {
+                    opened_at: Instant::now(),
+                    taken_sequence_number: AtomicI64::new(0),
+                    taken_at_millis: AtomicU64::new(0),
+                }),
+            });
             // Make the outer flush a no-op so failure originates from the immediate-close path.
             stream.last_sent_sequence_number = 1;
         }
@@ -4064,7 +4405,7 @@ mod tests {
             command_start_data(),
         );
         let parsed = ParsedMessage::from_message(&message).expect("valid message");
-        let mut stream = StreamState::new(&parsed, &[], None, true);
+        let mut stream = StreamState::new(&parsed, &[], None, true, Arc::default());
         for _ in 0..10 {
             stream.enqueue_event(&parsed, BesEventFormat::Buck).await;
         }
@@ -4249,5 +4590,322 @@ mod tests {
             counters.snapshot().failures_pushed_back,
             failures_after_first + 1
         );
+    }
+
+    struct ByteStreamThatNeverAnswers;
+
+    #[tonic::async_trait]
+    impl ByteStream for ByteStreamThatNeverAnswers {
+        type ReadStream = ReceiverStream<Result<ReadResponse, Status>>;
+
+        async fn read(
+            &self,
+            _request: tonic::Request<ReadRequest>,
+        ) -> Result<tonic::Response<Self::ReadStream>, Status> {
+            Err(Status::unimplemented("read"))
+        }
+
+        async fn write(
+            &self,
+            request: tonic::Request<tonic::Streaming<WriteRequest>>,
+        ) -> Result<tonic::Response<WriteResponse>, Status> {
+            let mut inbound = request.into_inner();
+            while let Ok(Some(_)) = inbound.message().await {}
+            std::future::pending().await
+        }
+
+        async fn query_write_status(
+            &self,
+            _request: tonic::Request<QueryWriteStatusRequest>,
+        ) -> Result<tonic::Response<QueryWriteStatusResponse>, Status> {
+            Err(Status::unimplemented("query_write_status"))
+        }
+    }
+
+    async fn serve_bytestream_that_never_answers() -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let endpoint = format!("http://{}", listener.local_addr().expect("local addr"));
+        tokio::spawn(
+            tonic::transport::Server::builder()
+                .add_service(ByteStreamServer::new(ByteStreamThatNeverAnswers))
+                .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener)),
+        );
+        endpoint
+    }
+
+    fn serve_silence() -> std::net::SocketAddr {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let address = listener.local_addr().expect("local addr");
+        thread::spawn(move || {
+            let mut held = Vec::new();
+            for connection in listener.incoming().flatten() {
+                held.push(connection);
+            }
+        });
+        address
+    }
+
+    #[tokio::test]
+    async fn a_bytestream_write_the_server_never_answers_is_given_up() {
+        // The server's connection answers HTTP/2 pings, so no keepalive ends this Write.
+        let endpoint = serve_bytestream_that_never_answers().await;
+        let counters = Arc::new(CounterState::default());
+        let mut uploader = BazelArtifactUploader::new(
+            BazelArtifactUploadConfig {
+                endpoint,
+                channel: BesChannelSettings {
+                    bytestream_progress_timeout_secs: Some(1),
+                    ..BesChannelSettings::default()
+                },
+                ..test_artifact_upload_config()
+            },
+            counters.clone(),
+        );
+
+        let uploaded =
+            tokio::time::timeout(Duration::from_secs(10), uploader.upload_bytes(b"stdout")).await;
+        let Ok(uploaded) = uploaded else {
+            panic!("a Write the server never answered held the uploader past 10 s");
+        };
+        assert_eq!(uploaded, None);
+        assert_eq!(counters.snapshot().failures_timed_out, 1);
+
+        // The stream's later files are not tried against the same server.
+        let started = Instant::now();
+        assert_eq!(uploader.upload_bytes(b"stderr").await, None);
+        assert!(started.elapsed() < Duration::from_millis(500));
+    }
+
+    #[tokio::test]
+    async fn keepalive_ends_a_write_to_a_peer_that_stopped_answering() {
+        let address = serve_silence();
+        let mut uploader = BazelArtifactUploader::new(
+            BazelArtifactUploadConfig {
+                endpoint: format!("http://{address}"),
+                grpc_timeout: Duration::from_secs(5),
+                channel: BesChannelSettings {
+                    grpc_keepalive_time_secs: Some(1),
+                    grpc_keepalive_timeout_secs: Some(1),
+                    // Only the keepalive can end the Write within the test.
+                    bytestream_progress_timeout_secs: Some(3600),
+                    ..BesChannelSettings::default()
+                },
+                ..test_artifact_upload_config()
+            },
+            Arc::default(),
+        );
+
+        let uploaded =
+            tokio::time::timeout(Duration::from_secs(15), uploader.upload_bytes(b"stdout")).await;
+        let Ok(uploaded) = uploaded else {
+            panic!("no keepalive ended a Write to a peer that never answered within 15 s");
+        };
+        assert_eq!(uploaded, None);
+    }
+
+    #[tokio::test]
+    async fn a_bes_server_that_accepts_and_says_nothing_does_not_hold_the_worker() {
+        let address = serve_silence();
+        let (mut worker, _counters) = worker_for(format!("https://{address}"));
+        let trace_id = TraceId::new().to_string();
+        let message = make_message(Some(&trace_id), Some(1), command_start_data());
+
+        let sent = tokio::time::timeout(
+            Duration::from_secs(10),
+            worker.send_message_with_retry(&message, false),
+        )
+        .await;
+        assert!(
+            sent.is_ok(),
+            "a TLS handshake the server never answered held the worker past 10 s \
+             (grpc_timeout {:?})",
+            worker.config.grpc_timeout
+        );
+    }
+
+    #[test]
+    fn a_priority_send_returns_at_its_deadline_while_the_worker_is_held() {
+        let address = serve_silence();
+        let config = BesConfig {
+            bes_backend: Some(format!("grpcs://{address}")),
+            // Holds the worker in the first connection for the whole test.
+            grpc_timeout: Duration::from_secs(60),
+            ..BesConfig::default()
+        };
+        // SAFETY: `BesClient::new` ignores the token, which outside fbcode stands for nothing.
+        let client = BesClient::new(unsafe { fbinit::assume_init() }, config).expect("client");
+        client.offer(make_message(
+            Some(&TraceId::new().to_string()),
+            Some(1),
+            command_start_data(),
+        ));
+        thread::sleep(Duration::from_millis(100));
+
+        let started = Instant::now();
+        let sent = client.send_messages_within(
+            vec![make_message(
+                Some(&TraceId::new().to_string()),
+                Some(1),
+                command_start_data(),
+            )],
+            Duration::from_millis(200),
+        );
+        assert!(matches!(sent, PrioritySend::StillQueued));
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[derive(Default)]
+    struct ZeroWindowLog {
+        opened: AtomicU64,
+        reset: AtomicU64,
+    }
+
+    /// An HTTP/2 peer that grants every stream a send window of 0 (RFC 9113 6.5.2,
+    /// SETTINGS_INITIAL_WINDOW_SIZE) and never raises it, while it answers PINGs, so keepalive
+    /// sees a healthy connection and no event ever reaches it.
+    async fn serve_zero_window() -> (String, Arc<ZeroWindowLog>) {
+        use tokio::io::AsyncReadExt;
+        use tokio::io::AsyncWriteExt;
+
+        fn frame(kind: u8, flags: u8, stream: u32, payload: &[u8]) -> Vec<u8> {
+            let mut frame = (payload.len() as u32).to_be_bytes()[1..].to_vec();
+            frame.extend([kind, flags]);
+            frame.extend(stream.to_be_bytes());
+            frame.extend(payload);
+            frame
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let endpoint = format!("http://{}", listener.local_addr().expect("local addr"));
+        let log = Arc::new(ZeroWindowLog::default());
+        let server_log = log.clone();
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let log = server_log.clone();
+                tokio::spawn(async move {
+                    let mut preface = [0u8; 24];
+                    socket.read_exact(&mut preface).await?;
+                    socket
+                        .write_all(&frame(0x4, 0, 0, &[0, 4, 0, 0, 0, 0]))
+                        .await?;
+                    loop {
+                        let mut header = [0u8; 9];
+                        socket.read_exact(&mut header).await?;
+                        let len = u32::from_be_bytes([0, header[0], header[1], header[2]]) as usize;
+                        let (kind, flags) = (header[3], header[4]);
+                        let mut payload = vec![0u8; len];
+                        socket.read_exact(&mut payload).await?;
+                        match kind {
+                            0x1 => {
+                                log.opened.fetch_add(1, Ordering::SeqCst);
+                            }
+                            0x3 => {
+                                log.reset.fetch_add(1, Ordering::SeqCst);
+                            }
+                            0x4 if flags & 0x1 == 0 => {
+                                socket.write_all(&frame(0x4, 0x1, 0, &[])).await?;
+                            }
+                            0x6 if flags & 0x1 == 0 => {
+                                socket.write_all(&frame(0x6, 0x1, 0, &payload)).await?;
+                            }
+                            _ => {}
+                        }
+                    }
+                    #[allow(unreachable_code)]
+                    Ok::<(), std::io::Error>(())
+                });
+            }
+        });
+        (endpoint, log)
+    }
+
+    #[tokio::test]
+    async fn a_stream_whose_connection_takes_no_event_is_reset() {
+        let (endpoint, log) = serve_zero_window().await;
+        let (mut worker, counters) = worker_for(endpoint);
+        let trace_id = TraceId::new().to_string();
+        // The first event can go out before the client applies the peer's SETTINGS; hyper then
+        // holds the next one while it waits for window, and the third stays queued. tonic
+        // encodes the events ready together into one frame, so each is given time to go alone.
+        // Fewer than `buffer_size` events wait, so the channel never fills and no send times out.
+        for data in [command_start_data(), action_start_data(), action_start_data()] {
+            send_queued_ok(&mut worker, &trace_id, data).await;
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert_eq!(log.opened.load(Ordering::SeqCst), 1);
+
+        let started = Instant::now();
+        let reset = tokio::time::timeout(Duration::from_secs(10), async {
+            while log.reset.load(Ordering::SeqCst) == 0 {
+                worker.close_due_streams().await;
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await;
+        assert!(
+            reset.is_ok(),
+            "a stream that carried no event stayed open past 10 s (grpc_timeout {:?})",
+            worker.config.grpc_timeout
+        );
+        assert!(started.elapsed() < worker.config.grpc_timeout + Duration::from_secs(2));
+        assert_eq!(counters.snapshot().failures_timed_out, 1);
+    }
+
+    #[test]
+    fn command_start_goes_ahead_of_a_stream_whose_connection_takes_no_event() {
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        let (endpoint, _log) = runtime.block_on(serve_zero_window());
+        let config = BesConfig {
+            bes_backend: Some(endpoint.replacen("http://", "grpc://", 1)),
+            // A channel of one event fills at once, and each later event of the stalled stream
+            // waits out grpc_timeout on the worker.
+            buffer_size: 1,
+            grpc_timeout: Duration::from_secs(30),
+            ..BesConfig::default()
+        };
+        // SAFETY: `BesClient::new` ignores the token, which outside fbcode stands for nothing.
+        let client = BesClient::new(unsafe { fbinit::assume_init() }, config).expect("client");
+        let stalled = TraceId::new().to_string();
+        let stalled_events = [command_start_data(), action_start_data(), action_start_data()];
+        for data in stalled_events {
+            client.offer(make_message(Some(&stalled), Some(1), data));
+            thread::sleep(Duration::from_millis(50));
+        }
+
+        let deadline = Duration::from_secs(2);
+        let started = Instant::now();
+        let sent = client.send_messages_within(
+            vec![make_message(
+                Some(&TraceId::new().to_string()),
+                Some(1),
+                command_start_data(),
+            )],
+            deadline,
+        );
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < deadline + Duration::from_millis(500),
+            "CommandStart returned after {elapsed:?}"
+        );
+        drop(sent);
+    }
+
+    #[tokio::test]
+    async fn no_stream_opens_for_events_the_converter_holds_back() {
+        let (endpoint, log) = serve_zero_window().await;
+        let mut worker = bazel_worker_for(endpoint);
+        let trace_id = TraceId::new().to_string();
+        let snapshot = buck2_data::buck_event::Data::Instant(buck2_data::InstantEvent {
+            data: Some(buck2_data::instant_event::Data::Snapshot(Box::default())),
+        });
+
+        send_queued_ok(&mut worker, &trace_id, snapshot).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        assert_eq!(log.opened.load(Ordering::SeqCst), 0);
     }
 }
