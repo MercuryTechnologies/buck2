@@ -28,6 +28,8 @@ use prost::Message;
 pub use scribe_client::ScribeConfig as RemoteEventConfig;
 
 use crate::BuckEvent;
+#[cfg(not(fbcode_build))]
+use crate::sink::bes_client::PrioritySend;
 use crate::Event;
 use crate::EventSink;
 use crate::EventSinkStats;
@@ -43,6 +45,13 @@ pub use crate::sink::bes_client::BesEventFormat;
 use crate::sink::smart_truncate_event::smart_truncate_event;
 #[cfg(not(fbcode_build))]
 use crate::sink::smart_truncate_event::smart_truncate_event_preserving_logs;
+
+/// How long a command waits for the sink's worker to send its CommandStart. The simple console
+/// prints "Waiting on buck2 daemon" once 7 s pass with nothing to show
+/// (buck2_client_ctx/src/subscribers/simpleconsole.rs:59), and a stalled sink must not read as a
+/// stalled daemon. A healthy send is a TCP and TLS connection and one write, a few round trips.
+#[cfg(not(fbcode_build))]
+const COMMAND_START_SEND_DEADLINE: std::time::Duration = std::time::Duration::from_secs(2);
 
 // 1 MiB limit
 static SCRIBE_MESSAGE_SIZE_LIMIT: usize = 1024 * 1024;
@@ -135,17 +144,18 @@ impl RemoteEventSink {
     }
 
     #[cfg(not(fbcode_build))]
-    fn send_now_without_waiting_for_acks(&self, event: &BuckEvent) -> buck2_error::Result<()> {
-        let message_key = event.trace_id()?.hash();
+    fn send_before_client_output(&self, event: &BuckEvent) -> PrioritySend {
+        let message_key = match event.trace_id() {
+            Ok(trace_id) => trace_id.hash(),
+            Err(e) => return PrioritySend::Done(Err(e)),
+        };
         let message = crate::sink::bes_client::Message {
             category: self.category.clone(),
             message: Self::encode_message(event.clone(), self.preserve_bazel_logs),
             message_key: Some(message_key),
         };
-        futures::executor::block_on(
-            self.client
-                .send_messages_without_waiting_for_acks(vec![message]),
-        )
+        self.client
+            .send_messages_within(vec![message], COMMAND_START_SEND_DEADLINE)
     }
 
     #[cfg(not(fbcode_build))]
@@ -447,8 +457,13 @@ impl EventSink for RemoteEventSink {
                         // CommandStart. Send that batch before the local client
                         // sees CommandStart and prints the BuildBuddy URL. This
                         // waits for local send, not for a BuildBuddy ACK.
-                        if self.send_now_without_waiting_for_acks(&event).is_err() {
-                            self.offer(event);
+                        match self.send_before_client_output(&event) {
+                            PrioritySend::Done(Ok(())) => {}
+                            PrioritySend::Done(Err(_)) => self.offer(event),
+                            PrioritySend::StillQueued => tracing::warn!(
+                                "BES sink: CommandStart not sent within {:?}; the command goes on, and the event is sent ahead of the command's later events once the sink's worker is free",
+                                COMMAND_START_SEND_DEADLINE
+                            ),
                         }
                         return;
                     }
@@ -691,6 +706,64 @@ mod tests {
             }),
         );
         assert!(!is_command_start_event(&console_message));
+    }
+
+    #[cfg(not(fbcode_build))]
+    #[test]
+    fn command_start_does_not_wait_for_a_sink_held_by_a_silent_server() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let address = listener.local_addr().expect("local addr");
+        std::thread::spawn(move || {
+            let mut held = Vec::new();
+            for connection in listener.incoming().flatten() {
+                held.push(connection);
+            }
+        });
+        let sink = Arc::new(
+            RemoteEventSink::new(
+                // SAFETY: outside fbcode the token stands for nothing and nothing reads it.
+                unsafe { fbinit::assume_init() },
+                "test".to_owned(),
+                RemoteEventConfig {
+                    bes_backend: Some(format!("grpcs://{address}")),
+                    event_format: BesEventFormat::Bazel,
+                    // Longer than the test: the TLS handshake holds the sink's worker throughout.
+                    grpc_timeout: std::time::Duration::from_secs(60),
+                    ..RemoteEventConfig::default()
+                },
+            )
+            .expect("sink"),
+        );
+        let command_start = || {
+            Event::Buck(BuckEvent::new(
+                SystemTime::now(),
+                TraceId::new(),
+                None,
+                None,
+                buck2_data::buck_event::Data::SpanStart(buck2_data::SpanStartEvent {
+                    data: Some(buck2_data::CommandStart::default().into()),
+                }),
+            ))
+        };
+
+        let earlier = command_start();
+        let earlier_sink = sink.clone();
+        std::thread::spawn(move || earlier_sink.send(earlier));
+        std::thread::sleep(std::time::Duration::from_millis(100));
+
+        let (sent_tx, sent_rx) = std::sync::mpsc::channel();
+        let later = command_start();
+        let later_sink = sink.clone();
+        std::thread::spawn(move || {
+            later_sink.send(later);
+            let _ignored = sent_tx.send(());
+        });
+        assert!(
+            sent_rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .is_ok(),
+            "a command's start waited more than 5 s on a BES worker held by a server that never answers"
+        );
     }
 
     #[test]
