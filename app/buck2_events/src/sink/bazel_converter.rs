@@ -41,6 +41,9 @@ const DEFAULT_CONFIGURATION_ID: &str = "buck2";
 const GENERIC_TARGET_KIND: &str = "buck2 rule";
 const TEST_TARGET_KIND: &str = "buck2_test rule";
 const INTERRUPTED_EXIT_CODE: i32 = 8;
+// Bazel's ExitCode values for a build with failed targets and for tests that did not pass.
+const BUILD_FAILURE_EXIT_CODE: i32 = 1;
+const TESTS_FAILED_EXIT_CODE: i32 = 3;
 const MAX_INLINE_FILE_BYTES: usize = 16 * 1024;
 const CANONICAL_COMMAND_LINE_LABEL: &str = "canonical";
 const ORIGINAL_COMMAND_LINE_LABEL: &str = "original";
@@ -1265,6 +1268,10 @@ pub(crate) struct BazelEventConverter {
     command_profile: CommandProfileBuilder,
     bes_progress: BesProgressState,
     pending_pre_start_events: Vec<bep::BuildEvent>,
+    /// The test executor's exit code from EndOfTestResults, which the client turns into
+    /// buck2's own exit code when the build had no errors.
+    test_executor_exit_code: Option<i32>,
+    saw_failing_test_result: bool,
 }
 
 impl BazelEventConverter {
@@ -1431,7 +1438,9 @@ impl BazelEventConverter {
         span_end: &buck2_data::SpanEndEvent,
         events: &mut Vec<bep::BuildEvent>,
     ) {
-        self.command_profile.record_span_end(event, span_end);
+        let tests_failed = self.tests_failed();
+        self.command_profile
+            .record_span_end(event, span_end, tests_failed);
 
         match span_end.data.as_ref() {
             Some(buck2_data::span_end_event::Data::Command(command)) => {
@@ -1439,13 +1448,15 @@ impl BazelEventConverter {
                 self.emit_pending_pattern_expanded(&[], events, true);
                 self.emit_completed_updates_for_actions(events);
                 self.push_convenience_symlinks_identified(&[], events);
-                self.push_finished(finished_event_from_command_end(event, command), events);
+                let outcome = command_outcome(command, tests_failed);
+                self.push_finished(finished_event_from_command_end(event, outcome), events);
                 self.push_final_progress(events);
                 self.push_build_tool_logs(
                     build_tool_logs_event_from_command_end(
                         event,
                         span_end,
                         command,
+                        outcome,
                         &self.command_profile,
                     ),
                     events,
@@ -1699,7 +1710,8 @@ impl BazelEventConverter {
                 }
                 self.push_held_test_events_once_complete(result, events);
             }
-            Some(buck2_data::instant_event::Data::EndOfTestResults(_)) => {
+            Some(buck2_data::instant_event::Data::EndOfTestResults(end)) => {
+                self.test_executor_exit_code = Some(end.exit_code);
                 self.push_all_held_test_events(events);
             }
             Some(buck2_data::instant_event::Data::RunExecRequest(request)) => {
@@ -2534,7 +2546,19 @@ impl BazelEventConverter {
         }
     }
 
+    /// Whether the test run failed as buck2's client judges it: the executor's exit code when
+    /// it reported one, which `buck2 test` exits with, and otherwise any failing result.
+    fn tests_failed(&self) -> bool {
+        match self.test_executor_exit_code {
+            Some(exit_code) => exit_code != 0,
+            None => self.saw_failing_test_result,
+        }
+    }
+
     fn remember_test_case(&mut self, result: &buck2_data::TestResult) {
+        if is_failing_test_status(test_status(result.status)) {
+            self.saw_failing_test_result = true;
+        }
         let Some(target) = result.target_label.as_ref() else {
             return;
         };
@@ -2764,6 +2788,7 @@ impl CommandProfileBuilder {
         &mut self,
         event: &buck2_data::BuckEvent,
         span_end: &buck2_data::SpanEndEvent,
+        tests_failed: bool,
     ) {
         let Some(data) = span_end.data.as_ref() else {
             return;
@@ -2775,7 +2800,7 @@ impl CommandProfileBuilder {
             .unwrap_or_default()
             .max(1);
         if let Some(mut open) = self.open_spans.remove(&event.span_id) {
-            extend_json_map(&mut open.args, profile_span_end_args(data));
+            extend_json_map(&mut open.args, profile_span_end_args(data, tests_failed));
             let parent_id = open.span_id;
             let parent_start_us = open.start_us;
             let parent_end_us = open.start_us.saturating_add(duration_us);
@@ -2807,7 +2832,7 @@ impl CommandProfileBuilder {
             return;
         };
         let mut args = details.args;
-        extend_json_map(&mut args, profile_span_end_args(data));
+        extend_json_map(&mut args, profile_span_end_args(data, tests_failed));
         let start_us = end_us.saturating_sub(duration_us);
         let parent_end_us = start_us.saturating_add(duration_us);
         self.push_completed(ProfileCompletedSpan {
@@ -2882,6 +2907,7 @@ impl CommandProfileBuilder {
         event: &buck2_data::BuckEvent,
         span_end: &buck2_data::SpanEndEvent,
         command: &buck2_data::CommandEnd,
+        outcome: CommandOutcome,
     ) -> Option<Vec<u8>> {
         let command_duration_us = span_end
             .duration
@@ -2897,16 +2923,9 @@ impl CommandProfileBuilder {
         let mut args = serde_json::Map::new();
         args.insert(
             "outcome".to_owned(),
-            serde_json::json!(if command.is_success {
-                "success"
-            } else {
-                "failed"
-            }),
+            serde_json::json!(outcome.outcome_name()),
         );
-        args.insert(
-            "exit_code".to_owned(),
-            serde_json::json!(if command.is_success { 0 } else { 1 }),
-        );
+        args.insert("exit_code".to_owned(), serde_json::json!(outcome.exit_code));
         args.insert(
             "trace_id".to_owned(),
             serde_json::json!(event.trace_id.as_str()),
@@ -5382,16 +5401,14 @@ fn profile_span_end_details(data: &buck2_data::span_end_event::Data) -> Option<P
 
 fn profile_span_end_args(
     data: &buck2_data::span_end_event::Data,
+    tests_failed: bool,
 ) -> serde_json::Map<String, serde_json::Value> {
     let mut args = serde_json::Map::new();
     match data {
         buck2_data::span_end_event::Data::Command(command) => {
-            json_arg_bool(&mut args, "success", command.is_success);
-            json_arg_i64(
-                &mut args,
-                "exit_code",
-                if command.is_success { 0 } else { 1 },
-            );
+            let outcome = command_outcome(command, tests_failed);
+            json_arg_bool(&mut args, "success", outcome.is_success());
+            json_arg_i64(&mut args, "exit_code", i64::from(outcome.exit_code));
         }
         buck2_data::span_end_event::Data::ActionExecution(action) => {
             json_arg_bool(&mut args, "failed", action.failed);
@@ -6189,28 +6206,23 @@ fn build_tool_logs_event_from_command_end(
     event: &buck2_data::BuckEvent,
     span_end: &buck2_data::SpanEndEvent,
     command: &buck2_data::CommandEnd,
+    outcome: CommandOutcome,
     profile: &CommandProfileBuilder,
 ) -> bep::BuildEvent {
     let command_name = command_end_name(command);
-    let outcome = if command.is_success {
-        "success"
-    } else {
-        "failed"
-    };
-    let exit_code = if command.is_success { 0 } else { 1 };
     let duration_ms = optional_duration_millis(span_end.duration.as_ref());
     let summary = serde_json::json!({
         "tool": BUILD_TOOL_VERSION,
         "command": command_name,
-        "outcome": outcome,
-        "exit_code": exit_code,
+        "outcome": outcome.outcome_name(),
+        "exit_code": outcome.exit_code,
         "timings_ms": {
             "command": duration_ms,
         },
     });
     let summary = serde_json::to_string_pretty(&summary).unwrap_or_else(|_| "{}".to_owned());
     let mut logs = vec![file_with_contents("buck2-invocation.json", summary)];
-    if let Some(profile) = profile.command_end_profile_gzip(event, span_end, command) {
+    if let Some(profile) = profile.command_end_profile_gzip(event, span_end, command, outcome) {
         logs.push(file_with_bytes(COMMAND_PROFILE_NAME, profile));
     }
     build_tool_logs_event(logs)
@@ -6891,20 +6903,59 @@ fn finished_event_from_invocation_record(
     )
 }
 
-fn finished_event_from_command_end(
-    event: &buck2_data::BuckEvent,
-    command: &buck2_data::CommandEnd,
-) -> bep::BuildEvent {
-    let (exit_code, exit_name) = if command.is_success {
-        (0, "SUCCESS")
-    } else {
-        (1, "FAILED")
-    };
+/// How a command ended, in Bazel's exit codes, so a BES server reads it as it reads Bazel.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct CommandOutcome {
+    exit_code: i32,
+    exit_name: &'static str,
+}
 
-    finished_event(
-        event.timestamp,
+impl CommandOutcome {
+    fn is_success(self) -> bool {
+        self.exit_code == 0
+    }
+
+    fn outcome_name(self) -> &'static str {
+        if self.is_success() {
+            "success"
+        } else {
+            "failed"
+        }
+    }
+}
+
+/// `is_success` is only whether the command returned `Ok`, and a build or test with failed
+/// targets returns `Ok` with the failures in its response, so it says nothing about them on its
+/// own. `build_result.build_completed` is false when the response carried errors, and the test
+/// result comes from the test events, because TestCommandEnd does not carry it.
+fn command_outcome(command: &buck2_data::CommandEnd, tests_failed: bool) -> CommandOutcome {
+    let (exit_code, exit_name) = if !command.is_success {
+        (1, "FAILED")
+    } else if command
+        .build_result
+        .as_ref()
+        .is_some_and(|result| !result.build_completed)
+    {
+        (BUILD_FAILURE_EXIT_CODE, "BUILD_FAILURE")
+    } else if tests_failed && matches!(command.data, Some(buck2_data::command_end::Data::Test(_))) {
+        (TESTS_FAILED_EXIT_CODE, "TESTS_FAILED")
+    } else {
+        (0, "SUCCESS")
+    };
+    CommandOutcome {
         exit_code,
         exit_name,
+    }
+}
+
+fn finished_event_from_command_end(
+    event: &buck2_data::BuckEvent,
+    outcome: CommandOutcome,
+) -> bep::BuildEvent {
+    finished_event(
+        event.timestamp,
+        outcome.exit_code,
+        outcome.exit_name,
         vec![build_tool_logs_id()],
     )
 }
@@ -7523,6 +7574,13 @@ fn test_status(status: i32) -> i32 {
     }
 }
 
+fn is_failing_test_status(status: i32) -> bool {
+    status == bep::TestStatus::Failed as i32
+        || status == bep::TestStatus::Timeout as i32
+        || status == bep::TestStatus::RemoteFailure as i32
+        || status == bep::TestStatus::FailedToBuild as i32
+}
+
 fn test_status_from_command_report(command: Option<&buck2_data::CommandExecution>) -> i32 {
     match command.and_then(|command| command.status.as_ref()) {
         Some(buck2_data::command_execution::Status::Success(_)) => bep::TestStatus::Passed as i32,
@@ -7552,15 +7610,10 @@ fn aggregate_test_status(
     if cases.is_empty() {
         return bep::TestStatus::NoStatus as i32;
     }
-    if cases.iter().any(|case| {
-        matches!(
-            test_status(case.status),
-            status if status == bep::TestStatus::Failed as i32
-                || status == bep::TestStatus::Timeout as i32
-                || status == bep::TestStatus::RemoteFailure as i32
-                || status == bep::TestStatus::FailedToBuild as i32
-        )
-    }) {
+    if cases
+        .iter()
+        .any(|case| is_failing_test_status(test_status(case.status)))
+    {
         return bep::TestStatus::Failed as i32;
     }
     if cases
@@ -13985,5 +14038,205 @@ mod tests {
                 .map(|detail| detail.message.as_str()),
             Some("Buck2 invocation failed with FAILED (1)")
         );
+    }
+
+    fn command_end_event(
+        data: buck2_data::command_end::Data,
+        is_success: bool,
+        build_completed: Option<bool>,
+    ) -> buck2_data::BuckEvent {
+        trace_event(buck2_data::buck_event::Data::SpanEnd(
+            buck2_data::SpanEndEvent {
+                data: Some(buck2_data::span_end_event::Data::Command(
+                    buck2_data::CommandEnd {
+                        data: Some(data),
+                        is_success,
+                        build_result: build_completed
+                            .map(|build_completed| buck2_data::BuildResult { build_completed }),
+                    },
+                )),
+                ..Default::default()
+            },
+        ))
+    }
+
+    fn end_of_test_results_with_exit_code(exit_code: i32) -> buck2_data::BuckEvent {
+        trace_event(buck2_data::buck_event::Data::Instant(
+            buck2_data::InstantEvent {
+                data: Some(buck2_data::instant_event::Data::EndOfTestResults(
+                    buck2_data::EndOfTestResults { exit_code },
+                )),
+            },
+        ))
+    }
+
+    /// The BuildFinished exit code, its name, and overall_success, and the outcome and exit code
+    /// in buck2-invocation.json, which has to say the same.
+    fn finished_outcome(events: &[bep::BuildEvent]) -> (i32, String, bool, serde_json::Value) {
+        let finished = events
+            .iter()
+            .find_map(|event| match event.payload.as_ref() {
+                Some(build_event::Payload::Finished(finished)) => Some(finished),
+                _ => None,
+            })
+            .expect("BuildFinished");
+        let exit_code = finished.exit_code.as_ref().expect("exit code");
+        let summary = events
+            .iter()
+            .find_map(|event| match event.payload.as_ref() {
+                Some(build_event::Payload::BuildToolLogs(logs)) => logs
+                    .log
+                    .iter()
+                    .find(|file| file.name == "buck2-invocation.json"),
+                _ => None,
+            })
+            .and_then(|file| match file.file.as_ref() {
+                Some(bep::file::File::Contents(contents)) => {
+                    serde_json::from_slice::<serde_json::Value>(contents).ok()
+                }
+                _ => None,
+            })
+            .expect("buck2-invocation.json");
+        (
+            exit_code.code,
+            exit_code.name.clone(),
+            finished.overall_success,
+            serde_json::json!([summary["outcome"], summary["exit_code"]]),
+        )
+    }
+
+    /// A build with failed targets returns Ok with the failures in BuildResponse.errors
+    /// (buck2_server_commands build.rs), so `is_success` is true and only `build_completed`
+    /// says the build failed.
+    #[test]
+    fn build_with_errors_finishes_as_build_failure() {
+        let mut converter = BazelEventConverter::default();
+        let events = converter.convert(
+            1,
+            &command_end_event(
+                buck2_data::command_end::Data::Build(buck2_data::BuildCommandEnd::default()),
+                true,
+                Some(false),
+            ),
+        );
+        assert_eq!(
+            finished_outcome(&events),
+            (
+                1,
+                "BUILD_FAILURE".to_owned(),
+                false,
+                serde_json::json!(["failed", 1])
+            )
+        );
+    }
+
+    #[test]
+    fn clean_build_finishes_as_success() {
+        let mut converter = BazelEventConverter::default();
+        let events = converter.convert(
+            1,
+            &command_end_event(
+                buck2_data::command_end::Data::Build(buck2_data::BuildCommandEnd::default()),
+                true,
+                Some(true),
+            ),
+        );
+        assert_eq!(
+            finished_outcome(&events),
+            (
+                0,
+                "SUCCESS".to_owned(),
+                true,
+                serde_json::json!(["success", 0])
+            )
+        );
+    }
+
+    /// A test run whose tests fail still returns Ok with every target built, so the failure is
+    /// only in the test events: the executor's exit code, which `buck2 test` exits with.
+    #[test]
+    fn failed_test_run_finishes_as_tests_failed() {
+        let mut converter = BazelEventConverter::default();
+        let target = configured_target();
+        converter.convert(
+            1,
+            &test_case_event(&target, buck2_data::TestStatus::Fail, "expected true"),
+        );
+        converter.convert(2, &end_of_test_results_with_exit_code(32));
+        let events = converter.convert(
+            3,
+            &command_end_event(
+                buck2_data::command_end::Data::Test(buck2_data::TestCommandEnd::default()),
+                true,
+                Some(true),
+            ),
+        );
+        assert_eq!(
+            finished_outcome(&events),
+            (
+                3,
+                "TESTS_FAILED".to_owned(),
+                false,
+                serde_json::json!(["failed", 3])
+            )
+        );
+    }
+
+    /// Without an EndOfTestResults, as when the executor dies before sending it, a failing
+    /// result is what is left to go on.
+    #[test]
+    fn failing_test_result_without_end_of_results_finishes_as_tests_failed() {
+        let mut converter = BazelEventConverter::default();
+        let target = configured_target();
+        converter.convert(
+            1,
+            &test_case_event(&target, buck2_data::TestStatus::Timeout, "timed out"),
+        );
+        let events = converter.convert(
+            2,
+            &command_end_event(
+                buck2_data::command_end::Data::Test(buck2_data::TestCommandEnd::default()),
+                true,
+                Some(true),
+            ),
+        );
+        assert_eq!(finished_outcome(&events).1, "TESTS_FAILED");
+    }
+
+    #[test]
+    fn passing_test_run_finishes_as_success() {
+        let mut converter = BazelEventConverter::default();
+        let target = configured_target();
+        converter.convert(
+            1,
+            &test_case_event(&target, buck2_data::TestStatus::Pass, ""),
+        );
+        converter.convert(2, &end_of_test_results_with_exit_code(0));
+        let events = converter.convert(
+            3,
+            &command_end_event(
+                buck2_data::command_end::Data::Test(buck2_data::TestCommandEnd::default()),
+                true,
+                Some(true),
+            ),
+        );
+        assert_eq!(finished_outcome(&events).1, "SUCCESS");
+    }
+
+    /// A test whose targets fail to build is a build failure, as in Bazel, whatever the tests
+    /// that did run reported.
+    #[test]
+    fn test_run_with_build_errors_finishes_as_build_failure() {
+        let mut converter = BazelEventConverter::default();
+        converter.convert(1, &end_of_test_results_with_exit_code(32));
+        let events = converter.convert(
+            2,
+            &command_end_event(
+                buck2_data::command_end::Data::Test(buck2_data::TestCommandEnd::default()),
+                true,
+                Some(false),
+            ),
+        );
+        assert_eq!(finished_outcome(&events).1, "BUILD_FAILURE");
     }
 }
