@@ -62,6 +62,17 @@ struct CompletedTargetState {
     success: bool,
 }
 
+/// A test run that ended before its per-test results arrived. buck2's test runner reports
+/// those after the run's span ends (buck2_test_runner src/runner.rs), so the run's TestResult
+/// and TestSummary wait here until its cases are in, or the results end.
+#[derive(Debug)]
+struct HeldTestEnd {
+    event: buck2_data::BuckEvent,
+    span_end: buck2_data::SpanEndEvent,
+    test_end: buck2_data::TestRunEnd,
+    expected_cases: usize,
+}
+
 #[derive(Clone, Debug)]
 struct TestCaseState {
     name: String,
@@ -1225,6 +1236,7 @@ pub(crate) struct BazelEventConverter {
     emitted_output_counts: BTreeMap<TargetKey, usize>,
     emitted_completed_targets: BTreeSet<TargetKey>,
     test_cases: BTreeMap<TargetKey, Vec<TestCaseState>>,
+    held_test_ends: BTreeMap<TargetKey, HeldTestEnd>,
     test_progress_counts: BTreeMap<TargetKey, i32>,
     test_timeouts: BTreeMap<TargetKey, prost_types::Duration>,
     announced_event_ids: BTreeMap<Vec<u8>, bep::BuildEventId>,
@@ -1423,6 +1435,7 @@ impl BazelEventConverter {
 
         match span_end.data.as_ref() {
             Some(buck2_data::span_end_event::Data::Command(command)) => {
+                self.push_all_held_test_events(events);
                 self.emit_pending_pattern_expanded(&[], events, true);
                 self.emit_completed_updates_for_actions(events);
                 self.push_convenience_symlinks_identified(&[], events);
@@ -1524,13 +1537,23 @@ impl BazelEventConverter {
                 {
                     self.push_configured_event(configured_event_from_test_suite(suite), events);
                 }
-                if let Some(result) =
-                    self.test_result_event_from_test_end(event, span_end, test_end)
-                {
-                    events.push(result);
-                }
-                if let Some(summary) = self.test_summary_event(event, span_end, test_end) {
-                    events.push(summary);
+                let expected_cases = test_end
+                    .suite
+                    .as_ref()
+                    .map_or(1, |suite| suite.test_names.len().max(1));
+                match test_run_key(test_end) {
+                    Some(key) if self.test_cases.get(&key).map_or(0, Vec::len) < expected_cases => {
+                        self.held_test_ends.insert(
+                            key,
+                            HeldTestEnd {
+                                event: event.clone(),
+                                span_end: span_end.clone(),
+                                test_end: test_end.clone(),
+                                expected_cases,
+                            },
+                        );
+                    }
+                    _ => self.push_test_events(event, span_end, test_end, events),
                 }
             }
             Some(buck2_data::span_end_event::Data::Materialization(materialization)) => {
@@ -1674,6 +1697,10 @@ impl BazelEventConverter {
                 if let Some(message) = test_result_progress_message(result) {
                     events.push(self.progress_event(sequence_hint, None, Some(message)));
                 }
+                self.push_held_test_events_once_complete(result, events);
+            }
+            Some(buck2_data::instant_event::Data::EndOfTestResults(_)) => {
+                self.push_all_held_test_events(events);
             }
             Some(buck2_data::instant_event::Data::RunExecRequest(request)) => {
                 events.push(exec_request_constructed_event(request));
@@ -1722,6 +1749,7 @@ impl BazelEventConverter {
                 self.emit_completed_updates_for_actions(events);
                 events.push(self.build_metadata_event(&build_metadata_from_invocation(record)));
                 self.push_convenience_symlinks_identified(&[], events);
+                self.push_all_held_test_events(events);
                 self.push_finished(finished_event_from_invocation_record(event, record), events);
                 self.push_final_progress(events);
                 events.push(build_metrics_event(
@@ -2077,7 +2105,44 @@ impl BazelEventConverter {
             self.pending_configured_events.push(event);
             return;
         }
+        self.announce_late_test_target(&event, events);
         events.push(event);
+    }
+
+    /// BuildBuddy's target tracker follows only the targets a PatternExpanded event names
+    /// (target_tracker.go handleExpandedEvent and handleEvent at v2.310.0), and a test command's
+    /// PatternExpanded goes out at its first target event, so a test target configured after it,
+    /// as under `//...` once actions run, would be left off the test grid. It gets a
+    /// PatternExpanded of its own, its label as the pattern, before its TargetConfigured.
+    fn announce_late_test_target(
+        &self,
+        configured: &bep::BuildEvent,
+        events: &mut Vec<bep::BuildEvent>,
+    ) {
+        if !self.defer_target_setup_until_first_result || !self.pattern_expanded_emitted {
+            return;
+        }
+        if !is_test_configured_event(configured) {
+            return;
+        }
+        let Some(id) = configured.id.as_ref() else {
+            return;
+        };
+        let Some(build_event_id::Id::TargetConfigured(configured_id)) = id.id.as_ref() else {
+            return;
+        };
+        let key = event_id_key(id);
+        let announced = self.announced_event_ids.contains_key(&key)
+            || events
+                .iter()
+                .flat_map(|event| &event.children)
+                .any(|child| event_id_key(child) == key);
+        if !announced {
+            events.push(pattern_expanded_event(
+                vec![configured_id.label.clone()],
+                vec![id.clone()],
+            ));
+        }
     }
 
     fn should_defer_target_setup(&self) -> bool {
@@ -2428,6 +2493,45 @@ impl BazelEventConverter {
             .into_iter()
             .flat_map(|outputs| outputs.values().cloned())
             .collect()
+    }
+
+    fn push_test_events(
+        &mut self,
+        event: &buck2_data::BuckEvent,
+        span_end: &buck2_data::SpanEndEvent,
+        test_end: &buck2_data::TestRunEnd,
+        events: &mut Vec<bep::BuildEvent>,
+    ) {
+        if let Some(result) = self.test_result_event_from_test_end(event, span_end, test_end) {
+            events.push(result);
+        }
+        if let Some(summary) = self.test_summary_event(event, span_end, test_end) {
+            events.push(summary);
+        }
+    }
+
+    fn push_held_test_events_once_complete(
+        &mut self,
+        result: &buck2_data::TestResult,
+        events: &mut Vec<bep::BuildEvent>,
+    ) {
+        let Some(key) = result.target_label.as_ref().and_then(target_key_for) else {
+            return;
+        };
+        let complete = self.held_test_ends.get(&key).is_some_and(|held| {
+            self.test_cases.get(&key).map_or(0, Vec::len) >= held.expected_cases
+        });
+        if complete && let Some(held) = self.held_test_ends.remove(&key) {
+            self.push_test_events(&held.event, &held.span_end, &held.test_end, events);
+        }
+    }
+
+    /// Every held run, with whatever cases arrived, before the results end or the command
+    /// finishes: a run that never reports a case still gets its TestResult and TestSummary.
+    fn push_all_held_test_events(&mut self, events: &mut Vec<bep::BuildEvent>) {
+        for (_, held) in std::mem::take(&mut self.held_test_ends) {
+            self.push_test_events(&held.event, &held.span_end, &held.test_end, events);
+        }
     }
 
     fn remember_test_case(&mut self, result: &buck2_data::TestResult) {
@@ -6426,6 +6530,31 @@ fn exact_target_label_from_pattern(pattern: &str) -> Option<String> {
     normalize_buck_label(pattern)
 }
 
+/// A configured target BuildBuddy counts as a test: a known test size, or a rule kind ending
+/// in "test" (target_tracker.go `isTest` at v2.310.0).
+fn is_test_configured_event(event: &bep::BuildEvent) -> bool {
+    let Some(build_event::Payload::Configured(configured)) = event.payload.as_ref() else {
+        return false;
+    };
+    configured.test_size != bep::TestSize::Unknown as i32
+        || configured
+            .target_kind
+            .to_lowercase()
+            .trim_end_matches(" rule")
+            .ends_with("test")
+}
+
+fn target_key_for(target: &buck2_data::ConfiguredTargetLabel) -> Option<TargetKey> {
+    Some(TargetKey {
+        label: label_for_configured_target(target)?,
+        configuration: configuration_id_for_target(target),
+    })
+}
+
+fn test_run_key(test_end: &buck2_data::TestRunEnd) -> Option<TargetKey> {
+    target_key_for(test_end.suite.as_ref()?.target_label.as_ref()?)
+}
+
 fn pattern_expanded_event(
     patterns: Vec<String>,
     children: Vec<bep::BuildEventId>,
@@ -9986,7 +10115,7 @@ mod tests {
                 .any(|event| matches!(event.payload, Some(build_event::Payload::Configured(_))))
         );
 
-        let test_events = converter.convert(
+        let test_events = convert_through_end_of_results(&mut converter,
             4,
             &trace_event(buck2_data::buck_event::Data::SpanEnd(
                 buck2_data::SpanEndEvent {
@@ -10414,7 +10543,7 @@ mod tests {
             )),
         );
 
-        let test_events = converter.convert(
+        let test_events = convert_through_end_of_results(&mut converter,
             5,
             &trace_event(buck2_data::buck_event::Data::SpanEnd(
                 buck2_data::SpanEndEvent {
@@ -10529,7 +10658,7 @@ mod tests {
             )),
         );
 
-        let test_events = converter.convert(
+        let test_events = convert_through_end_of_results(&mut converter,
             4,
             &trace_event(buck2_data::buck_event::Data::SpanEnd(
                 buck2_data::SpanEndEvent {
@@ -12555,7 +12684,8 @@ mod tests {
         let mut converter = BazelEventConverter::default();
         let target = configured_target();
 
-        let test_events = converter.convert(
+        let test_events = convert_through_end_of_results(
+            &mut converter,
             1,
             &trace_event(buck2_data::buck_event::Data::SpanEnd(
                 buck2_data::SpanEndEvent {
@@ -12670,7 +12800,7 @@ mod tests {
         let mut converter = BazelEventConverter::default();
         let target = configured_target();
 
-        let test_events = converter.convert(
+        let test_events = convert_through_end_of_results(&mut converter,
             1,
             &trace_event(buck2_data::buck_event::Data::SpanEnd(
                 buck2_data::SpanEndEvent {
@@ -12733,6 +12863,233 @@ mod tests {
             })
             .expect("expected TestSummary event");
         assert_eq!(summary.total_num_cached, 1);
+    }
+
+    fn test_run_end_event(
+        target: &buck2_data::ConfiguredTargetLabel,
+        exit_code: i32,
+    ) -> buck2_data::BuckEvent {
+        let status = if exit_code == 0 {
+            buck2_data::command_execution::Status::Success(
+                buck2_data::command_execution::Success {},
+            )
+        } else {
+            buck2_data::command_execution::Status::Failure(
+                buck2_data::command_execution::Failure {},
+            )
+        };
+        trace_event(buck2_data::buck_event::Data::SpanEnd(
+            buck2_data::SpanEndEvent {
+                data: Some(buck2_data::span_end_event::Data::TestRun(
+                    buck2_data::TestRunEnd {
+                        suite: Some(buck2_data::TestSuite {
+                            suite_name: "suite".to_owned(),
+                            test_names: Vec::new(),
+                            target_label: Some(target.clone()),
+                            labels: Vec::new(),
+                        }),
+                        command_report: Some(buck2_data::CommandExecution {
+                            details: Some(buck2_data::CommandExecutionDetails {
+                                signed_exit_code: Some(exit_code),
+                                ..Default::default()
+                            }),
+                            status: Some(status),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    },
+                )),
+                ..Default::default()
+            },
+        ))
+    }
+
+    fn test_case_event(
+        target: &buck2_data::ConfiguredTargetLabel,
+        status: buck2_data::TestStatus,
+        msg: &str,
+    ) -> buck2_data::BuckEvent {
+        trace_event(buck2_data::buck_event::Data::Instant(
+            buck2_data::InstantEvent {
+                data: Some(buck2_data::instant_event::Data::TestResult(
+                    buck2_data::TestResult {
+                        name: "test_fails".to_owned(),
+                        status: status as i32,
+                        msg: Some(buck2_data::test_result::OptionalMsg {
+                            msg: msg.to_owned(),
+                        }),
+                        target_label: Some(target.clone()),
+                        ..Default::default()
+                    },
+                )),
+            },
+        ))
+    }
+
+    fn end_of_test_results_event() -> buck2_data::BuckEvent {
+        trace_event(buck2_data::buck_event::Data::Instant(
+            buck2_data::InstantEvent {
+                data: Some(buck2_data::instant_event::Data::EndOfTestResults(
+                    buck2_data::EndOfTestResults::default(),
+                )),
+            },
+        ))
+    }
+
+    fn test_discovery_event(target: &buck2_data::ConfiguredTargetLabel) -> buck2_data::BuckEvent {
+        trace_event(buck2_data::buck_event::Data::SpanStart(
+            buck2_data::SpanStartEvent {
+                data: Some(buck2_data::span_start_event::Data::TestDiscovery(
+                    buck2_data::TestDiscoveryStart {
+                        suite_name: "suite".to_owned(),
+                        target_label: Some(target.clone()),
+                        labels: Vec::new(),
+                    },
+                )),
+            },
+        ))
+    }
+
+    fn count_test_events(events: &[bep::BuildEvent]) -> (usize, usize) {
+        let results = events
+            .iter()
+            .filter(|e| matches!(e.payload, Some(build_event::Payload::TestResult(_))))
+            .count();
+        let summaries = events
+            .iter()
+            .filter(|e| matches!(e.payload, Some(build_event::Payload::TestSummary(_))))
+            .count();
+        (results, summaries)
+    }
+
+    /// buck2's test runner reports a target's per-test result after the run's span ends
+    /// (buck2_test_runner src/runner.rs), so the summary must wait for it to carry its log.
+    #[test]
+    fn test_run_waits_for_its_test_result_reported_after_the_span_end() {
+        let mut converter = BazelEventConverter::default();
+        let target = configured_target();
+
+        let at_end = converter.convert(1, &test_run_end_event(&target, 1));
+        assert_eq!(
+            count_test_events(&at_end),
+            (0, 0),
+            "TestResult and TestSummary went out before the run's test result arrived"
+        );
+
+        let at_case = converter.convert(
+            2,
+            &test_case_event(&target, buck2_data::TestStatus::Fail, "expected true"),
+        );
+        assert_eq!(count_test_events(&at_case), (1, 1));
+        let summary = at_case
+            .iter()
+            .find_map(|event| match event.payload.as_ref() {
+                Some(build_event::Payload::TestSummary(summary)) => Some(summary),
+                _ => None,
+            })
+            .expect("TestSummary");
+        let log = summary
+            .failed
+            .iter()
+            .find(|file| file.name == "test.log")
+            .expect("test summary log");
+        let Some(bep::file::File::Contents(contents)) = log.file.as_ref() else {
+            panic!("expected an inline test log, got {:?}", log.file);
+        };
+        assert!(
+            std::str::from_utf8(contents)
+                .expect("utf8")
+                .contains("test_fails: expected true"),
+            "the summary's log is missing the test case reported after the span end"
+        );
+
+        let at_end_of_results = converter.convert(3, &end_of_test_results_event());
+        assert_eq!(count_test_events(&at_end_of_results), (0, 0), "sent twice");
+        assert!(converter.held_test_ends.is_empty());
+        assert!(
+            converter.test_cases.is_empty(),
+            "a case was kept after its summary"
+        );
+    }
+
+    /// A test command's PatternExpanded goes out with its first target event, so a test target
+    /// configured later needs an announcement of its own for BuildBuddy's target tracker.
+    #[test]
+    fn test_target_configured_after_the_pattern_expansion_is_announced_first() {
+        let mut converter = BazelEventConverter::default();
+        let first = configured_target();
+        let second = configured_target_with_package("pkg", "second", "cfg");
+        let second_id = target_configured_id("//pkg:second".to_owned());
+
+        converter.convert(
+            1,
+            &trace_event(buck2_data::buck_event::Data::SpanStart(
+                buck2_data::SpanStartEvent {
+                    data: Some(buck2_data::span_start_event::Data::Command(
+                        buck2_data::CommandStart {
+                            cli_args: vec![
+                                "buck2".to_owned(),
+                                "test".to_owned(),
+                                "//pkg/...".to_owned(),
+                            ],
+                            data: Some(buck2_data::command_start::Data::Test(
+                                buck2_data::TestCommandStart {},
+                            )),
+                            ..Default::default()
+                        },
+                    )),
+                },
+            )),
+        );
+        let mut first_events = converter.convert(2, &test_discovery_event(&first));
+        first_events.extend(converter.convert(3, &test_run_end_event(&first, 0)));
+        first_events.extend(converter.convert(
+            4,
+            &test_case_event(&first, buck2_data::TestStatus::Pass, ""),
+        ));
+        let first_expansion = first_events
+            .iter()
+            .find(|event| matches!(event.payload, Some(build_event::Payload::Expanded(_))))
+            .expect("the first PatternExpanded");
+        assert!(!first_expansion.children.contains(&second_id));
+
+        let later = converter.convert(5, &test_discovery_event(&second));
+        let announced = later
+            .iter()
+            .position(|event| {
+                matches!(event.payload, Some(build_event::Payload::Expanded(_)))
+                    && event.children.contains(&second_id)
+            })
+            .expect("a PatternExpanded naming the late test target");
+        let configured = later
+            .iter()
+            .position(|event| event.id.as_ref() == Some(&second_id))
+            .expect("the late target's TargetConfigured");
+        assert!(
+            announced < configured,
+            "announced after its TargetConfigured"
+        );
+    }
+
+    /// Converts a test run's span end and then the stream's EndOfTestResults, the order a test
+    /// command sends them in, and returns the events of both.
+    fn convert_through_end_of_results(
+        converter: &mut BazelEventConverter,
+        sequence: i64,
+        event: &buck2_data::BuckEvent,
+    ) -> Vec<bep::BuildEvent> {
+        let mut events = converter.convert(sequence, event);
+        events.extend(converter.convert(
+            sequence + 1,
+            &trace_event(buck2_data::buck_event::Data::Instant(
+                buck2_data::InstantEvent {
+                    data: Some(buck2_data::instant_event::Data::EndOfTestResults(
+                        buck2_data::EndOfTestResults::default(),
+                    )),
+                },
+            )),
+        ));
+        events
     }
 
     #[test]
@@ -12879,7 +13236,8 @@ mod tests {
         let mut converter = BazelEventConverter::default();
         let target = configured_target();
 
-        let test_events = converter.convert(
+        let test_events = convert_through_end_of_results(
+            &mut converter,
             1,
             &trace_event_at(
                 1,
@@ -12943,7 +13301,8 @@ mod tests {
         let mut converter = BazelEventConverter::default();
         let target = configured_target();
 
-        let test_events = converter.convert(
+        let test_events = convert_through_end_of_results(
+            &mut converter,
             1,
             &trace_event(buck2_data::buck_event::Data::SpanEnd(
                 buck2_data::SpanEndEvent {
@@ -13043,7 +13402,8 @@ mod tests {
         let mut converter = BazelEventConverter::default();
         let target = configured_target();
 
-        let test_events = converter.convert(
+        let test_events = convert_through_end_of_results(
+            &mut converter,
             1,
             &trace_event(buck2_data::buck_event::Data::SpanEnd(
                 buck2_data::SpanEndEvent {
