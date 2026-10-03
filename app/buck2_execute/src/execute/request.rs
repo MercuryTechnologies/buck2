@@ -17,6 +17,7 @@ use buck2_common::local_resource_state::LocalResourceState;
 use buck2_core::content_hash::ContentBasedPathHash;
 use buck2_core::execution_types::executor_config::MetaInternalExtraParams;
 use buck2_core::execution_types::executor_config::ReGangWorker;
+use buck2_core::execution_types::executor_config::RePlatformFields;
 use buck2_core::execution_types::executor_config::RemoteExecutorCustomImage;
 use buck2_core::execution_types::executor_config::RemoteExecutorDependency;
 use buck2_core::fs::artifact_path_resolver::ArtifactFs;
@@ -393,6 +394,9 @@ pub struct CommandExecutionRequest {
     remote_execution_dependencies: Vec<RemoteExecutorDependency>,
     /// RE custom tupperware image.
     remote_execution_custom_image: Option<RemoteExecutorCustomImage>,
+    /// Merged over the executor's platform, so it is part of the action digest;
+    /// None leaves the digest exactly what it was without the field.
+    remote_execution_properties: Option<RePlatformFields>,
     /// RE execution policy.
     meta_internal_extra_params: Arc<MetaInternalExtraParams>,
     /// Failed action outputs to materialize
@@ -444,6 +448,7 @@ impl CommandExecutionRequest {
             re_gang_workers: Vec::new(),
             remote_execution_dependencies: Vec::new(),
             remote_execution_custom_image: None,
+            remote_execution_properties: None,
             meta_internal_extra_params: MetaInternalExtraParams::default_arc(),
             outputs_for_error_handler: Vec::new(),
             run_action_key: None,
@@ -700,6 +705,18 @@ impl CommandExecutionRequest {
 
     pub fn remote_execution_custom_image(&self) -> &Option<RemoteExecutorCustomImage> {
         &self.remote_execution_custom_image
+    }
+
+    pub fn with_remote_execution_properties(
+        mut self,
+        remote_execution_properties: Option<RePlatformFields>,
+    ) -> Self {
+        self.remote_execution_properties = remote_execution_properties;
+        self
+    }
+
+    pub fn remote_execution_properties(&self) -> Option<&RePlatformFields> {
+        self.remote_execution_properties.as_ref()
     }
 
     pub fn with_meta_internal_extra_params(

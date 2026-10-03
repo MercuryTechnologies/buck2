@@ -61,6 +61,7 @@ use buck2_core::content_hash::ContentBasedPathHash;
 use buck2_core::deferred::base_deferred_key::BaseDeferredKey;
 use buck2_core::execution_types::executor_config::MetaInternalExtraParams;
 use buck2_core::execution_types::executor_config::ReGangWorker;
+use buck2_core::execution_types::executor_config::RePlatformFields;
 use buck2_core::execution_types::executor_config::RemoteExecutorCustomImage;
 use buck2_core::execution_types::executor_config::RemoteExecutorDependency;
 use buck2_core::fs::artifact_path_resolver::ArtifactFs;
@@ -298,6 +299,8 @@ pub(crate) struct UnregisteredRunAction {
     // Since this is usually None, use a Box to avoid using memory that is the size
     // of RemoteExecutorCustomImage.
     pub(crate) remote_execution_custom_image: Option<Box<RemoteExecutorCustomImage>>,
+    // Boxed for the same reason: almost every action leaves it unset.
+    pub(crate) remote_execution_properties: Option<Box<RePlatformFields>>,
     pub(crate) meta_internal_extra_params: Arc<MetaInternalExtraParams>,
     pub(crate) expected_eligible_for_dedupe: Option<bool>,
     pub(crate) timeout: Option<Duration>,
@@ -1157,11 +1160,12 @@ impl RunAction {
 
                 // Enable remote dep file cache lookup for actions that have remote depfile uploads enabled.
                 if supports_remote_dep_files {
+                    let re_platform = ctx.re_platform_for(&req).into_owned();
                     let remote_dep_file_key = dep_file_bundle
                         .remote_dep_file_action(
                             ctx.digest_config(),
                             ctx.mergebase().0.as_ref(),
-                            ctx.re_platform(),
+                            &re_platform,
                         )
                         .action
                         .coerce();
@@ -1289,6 +1293,9 @@ impl RunAction {
             .with_re_gang_workers(self.inner.re_gang_workers.to_vec())
             .with_remote_execution_custom_image(
                 self.inner.remote_execution_custom_image.clone().map(|s| *s),
+            )
+            .with_remote_execution_properties(
+                self.inner.remote_execution_properties.as_deref().cloned(),
             )
             .with_meta_internal_extra_params(self.inner.meta_internal_extra_params.clone())
             .with_outputs_for_error_handler(outputs_for_error_handler);
