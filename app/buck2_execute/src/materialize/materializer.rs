@@ -1032,6 +1032,17 @@ impl CasDownloadInfo {
     }
 }
 
+/// The contents of a declared file that the materializer keeps in memory
+/// until something needs the file on disk.
+pub trait InMemoryFileContent: fmt::Debug + Send + Sync + 'static {
+    /// The length of the file in bytes, known without reading it.
+    fn size_bytes(&self) -> u64;
+
+    /// The file's bytes. This may decompress them, so callers should not run
+    /// it on a thread that other work is waiting on.
+    fn read(&self) -> buck2_error::Result<Vec<u8>>;
+}
+
 #[derive(Debug, buck2_error::Error)]
 #[buck2(tag = Input)]
 pub enum ArtifactNotMaterializedReason {
@@ -1050,6 +1061,15 @@ pub enum ArtifactNotMaterializedReason {
 
     #[error("The artifact at path '{}' has not been downloaded yet", .path)]
     RequiresMaterialization { path: ProjectRelativePathBuf },
+
+    /// The materializer holds the file's contents in memory, so a consumer
+    /// that only needs its bytes can take them from `content` instead of
+    /// asking for the file to be written to `path`.
+    #[error("The artifact at path '{}' has not been written yet", .path)]
+    InMemoryWrite {
+        path: ProjectRelativePathBuf,
+        content: Arc<dyn InMemoryFileContent>,
+    },
 
     #[error(
         "The artifact at path '{}' points into an entry ({}) \

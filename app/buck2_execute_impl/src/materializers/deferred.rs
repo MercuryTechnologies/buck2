@@ -60,6 +60,7 @@ use buck2_execute::materialize::materializer::CleanStaleArtifactsArgs;
 use buck2_execute::materialize::materializer::CopiedArtifact;
 use buck2_execute::materialize::materializer::DeclareArtifactPayload;
 use buck2_execute::materialize::materializer::DeclareMatchOutcome;
+use buck2_execute::materialize::materializer::InMemoryFileContent;
 use buck2_execute::materialize::materializer::MaterializationError;
 use buck2_execute::materialize::materializer::MaterializationPurpose;
 use buck2_execute::materialize::materializer::MaterializeRequest;
@@ -1107,5 +1108,16 @@ impl WriteFile {
             decompressed_size: content.len(),
             is_executable,
         }))
+    }
+}
+
+impl InMemoryFileContent for WriteFile {
+    fn size_bytes(&self) -> u64 {
+        self.decompressed_size as u64
+    }
+
+    fn read(&self) -> buck2_error::Result<Vec<u8>> {
+        zstd::bulk::decompress(&self.compressed_data, self.decompressed_size)
+            .buck_error_context("Error decompressing data")
     }
 }
