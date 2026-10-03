@@ -64,11 +64,34 @@ pub fn expand_bes_config_env_vars(raw: &str) -> String {
     expand_bes_config_env_vars_with(raw, |name| std::env::var(name).ok())
 }
 
+/// `[bes] header` entries as name and value, and the variables they named that were unset or
+/// empty, which turn the BES sink off.
 #[cfg(not(fbcode_build))]
-pub fn expand_bes_config_env_vars_with<F>(raw: &str, mut env: F) -> String
+pub type BesHeadersAndMissingVars = (Vec<(String, String)>, Vec<String>);
+
+#[cfg(not(fbcode_build))]
+pub fn expand_bes_config_env_vars_with<F>(raw: &str, env: F) -> String
 where
     F: FnMut(&str) -> Option<String>,
 {
+    expand_bes_config_env_vars_reporting(raw, env).0
+}
+
+/// `expand_bes_config_env_vars_with`, which also names the variables that were unset or empty
+/// and so expanded to nothing.
+#[cfg(not(fbcode_build))]
+pub fn expand_bes_config_env_vars_reporting<F>(raw: &str, mut env: F) -> (String, Vec<String>)
+where
+    F: FnMut(&str) -> Option<String>,
+{
+    let mut missing = Vec::new();
+    let mut lookup = |name: &str| match env(name).filter(|value| !value.is_empty()) {
+        Some(value) => value,
+        None => {
+            missing.push(name.to_owned());
+            String::new()
+        }
+    };
     let mut expanded = String::with_capacity(raw.len());
     let mut chars = raw.chars().peekable();
 
@@ -92,7 +115,7 @@ where
                 }
 
                 if closed && is_env_name(&name) {
-                    expanded.push_str(&env(&name).unwrap_or_default());
+                    expanded.push_str(&lookup(&name));
                 } else {
                     expanded.push('$');
                     expanded.push('{');
@@ -111,13 +134,28 @@ where
                     name.push(c);
                     chars.next();
                 }
-                expanded.push_str(&env(&name).unwrap_or_default());
+                expanded.push_str(&lookup(&name));
             }
             _ => expanded.push('$'),
         }
     }
 
-    expanded
+    (expanded, missing)
+}
+
+/// The warning for a `bes.header` entry that names an unset variable, which turns BES off
+/// rather than send the header empty: a server takes an empty API key for no key at all. It
+/// names the variables and the key, never a value.
+#[cfg(not(fbcode_build))]
+pub fn missing_bes_header_env_warning(missing: &[String], whose: &str) -> String {
+    let names = missing
+        .iter()
+        .map(|name| format!("${name}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "BES disabled: `bes.header` names {names}, which is not set in {whose} environment, so its value would be sent empty"
+    )
 }
 
 #[cfg(not(fbcode_build))]
@@ -149,6 +187,31 @@ mod tests {
             ),
             "key=secret,run=run-id,missing=,literal=$9",
         );
+    }
+
+    #[test]
+    fn reports_the_variables_that_expand_to_nothing() {
+        let (expanded, missing) = expand_bes_config_env_vars_reporting(
+            "key=$BUILDBUDDY_API_KEY,missing=$MISSING,empty=${EMPTY},literal=$9",
+            |name| match name {
+                "EMPTY" => Some(String::new()),
+                other => test_env(other),
+            },
+        );
+        assert_eq!(expanded, "key=secret,missing=,empty=,literal=$9");
+        assert_eq!(missing, vec!["MISSING".to_owned(), "EMPTY".to_owned()]);
+
+        let (literal, none) = expand_bes_config_env_vars_reporting("x-literal=value", test_env);
+        assert_eq!((literal.as_str(), none.len()), ("x-literal=value", 0));
+    }
+
+    #[test]
+    fn the_missing_header_warning_names_variables_never_values() {
+        let warning =
+            missing_bes_header_env_warning(&["BUILDBUDDY_API_KEY".to_owned()], "the daemon's");
+        assert!(warning.contains("$BUILDBUDDY_API_KEY"), "{warning}");
+        assert!(warning.contains("`bes.header`"), "{warning}");
+        assert!(!warning.contains("secret"), "{warning}");
     }
 
     fn test_env(name: &str) -> Option<String> {
