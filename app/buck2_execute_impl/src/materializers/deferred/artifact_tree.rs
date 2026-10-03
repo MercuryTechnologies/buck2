@@ -462,9 +462,14 @@ impl ArtifactTree {
                     ),
                 }
             }
-            ArtifactMaterializationMethod::Write { .. } => {
-                // TODO: Do the write directly to RE instead of materializing locally?
-                Err(ArtifactNotMaterializedReason::RequiresMaterialization { path })
+            // The contents are already in memory. Handing them out lets an RE
+            // upload send them without writing the file first; the artifact
+            // stays declared, so a local consumer still materializes it.
+            ArtifactMaterializationMethod::Write(write) => {
+                Err(ArtifactNotMaterializedReason::InMemoryWrite {
+                    path,
+                    content: write.dupe(),
+                })
             }
             // TODO: also record and check materialized_files for LocalCopy
             ArtifactMaterializationMethod::LocalCopy(srcs, _) => {
