@@ -85,6 +85,20 @@ Keys supported include:
   the cache lookup. The timeout has to be longer than the time the server joins
   a new `Execute` to a pending execution of the same action, or the new
   `Execute` joins the stuck one: 10 minutes on BuildBuddy.
+- `stalled_operation_timeout_secs` - how long an operation an executor has
+  claimed may go without a new message on its stream before Buck2 executes the
+  action once more, in seconds. Defaults to 600 (10 minutes); 0 turns it off.
+  BuildBuddy's executors send an update for a running task every 60 seconds, so
+  10 minutes is ten missed updates. A resumed stream's first message repeats
+  the last status and does not count. The second `Execute` sends the action
+  with `do_not_cache` set, under its own digest, because the server would
+  otherwise merge it into the stalled execution; its result is not written to
+  the action cache. A console warning names the action, the new digest and the
+  wait. If the second operation stalls too, the action fails with
+  `DEADLINE_EXCEEDED` and a message saying so. A command that exits non-zero,
+  or an operation that ends with an error, is never retried by this timeout. A
+  server whose executors send nothing while a command runs needs this set
+  above its longest action, or to 0.
 
 ## Credential helpers
 
