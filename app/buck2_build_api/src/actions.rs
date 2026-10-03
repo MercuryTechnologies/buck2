@@ -353,6 +353,11 @@ pub trait ActionExecutionCtx: Send + Sync {
 
     fn re_platform(&self) -> &remote_execution::Platform;
 
+    fn re_platform_for(
+        &self,
+        request: &CommandExecutionRequest,
+    ) -> Cow<'_, remote_execution::Platform>;
+
     fn digest_config(&self) -> DigestConfig;
 
     /// Obtain per-command knobs for RunAction.
