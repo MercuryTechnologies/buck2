@@ -8,6 +8,7 @@
  * above-listed licenses.
  */
 
+use std::borrow::Cow;
 use std::fmt::Debug;
 use std::ops::ControlFlow;
 use std::sync::Arc;
@@ -666,6 +667,13 @@ impl ActionExecutionCtx for BuckActionExecutionContext<'_, '_> {
         self.executor.command_executor.re_platform()
     }
 
+    fn re_platform_for(
+        &self,
+        request: &CommandExecutionRequest,
+    ) -> Cow<'_, remote_execution::Platform> {
+        self.executor.command_executor.re_platform_for(request)
+    }
+
     fn digest_config(&self) -> DigestConfig {
         self.executor.digest_config
     }
@@ -863,6 +871,7 @@ impl ActionExecutionCtx for BuckActionExecutionContext<'_, '_> {
         allow_cache_upload: bool,
     ) -> buck2_error::Result<CacheUploadResults> {
         let action = self.target();
+        let re_platform = self.re_platform_for(request);
         Ok(self
             .executor
             .command_executor
@@ -871,7 +880,7 @@ impl ActionExecutionCtx for BuckActionExecutionContext<'_, '_> {
                     target: &action as _,
                     digest_config: self.digest_config(),
                     mergebase: self.mergebase().0.as_ref(),
-                    re_platform: self.re_platform(),
+                    re_platform: &re_platform,
                     allow_cache_upload,
                     paths: request.paths(),
                 },
