@@ -392,7 +392,7 @@ impl DaemonState {
                 })
                 .map(str::to_owned);
             #[cfg(not(fbcode_build))]
-            let bes_headers =
+            let (bes_headers, missing_header_env) =
                 Self::parse_bes_headers(root_config.parse_list::<String>(BuckconfigKeyRef {
                     section: "bes",
                     property: "header",
@@ -432,6 +432,19 @@ impl DaemonState {
                     .as_ref()
                     .map(|connection| connection.backend.clone())
             });
+            // Headers are expanded once, here, from this process's environment, and a server
+            // takes an empty API key for none: a header whose variable is unset turns BES off
+            // for the daemon's life rather than send every stream unauthenticated.
+            #[cfg(not(fbcode_build))]
+            let bes_backend = if missing_header_env.is_empty() {
+                bes_backend
+            } else {
+                tracing::warn!(
+                    "{}",
+                    remote::missing_bes_header_env_warning(&missing_header_env, "the daemon's")
+                );
+                None
+            };
             #[cfg(not(fbcode_build))]
             let (bes_headers, bes_credential_helper) = if bes_headers.is_empty() {
                 bes_connection
@@ -1056,7 +1069,7 @@ impl DaemonState {
     #[cfg(not(fbcode_build))]
     fn parse_bes_headers(
         raw_headers: Option<Vec<String>>,
-    ) -> buck2_error::Result<Vec<(String, String)>> {
+    ) -> buck2_error::Result<(Vec<(String, String)>, Vec<String>)> {
         Self::parse_bes_headers_with_env(raw_headers, |name| std::env::var(name).ok())
     }
 
@@ -1064,13 +1077,16 @@ impl DaemonState {
     fn parse_bes_headers_with_env<F>(
         raw_headers: Option<Vec<String>>,
         mut env: F,
-    ) -> buck2_error::Result<Vec<(String, String)>>
+    ) -> buck2_error::Result<(Vec<(String, String)>, Vec<String>)>
     where
         F: FnMut(&str) -> Option<String>,
     {
         let mut headers = Vec::new();
+        let mut missing = Vec::new();
         for raw_header in raw_headers.unwrap_or_default() {
-            let raw_header = remote::expand_bes_config_env_vars_with(&raw_header, &mut env);
+            let (raw_header, unset) =
+                remote::expand_bes_config_env_vars_reporting(&raw_header, &mut env);
+            missing.extend(unset);
             let (key, value) = raw_header.split_once('=').ok_or_else(|| {
                 buck2_error!(
                     ErrorTag::Input,
@@ -1088,7 +1104,7 @@ impl DaemonState {
             }
             headers.push((key.to_owned(), value.to_owned()));
         }
-        Ok(headers)
+        Ok((headers, missing))
     }
 
     #[cfg(not(fbcode_build))]
@@ -1446,7 +1462,7 @@ mod tests {
     #[cfg(not(fbcode_build))]
     #[test]
     fn expands_env_vars_in_bes_headers_and_metadata() {
-        let headers = DaemonState::parse_bes_headers_with_env(
+        let (headers, missing) = DaemonState::parse_bes_headers_with_env(
             Some(vec!["x-buildbuddy-api-key=$BUILDBUDDY_API_KEY".to_owned()]),
             test_env,
         )
@@ -1455,6 +1471,14 @@ mod tests {
             headers,
             vec![("x-buildbuddy-api-key".to_owned(), "secret".to_owned())]
         );
+        assert!(missing.is_empty());
+
+        let (_, missing) = DaemonState::parse_bes_headers_with_env(
+            Some(vec!["x-buildbuddy-api-key=$UNSET_API_KEY".to_owned()]),
+            test_env,
+        )
+        .unwrap();
+        assert_eq!(missing, vec!["UNSET_API_KEY".to_owned()]);
 
         let metadata = DaemonState::parse_bes_build_metadata_with_env(
             Some(vec![

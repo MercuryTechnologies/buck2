@@ -1228,6 +1228,13 @@ struct WorkerState {
     /// commands being cancelled, are dropped rather than opening a second stream for an
     /// invocation the server already saw end.
     closed: bool,
+    /// The server refused this daemon's credentials and nothing can change them: the configured
+    /// headers are fixed for the daemon's life, and either no credential helper can refresh them
+    /// or its refreshed ones were refused too. No stream opens again; events are dropped.
+    credentials_refused: bool,
+    /// The credential helper's credentials were refreshed after a refusal, so the next refusal
+    /// is final.
+    refreshed_after_refusal: bool,
 }
 
 impl WorkerState {
@@ -1239,6 +1246,8 @@ impl WorkerState {
             streams: HashMap::new(),
             credentials_rejected: false,
             closed: false,
+            credentials_refused: false,
+            refreshed_after_refusal: false,
         }
     }
 
@@ -1261,7 +1270,7 @@ impl WorkerState {
         message: &Message,
         fail_fast: bool,
     ) -> buck2_error::Result<Option<(String, i64)>> {
-        if self.closed {
+        if self.closed || self.credentials_refused {
             self.counters.inc_dropped();
             return Ok(None);
         }
@@ -1509,6 +1518,15 @@ impl WorkerState {
 
     fn stream_failed(&mut self, invocation_id: &str, status: &Status) {
         self.record_status_failure(status);
+        if buck2_credential_helper::status_rejects_credentials(status) {
+            if self.connection.credential_helper.is_none() || self.refreshed_after_refusal {
+                self.refuse_credentials(status);
+                return;
+            }
+            // The next open asks the helper afresh (`credentials_rejected`); a refusal of those
+            // credentials is final.
+            self.refreshed_after_refusal = true;
+        }
         let max_unacked = self.max_unacked();
         let Some(stream) = self.streams.get_mut(invocation_id) else {
             return;
@@ -1541,6 +1559,28 @@ impl WorkerState {
                 invocation_id,
                 "the stream failed for the whole retry window",
             );
+        }
+    }
+
+    /// Turns this daemon's BES off for good after a refusal no retry can cure, dropping what the
+    /// streams hold. A retry would redial with the same headers and be refused again; against one
+    /// BuildBuddy deployment a daemon redialled 30 to 117 times in 10 to 15 s. The warning names
+    /// the status code, never a header.
+    fn refuse_credentials(&mut self, status: &Status) {
+        if !self.credentials_refused {
+            tracing::warn!(
+                "The BES server refused this daemon's credentials ({:?}); it sends no build events until it restarts, because its `bes.header` values are fixed at startup and no credential helper can replace them",
+                status.code(),
+            );
+        }
+        self.credentials_refused = true;
+        for stream in self.streams.values_mut() {
+            self.counters
+                .add_dropped(stream.pending_unacked.len() as u64);
+            stream.pending_unacked = VecDeque::new();
+            stream.discard_transport();
+            stream.failing = None;
+            stream.abandoned = true;
         }
     }
 
@@ -1599,6 +1639,14 @@ impl WorkerState {
                 .finished_ack_task_status()
                 .await
                 .unwrap_or_else(|| Status::unavailable("BES stream closed")));
+        }
+        // A refused stream ends its ack task with UNAUTHENTICATED or PERMISSION_DENIED. Reopening
+        // at once, as for a stream the server merely closed, would redial on every event; the
+        // caller's `stream_failed` decides instead.
+        if let Some(status) = stream.finished_ack_task_status().await
+            && buck2_credential_helper::status_rejects_credentials(&status)
+        {
+            return Err(status);
         }
 
         self.discard_stream_transport(invocation_id);
@@ -3495,6 +3543,82 @@ mod tests {
         assert_eq!(counters.snapshot().successes, (events - 1) as u64);
         assert_eq!(counters.snapshot().dropped, 0);
         assert_eq!(failures(&counters), 0);
+    }
+
+    /// Refuses every stream as a server refuses a client without a valid API key, and counts
+    /// the streams opened.
+    struct BesThatRefusesCredentials {
+        opens: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[tonic::async_trait]
+    impl PublishBuildEvent for BesThatRefusesCredentials {
+        async fn publish_lifecycle_event(
+            &self,
+            _request: tonic::Request<PublishLifecycleEventRequest>,
+        ) -> Result<tonic::Response<()>, Status> {
+            Err(Status::unauthenticated("anonymous access disabled"))
+        }
+
+        type PublishBuildToolEventStreamStream =
+            ReceiverStream<Result<PublishBuildToolEventStreamResponse, Status>>;
+
+        async fn publish_build_tool_event_stream(
+            &self,
+            _request: tonic::Request<tonic::Streaming<PublishBuildToolEventStreamRequest>>,
+        ) -> Result<tonic::Response<Self::PublishBuildToolEventStreamStream>, Status> {
+            self.opens.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err(Status::unauthenticated("anonymous access disabled"))
+        }
+    }
+
+    #[tokio::test]
+    async fn a_refused_stream_is_not_redialled_and_no_later_stream_opens() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let endpoint = format!("http://{}", listener.local_addr().expect("local addr"));
+        let opens = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        tokio::spawn(
+            tonic::transport::Server::builder()
+                .add_service(PublishBuildEventServer::new(BesThatRefusesCredentials {
+                    opens: opens.clone(),
+                }))
+                .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener)),
+        );
+        let (mut worker, counters) = worker_for(endpoint);
+
+        let first = TraceId::new().to_string();
+        send_queued_ok(&mut worker, &first, command_start_data()).await;
+        for _ in 0..10 {
+            // Let the server's refusal reach the stream's acknowledgement task.
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            send_queued_ok(&mut worker, &first, action_start_data()).await;
+        }
+        let second = TraceId::new().to_string();
+        send_queued_ok(&mut worker, &second, command_start_data()).await;
+        send_queued_ok(&mut worker, &second, action_start_data()).await;
+
+        assert_eq!(
+            opens.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "a refusal must not be answered by redialling, nor a later invocation open a stream"
+        );
+        let snapshot = counters.snapshot();
+        assert!(snapshot.failures_unauthorized >= 1, "{snapshot:?}");
+        assert!(
+            snapshot.dropped >= 2,
+            "later events are dropped: {snapshot:?}"
+        );
+        // A priority send returns at once rather than waiting on a refused stream.
+        let message = make_message(Some(&second), Some(1), action_start_data());
+        let sent = tokio::time::timeout(
+            Duration::from_secs(1),
+            worker.send_message_with_retry(&message, true),
+        )
+        .await
+        .expect("a priority send must not wait on a refused stream");
+        assert_eq!(sent.expect("not an error"), None);
     }
 
     #[tokio::test]
