@@ -15,11 +15,14 @@ use buck2_error::internal_error;
 use buck2_test_api::data::ArgValue;
 use buck2_test_api::data::ArgValueContent;
 use buck2_test_api::data::ConfiguredTargetHandle;
+use buck2_test_api::data::DeclaredOutput;
 use buck2_test_api::data::ExecuteResponse;
 use buck2_test_api::data::ExecutionResult2;
 use buck2_test_api::data::ExecutionStatus;
 use buck2_test_api::data::ExternalRunnerSpec;
 use buck2_test_api::data::ExternalRunnerSpecValue;
+use buck2_test_api::data::OutputName;
+use buck2_test_api::data::RemoteStorageConfig;
 use buck2_test_api::data::RequiredLocalResources;
 use buck2_test_api::data::TestResult;
 use buck2_test_api::data::TestStage;
@@ -31,6 +34,7 @@ use futures::TryStreamExt;
 use futures::channel::mpsc::UnboundedReceiver;
 use host_sharing::HostSharingRequirements;
 use parking_lot::Mutex;
+use sorted_vector_map::SortedVectorMap;
 
 use crate::config::Config;
 use crate::config::EnvValue;
@@ -167,24 +171,11 @@ impl Buck2TestRunner {
             )
         });
 
-        let env = spec
-            .env
-            .into_iter()
-            .map(|(key, value)| {
-                (
-                    key,
-                    ArgValue {
-                        content: ArgValueContent::ExternalRunnerSpecValue(value),
-                        format: None,
-                    },
-                )
-            })
-            .chain(config_env)
-            .collect();
+        let (test_output_dir, env) = test_env(spec.env, config_env);
 
         let target_handle = spec.target.handle;
         let host_sharing_requirements = HostSharingRequirements::default();
-        let pre_create_dirs = Vec::new();
+        let pre_create_dirs = vec![test_output_dir];
         let executor_override = None;
 
         self.orchestrator_client
@@ -208,6 +199,62 @@ impl Buck2TestRunner {
             .report_test_result(test_result)
             .await
     }
+}
+
+/// The variable that names a directory a test may write files into, collected
+/// with its result. It is Bazel's name for the same directory, so a test
+/// written for either finds it; Bazel gives an absolute path, and this one is
+/// relative to the test's working directory, like every output path buck2
+/// passes a test.
+/// https://bazel.build/reference/test-encyclopedia#initial-conditions
+const TEST_OUTPUT_DIR_ENV: &str = "TEST_UNDECLARED_OUTPUTS_DIR";
+
+const TEST_OUTPUT_DIR_NAME: &str = "test_outputs";
+
+/// The output directory every test gets, and the variable naming its path.
+///
+/// It comes first in the environment, so a target's own `env` or the runner's
+/// `--env` can still set the variable. `supports_remote` leaves a remote test's
+/// directory in the CAS, listed in its action result, rather than downloading
+/// every test's files; a local test's directory is written under buck-out.
+fn test_output_dir() -> (DeclaredOutput, (String, ArgValue)) {
+    let name = OutputName::unchecked_new(TEST_OUTPUT_DIR_NAME.to_owned());
+    (
+        DeclaredOutput {
+            name: name.clone(),
+            remote_storage_config: RemoteStorageConfig::new(true),
+        },
+        (
+            TEST_OUTPUT_DIR_ENV.to_owned(),
+            ArgValue {
+                content: ArgValueContent::DeclaredOutput(name),
+                format: None,
+            },
+        ),
+    )
+}
+
+/// A test's environment: its output directory's variable, then the target's
+/// `env`, then the runner's `--env`, each later one winning over an earlier
+/// one of the same name.
+fn test_env(
+    spec_env: impl IntoIterator<Item = (String, ExternalRunnerSpecValue)>,
+    config_env: impl IntoIterator<Item = (String, ArgValue)>,
+) -> (DeclaredOutput, SortedVectorMap<String, ArgValue>) {
+    let (test_output_dir, test_output_env) = test_output_dir();
+    let env = std::iter::once(test_output_env)
+        .chain(spec_env.into_iter().map(|(key, value)| {
+            (
+                key,
+                ArgValue {
+                    content: ArgValueContent::ExternalRunnerSpecValue(value),
+                    format: None,
+                },
+            )
+        }))
+        .chain(config_env)
+        .collect();
+    (test_output_dir, env)
 }
 
 fn get_test_result(
@@ -247,6 +294,43 @@ impl RunVerdict {
         match self {
             RunVerdict::Pass => 0,
             RunVerdict::Fail => 32,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn verbatim(value: &str) -> ExternalRunnerSpecValue {
+        ExternalRunnerSpecValue::Verbatim(value.to_owned())
+    }
+
+    #[test]
+    fn every_test_gets_one_output_dir_named_by_the_variable() {
+        let (declared, env) = test_env(Vec::new(), Vec::new());
+        assert_eq!(declared.name.as_str(), "test_outputs");
+        assert!(declared.remote_storage_config.supports_remote);
+        match &env["TEST_UNDECLARED_OUTPUTS_DIR"].content {
+            ArgValueContent::DeclaredOutput(output) => assert_eq!(output, &declared.name),
+            other => panic!("the variable should name the declared output, got {other}"),
+        }
+    }
+
+    #[test]
+    fn a_target_s_own_value_wins() {
+        let (_, env) = test_env(
+            vec![(
+                "TEST_UNDECLARED_OUTPUTS_DIR".to_owned(),
+                verbatim("/elsewhere"),
+            )],
+            Vec::new(),
+        );
+        match &env["TEST_UNDECLARED_OUTPUTS_DIR"].content {
+            ArgValueContent::ExternalRunnerSpecValue(ExternalRunnerSpecValue::Verbatim(v)) => {
+                assert_eq!(v, "/elsewhere")
+            }
+            other => panic!("the target's value should win, got {other}"),
         }
     }
 }
