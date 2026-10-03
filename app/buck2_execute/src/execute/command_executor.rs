@@ -8,6 +8,8 @@
  * above-listed licenses.
  */
 
+use std::borrow::Cow;
+use std::collections::BTreeMap;
 use std::ops::ControlFlow;
 use std::sync::Arc;
 use std::time::Duration;
@@ -17,6 +19,7 @@ use buck2_core::execution_types::executor_config::CommandGenerationOptions;
 use buck2_core::execution_types::executor_config::ExecutorNetworkAccess;
 use buck2_core::execution_types::executor_config::OutputPathsBehavior;
 use buck2_core::execution_types::executor_config::ReGangWorker;
+use buck2_core::execution_types::executor_config::RePlatformFields;
 use buck2_core::execution_types::executor_config::RemoteExecutorCafFbpkg;
 use buck2_core::execution_types::executor_config::RemoteExecutorCustomImage;
 use buck2_core::execution_types::executor_config::RemoteExecutorDependency;
@@ -122,6 +125,14 @@ impl CommandExecutor {
         &self.0.re_platform
     }
 
+    /// The platform an action's request is keyed and executed with. A
+    /// local-only executor has an empty platform and no remote request to put
+    /// properties on, so it ignores them rather than giving its actions
+    /// digests that no remote executor would ever produce.
+    pub fn re_platform_for(&self, request: &CommandExecutionRequest) -> Cow<'_, RE::Platform> {
+        platform_for(&self.0.re_platform, request.remote_execution_properties())
+    }
+
     /// Check if the action can be served by the action cache.
     pub async fn action_cache(
         &self,
@@ -203,7 +214,7 @@ impl CommandExecutor {
         executor_stage(buck2_data::PrepareAction {}, || {
             let input_digest = request.paths().input_directory().fingerprint();
 
-            let mut platform = self.0.re_platform.clone();
+            let mut platform = self.re_platform_for(request).into_owned();
             let all_args = if self.0.options.use_bazel_protocol_remote_persistent_workers
                 && let Some(worker) = request.worker()
                 && let Some(key) = worker.remote_key.as_ref()
@@ -266,6 +277,40 @@ impl CommandExecutor {
 
             buck2_error::Ok(action)
         })
+    }
+}
+
+fn platform_for<'a>(
+    base: &'a RE::Platform,
+    overrides: Option<&RePlatformFields>,
+) -> Cow<'a, RE::Platform> {
+    match overrides {
+        Some(overrides) if !overrides.properties.is_empty() && !base.properties.is_empty() => {
+            Cow::Owned(merge_re_platform(base, overrides))
+        }
+        _ => Cow::Borrowed(base),
+    }
+}
+
+/// Sorted by name, as the platform's own properties are, so that an override
+/// equal to the platform's value leaves the digest unchanged.
+fn merge_re_platform(base: &RE::Platform, overrides: &RePlatformFields) -> RE::Platform {
+    let mut merged: BTreeMap<&str, &str> = base
+        .properties
+        .iter()
+        .map(|p| (p.name.as_str(), p.value.as_str()))
+        .collect();
+    for (name, value) in overrides.properties.iter() {
+        merged.insert(name.as_str(), value.as_str());
+    }
+    RE::Platform {
+        properties: merged
+            .into_iter()
+            .map(|(name, value)| RE::Property {
+                name: name.to_owned(),
+                value: value.to_owned(),
+            })
+            .collect(),
     }
 }
 
@@ -509,4 +554,152 @@ fn set_action_network_access(
         ExecutorNetworkAccess::Loopback => RE::NetworkIsolationType::Loopback,
         ExecutorNetworkAccess::Private => RE::NetworkIsolationType::Private,
     } as i32;
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use buck2_core::execution_types::executor_config::OutputPathsBehavior;
+    use buck2_core::execution_types::executor_config::RePlatformFields;
+    use buck2_core::fs::project_rel_path::ProjectRelativePath;
+    use remote_execution as RE;
+    use sorted_vector_map::SortedVectorMap;
+
+    use super::*;
+
+    fn platform(properties: &[(&str, &str)]) -> RE::Platform {
+        RE::Platform {
+            properties: properties
+                .iter()
+                .map(|(name, value)| RE::Property {
+                    name: (*name).to_owned(),
+                    value: (*value).to_owned(),
+                })
+                .collect(),
+        }
+    }
+
+    fn overrides(properties: &[(&str, &str)]) -> RePlatformFields {
+        RePlatformFields {
+            properties: Arc::new(
+                properties
+                    .iter()
+                    .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
+                    .collect(),
+            ),
+        }
+    }
+
+    fn base() -> RE::Platform {
+        platform(&[
+            ("EstimatedMemory", "4GB"),
+            ("OSFamily", "Linux"),
+            ("Pool", "usw2"),
+        ])
+    }
+
+    fn prepare(platform: RE::Platform) -> PreparedAction {
+        let digest_config = DigestConfig::testing_default();
+        let empty_input = digest_config.empty_file();
+        re_create_action(
+            vec!["ghc".to_owned()],
+            vec!["ghc".to_owned()],
+            &[],
+            ProjectRelativePath::empty(),
+            &SortedVectorMap::new(),
+            &empty_input.digest,
+            None,
+            platform,
+            false,
+            digest_config,
+            OutputPathsBehavior::Compatibility,
+            None,
+            false,
+            &Vec::new(),
+            &Vec::new(),
+            &None,
+            &[],
+            &None,
+            true,
+            false,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn an_override_replaces_the_platform_value_and_keeps_the_order() {
+        let base = base();
+        let merged = platform_for(&base, Some(&overrides(&[("EstimatedMemory", "12GB")])));
+        assert_eq!(
+            merged.into_owned(),
+            platform(&[
+                ("EstimatedMemory", "12GB"),
+                ("OSFamily", "Linux"),
+                ("Pool", "usw2"),
+            ])
+        );
+    }
+
+    #[test]
+    fn a_new_key_is_inserted_in_name_order() {
+        let base = base();
+        let merged = platform_for(&base, Some(&overrides(&[("Arch", "arm64")])));
+        assert_eq!(
+            merged.into_owned(),
+            platform(&[
+                ("Arch", "arm64"),
+                ("EstimatedMemory", "4GB"),
+                ("OSFamily", "Linux"),
+                ("Pool", "usw2"),
+            ])
+        );
+    }
+
+    #[test]
+    fn no_override_borrows_the_platform_unchanged() {
+        let base = base();
+        assert!(matches!(platform_for(&base, None), Cow::Borrowed(_)));
+        assert!(matches!(
+            platform_for(&base, Some(&overrides(&[]))),
+            Cow::Borrowed(_)
+        ));
+    }
+
+    #[test]
+    fn a_local_only_executor_ignores_overrides() {
+        let empty = RE::Platform::default();
+        let result = platform_for(&empty, Some(&overrides(&[("EstimatedMemory", "12GB")])));
+        assert!(matches!(result, Cow::Borrowed(_)));
+        assert!(result.properties.is_empty());
+    }
+
+    #[test]
+    fn the_action_digest_moves_only_with_a_real_override() {
+        let base = base();
+        let without = prepare(platform_for(&base, None).into_owned());
+        let equal = prepare(
+            platform_for(&base, Some(&overrides(&[("EstimatedMemory", "4GB")]))).into_owned(),
+        );
+        let heavier = prepare(
+            platform_for(&base, Some(&overrides(&[("EstimatedMemory", "12GB")]))).into_owned(),
+        );
+
+        assert_eq!(
+            without.action_and_blobs.action,
+            equal.action_and_blobs.action
+        );
+        assert_ne!(
+            without.action_and_blobs.action,
+            heavier.action_and_blobs.action
+        );
+        assert_eq!(
+            heavier.platform,
+            platform(&[
+                ("EstimatedMemory", "12GB"),
+                ("OSFamily", "Linux"),
+                ("Pool", "usw2"),
+            ])
+        );
+    }
 }
