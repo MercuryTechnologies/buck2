@@ -52,6 +52,7 @@ use gazebo::prelude::*;
 use hyper_util::client::legacy::connect::HttpConnector;
 use lru::LruCache;
 use prost::Message;
+use re_grpc_proto::build::bazel::remote::execution::v2::Action;
 use re_grpc_proto::build::bazel::remote::execution::v2::ActionResult;
 use re_grpc_proto::build::bazel::remote::execution::v2::BatchReadBlobsRequest;
 use re_grpc_proto::build::bazel::remote::execution::v2::BatchReadBlobsResponse;
@@ -153,6 +154,9 @@ const DEFAULT_BYTESTREAM_PROGRESS_TIMEOUT_SECS: u64 = 60;
 /// enterprise/server/remote_execution/action_merger/action_merger.go:27, 288-294), so only an
 /// Execute sent later than that starts a fresh execution.
 const DEFAULT_QUEUED_OPERATION_TIMEOUT_SECS: u64 = 15 * 60;
+/// Ten of the 60 s progress updates BuildBuddy's executor sends for a task it is running
+/// (v2.310.0 enterprise/server/remote_execution/executor/executor.go:58), missed in a row.
+const DEFAULT_STALLED_OPERATION_TIMEOUT_SECS: u64 = 10 * 60;
 const DEFAULT_FAST_CDC_2020_AVG_CHUNK_SIZE: u64 = 512 * 1024;
 // Match Bazel's default gRPC remote-execution fanout: roughly 100 requests per
 // connection, with at most 100 connections unless explicitly overridden.
@@ -1162,8 +1166,12 @@ struct OperationStream {
     /// operation's current status again (REAPI remote_execution.proto, `WaitExecution`).
     resumed: bool,
     queued: QueuedDeadline,
+    stalled: StallDeadline,
     /// Operations of the action that stayed QUEUED and were executed again, still read.
     superseded: Vec<SupersededOperation>,
+    /// The Execute that every later Execute of the action repeats: the original, or, once the
+    /// action has stalled, the one for its uncached Action.
+    execute_request: GExecuteRequest,
 }
 
 /// When an action is executed again because its operation is still QUEUED.
@@ -1249,8 +1257,9 @@ enum OperationStreamEvent {
     Next(Result<Option<Operation>, tonic::Status>),
     /// A superseded operation has been claimed, or has finished with the action's result.
     Superseded(SupersededOperation, Operation),
-    /// The current operation is still QUEUED at its deadline.
-    StayedQueued,
+    /// The current operation is still QUEUED at its deadline, or, once claimed, has made no
+    /// progress by its stall deadline.
+    Deadline,
 }
 
 /// Whether an operation's stage says an executor has claimed it, which stops its QUEUED clock.
@@ -1340,7 +1349,7 @@ async fn next_operation_event(
         }
         match deadline.as_mut().map(|sleep| sleep.as_mut().poll(cx)) {
             Some(std::task::Poll::Ready(())) => {
-                std::task::Poll::Ready(OperationStreamEvent::StayedQueued)
+                std::task::Poll::Ready(OperationStreamEvent::Deadline)
             }
             _ => std::task::Poll::Pending,
         }
@@ -1371,6 +1380,258 @@ fn warn_stayed_queued(
     });
 }
 
+/// When an action is executed once more because its claimed operation went quiet.
+///
+/// An executor that is running a task tells the server so: BuildBuddy's republishes the task's
+/// state every `executor.task_progress_publish_interval`, 60 s by default, each time with a new
+/// timestamp in the operation's partial execution metadata (v2.310.0
+/// enterprise/server/remote_execution/executor/executor.go:58, 446-457,
+/// operation/operation.go:62-84), and the app forwards every update to the operation's streams
+/// (execution_server/execution_server.go:1611-1615). A claimed operation whose stream says nothing
+/// new for many such intervals has lost its executor or its updates. On 2026-10-03 one did both:
+/// its first requester's Execute was cancelled during dispatch, the app then marked the execution
+/// failed on that same cancelled context, so the failure was never published
+/// (execution_server.go:1155-1160, 1373-1376), and every request merged onto the execution waited
+/// on a stream nothing would finish. A resumption replays the last status published, EXECUTING,
+/// and nothing after it, so it waits again (execution_server.go:1286-1293).
+struct StallDeadline {
+    timeout: Duration,
+    /// None until the current operation is claimed, and after the clock is turned off.
+    at: Option<tokio::time::Instant>,
+    /// The metadata of the last claimed Operation, which a resumption repeats first and is
+    /// therefore not progress.
+    last_metadata: Option<Vec<u8>>,
+    /// Whether the action has already been executed again after a stall.
+    reexecuted: bool,
+}
+
+impl StallDeadline {
+    fn new(timeout: Duration) -> Self {
+        Self {
+            timeout,
+            at: None,
+            last_metadata: None,
+            reexecuted: false,
+        }
+    }
+
+    /// Stops the clock for a new operation, which an Execute has just created or which replaces
+    /// the current one, until it is claimed.
+    fn reset(&mut self) {
+        self.at = None;
+        self.last_metadata = None;
+    }
+
+    /// Restarts the clock when a claimed operation says something new.
+    fn observe(&mut self, metadata: Vec<u8>) {
+        if self.at.is_some() && self.last_metadata.as_ref() == Some(&metadata) {
+            return;
+        }
+        self.last_metadata = Some(metadata);
+        self.at = if self.timeout.is_zero() {
+            None
+        } else {
+            tokio::time::Instant::now().checked_add(self.timeout)
+        };
+    }
+}
+
+/// A resumption of a claimed operation that did not answer before the operation's stall
+/// deadline.
+#[derive(Debug)]
+struct ResumptionStalled;
+
+impl std::fmt::Display for ResumptionStalled {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the resumption of a claimed operation made no progress before its deadline")
+    }
+}
+
+impl std::error::Error for ResumptionStalled {}
+
+/// The connection and settings a stalled action's re-Execute is sent with.
+struct StalledReexecute<'a> {
+    grpc_clients: Arc<GRPCClients>,
+    metadata: &'a RemoteExecutionMetadata,
+    use_fbcode_metadata: bool,
+    request_metadata_tool_name: &'a str,
+    retries: usize,
+    retry_max_delay: Duration,
+    grpc_request_timeout: Duration,
+}
+
+impl StalledReexecute<'_> {
+    /// Executes the action of `request`, whose operation has made no progress for the stall
+    /// timeout, once more, as an Action with `do_not_cache` set. BuildBuddy merges an Execute
+    /// onto a pending execution of the same action digest, keyed on the digest alone
+    /// (action_merger/action_merger.go:68-81), for as long as the merge record lives: 10 minutes
+    /// from the first Execute, and while an executor holds a lease, 4 lease periods from its last
+    /// renewal (action_merger.go:27-34, 112-133;
+    /// enterprise/server/scheduling/scheduler_server/scheduler_server.go:2329). A plain re-Execute
+    /// could join the stalled execution. An Action with `do_not_cache` is never merged
+    /// (action_merger.go:260-263), and its digest differs, so it is not looked up under the
+    /// stalled one either. Its result is not written to the action cache
+    /// (execution_server.go:1693-1697), which costs one cache entry for one action. A second
+    /// stall fails the action.
+    async fn execute(
+        &self,
+        request: &GExecuteRequest,
+        operation_name: Option<&str>,
+        stalled: &mut StallDeadline,
+    ) -> anyhow::Result<(tonic::Streaming<Operation>, GExecuteRequest)> {
+        let operation_name = operation_name.unwrap_or("");
+        let action = execute_request_action(request);
+        let waited = stalled.timeout.as_secs();
+        if stalled.reexecuted {
+            let message = format!(
+                "RE operation `{operation_name}` of action {action} made no progress for {waited}s, after the action had already been executed again once because an earlier operation made none; failing the action instead of waiting on it"
+            );
+            warn_re_execution_retry(message.clone());
+            return Err(REClientError {
+                code: TCode::DEADLINE_EXCEEDED,
+                message,
+                group: TCodeReasonGroup::UNKNOWN,
+            }
+            .into());
+        }
+        stalled.reexecuted = true;
+        let uncached = self.uncached_request(request).await.with_context(|| {
+            format!(
+                "RE operation `{operation_name}` of action {action} made no progress for {waited}s, and its Action could not be sent again with do_not_cache"
+            )
+        })?;
+        warn_re_execution_retry(format!(
+            "Executing RE action {action} again as action {} with do_not_cache set: its operation `{operation_name}` made no progress for {waited}s. The server does not merge this Execute into the stalled operation, and does not cache its result",
+            execute_request_action(&uncached),
+        ));
+        let stream = execute_stream(
+            self.grpc_clients.clone(),
+            self.metadata.clone(),
+            self.use_fbcode_metadata,
+            self.request_metadata_tool_name,
+            uncached.clone(),
+            self.retries,
+            self.retry_max_delay,
+        )
+        .await
+        .with_context(|| {
+            format!(
+                "RE operation `{operation_name}` of action {action} made no progress for {waited}s, and the Execute of its uncached Action failed"
+            )
+        })?;
+        Ok((stream, uncached))
+    }
+
+    /// `request` for its Action with `do_not_cache` set, which is uploaded under its own digest.
+    /// An Action that already has it was never merged, and is executed as it is.
+    async fn uncached_request(&self, request: &GExecuteRequest) -> anyhow::Result<GExecuteRequest> {
+        let action_digest = request
+            .action_digest
+            .clone()
+            .context("The Execute request has no action digest")?;
+        let read = BatchReadBlobsRequest {
+            instance_name: request.instance_name.clone(),
+            digests: vec![action_digest.clone()],
+            acceptable_compressors: vec![compressor::Value::Identity as i32],
+            digest_function: request.digest_function,
+            ..Default::default()
+        };
+        let read = retry_grpc_request_with_client_reconnect(
+            self.grpc_clients.clone(),
+            GrpcClientKind::Cas,
+            self.retries,
+            self.retry_max_delay,
+            || {
+                let grpc_clients = self.grpc_clients.clone();
+                let read = read.clone();
+                async move {
+                    Ok(grpc_clients
+                        .cas_client()
+                        .await?
+                        .batch_read_blobs(with_re_metadata_timeout(
+                            read,
+                            self.metadata.clone(),
+                            self.use_fbcode_metadata,
+                            self.request_metadata_tool_name,
+                            self.grpc_request_timeout,
+                        ))
+                        .await?
+                        .into_inner())
+                }
+            },
+        )
+        .await?;
+        let blob = read
+            .responses
+            .into_iter()
+            .find(|blob| blob.digest.as_ref() == Some(&action_digest))
+            .context("The CAS did not return the Action")?;
+        if let Some(status) = blob.status.as_ref().filter(|status| status.code != 0) {
+            return Err(anyhow::Error::from(re_client_error_from_rpc_status(status))
+                .context("The CAS could not read the Action"));
+        }
+        let mut action = Action::decode(&blob.data[..]).context("The Action does not decode")?;
+        if action.do_not_cache {
+            return Ok(request.clone());
+        }
+        action.do_not_cache = true;
+        let data = action.encode_to_vec();
+        let digest = tdigest_to(digest_blob(
+            &data,
+            digest_function_from_grpc(request.digest_function)
+                .unwrap_or(digest_function::Value::Sha256),
+        )?);
+        let update = BatchUpdateBlobsRequest {
+            instance_name: request.instance_name.clone(),
+            requests: vec![Request {
+                digest: Some(digest.clone()),
+                data,
+                compressor: compressor::Value::Identity as i32,
+            }],
+            digest_function: request.digest_function,
+            ..Default::default()
+        };
+        let update = retry_grpc_request_with_client_reconnect(
+            self.grpc_clients.clone(),
+            GrpcClientKind::Cas,
+            self.retries,
+            self.retry_max_delay,
+            || {
+                let grpc_clients = self.grpc_clients.clone();
+                let update = update.clone();
+                async move {
+                    Ok(grpc_clients
+                        .cas_client()
+                        .await?
+                        .batch_update_blobs(with_re_metadata_timeout(
+                            update,
+                            self.metadata.clone(),
+                            self.use_fbcode_metadata,
+                            self.request_metadata_tool_name,
+                            self.grpc_request_timeout,
+                        ))
+                        .await?
+                        .into_inner())
+                }
+            },
+        )
+        .await?;
+        if let Some(status) = update
+            .responses
+            .iter()
+            .filter_map(|response| response.status.as_ref())
+            .find(|status| status.code != 0)
+        {
+            return Err(anyhow::Error::from(re_client_error_from_rpc_status(status))
+                .context("The CAS could not store the uncached Action"));
+        }
+        Ok(GExecuteRequest {
+            action_digest: Some(digest),
+            ..request.clone()
+        })
+    }
+}
+
 /// Resumes an operation with WaitExecution, or executes its action again when WaitExecution says
 /// the operation or its connection is lost, or when the operation is still QUEUED at the deadline
 /// before the resumption answers. BuildBuddy answers a WaitExecution with the last status
@@ -1389,6 +1650,7 @@ async fn resume_or_retry_execute(
     retry_max_delay: Duration,
     wait_failure_context: String,
     queued: &mut QueuedDeadline,
+    stalled: &mut StallDeadline,
 ) -> anyhow::Result<(tonic::Streaming<Operation>, Option<String>, usize)> {
     loop {
         // Only the WaitExecution runs against the clock. An Execute cut off by it might already
@@ -1402,9 +1664,15 @@ async fn resume_or_retry_execute(
             retries,
             retry_max_delay,
         );
-        let waited = match queued.at {
-            None => Some(wait.await),
-            Some(at) => tokio::time::timeout_at(at, wait).await.ok(),
+        let waited = match (queued.at, stalled.at) {
+            (Some(at), _) => tokio::time::timeout_at(at, wait).await.ok(),
+            // A claimed operation's resumption is held to the operation's stall deadline, whose
+            // re-Execute the caller sends.
+            (None, Some(at)) => match tokio::time::timeout_at(at, wait).await {
+                Ok(waited) => Some(waited),
+                Err(_) => return Err(anyhow::Error::new(ResumptionStalled)),
+            },
+            (None, None) => Some(wait.await),
         };
         let failure_context = match waited {
             Some(Ok(stream)) => return Ok((stream, Some(operation_name), execute_retry_attempts)),
@@ -1445,6 +1713,7 @@ async fn resume_or_retry_execute(
                 {
                     Ok(stream) => {
                         queued.start();
+                        stalled.reset();
                         return Ok((stream, None, execute_retry_attempts));
                     }
                     // The operation may still be queued legitimately, so, as on its own stream,
@@ -1483,6 +1752,7 @@ async fn resume_or_retry_execute(
         .await
         .context(failure_context)?;
         queued.start();
+        stalled.reset();
         return Ok((stream, None, execute_retry_attempts));
     }
 }
@@ -1704,6 +1974,9 @@ pub struct RERuntimeOpts {
     bytestream_progress_timeout: Duration,
     /// Time an operation may stay QUEUED before its action is executed again; zero is never.
     queued_operation_timeout: Duration,
+    /// Time a claimed operation may make no progress before its action is executed again, once;
+    /// zero is never.
+    stalled_operation_timeout: Duration,
     /// Digest function selected from user config and capabilities for download hash validation.
     download_hash_digest_function: Option<digest_function::Value>,
     /// Digest functions selected from daemon config for RE request fields.
@@ -2961,6 +3234,10 @@ impl REClientBuilder {
             opts.queued_operation_timeout_secs
                 .unwrap_or(DEFAULT_QUEUED_OPERATION_TIMEOUT_SECS),
         );
+        let stalled_operation_timeout = Duration::from_secs(
+            opts.stalled_operation_timeout_secs
+                .unwrap_or(DEFAULT_STALLED_OPERATION_TIMEOUT_SECS),
+        );
 
         let capabilities = if opts.capabilities.unwrap_or(true) {
             Self::fetch_rbe_capabilities(
@@ -3126,6 +3403,7 @@ impl REClientBuilder {
                 grpc_request_timeout,
                 bytestream_progress_timeout,
                 queued_operation_timeout,
+                stalled_operation_timeout,
                 download_hash_digest_function,
                 request_digest_function_config,
             },
@@ -4418,11 +4696,11 @@ impl REClient {
 
         let grpc_clients = self.grpc_clients.clone();
         let metadata_for_wait_execution = metadata.clone();
-        let grpc_request_for_retry = grpc_request.clone();
         let use_fbcode_metadata = self.runtime_opts.use_fbcode_metadata;
         let retries = self.runtime_opts.retries;
         let retry_max_delay = Duration::from_millis(self.runtime_opts.retry_max_delay_ms);
         let cas_ttl_secs = self.runtime_opts.cas_ttl_secs;
+        let grpc_request_timeout = self.runtime_opts.grpc_request_timeout;
 
         let stream = futures::stream::try_unfold(
             Some(OperationStream {
@@ -4432,12 +4710,13 @@ impl REClient {
                 stalled_resumes: 0,
                 resumed: false,
                 queued: QueuedDeadline::new(self.runtime_opts.queued_operation_timeout),
+                stalled: StallDeadline::new(self.runtime_opts.stalled_operation_timeout),
                 superseded: Vec::new(),
+                execute_request: grpc_request.clone(),
             }),
             move |state| {
                 let grpc_clients = grpc_clients.clone();
                 let metadata = metadata_for_wait_execution.clone();
-                let grpc_request = grpc_request_for_retry.clone();
                 let request_metadata_tool_name = request_metadata_tool_name.clone();
                 async move {
                     let Some(OperationStream {
@@ -4447,15 +4726,30 @@ impl REClient {
                         mut stalled_resumes,
                         mut resumed,
                         mut queued,
+                        mut stalled,
                         mut superseded,
+                        execute_request: mut grpc_request,
                     }) = state
                     else {
                         return Ok(None);
                     };
+                    let stalled_reexecute = StalledReexecute {
+                        grpc_clients: grpc_clients.clone(),
+                        metadata: &metadata,
+                        use_fbcode_metadata,
+                        request_metadata_tool_name: request_metadata_tool_name.as_str(),
+                        retries,
+                        retry_max_delay,
+                        grpc_request_timeout,
+                    };
                     loop {
                         let msg = loop {
-                            match next_operation_event(&mut stream, &mut superseded, queued.at)
-                                .await
+                            match next_operation_event(
+                                &mut stream,
+                                &mut superseded,
+                                queued.at.or(stalled.at),
+                            )
+                            .await
                             {
                                 OperationStreamEvent::Next(Ok(Some(msg))) => break msg,
                                 OperationStreamEvent::Superseded(first, msg) => {
@@ -4467,10 +4761,29 @@ impl REClient {
                                     stream = first.stream;
                                     operation_name = first.operation_name;
                                     queued.seen_queued = first.seen_queued;
+                                    stalled.reset();
                                     resumed = false;
                                     break msg;
                                 }
-                                OperationStreamEvent::StayedQueued => {
+                                // A claimed operation has no QUEUED clock, so this is its stall
+                                // deadline.
+                                OperationStreamEvent::Deadline if queued.at.is_none() => {
+                                    let (next_stream, next_request) = stalled_reexecute
+                                        .execute(
+                                            &grpc_request,
+                                            operation_name.as_deref(),
+                                            &mut stalled,
+                                        )
+                                        .await?;
+                                    stream = next_stream;
+                                    grpc_request = next_request;
+                                    operation_name = None;
+                                    resumed = false;
+                                    superseded.clear();
+                                    queued.start();
+                                    stalled.reset();
+                                }
+                                OperationStreamEvent::Deadline => {
                                     let waited = queued.wait;
                                     if !can_retry_execute(execute_retry_attempts, retries) {
                                         warn_stayed_queued(
@@ -4511,6 +4824,7 @@ impl REClient {
                                             });
                                             resumed = false;
                                             queued.start();
+                                            stalled.reset();
                                         }
                                         // The operation may still be queued legitimately, so it is
                                         // waited for rather than failed; the attempt is spent.
@@ -4547,11 +4861,7 @@ impl REClient {
                                         operation_name = %name,
                                         "Execute stream ended before completion; resuming with WaitExecution"
                                     );
-                                    let (
-                                        next_stream,
-                                        next_operation_name,
-                                        next_execute_retry_attempts,
-                                    ) = resume_or_retry_execute(
+                                    let resumption = resume_or_retry_execute(
                                         grpc_clients.clone(),
                                         metadata.clone(),
                                         use_fbcode_metadata,
@@ -4563,8 +4873,32 @@ impl REClient {
                                         retry_max_delay,
                                         "RE WaitExecution failed after Execute stream ended before completion".to_owned(),
                                         &mut queued,
+                                        &mut stalled,
                                     )
-                                    .await?;
+                                    .await;
+                                    let (
+                                        next_stream,
+                                        next_operation_name,
+                                        next_execute_retry_attempts,
+                                    ) = match resumption {
+                                        Err(err) if err.is::<ResumptionStalled>() => {
+                                            let (next_stream, next_request) = stalled_reexecute
+                                                .execute(
+                                                    &grpc_request,
+                                                    operation_name.as_deref(),
+                                                    &mut stalled,
+                                                )
+                                                .await?;
+                                            stream = next_stream;
+                                            grpc_request = next_request;
+                                            operation_name = None;
+                                            resumed = false;
+                                            queued.start();
+                                            stalled.reset();
+                                            continue;
+                                        }
+                                        resumption => resumption?,
+                                    };
                                     stream = next_stream;
                                     operation_name = next_operation_name;
                                     execute_retry_attempts = next_execute_retry_attempts;
@@ -4598,6 +4932,7 @@ impl REClient {
                                         .await
                                         .context("RE operation stream returned NOT_FOUND and Execute retry failed")?;
                                         queued.start();
+                                        stalled.reset();
                                         operation_name = None;
                                         continue;
                                     }
@@ -4642,6 +4977,7 @@ impl REClient {
                                             "Execute stream failed before operation creation and Execute retry failed",
                                         )?;
                                         queued.start();
+                                        stalled.reset();
                                         continue;
                                     };
 
@@ -4662,11 +4998,7 @@ impl REClient {
                                         execute_request_action(&grpc_request),
                                         retries + 1,
                                     ));
-                                    let (
-                                        next_stream,
-                                        next_operation_name,
-                                        next_execute_retry_attempts,
-                                    ) = resume_or_retry_execute(
+                                    let resumption = resume_or_retry_execute(
                                         grpc_clients.clone(),
                                         metadata.clone(),
                                         use_fbcode_metadata,
@@ -4678,8 +5010,32 @@ impl REClient {
                                         retry_max_delay,
                                         format!("RE WaitExecution failed after Execute stream interruption ({err:#})"),
                                         &mut queued,
+                                        &mut stalled,
                                     )
-                                    .await?;
+                                    .await;
+                                    let (
+                                        next_stream,
+                                        next_operation_name,
+                                        next_execute_retry_attempts,
+                                    ) = match resumption {
+                                        Err(err) if err.is::<ResumptionStalled>() => {
+                                            let (next_stream, next_request) = stalled_reexecute
+                                                .execute(
+                                                    &grpc_request,
+                                                    operation_name.as_deref(),
+                                                    &mut stalled,
+                                                )
+                                                .await?;
+                                            stream = next_stream;
+                                            grpc_request = next_request;
+                                            operation_name = None;
+                                            resumed = false;
+                                            queued.start();
+                                            stalled.reset();
+                                            continue;
+                                        }
+                                        resumption => resumption?,
+                                    };
                                     stream = next_stream;
                                     operation_name = next_operation_name;
                                     execute_retry_attempts = next_execute_retry_attempts;
@@ -4733,6 +5089,7 @@ impl REClient {
                                             "Execute operation failed and Execute retry failed",
                                         )?;
                                         queued.start();
+                                        stalled.reset();
                                         operation_name = None;
                                         continue;
                                     }
@@ -4777,6 +5134,7 @@ impl REClient {
                                             "Execute response failed and Execute retry failed",
                                         )?;
                                         queued.start();
+                                        stalled.reset();
                                         operation_name = None;
                                         continue;
                                     }
@@ -4814,9 +5172,8 @@ impl REClient {
                             }
                         }
 
-                        let meta = ExecuteOperationMetadata::decode(
-                            &msg.metadata.unwrap_or_default().value[..],
-                        )?;
+                        let metadata = msg.metadata.unwrap_or_default().value;
+                        let meta = ExecuteOperationMetadata::decode(&metadata[..])?;
                         let stage = match execution_stage::Value::try_from(meta.stage) {
                             Ok(execution_stage::Value::Unknown) => Stage::UNKNOWN,
                             Ok(execution_stage::Value::CacheCheck) => Stage::CACHE_CHECK,
@@ -4828,6 +5185,7 @@ impl REClient {
                         if operation_claimed(meta.stage, &mut queued.seen_queued) {
                             queued.at = None;
                             superseded.clear();
+                            stalled.observe(metadata);
                         }
                         return anyhow::Ok(Some((
                             ExecuteWithProgressResponse {
@@ -4842,7 +5200,9 @@ impl REClient {
                                 stalled_resumes,
                                 resumed,
                                 queued,
+                                stalled,
                                 superseded,
+                                execute_request: grpc_request,
                             }),
                         )));
                     }
@@ -8528,6 +8888,7 @@ mod tests {
                 DEFAULT_BYTESTREAM_PROGRESS_TIMEOUT_SECS,
             ),
             queued_operation_timeout: Duration::from_secs(DEFAULT_QUEUED_OPERATION_TIMEOUT_SECS),
+            stalled_operation_timeout: Duration::from_secs(DEFAULT_STALLED_OPERATION_TIMEOUT_SECS),
             download_hash_digest_function: Some(digest_function::Value::Sha256),
             request_digest_function_config: digest_function_config,
         };
@@ -10004,6 +10365,9 @@ mod tests {
         Operations(Vec<(Duration, Operation)>, RawTrailers),
         /// Holds the stream open without even its response headers.
         Nothing,
+        /// Answers with one encoded message, as a unary call such as a CAS read does, and the
+        /// trailers.
+        Unary(Vec<u8>),
     }
 
     #[derive(Default)]
@@ -10064,7 +10428,10 @@ mod tests {
     }
 
     fn raw_grpc_message(operation: &Operation) -> Vec<u8> {
-        let message = operation.encode_to_vec();
+        raw_grpc_bytes(operation.encode_to_vec())
+    }
+
+    fn raw_grpc_bytes(message: Vec<u8>) -> Vec<u8> {
         let mut data = vec![0u8];
         data.extend((message.len() as u32).to_be_bytes());
         data.extend(message);
@@ -10136,6 +10503,18 @@ mod tests {
                             return Ok(());
                         }
                         RawReply::Nothing => continue,
+                        RawReply::Unary(message) => {
+                            frames.send(h2_frame(
+                                H2_HEADERS,
+                                H2_FLAG_END_HEADERS,
+                                stream,
+                                H2_RESPONSE_HEADERS,
+                            ))?;
+                            frames.send(h2_frame(H2_DATA, 0, stream, &raw_grpc_bytes(message)))?;
+                            pending.lock().unwrap().insert(stream);
+                            send_raw_trailers(stream, &pending, &frames, &log);
+                            continue;
+                        }
                         RawReply::Operations(operations, trailers) => {
                             frames.send(h2_frame(
                                 H2_HEADERS,
@@ -11058,6 +11437,437 @@ mod tests {
 
         assert!(QueuedDeadline::new(Duration::ZERO).at.is_none());
         assert!(QueuedDeadline::new(Duration::MAX).at.is_none());
+    }
+
+    /// A request to the raw server of the stall tests, told apart by which message its body
+    /// decodes to with the fields that message needs.
+    enum StallRequest {
+        Wait(String),
+        Execute(Digest),
+        Read(Vec<Digest>),
+        Update(Vec<(Digest, Vec<u8>)>),
+    }
+
+    fn stall_request(body: &[u8]) -> StallRequest {
+        if let Ok(request) = WaitExecutionRequest::decode(body)
+            && !request.name.is_empty()
+        {
+            return StallRequest::Wait(request.name);
+        }
+        if let Ok(request) = BatchUpdateBlobsRequest::decode(body)
+            && !request.requests.is_empty()
+        {
+            return StallRequest::Update(
+                request
+                    .requests
+                    .into_iter()
+                    .map(|blob| (blob.digest.unwrap_or_default(), blob.data))
+                    .collect(),
+            );
+        }
+        if let Ok(request) = BatchReadBlobsRequest::decode(body)
+            && !request.digests.is_empty()
+        {
+            return StallRequest::Read(request.digests);
+        }
+        match GExecuteRequest::decode(body) {
+            Ok(GExecuteRequest {
+                action_digest: Some(digest),
+                ..
+            }) => StallRequest::Execute(digest),
+            _ => panic!("the raw server got a request it does not know"),
+        }
+    }
+
+    /// What the raw server of the stall tests has been asked.
+    #[derive(Default)]
+    struct StallCalls {
+        /// The action digest of each Execute, in order.
+        executes: Mutex<Vec<Digest>>,
+        waits: AtomicUsize,
+        /// The blobs uploaded with BatchUpdateBlobs.
+        uploads: Mutex<Vec<(Digest, Vec<u8>)>>,
+    }
+
+    /// The Action the raw server keeps under every digest it is asked for.
+    fn stalling_action() -> Action {
+        Action {
+            command_digest: Some(Digest {
+                hash: "cd".repeat(32),
+                size_bytes: 3,
+            }),
+            input_root_digest: Some(Digest {
+                hash: "ef".repeat(32),
+                size_bytes: 4,
+            }),
+            ..Default::default()
+        }
+    }
+
+    /// An EXECUTING Operation whose metadata differs with `ping`, as BuildBuddy's periodic
+    /// progress updates do by their timestamp.
+    fn executing_ping(name: &str, ping: u32) -> Operation {
+        let mut operation = staged_operation(name, execution_stage::Value::Executing);
+        operation.metadata = Some(prost_types::Any {
+            type_url:
+                "type.googleapis.com/build.bazel.remote.execution.v2.ExecuteOperationMetadata"
+                    .to_owned(),
+            value: ExecuteOperationMetadata {
+                stage: execution_stage::Value::Executing as i32,
+                partial_execution_metadata: Some(ExecutedActionMetadata {
+                    worker: format!("ping {ping}"),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }
+            .encode_to_vec(),
+        });
+        operation
+    }
+
+    /// A finished Operation whose command exited with `exit_code`, with `status` as its
+    /// ExecuteResponse's status.
+    fn finished_operation(exit_code: i32, status: Status) -> Operation {
+        let response = GExecuteResponse {
+            result: Some(ActionResult {
+                exit_code,
+                execution_metadata: Some(ExecutedActionMetadata::default()),
+                ..Default::default()
+            }),
+            status: Some(status),
+            ..Default::default()
+        };
+        Operation {
+            name: "operations/finished".to_owned(),
+            done: true,
+            result: Some(OpResult::Response(prost_types::Any {
+                type_url: "type.googleapis.com/build.bazel.remote.execution.v2.ExecuteResponse"
+                    .to_owned(),
+                value: response.encode_to_vec(),
+            })),
+            ..Default::default()
+        }
+    }
+
+    /// A raw server that keeps `stalling_action` in its CAS, stores what is uploaded, and answers
+    /// the nth Execute or WaitExecution through `reply`; and a client of it whose claimed
+    /// operations may make no progress for 1 s.
+    async fn serve_stalling(
+        reply: impl Fn(usize, Option<String>) -> RawReply + Send + Sync + 'static,
+    ) -> anyhow::Result<(REClient, Arc<StallCalls>, tokio::task::JoinHandle<()>)> {
+        let calls = Arc::new(StallCalls::default());
+        let (address, _log, server) = serve_raw_h2({
+            let calls = calls.clone();
+            move |body| match stall_request(body) {
+                StallRequest::Wait(name) => {
+                    let earlier = calls.waits.fetch_add(1, Ordering::SeqCst);
+                    reply(earlier, Some(name))
+                }
+                StallRequest::Execute(digest) => {
+                    let mut executes = calls.executes.lock().unwrap();
+                    executes.push(digest);
+                    reply(executes.len() - 1, None)
+                }
+                StallRequest::Read(digests) => RawReply::Unary(
+                    BatchReadBlobsResponse {
+                        responses: digests
+                            .into_iter()
+                            .map(|digest| batch_read_blobs_response::Response {
+                                digest: Some(digest),
+                                data: stalling_action().encode_to_vec(),
+                                status: Some(Status::default()),
+                                ..Default::default()
+                            })
+                            .collect(),
+                    }
+                    .encode_to_vec(),
+                ),
+                StallRequest::Update(blobs) => {
+                    let responses = blobs
+                        .iter()
+                        .map(|(digest, _)| batch_update_blobs_response::Response {
+                            digest: Some(digest.clone()),
+                            status: Some(Status::default()),
+                        })
+                        .collect();
+                    calls.uploads.lock().unwrap().extend(blobs);
+                    RawReply::Unary(BatchUpdateBlobsResponse { responses }.encode_to_vec())
+                }
+            }
+        })
+        .await?;
+        let client = raw_h2_client_with(
+            address,
+            Buck2OssReConfiguration {
+                retries: Some(2),
+                stalled_operation_timeout_secs: Some(1),
+                ..Default::default()
+            },
+        )
+        .await?;
+        Ok((client, calls, server))
+    }
+
+    /// Runs an action as `execute_raw_h2_action` does, and returns its outcome with the console
+    /// warnings it put on the event stream.
+    async fn execute_stalling_action(
+        client: &REClient,
+    ) -> (anyhow::Result<ExecuteResponse>, Vec<String>) {
+        let (mut events, sink) = buck2_events::create_source_sink_pair();
+        let dispatcher = buck2_events::dispatch::EventDispatcher::new(
+            buck2_wrapper_common::invocation_id::TraceId::null(),
+            buck2_events::daemon_id::DaemonId::null(),
+            sink,
+        );
+        let outcome = buck2_events::dispatch::with_dispatcher_async(
+            dispatcher,
+            tokio::time::timeout(Duration::from_secs(20), execute_raw_h2_action(client)),
+        )
+        .await
+        .map_err(anyhow::Error::from)
+        .and_then(|outcome| outcome);
+        let mut warnings = Vec::new();
+        while let Some(event) = events.try_receive() {
+            if let buck2_events::Event::Buck(event) = event
+                && let buck2_data::buck_event::Data::Instant(buck2_data::InstantEvent {
+                    data: Some(buck2_data::instant_event::Data::ConsoleWarning(warning)),
+                }) = event.data()
+            {
+                warnings.push(warning.message.clone());
+            }
+        }
+        (outcome, warnings)
+    }
+
+    /// The Action the client uploaded, and the digest the server stores it under, which must be
+    /// the digest of the second Execute.
+    fn uploaded_action(calls: &StallCalls) -> (Action, Digest) {
+        let uploads = calls.uploads.lock().unwrap();
+        assert_eq!(uploads.len(), 1, "one Action is uploaded");
+        let (digest, data) = &uploads[0];
+        let expected = tdigest_to(
+            digest_blob(data, digest_function::Value::Sha256).expect("a SHA-256 digest"),
+        );
+        assert_eq!(
+            digest, &expected,
+            "the upload is stored under its own digest"
+        );
+        (
+            Action::decode(&data[..]).expect("an Action"),
+            digest.clone(),
+        )
+    }
+
+    /// The incident of 2026-10-03 on BuildBuddy v2.310.0: an execution that had reached
+    /// EXECUTING lost its task, and its failure was never published, so the stream that every
+    /// merged request was reading said nothing more for over an hour.
+    #[tokio::test]
+    async fn an_executing_operation_that_stalls_is_executed_again_uncached() -> anyhow::Result<()> {
+        let (client, calls, server) = serve_stalling(|earlier, _| match earlier {
+            0 => RawReply::Operations(
+                vec![
+                    (Duration::ZERO, queued_operation("operations/stuck")),
+                    (Duration::ZERO, executing_ping("operations/stuck", 0)),
+                ],
+                RawTrailers::Never,
+            ),
+            _ => RawReply::Operation(done_operation(), RawTrailers::After(Duration::ZERO)),
+        })
+        .await?;
+
+        let started = Instant::now();
+        let (completed, warnings) = execute_stalling_action(&client).await;
+
+        assert_eq!(completed?.status.code, TCode::OK);
+        assert!(started.elapsed() >= Duration::from_secs(1));
+        let (action, uploaded) = uploaded_action(&calls);
+        assert!(action.do_not_cache);
+        assert_eq!(
+            Action {
+                do_not_cache: false,
+                ..action
+            },
+            stalling_action()
+        );
+        let original = Digest {
+            hash: "ab".repeat(32),
+            size_bytes: 1,
+        };
+        assert_eq!(
+            *calls.executes.lock().unwrap(),
+            vec![original, uploaded.clone()]
+        );
+        assert_eq!(calls.waits.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            warnings,
+            vec![format!(
+                "Executing RE action {}/1 again as action {}/{} with do_not_cache set: its operation `operations/stuck` made no progress for 1s. The server does not merge this Execute into the stalled operation, and does not cache its result",
+                "ab".repeat(32),
+                uploaded.hash,
+                uploaded.size_bytes,
+            )]
+        );
+        server.abort();
+        Ok(())
+    }
+
+    /// A WaitExecution of a claimed operation replays its last status (BuildBuddy v2.310.0
+    /// execution_server.go:1286-1293), which is not progress, so a stream that keeps being cut and
+    /// resumed onto a stalled operation does not hold the action forever.
+    #[tokio::test]
+    async fn resuming_a_stalled_operation_does_not_restart_its_clock() -> anyhow::Result<()> {
+        let (client, calls, server) = serve_stalling(|earlier, wait| match (earlier, wait) {
+            (0, None) => RawReply::Operations(
+                vec![(Duration::ZERO, executing_ping("operations/stuck", 0))],
+                RawTrailers::After(Duration::from_millis(600)),
+            ),
+            (_, Some(name)) => RawReply::Operation(executing_ping(&name, 0), RawTrailers::Never),
+            _ => RawReply::Operation(done_operation(), RawTrailers::After(Duration::ZERO)),
+        })
+        .await?;
+
+        let started = Instant::now();
+        let (completed, warnings) = execute_stalling_action(&client).await;
+
+        assert_eq!(completed?.status.code, TCode::OK);
+        // A clock restarted by the resumption at 0.6 s would not end before 1.6 s.
+        assert!(started.elapsed() < Duration::from_millis(1500));
+        assert_eq!(calls.waits.load(Ordering::SeqCst), 1);
+        assert_eq!(calls.executes.lock().unwrap().len(), 2);
+        assert!(uploaded_action(&calls).0.do_not_cache);
+        assert_eq!(warnings.len(), 1, "{warnings:#?}");
+        server.abort();
+        Ok(())
+    }
+
+    /// An action that runs longer than the stall timeout is not cut while its executor keeps
+    /// sending progress updates.
+    #[tokio::test]
+    async fn an_executing_operation_that_keeps_making_progress_is_not_executed_again()
+    -> anyhow::Result<()> {
+        let (client, calls, server) = serve_stalling(|earlier, _| match earlier {
+            0 => RawReply::Operations(
+                (0..6)
+                    .map(|ping| {
+                        (
+                            Duration::from_millis(if ping == 0 { 0 } else { 500 }),
+                            executing_ping("operations/long", ping),
+                        )
+                    })
+                    .chain([(Duration::from_millis(500), done_operation())])
+                    .collect(),
+                RawTrailers::After(Duration::ZERO),
+            ),
+            _ => RawReply::Operation(done_operation(), RawTrailers::After(Duration::ZERO)),
+        })
+        .await?;
+
+        let started = Instant::now();
+        let (completed, warnings) = execute_stalling_action(&client).await;
+
+        assert_eq!(completed?.status.code, TCode::OK);
+        assert!(started.elapsed() >= Duration::from_secs(3));
+        assert_eq!(calls.executes.lock().unwrap().len(), 1);
+        assert!(calls.uploads.lock().unwrap().is_empty());
+        assert_eq!(warnings, Vec::<String>::new());
+        server.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn an_action_that_stalls_twice_fails() -> anyhow::Result<()> {
+        let (client, calls, server) = serve_stalling(|_, _| {
+            RawReply::Operations(
+                vec![(Duration::ZERO, executing_ping("operations/stuck", 0))],
+                RawTrailers::Never,
+            )
+        })
+        .await?;
+
+        let (completed, warnings) = execute_stalling_action(&client).await;
+
+        let Err(err) = completed else {
+            panic!("the action finished");
+        };
+        let message = format!(
+            "RE operation `operations/stuck` of action {}/{} made no progress for 1s, after the action had already been executed again once because an earlier operation made none; failing the action instead of waiting on it",
+            uploaded_action(&calls).1.hash,
+            uploaded_action(&calls).1.size_bytes,
+        );
+        assert_eq!(
+            err.downcast_ref::<REClientError>()
+                .map(|err| (err.code, err.message.clone())),
+            Some((TCode::DEADLINE_EXCEEDED, message.clone())),
+            "{err:#}"
+        );
+        assert_eq!(calls.executes.lock().unwrap().len(), 2);
+        assert_eq!(warnings.len(), 2, "{warnings:#?}");
+        assert_eq!(warnings[1], message);
+        server.abort();
+        Ok(())
+    }
+
+    /// The re-Execute's own answer is the action's: a command that exits non-zero, or an error
+    /// status, is returned as it is rather than retried for having followed a stall.
+    #[tokio::test]
+    async fn the_answer_to_a_stalled_actions_reexecute_is_not_retried() -> anyhow::Result<()> {
+        for (finished, exit_code, status_code) in [
+            (finished_operation(1, Status::default()), Some(1), None),
+            (
+                finished_operation(
+                    0,
+                    Status {
+                        code: TCode::INVALID_ARGUMENT.0,
+                        message: "bad action".to_owned(),
+                        ..Default::default()
+                    },
+                ),
+                None,
+                Some(TCode::INVALID_ARGUMENT),
+            ),
+        ] {
+            let (client, calls, server) = serve_stalling(move |earlier, _| match earlier {
+                0 => RawReply::Operations(
+                    vec![(Duration::ZERO, executing_ping("operations/stuck", 0))],
+                    RawTrailers::Never,
+                ),
+                _ => RawReply::Operation(finished.clone(), RawTrailers::After(Duration::ZERO)),
+            })
+            .await?;
+
+            let (completed, warnings) = execute_stalling_action(&client).await;
+
+            match completed {
+                Ok(response) => {
+                    assert_eq!(Some(response.action_result.exit_code), exit_code)
+                }
+                Err(err) => assert_eq!(
+                    err.downcast_ref::<REClientError>().map(|err| err.code),
+                    status_code,
+                    "{err:#}"
+                ),
+            }
+            assert_eq!(calls.executes.lock().unwrap().len(), 2);
+            assert_eq!(warnings.len(), 1, "{warnings:#?}");
+            server.abort();
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn an_unset_stalled_operation_timeout_is_ten_minutes() -> anyhow::Result<()> {
+        let (address, _log, server) = serve_raw_h2(|_| RawReply::Close).await?;
+        let client = raw_h2_client(address, 0).await?;
+
+        assert_eq!(
+            client.runtime_opts.stalled_operation_timeout,
+            Duration::from_secs(600)
+        );
+        let mut off = StallDeadline::new(Duration::ZERO);
+        off.observe(vec![1]);
+        assert!(off.at.is_none());
+        server.abort();
+        Ok(())
     }
 
     #[tokio::test]
