@@ -197,7 +197,7 @@ fn read_buckconfig_bes_settings(
             ));
         }
     };
-    let mut bes_headers =
+    let (mut bes_headers, missing_header_env) =
         parse_bes_headers(root_config.parse_list::<String>(BuckconfigKeyRef {
             section: "bes",
             property: "header",
@@ -228,6 +228,20 @@ fn read_buckconfig_bes_settings(
                 .as_ref()
                 .map(|connection| connection.backend.clone())
         });
+    // An empty API key reads as none at all to the server, so a header whose variable is unset
+    // turns BES off here as it does in the daemon (buck2_server daemon/state.rs).
+    let bes_backend = if missing_header_env.is_empty() {
+        bes_backend
+    } else {
+        tracing::warn!(
+            "{}",
+            buck2_events::sink::remote::missing_bes_header_env_warning(
+                &missing_header_env,
+                "the client's"
+            )
+        );
+        None
+    };
     // No backend, no sink: a results URL would name a page that never gets written.
     let bes_results_url = bes_results_url.filter(|_| bes_backend.is_some());
 
@@ -292,9 +306,10 @@ fn read_buckconfig_bes_settings(
 }
 
 #[cfg(not(fbcode_build))]
+/// The headers, and the variables they name that are unset or empty.
 fn parse_bes_headers(
     raw_headers: Option<Vec<String>>,
-) -> buck2_error::Result<Vec<(String, String)>> {
+) -> buck2_error::Result<buck2_events::sink::remote::BesHeadersAndMissingVars> {
     parse_bes_headers_with_env(raw_headers, |name| std::env::var(name).ok())
 }
 
@@ -302,14 +317,16 @@ fn parse_bes_headers(
 fn parse_bes_headers_with_env<F>(
     raw_headers: Option<Vec<String>>,
     mut env: F,
-) -> buck2_error::Result<Vec<(String, String)>>
+) -> buck2_error::Result<buck2_events::sink::remote::BesHeadersAndMissingVars>
 where
     F: FnMut(&str) -> Option<String>,
 {
     let mut headers = Vec::new();
+    let mut missing = Vec::new();
     for raw_header in raw_headers.unwrap_or_default() {
-        let raw_header =
-            buck2_events::sink::remote::expand_bes_config_env_vars_with(&raw_header, &mut env);
+        let (raw_header, unset) =
+            buck2_events::sink::remote::expand_bes_config_env_vars_reporting(&raw_header, &mut env);
+        missing.extend(unset);
         let (key, value) = raw_header.split_once('=').ok_or_else(|| {
             buck2_error::buck2_error!(
                 ErrorTag::Input,
@@ -327,7 +344,7 @@ where
         }
         headers.push((key.to_owned(), value.to_owned()));
     }
-    Ok(headers)
+    Ok((headers, missing))
 }
 
 #[cfg(not(fbcode_build))]
@@ -402,8 +419,22 @@ mod tests {
     }
 
     #[test]
+    fn a_header_naming_an_unset_variable_reports_it() {
+        let (headers, missing) = parse_bes_headers_with_env(
+            Some(vec![
+                "x-buildbuddy-api-key=$UNSET_API_KEY".to_owned(),
+                "x-literal=value".to_owned(),
+            ]),
+            test_env,
+        )
+        .unwrap();
+        assert_eq!(missing, vec!["UNSET_API_KEY".to_owned()]);
+        assert_eq!(headers[1], ("x-literal".to_owned(), "value".to_owned()));
+    }
+
+    #[test]
     fn expands_env_vars_in_bes_headers_and_metadata() {
-        let headers = parse_bes_headers_with_env(
+        let (headers, missing) = parse_bes_headers_with_env(
             Some(vec!["x-buildbuddy-api-key=$BUILDBUDDY_API_KEY".to_owned()]),
             test_env,
         )
@@ -412,6 +443,7 @@ mod tests {
             headers,
             vec![("x-buildbuddy-api-key".to_owned(), "secret".to_owned())]
         );
+        assert!(missing.is_empty());
 
         let metadata = parse_bes_build_metadata_with_env(
             Some(vec![
