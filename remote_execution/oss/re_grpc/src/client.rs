@@ -10368,6 +10368,9 @@ mod tests {
         /// Answers with one encoded message, as a unary call such as a CAS read does, and the
         /// trailers.
         Unary(Vec<u8>),
+        /// Stops reading the connection, PINGs included, and holds it open: a peer whose
+        /// process stopped while its kernel keeps the TCP session.
+        Silence,
     }
 
     #[derive(Default)]
@@ -10515,6 +10518,7 @@ mod tests {
                             send_raw_trailers(stream, &pending, &frames, &log);
                             continue;
                         }
+                        RawReply::Silence => return std::future::pending().await,
                         RawReply::Operations(operations, trailers) => {
                             frames.send(h2_frame(
                                 H2_HEADERS,
@@ -10716,6 +10720,76 @@ mod tests {
             log.connections.load(Ordering::SeqCst) - connections_before >= 2,
             "a retry after a timeout reconnects first"
         );
+        server.abort();
+        Ok(())
+    }
+
+    /// The keepalive set through `Buck2OssReConfiguration` reaches channels built with
+    /// `connect_with_connector`: a lookup on a connection whose peer stopped answering fails as
+    /// a broken connection after the PING goes unanswered, well before the request timeout.
+    #[tokio::test]
+    async fn keepalive_ends_a_lookup_on_a_connection_that_stopped_answering()
+    -> anyhow::Result<()> {
+        let requests = Arc::new(AtomicUsize::new(0));
+        let (address, log, server) = serve_raw_h2({
+            let requests = requests.clone();
+            move |_| {
+                if requests.fetch_add(1, Ordering::SeqCst) == 0 {
+                    RawReply::Silence
+                } else {
+                    RawReply::Close
+                }
+            }
+        })
+        .await?;
+        let client = raw_h2_client_with(
+            address,
+            Buck2OssReConfiguration {
+                retries: Some(0),
+                grpc_request_timeout_secs: Some(30),
+                grpc_keepalive_time_secs: Some(1),
+                grpc_keepalive_timeout_secs: Some(1),
+                ..Default::default()
+            },
+        )
+        .await?;
+        let metadata = RemoteExecutionMetadata::default();
+        let lookup = || {
+            client.get_action_result(
+                &metadata,
+                ActionResultRequest {
+                    digest: TDigest {
+                        hash: "ab".repeat(32),
+                        size_in_bytes: 1,
+                        _dot_dot: (),
+                    },
+                    platform: None,
+                    _dot_dot: (),
+                },
+            )
+        };
+
+        let started = Instant::now();
+        let err = tokio::time::timeout(Duration::from_secs(10), lookup())
+            .await
+            .expect("the lookup on the silent connection ended within 10 s")
+            .err()
+            .expect("a lookup the server never answers fails");
+        let elapsed = started.elapsed();
+        assert!(is_broken_connection_error(&err), "{err:#}");
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "ended after {elapsed:?}, not at keepalive interval + timeout (2 s)"
+        );
+
+        let connections_after_failure = log.connections.load(Ordering::SeqCst);
+        let _ = tokio::time::timeout(Duration::from_secs(10), lookup())
+            .await
+            .expect("the next lookup ended within 10 s");
+        // The silent connection reads nothing, so a second request seen by the server came
+        // over another connection.
+        assert_eq!(requests.load(Ordering::SeqCst), 2);
+        assert!(log.connections.load(Ordering::SeqCst) > connections_after_failure);
         server.abort();
         Ok(())
     }
