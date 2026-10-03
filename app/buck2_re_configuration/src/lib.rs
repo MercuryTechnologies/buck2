@@ -463,6 +463,9 @@ pub struct Buck2OssReConfiguration {
     /// Address for RBE Action Cache service. Accepted schemes: grpc, grpcs, http, https, dns,
     /// ipv4, ipv6. If no scheme is provided, TLS is enabled by default.
     pub action_cache_address: Option<String>,
+    /// Number of gRPC connections to use for RBE Action Cache requests. Unset, it is the number
+    /// `engine_connection_count` defaults to.
+    pub action_cache_connection_count: Option<usize>,
     /// Whether to use TLS. Unset, TLS follows the address scheme (grpcs, https, or no scheme
     /// mean TLS). Set, it overrides the scheme: upstream buck2 takes TLS from this key alone,
     /// and tools that write its config, nsc among them, write `grpc://host:port` next to
@@ -655,6 +658,10 @@ impl Buck2OssReConfiguration {
                     property: "action_cache_address",
                 })?
                 .or(default_address),
+            action_cache_connection_count: legacy_config.parse(BuckconfigKeyRef {
+                section: BUCK2_RE_CLIENT_CFG_SECTION,
+                property: "action_cache_connection_count",
+            })?,
             tls: legacy_config.parse(BuckconfigKeyRef {
                 section: BUCK2_RE_CLIENT_CFG_SECTION,
                 property: "tls",
@@ -902,6 +909,30 @@ mod tests {
         let config = Buck2OssReConfiguration::from_legacy_config(&legacy_config, Vec::new())?;
 
         assert_eq!(config.engine_connection_count, Some(8));
+        Ok(())
+    }
+
+    #[test]
+    fn oss_config_parses_action_cache_connection_count() -> buck2_error::Result<()> {
+        let unset = parse(&[("config", "")], "config")?;
+        let set = parse(
+            &[(
+                "config",
+                "[buck2_re_client]\naction_cache_connection_count = 8\n",
+            )],
+            "config",
+        )?;
+
+        assert_eq!(
+            Buck2OssReConfiguration::from_legacy_config(&unset, Vec::new())?
+                .action_cache_connection_count,
+            None
+        );
+        assert_eq!(
+            Buck2OssReConfiguration::from_legacy_config(&set, Vec::new())?
+                .action_cache_connection_count,
+            Some(8)
+        );
         Ok(())
     }
 

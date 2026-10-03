@@ -1015,6 +1015,41 @@ where
     .await
 }
 
+/// `retry_grpc_request_with_policy` for an ActionCache call. Each attempt goes out on the next
+/// member of the pool, so a retry lands on another connection, and a reconnect redials the
+/// member the failed attempt used.
+async fn retry_action_cache_request<T, Fut, F>(
+    grpc_clients: Arc<GRPCClients>,
+    retries: usize,
+    retry_max_delay: Duration,
+    retry_client_timeouts: bool,
+    request: F,
+) -> anyhow::Result<T>
+where
+    Fut: Future<Output = anyhow::Result<T>>,
+    F: Fn(ActionCacheClient<GrpcService>) -> Fut,
+{
+    let member = AtomicUsize::new(0);
+    retry_grpc_request_with_policy(
+        retries,
+        retry_max_delay,
+        || async {
+            let (index, client) = grpc_clients.action_cache_client().await?;
+            member.store(index, Ordering::Relaxed);
+            request(client).await
+        },
+        |recovery| {
+            let kind = GrpcClientKind::ActionCache {
+                member: member.load(Ordering::Relaxed),
+            };
+            let grpc_clients = grpc_clients.clone();
+            async move { grpc_clients.recover(kind, recovery).await }
+        },
+        retry_client_timeouts,
+    )
+    .await
+}
+
 async fn execute_stream(
     grpc_clients: Arc<GRPCClients>,
     metadata: RemoteExecutionMetadata,
@@ -3188,9 +3223,8 @@ impl REClientBuilder {
             credential_helper.clone(),
         );
 
-        let (cas, action_cache, bytestream, capabilities) = futures::future::join4(
+        let (cas, bytestream, capabilities) = futures::future::join3(
             cas_connector.connect(),
-            action_cache_connector.connect(),
             bytestream_connector.connect(),
             capabilities_connector.connect(),
         )
@@ -3205,6 +3239,19 @@ impl REClientBuilder {
         )
         .await
         .context("Error creating Execution clients")?;
+        // Sized like the Execution pool, since a remote action makes one lookup and one Execute.
+        // The pool is for a connection that stops answering, which then holds 1/N of the lookups
+        // rather than all of them: on 2026-10-03 the single one stalled for 96 s, and all 343
+        // lookups in flight on it timed out.
+        let action_cache_connection_count = configured_connection_count(
+            opts.action_cache_connection_count,
+            opts.execution_concurrency_limit,
+        );
+        let action_cache_channels = futures::future::try_join_all(
+            (0..action_cache_connection_count).map(|_| action_cache_connector.connect()),
+        )
+        .await
+        .context("Error creating ActionCache clients")?;
 
         let interceptor = InjectHeadersInterceptor::new(&opts.http_headers)?;
 
@@ -3348,6 +3395,7 @@ impl REClientBuilder {
                 .as_ref()
                 .map(|cache| cache.root.display().to_string()),
             execution_connection_count = execution_connection_count,
+            action_cache_connection_count = action_cache_connection_count,
             "RE server capabilities"
         );
 
@@ -3366,8 +3414,8 @@ impl REClientBuilder {
                 max_decoding_msg_size,
                 build_execution_client,
             ),
-            action_cache_client: ResettableGrpcClient::new(
-                action_cache.context("Error creating ActionCache client")?,
+            action_cache_client: ResettableGrpcClientPool::new(
+                action_cache_channels,
                 action_cache_connector,
                 interceptor.dupe(),
                 max_decoding_msg_size,
@@ -3937,8 +3985,18 @@ impl<C> ResettableGrpcClientPool<C> {
     }
 
     async fn client(&self) -> anyhow::Result<C> {
-        let index = self.next_client.fetch_add(1, Ordering::Relaxed) % self.clients.len();
-        self.clients[index].client().await
+        Ok(self.next_client().await?.1)
+    }
+
+    /// The next member in turn, and a client on it. The member is what `reconnect_member` takes.
+    async fn next_client(&self) -> anyhow::Result<(usize, C)> {
+        let member = self.next_client.fetch_add(1, Ordering::Relaxed) % self.clients.len();
+        Ok((member, self.clients[member].client().await?))
+    }
+
+    /// Redials one member and leaves the others' connections alone.
+    async fn reconnect_member(&self, member: usize) -> anyhow::Result<()> {
+        self.clients[member].reconnect().await
     }
 
     async fn reconnect(&self) -> anyhow::Result<()> {
@@ -4004,14 +4062,19 @@ fn build_capabilities_client(
 enum GrpcClientKind {
     Cas,
     Execution,
-    ActionCache,
+    /// The member of the ActionCache pool the request went out on. A reconnect redials that
+    /// member only: a lookup times out because its own connection stopped answering, and the
+    /// other members' connections are still answering theirs.
+    ActionCache {
+        member: usize,
+    },
     ByteStream,
 }
 
 pub struct GRPCClients {
     cas_client: ResettableGrpcClient<ContentAddressableStorageClient<GrpcService>>,
     execution_client: ResettableGrpcClientPool<ExecutionClient<GrpcService>>,
-    action_cache_client: ResettableGrpcClient<ActionCacheClient<GrpcService>>,
+    action_cache_client: ResettableGrpcClientPool<ActionCacheClient<GrpcService>>,
     bytestream_client: ResettableGrpcClient<ByteStreamClient<GrpcService>>,
     /// The helper every connector above asks; held here to drop its cache when a remote
     /// rejects what it handed out.
@@ -4029,8 +4092,10 @@ impl GRPCClients {
         self.execution_client.client().await
     }
 
-    async fn action_cache_client(&self) -> anyhow::Result<ActionCacheClient<GrpcService>> {
-        self.action_cache_client.client().await
+    /// A client on the next member of the ActionCache pool, and that member, for
+    /// `GrpcClientKind::ActionCache`.
+    async fn action_cache_client(&self) -> anyhow::Result<(usize, ActionCacheClient<GrpcService>)> {
+        self.action_cache_client.next_client().await
     }
 
     async fn bytestream_client(&self) -> anyhow::Result<ByteStreamClient<GrpcService>> {
@@ -4068,7 +4133,9 @@ impl GRPCClients {
         match kind {
             GrpcClientKind::Cas => self.cas_client.reconnect().await,
             GrpcClientKind::Execution => self.execution_client.reconnect().await,
-            GrpcClientKind::ActionCache => self.action_cache_client.reconnect().await,
+            GrpcClientKind::ActionCache { member } => {
+                self.action_cache_client.reconnect_member(member).await
+            }
             GrpcClientKind::ByteStream => self.bytestream_client.reconnect().await,
         }
     }
@@ -4533,17 +4600,15 @@ impl REClient {
                 metadata,
                 Some(grpc_digest_string(&action_digest)),
             ),
-            retry_idempotent_read_with_client_reconnect(
+            retry_action_cache_request(
                 self.grpc_clients.clone(),
-                GrpcClientKind::ActionCache,
                 self.runtime_opts.retries,
                 Duration::from_millis(self.runtime_opts.retry_max_delay_ms),
-                || {
-                    let grpc_clients = self.grpc_clients.clone();
+                true,
+                |mut client| {
                     let metadata = metadata.clone();
                     let action_digest = action_digest.clone();
                     async move {
-                        let mut client = grpc_clients.action_cache_client().await?;
                         client
                             .get_action_result(with_re_metadata_timeout(
                                 GetActionResultRequest {
@@ -4599,18 +4664,16 @@ impl REClient {
         );
         let res = remote_request_span(
             start,
-            retry_grpc_request_with_client_reconnect(
+            retry_action_cache_request(
                 self.grpc_clients.clone(),
-                GrpcClientKind::ActionCache,
                 self.runtime_opts.retries,
                 Duration::from_millis(self.runtime_opts.retry_max_delay_ms),
-                || {
-                    let grpc_clients = self.grpc_clients.clone();
+                false,
+                |mut client| {
                     let metadata = metadata.clone();
                     let action_digest = action_digest.clone();
                     let action_result = action_result.clone();
                     async move {
-                        let mut client = grpc_clients.action_cache_client().await?;
                         client
                             .update_action_result(with_re_metadata_timeout(
                                 UpdateActionResultRequest {
@@ -10381,6 +10444,8 @@ mod tests {
         go_away: Mutex<Option<(u32, Vec<u8>)>>,
         trailers_sent: AtomicUsize,
         connections: AtomicUsize,
+        /// The requests each connection carried, by the order the server accepted it in.
+        requests_by_connection: Mutex<HashMap<usize, usize>>,
     }
 
     fn h2_frame(kind: u8, flags: u8, stream: u32, payload: &[u8]) -> Vec<u8> {
@@ -10414,16 +10479,30 @@ mod tests {
     async fn serve_raw_h2(
         reply: impl Fn(&[u8]) -> RawReply + Send + Sync + 'static,
     ) -> anyhow::Result<(String, Arc<RawH2Log>, tokio::task::JoinHandle<()>)> {
+        serve_raw_h2_by_connection(move |_, request| reply(request)).await
+    }
+
+    /// `serve_raw_h2`, whose `reply` is also given the connection, numbered from 0 in the order
+    /// the server accepted it.
+    async fn serve_raw_h2_by_connection(
+        reply: impl Fn(usize, &[u8]) -> RawReply + Send + Sync + 'static,
+    ) -> anyhow::Result<(String, Arc<RawH2Log>, tokio::task::JoinHandle<()>)> {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
         let address = format!("grpc://{}", listener.local_addr()?);
         let log = Arc::new(RawH2Log::default());
-        let reply: Arc<dyn Fn(&[u8]) -> RawReply + Send + Sync> = Arc::new(reply);
+        let reply: Arc<dyn Fn(usize, &[u8]) -> RawReply + Send + Sync> = Arc::new(reply);
         let server = tokio::spawn({
             let log = log.clone();
             async move {
                 while let Ok((socket, _)) = listener.accept().await {
-                    log.connections.fetch_add(1, Ordering::SeqCst);
-                    tokio::spawn(serve_raw_h2_connection(socket, reply.clone(), log.clone()));
+                    let connection = log.connections.fetch_add(1, Ordering::SeqCst);
+                    let reply = reply.clone();
+                    tokio::spawn(serve_raw_h2_connection(
+                        socket,
+                        Arc::new(move |request: &[u8]| reply(connection, request)),
+                        connection,
+                        log.clone(),
+                    ));
                 }
             }
         });
@@ -10444,6 +10523,7 @@ mod tests {
     async fn serve_raw_h2_connection(
         socket: tokio::net::TcpStream,
         reply: Arc<dyn Fn(&[u8]) -> RawReply + Send + Sync>,
+        connection: usize,
         log: Arc<RawH2Log>,
     ) -> anyhow::Result<()> {
         let (mut reader, mut writer) = socket.into_split();
@@ -10498,6 +10578,11 @@ mod tests {
                         continue;
                     }
                     let body = bodies.remove(&stream).unwrap_or_default();
+                    *log.requests_by_connection
+                        .lock()
+                        .unwrap()
+                        .entry(connection)
+                        .or_default() += 1;
                     let (operation, trailers) = match reply(body.get(5..).unwrap_or_default()) {
                         RawReply::Operation(operation, trailers) => (operation, Some(trailers)),
                         RawReply::OperationThenClose(operation) => (operation, None),
@@ -10749,6 +10834,7 @@ mod tests {
                 grpc_request_timeout_secs: Some(30),
                 grpc_keepalive_time_secs: Some(1),
                 grpc_keepalive_timeout_secs: Some(1),
+                action_cache_connection_count: Some(1),
                 ..Default::default()
             },
         )
@@ -11977,6 +12063,148 @@ mod tests {
         assert_eq!(settled().await, before + 4);
         execute_raw_h2_action(&client).await?;
         server.abort();
+        Ok(())
+    }
+
+    /// A client whose action cache is `action_cache` over `opts.action_cache_connection_count`
+    /// connections, and whose other services are a server that answers nothing, so every
+    /// connection `action_cache` accepts is one of the pool's.
+    async fn action_cache_pool_client(
+        action_cache: String,
+        opts: Buck2OssReConfiguration,
+    ) -> anyhow::Result<(REClient, tokio::task::JoinHandle<()>)> {
+        let (others, _log, others_server) = serve_raw_h2(|_| RawReply::Close).await?;
+        let client = REClientBuilder::build_and_connect(&Buck2OssReConfiguration {
+            cas_address: Some(others.clone()),
+            engine_address: Some(others),
+            action_cache_address: Some(action_cache),
+            tls: Some(false),
+            capabilities: Some(false),
+            engine_connection_count: Some(1),
+            retry_max_delay_ms: Some(10),
+            ..opts
+        })
+        .await?;
+        Ok((client, others_server))
+    }
+
+    fn raw_action_result_reply() -> RawReply {
+        RawReply::Unary(
+            ActionResult {
+                execution_metadata: Some(ExecutedActionMetadata::default()),
+                ..Default::default()
+            }
+            .encode_to_vec(),
+        )
+    }
+
+    async fn raw_h2_lookup(client: &REClient) -> anyhow::Result<ActionResultResponse> {
+        client
+            .get_action_result(
+                &RemoteExecutionMetadata::default(),
+                ActionResultRequest {
+                    digest: TDigest {
+                        hash: "ab".repeat(32),
+                        size_in_bytes: 1,
+                        _dot_dot: (),
+                    },
+                    platform: None,
+                    _dot_dot: (),
+                },
+            )
+            .await
+    }
+
+    #[tokio::test]
+    async fn action_cache_lookups_take_the_pooled_connections_in_turn() -> anyhow::Result<()> {
+        let (address, log, server) =
+            serve_raw_h2_by_connection(|_, _| raw_action_result_reply()).await?;
+        let (client, others_server) = action_cache_pool_client(
+            address,
+            Buck2OssReConfiguration {
+                action_cache_connection_count: Some(4),
+                ..Default::default()
+            },
+        )
+        .await?;
+
+        for _ in 0..8 {
+            raw_h2_lookup(&client).await?;
+        }
+
+        assert_eq!(log.connections.load(Ordering::SeqCst), 4);
+        assert_eq!(
+            *log.requests_by_connection.lock().unwrap(),
+            (0..4)
+                .map(|connection| (connection, 2))
+                .collect::<HashMap<_, _>>()
+        );
+        server.abort();
+        others_server.abort();
+        Ok(())
+    }
+
+    /// One pooled connection stops answering while it still acknowledges PINGs, so keepalive
+    /// cannot tell, as the action cache connection did for 96 s on 2026-10-03. The lookups on
+    /// the other connections are answered at once. Each lookup on the stalled one times out,
+    /// is retried on another connection and succeeds, and only the stalled connection is
+    /// redialed.
+    #[tokio::test]
+    async fn a_stalled_action_cache_connection_delays_only_its_own_lookups() -> anyhow::Result<()> {
+        let (address, log, server) = serve_raw_h2_by_connection(|connection, _| {
+            if connection == 0 {
+                RawReply::Nothing
+            } else {
+                raw_action_result_reply()
+            }
+        })
+        .await?;
+        let (client, others_server) = action_cache_pool_client(
+            address,
+            Buck2OssReConfiguration {
+                action_cache_connection_count: Some(4),
+                grpc_request_timeout_secs: Some(2),
+                retries: Some(1),
+                ..Default::default()
+            },
+        )
+        .await?;
+
+        let started = Instant::now();
+        let lookups = futures::future::join_all((0..8).map(|_| async {
+            let result = raw_h2_lookup(&client).await;
+            (result, started.elapsed())
+        }))
+        .await;
+
+        for (result, _) in &lookups {
+            if let Err(err) = result {
+                panic!("every lookup succeeds, at the latest on its retry: {err:#}");
+            }
+        }
+        let answered_before_the_timeout = lookups
+            .iter()
+            .filter(|(_, elapsed)| *elapsed < Duration::from_secs(1))
+            .count();
+        assert_eq!(
+            answered_before_the_timeout,
+            6,
+            "{:?}",
+            lookups
+                .iter()
+                .map(|(_, elapsed)| elapsed)
+                .collect::<Vec<_>>()
+        );
+        let requests = log.requests_by_connection.lock().unwrap().clone();
+        assert_eq!(requests.get(&0), Some(&2), "{requests:?}");
+        assert_eq!(requests.values().sum::<usize>(), 10, "{requests:?}");
+        assert_eq!(
+            log.connections.load(Ordering::SeqCst),
+            5,
+            "the stalled connection is redialed once, and the others are kept"
+        );
+        server.abort();
+        others_server.abort();
         Ok(())
     }
 
