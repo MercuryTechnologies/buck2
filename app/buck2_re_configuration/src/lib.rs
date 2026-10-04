@@ -527,6 +527,10 @@ pub struct Buck2OssReConfiguration {
     /// when many actions issue independent calls. Recommended to raise
     /// only in combination with `[buck2] deduplicate_get_digests_ttl_calls`.
     pub find_missing_blobs_batch_size: Option<usize>,
+    /// How long, in milliseconds, a check of which blobs the CAS holds that is not part of an
+    /// upload waits for other checks to share its `FindMissingBlobs` RPC. 0 sends each check
+    /// as its own RPC.
+    pub find_missing_blobs_batch_window_ms: Option<u64>,
     /// Time that digests are assumed to live in CAS after being touched.
     pub cas_ttl_secs: Option<i64>,
     /// Whether to chunk large remote-cache blobs using FastCDC 2020 and SpliceBlob.
@@ -735,6 +739,10 @@ impl Buck2OssReConfiguration {
             find_missing_blobs_batch_size: legacy_config.parse(BuckconfigKeyRef {
                 section: BUCK2_RE_CLIENT_CFG_SECTION,
                 property: "find_missing_blobs_batch_size",
+            })?,
+            find_missing_blobs_batch_window_ms: legacy_config.parse(BuckconfigKeyRef {
+                section: BUCK2_RE_CLIENT_CFG_SECTION,
+                property: "find_missing_blobs_batch_window_ms",
             })?,
             cas_ttl_secs: legacy_config.parse(BuckconfigKeyRef {
                 section: BUCK2_RE_CLIENT_CFG_SECTION,

@@ -158,6 +158,10 @@ const DEFAULT_QUEUED_OPERATION_TIMEOUT_SECS: u64 = 15 * 60;
 /// Ten of the 60 s progress updates BuildBuddy's executor sends for a task it is running
 /// (v2.310.0 enterprise/server/remote_execution/executor/executor.go:58), missed in a row.
 const DEFAULT_STALLED_OPERATION_TIMEOUT_SECS: u64 = 10 * 60;
+/// Replaying the starts of the 83,812 FindMissingBlobs calls of a warm build (invocation
+/// 1107e6e3) through a 5 ms window leaves 16,534 RPCs and makes a call wait 3.1 ms on average,
+/// against a median of 42 ms for the RPC itself; 10 ms gains 7 more points for twice the wait.
+const DEFAULT_FIND_MISSING_BLOBS_BATCH_WINDOW_MS: u64 = 5;
 const DEFAULT_FAST_CDC_2020_AVG_CHUNK_SIZE: u64 = 512 * 1024;
 // Match Bazel's default gRPC remote-execution fanout: roughly 100 requests per
 // connection, with at most 100 connections unless explicitly overridden.
@@ -1997,6 +2001,9 @@ pub struct RERuntimeOpts {
     cas_ttl_secs: i64,
     /// Maximum number of digests per `FindMissingBlobs` RPC.
     find_missing_blobs_batch_size: usize,
+    /// How long a check that is not part of an upload waits for others to share its
+    /// `FindMissingBlobs` RPC; zero sends each check on its own.
+    find_missing_blobs_batch_window: Duration,
     /// Whether to chunk large remote-cache blobs using FastCDC 2020 and SpliceBlob.
     remote_cache_chunking: bool,
     /// Minimum blob size for remote cache compression.
@@ -3446,6 +3453,10 @@ impl REClientBuilder {
                     .find_missing_blobs_batch_size
                     .unwrap_or(100)
                     .max(1),
+                find_missing_blobs_batch_window: Duration::from_millis(
+                    opts.find_missing_blobs_batch_window_ms
+                        .unwrap_or(DEFAULT_FIND_MISSING_BLOBS_BATCH_WINDOW_MS),
+                ),
                 remote_cache_chunking: opts.remote_cache_chunking,
                 remote_cache_compression_threshold,
                 retries,
@@ -4320,8 +4331,20 @@ struct SharedCallFailure {
     final_for_every_caller: bool,
 }
 
+impl std::fmt::Display for SharedCallFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for SharedCallFailure {}
+
 impl SharedCallFailure {
     fn from_error(err: &anyhow::Error) -> Self {
+        // A failure shared by a FindMissingBlobs batch reaches each caller as it was.
+        if let Some(failure) = err.downcast_ref::<Self>() {
+            return failure.clone();
+        }
         Self {
             message: format!("{err:#}"),
             code: error_tcode(err),
@@ -4459,6 +4482,192 @@ impl<T> Drop for SharedCallRemoval<T> {
             if map.calls.get(digest).is_some_and(|(id, _)| *id == self.id) {
                 map.calls.remove(digest);
             }
+        }
+    }
+}
+
+/// FindMissingBlobs requests that callers made within `window` of each other, sent as one RPC
+/// of at most `max_digests` digests. Bazel's RemoteExecutionCache sends one findMissingDigests
+/// for all the inputs of an action and hands its answer, or its error, to each of them, through
+/// an AsyncSubject so that a subscriber that goes away does not cancel the call for the rest
+/// (src/main/java/com/google/devtools/build/lib/remote/RemoteExecutionCache.java). This does
+/// the same across callers: a batch is sent by a task of its own, so a caller that is dropped
+/// leaves the batch to the others.
+struct FindMissingBatcher {
+    window: Duration,
+    max_digests: usize,
+    open: Arc<Mutex<OpenFindMissingBatches>>,
+}
+
+#[derive(Default)]
+struct OpenFindMissingBatches {
+    next_id: u64,
+    /// Calls share a batch only when their request metadata reads the same, so the server sees
+    /// the RPC as it would have seen each call.
+    by_request_metadata: HashMap<Vec<String>, OpenFindMissingBatch>,
+}
+
+/// The fields of `metadata` that `with_re_metadata` puts on a request.
+fn find_missing_batch_key(metadata: &RemoteExecutionMetadata) -> Vec<String> {
+    let buck_info = metadata.buck_info.clone().unwrap_or_default();
+    let mut key = vec![
+        metadata.use_case_id.clone(),
+        metadata
+            .correlated_invocations_id
+            .clone()
+            .unwrap_or_default(),
+        buck_info.build_id,
+        buck_info.version,
+        metadata.action_id.clone().unwrap_or_default(),
+        metadata.action_mnemonic.clone().unwrap_or_default(),
+        metadata.target_id.clone().unwrap_or_default(),
+        metadata.configuration_id.clone().unwrap_or_default(),
+    ];
+    key.extend(
+        metadata
+            .platform
+            .iter()
+            .flat_map(|platform| &platform.properties)
+            .map(|property| format!("{}={}", property.name, property.value)),
+    );
+    key
+}
+
+type FindMissingAnswer = Result<Arc<HashSet<TDigest>>, SharedCallFailure>;
+
+struct OpenFindMissingBatch {
+    id: u64,
+    digests: Vec<TDigest>,
+    included: HashSet<TDigest>,
+    /// Hands the digests to the batch's task when the batch fills before its window ends.
+    full: tokio::sync::oneshot::Sender<Vec<TDigest>>,
+    answer: futures::future::Shared<tokio::sync::oneshot::Receiver<FindMissingAnswer>>,
+}
+
+impl OpenFindMissingBatch {
+    fn send_now(self) {
+        drop(self.full.send(self.digests));
+    }
+}
+
+impl FindMissingBatcher {
+    fn new(window: Duration, max_digests: usize) -> Self {
+        Self {
+            window,
+            max_digests,
+            open: Arc::default(),
+        }
+    }
+
+    /// Which of `digests`, at most `max_digests` of them, the CAS lacks.
+    fn find_missing_blobs(
+        &self,
+        context: &CasCallContext,
+        metadata: RemoteExecutionMetadata,
+        digests: Vec<TDigest>,
+    ) -> BoxFuture<'static, anyhow::Result<HashSet<TDigest>>> {
+        if self.window.is_zero() {
+            return context
+                .clone()
+                .find_missing_blobs(metadata, digests)
+                .boxed();
+        }
+        let key = find_missing_batch_key(&metadata);
+
+        let answer = {
+            let mut open = self.open.lock().unwrap();
+            if open
+                .by_request_metadata
+                .get(&key)
+                .is_some_and(|batch| batch.digests.len() + digests.len() > self.max_digests)
+            {
+                open.by_request_metadata.remove(&key).unwrap().send_now();
+            }
+            let open = &mut *open;
+            let batch = open
+                .by_request_metadata
+                .entry(key.clone())
+                .or_insert_with(|| {
+                    open.next_id += 1;
+                    self.start_batch(open.next_id, key.clone(), context, metadata)
+                });
+            for digest in &digests {
+                if batch.included.insert(digest.clone()) {
+                    batch.digests.push(digest.clone());
+                }
+            }
+            let answer = batch.answer.clone();
+            if batch.digests.len() >= self.max_digests {
+                open.by_request_metadata.remove(&key).unwrap().send_now();
+            }
+            answer
+        };
+
+        async move {
+            let missing = answer.await.unwrap_or_else(|_| {
+                Err(SharedCallFailure {
+                    message: "FindMissingBlobs batch ended without an answer".to_owned(),
+                    code: None,
+                    group: TCodeReasonGroup::UNKNOWN,
+                    final_for_every_caller: false,
+                })
+            })?;
+            Ok(digests
+                .into_iter()
+                .filter(|digest| missing.contains(digest))
+                .collect())
+        }
+        .boxed()
+    }
+
+    /// Spawns the task that sends batch `id` when its window ends or it fills, whichever comes
+    /// first.
+    fn start_batch(
+        &self,
+        id: u64,
+        key: Vec<String>,
+        context: &CasCallContext,
+        metadata: RemoteExecutionMetadata,
+    ) -> OpenFindMissingBatch {
+        let (full, mut filled) = tokio::sync::oneshot::channel();
+        let (answer_sender, answer) = tokio::sync::oneshot::channel();
+        let open = self.open.dupe();
+        let window = self.window;
+        let context = context.clone();
+        tokio::spawn(async move {
+            let digests = match tokio::time::timeout(window, &mut filled).await {
+                Ok(digests) => digests,
+                Err(_elapsed) => {
+                    let batch = {
+                        let mut open = open.lock().unwrap();
+                        match open.by_request_metadata.get(&key) {
+                            Some(batch) if batch.id == id => open.by_request_metadata.remove(&key),
+                            _ => None,
+                        }
+                    };
+                    match batch {
+                        Some(batch) => Ok(batch.digests),
+                        // A caller filled it as the window ended.
+                        None => filled.await,
+                    }
+                }
+            };
+            let Ok(digests) = digests else {
+                return;
+            };
+            let result = context
+                .find_missing_blobs(metadata, digests)
+                .await
+                .map(Arc::new)
+                .map_err(|err| SharedCallFailure::from_error(&err));
+            drop(answer_sender.send(result));
+        });
+        OpenFindMissingBatch {
+            id,
+            digests: Vec::new(),
+            included: HashSet::new(),
+            full,
+            answer: answer.shared(),
         }
     }
 }
@@ -4696,6 +4905,8 @@ pub struct REClient {
     /// The FindMissingBlobs calls in flight, by the digests they ask about, answering with the
     /// ones the CAS lacks.
     shared_find_missing: SharedCallRegistry<HashSet<TDigest>>,
+    /// Batches the FindMissingBlobs calls of checks that are not part of an upload.
+    find_missing_batcher: FindMissingBatcher,
 }
 
 impl Drop for REClient {
@@ -4782,6 +4993,10 @@ impl REClient {
             grpc_request_timeout: runtime_opts.grpc_request_timeout,
             request_digest_function_config: runtime_opts.request_digest_function_config,
         };
+        let find_missing_batcher = FindMissingBatcher::new(
+            runtime_opts.find_missing_blobs_batch_window,
+            runtime_opts.find_missing_blobs_batch_size,
+        );
         REClient {
             runtime_opts,
             grpc_clients,
@@ -4802,6 +5017,7 @@ impl REClient {
             cas_context,
             shared_batch_uploads: SharedCallRegistry::new(),
             shared_find_missing: SharedCallRegistry::new(),
+            find_missing_batcher,
         }
     }
 
@@ -6667,12 +6883,22 @@ impl REClient {
                 let started = own
                     .chunks(self.runtime_opts.find_missing_blobs_batch_size.max(1))
                     .map(|chunk| {
-                        let call = calls.start(
-                            chunk.to_vec(),
+                        // An upload asks about all of one action's inputs at once and waits on
+                        // the answer to start uploading, so only the other checks, such as the
+                        // one after each action cache hit, wait to share an RPC.
+                        let find_missing = if request.is_for_upload == Some(true) {
                             self.cas_context
                                 .clone()
-                                .find_missing_blobs(metadata.clone(), chunk.to_vec()),
-                        );
+                                .find_missing_blobs(metadata.clone(), chunk.to_vec())
+                                .boxed()
+                        } else {
+                            self.find_missing_batcher.find_missing_blobs(
+                                &self.cas_context,
+                                metadata.clone(),
+                                chunk.to_vec(),
+                            )
+                        };
+                        let call = calls.start(chunk.to_vec(), find_missing);
                         (chunk.to_vec(), call)
                     })
                     .collect::<Vec<_>>();
@@ -9398,6 +9624,7 @@ mod tests {
             max_concurrent_uploads_per_action: None,
             cas_ttl_secs: 0,
             find_missing_blobs_batch_size: 100,
+            find_missing_blobs_batch_window: Duration::ZERO,
             remote_cache_chunking: false,
             remote_cache_compression_threshold: DEFAULT_REMOTE_CACHE_COMPRESSION_THRESHOLD,
             retries: 0,
@@ -12778,6 +13005,9 @@ mod tests {
         asked: Mutex<HashMap<String, usize>>,
         /// How many BatchUpdateBlobs calls carried each hash.
         uploaded: Mutex<HashMap<String, usize>>,
+        find_missing_calls: AtomicUsize,
+        /// Errors the next FindMissingBlobs calls answer with, in order.
+        find_missing_failures: Mutex<VecDeque<tonic::Status>>,
         batch_update_calls: AtomicUsize,
         /// How long each FindMissingBlobs and BatchUpdateBlobs call takes to answer.
         delay: Duration,
@@ -12822,11 +13052,15 @@ mod tests {
             request: tonic::Request<FindMissingBlobsRequest>,
         ) -> Result<tonic::Response<FindMissingBlobsResponse>, tonic::Status> {
             let state = &self.0;
+            state.find_missing_calls.fetch_add(1, Ordering::SeqCst);
             let digests = request.into_inner().blob_digests;
             for digest in &digests {
                 *state.asked.lock().unwrap().entry(digest.hash.clone()).or_default() += 1;
             }
             tokio::time::sleep(state.delay).await;
+            if let Some(status) = state.find_missing_failures.lock().unwrap().pop_front() {
+                return Err(status);
+            }
             let stored = state.stored.lock().unwrap();
             Ok(tonic::Response::new(FindMissingBlobsResponse {
                 missing_blob_digests: digests
@@ -13061,6 +13295,208 @@ mod tests {
         assert!(ttl?.digests_with_ttl[0].ttl > 0);
         assert_eq!(state.asked(&digest), 0);
         assert_eq!(state.uploaded(&digest), 1);
+        Ok(())
+    }
+
+    /// The outputs of `actions` action cache hits, three each, with the CAS holding all of them
+    /// but those named in `evicted`.
+    fn cache_hit_outputs(
+        state: &FakeCasState,
+        actions: usize,
+        evicted: &[(usize, usize)],
+    ) -> Vec<Vec<TDigest>> {
+        let outputs = (0..actions)
+            .map(|action| {
+                (0..3)
+                    .map(|output| digest_for_test_data(format!("{action}/{output}").as_bytes()))
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let mut stored = state.stored.lock().unwrap();
+        for (action, digests) in outputs.iter().enumerate() {
+            for (output, digest) in digests.iter().enumerate() {
+                if !evicted.contains(&(action, output)) {
+                    stored.insert(digest.hash.clone());
+                }
+            }
+        }
+        outputs
+    }
+
+    fn expiration_check(digests: &[TDigest]) -> GetDigestsTtlRequest {
+        GetDigestsTtlRequest {
+            digests: digests.to_vec(),
+            is_for_upload: Some(false),
+            ..Default::default()
+        }
+    }
+
+    /// The digests of `response` the CAS reported missing.
+    fn reported_missing(response: &GetDigestsTtlResponse) -> Vec<TDigest> {
+        response
+            .digests_with_ttl
+            .iter()
+            .filter(|digest| digest.ttl <= 0)
+            .map(|digest| digest.digest.clone())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn checks_after_concurrent_cache_hits_share_one_find_missing() -> anyhow::Result<()> {
+        let state = Arc::new(FakeCasState::default());
+        let (client, _server) = fake_cas_client(state.clone(), Default::default()).await?;
+        let outputs = cache_hit_outputs(&state, 50, &[(7, 1), (31, 0)]);
+        let metadata = RemoteExecutionMetadata::default();
+
+        let results = futures::future::join_all(
+            outputs
+                .iter()
+                .map(|digests| client.get_digests_ttl(&metadata, expiration_check(digests))),
+        )
+        .await;
+
+        for (action, result) in results.into_iter().enumerate() {
+            let response = result?;
+            assert_eq!(response.digests_with_ttl.len(), 3);
+            let expected = match action {
+                7 => vec![outputs[7][1].clone()],
+                31 => vec![outputs[31][0].clone()],
+                _ => Vec::new(),
+            };
+            assert_eq!(reported_missing(&response), expected, "action {action}");
+        }
+        // 150 digests, at most 100 to an RPC by default.
+        assert_eq!(state.find_missing_calls.load(Ordering::SeqCst), 2);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn with_no_batch_window_each_check_sends_its_own_find_missing() -> anyhow::Result<()> {
+        let state = Arc::new(FakeCasState::default());
+        let (client, _server) = fake_cas_client(
+            state.clone(),
+            Buck2OssReConfiguration {
+                find_missing_blobs_batch_window_ms: Some(0),
+                ..Default::default()
+            },
+        )
+        .await?;
+        let outputs = cache_hit_outputs(&state, 8, &[(5, 2)]);
+        let metadata = RemoteExecutionMetadata::default();
+
+        let results = futures::future::join_all(
+            outputs
+                .iter()
+                .map(|digests| client.get_digests_ttl(&metadata, expiration_check(digests))),
+        )
+        .await;
+
+        for (action, result) in results.into_iter().enumerate() {
+            let expected = if action == 5 {
+                vec![outputs[5][2].clone()]
+            } else {
+                Vec::new()
+            };
+            assert_eq!(reported_missing(&result?), expected, "action {action}");
+        }
+        assert_eq!(state.find_missing_calls.load(Ordering::SeqCst), 8);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn an_evicted_output_is_reported_missing_to_its_action_alone() -> anyhow::Result<()> {
+        let state = Arc::new(FakeCasState::default());
+        let (client, _server) = fake_cas_client(state.clone(), Default::default()).await?;
+        let outputs = cache_hit_outputs(&state, 4, &[(2, 2)]);
+        let metadata = RemoteExecutionMetadata::default();
+
+        let results = futures::future::join_all(
+            outputs
+                .iter()
+                .map(|digests| client.get_digests_ttl(&metadata, expiration_check(digests))),
+        )
+        .await;
+
+        for (action, result) in results.into_iter().enumerate() {
+            let response = result?;
+            if action == 2 {
+                assert_eq!(reported_missing(&response), vec![outputs[2][2].clone()]);
+            } else {
+                assert!(reported_missing(&response).is_empty(), "action {action}");
+                assert!(
+                    response
+                        .digests_with_ttl
+                        .iter()
+                        .all(|digest| digest.ttl > 0)
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_failed_find_missing_fails_every_check_that_shared_it() -> anyhow::Result<()> {
+        let state = Arc::new(FakeCasState {
+            find_missing_failures: Mutex::new(VecDeque::from([tonic::Status::permission_denied(
+                "not this instance",
+            )])),
+            ..Default::default()
+        });
+        let (client, _server) = fake_cas_client(state.clone(), Default::default()).await?;
+        let mut outputs = cache_hit_outputs(&state, 4, &[]);
+        // Every action also asks about one shared blob, which the later ones join the first
+        // one's call for.
+        let shared = digest_for_test_data(b"a blob every action produced");
+        for digests in &mut outputs {
+            digests.push(shared.clone());
+        }
+        let metadata = RemoteExecutionMetadata::default();
+
+        let results = futures::future::join_all(
+            outputs
+                .iter()
+                .map(|digests| client.get_digests_ttl(&metadata, expiration_check(digests))),
+        )
+        .await;
+
+        for result in results {
+            let Err(err) = result else {
+                panic!("a check that shared the failed call succeeded");
+            };
+            assert_eq!(
+                err.downcast_ref::<REClientError>().map(|err| err.code),
+                Some(TCode::PERMISSION_DENIED),
+                "{err:#}"
+            );
+        }
+        assert_eq!(state.find_missing_calls.load(Ordering::SeqCst), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_check_dropped_before_its_batch_is_sent_leaves_the_batch_to_the_rest()
+    -> anyhow::Result<()> {
+        let state = Arc::new(FakeCasState::default());
+        let (client, _server) = fake_cas_client(state.clone(), Default::default()).await?;
+        let outputs = cache_hit_outputs(&state, 2, &[(1, 0)]);
+        let metadata = RemoteExecutionMetadata::default();
+
+        // The first check asks about the first output of the second action as well, joins a
+        // batch, and is dropped before the batch is sent.
+        let first = [outputs[0].clone(), vec![outputs[1][0].clone()]].concat();
+        assert!(
+            client
+                .get_digests_ttl(&metadata, expiration_check(&first))
+                .now_or_never()
+                .is_none()
+        );
+        let response = client
+            .get_digests_ttl(&metadata, expiration_check(&outputs[1]))
+            .await?;
+
+        assert_eq!(reported_missing(&response), vec![outputs[1][0].clone()]);
+        assert_eq!(state.find_missing_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(state.asked(&outputs[1][0]), 1);
         Ok(())
     }
 

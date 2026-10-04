@@ -577,12 +577,7 @@ impl CasDownloader<'_> {
         }
 
         let expirations = self.re_client.get_digest_expirations(digests).await?;
-        let now = Timestamp::now();
-        Ok(expirations.into_iter().find_map(
-            |(digest, expires)| {
-                if expires <= now { Some(digest) } else { None }
-            },
-        ))
+        Ok(first_expired_digest(expirations, Timestamp::now()))
     }
 
     async fn materialize_outputs(
@@ -608,6 +603,13 @@ fn re_forward_path(re_path: &str) -> buck2_error::Result<&ForwardRelativePath> {
     // RE sends us paths with trailing slash.
     ForwardRelativePath::new_trim_trailing_slashes(re_path)
         .buck_error_context("Path received from RE is not normalized.")
+}
+
+/// An output the CAS reported missing has a TTL of zero, so it expired when it was asked about.
+fn first_expired_digest(expirations: Vec<(TDigest, Timestamp)>, now: Timestamp) -> Option<TDigest> {
+    expirations
+        .into_iter()
+        .find_map(|(digest, expires)| if expires <= now { Some(digest) } else { None })
 }
 
 fn extracted_artifact_file_digests(
@@ -695,6 +697,37 @@ mod tests {
     use buck2_execute::re::error::test_re_error;
 
     use super::*;
+
+    #[test]
+    fn an_output_the_cas_reported_missing_makes_the_hit_a_miss() {
+        let present = TDigest {
+            hash: "0123456789abcdef0123456789abcdef01234567".to_owned(),
+            size_in_bytes: 1,
+            ..Default::default()
+        };
+        let missing = TDigest {
+            hash: "89abcdef0123456789abcdef0123456789abcdef".to_owned(),
+            size_in_bytes: 2,
+            ..Default::default()
+        };
+        let asked = Timestamp::now();
+        let expirations = vec![
+            (
+                present.clone(),
+                buck2_execute::re::ttl::re_expiration_from_ttl(asked, 3 * 60 * 60, &present),
+            ),
+            (
+                missing.clone(),
+                buck2_execute::re::ttl::re_expiration_from_ttl(asked, 0, &missing),
+            ),
+        ];
+
+        assert_eq!(
+            first_expired_digest(expirations.clone(), asked),
+            Some(missing.clone())
+        );
+        assert_eq!(first_expired_digest(expirations[..1].to_vec(), asked), None);
+    }
 
     #[test]
     fn identifies_missing_cas_errors() {
