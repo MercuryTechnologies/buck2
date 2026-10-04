@@ -162,6 +162,13 @@ const DEFAULT_STALLED_OPERATION_TIMEOUT_SECS: u64 = 10 * 60;
 /// 1107e6e3) through a 5 ms window leaves 16,534 RPCs and makes a call wait 3.1 ms on average,
 /// against a median of 42 ms for the RPC itself; 10 ms gains 7 more points for twice the wait.
 const DEFAULT_FIND_MISSING_BLOBS_BATCH_WINDOW_MS: u64 = 5;
+/// 99.6% of the 126,740 one-blob BatchReadBlobs calls of a cold build (invocation a5934f30,
+/// 2026-10-04) read a blob of 64 KiB or less, and all but 15 of its 17,844 distinct action
+/// stderr blobs were that small.
+const DEFAULT_READ_CACHE_MAX_BLOB_BYTES: usize = 64 * 1024;
+/// The 17,844 distinct stderr blobs of that build came to 11.6 MB, so 64 MiB keeps them all
+/// with room for the output trees read beside them, at a small part of a daemon's memory.
+const DEFAULT_READ_CACHE_BYTES: usize = 64 * 1024 * 1024;
 /// BuildBuddy answers an Execute with an Operation as soon as it has looked the action up in the
 /// cache and dispatched or merged it, before any executor is involved (v2.310.0
 /// enterprise/server/remote_execution/execution_server/execution_server.go:1124-1197, 1297-1306),
@@ -2128,6 +2135,11 @@ pub struct RERuntimeOpts {
     /// How long a check that is not part of an upload waits for others to share its
     /// `FindMissingBlobs` RPC; zero sends each check on its own.
     find_missing_blobs_batch_window: Duration,
+    /// How many bytes of small blobs the client keeps in memory after reading them; zero keeps
+    /// none.
+    read_cache_bytes: usize,
+    /// The largest blob the client keeps in memory after reading it; zero keeps none.
+    read_cache_max_blob_bytes: usize,
     /// Whether to chunk large remote-cache blobs using FastCDC 2020 and SpliceBlob.
     remote_cache_chunking: bool,
     /// Minimum blob size for remote cache compression.
@@ -3588,6 +3600,10 @@ impl REClientBuilder {
                     opts.find_missing_blobs_batch_window_ms
                         .unwrap_or(DEFAULT_FIND_MISSING_BLOBS_BATCH_WINDOW_MS),
                 ),
+                read_cache_bytes: opts.read_cache_bytes.unwrap_or(DEFAULT_READ_CACHE_BYTES),
+                read_cache_max_blob_bytes: opts
+                    .read_cache_max_blob_bytes
+                    .unwrap_or(DEFAULT_READ_CACHE_MAX_BLOB_BYTES),
                 remote_cache_chunking: opts.remote_cache_chunking,
                 remote_cache_compression_threshold,
                 retries,
@@ -4929,6 +4945,340 @@ impl CasCallContext {
     }
 }
 
+impl CasCallContext {
+    /// BatchReadBlobs, retried as every read is.
+    async fn batch_read_blobs(
+        self,
+        metadata: RemoteExecutionMetadata,
+        re_request: BatchReadBlobsRequest,
+    ) -> anyhow::Result<BatchReadBlobsResponse> {
+        let (digest_count, bytes) = request_stats_for_grpc_digests(re_request.digests.iter());
+        let mut start = remote_request_start("CAS", "BatchReadBlobs", &metadata, None);
+        start.digest_count = Some(digest_count);
+        start.bytes = Some(bytes);
+        remote_request_span(
+            start,
+            retry_grpc_request_with_client_reconnect(
+                self.grpc_clients.clone(),
+                GrpcClientKind::Cas,
+                self.retries,
+                self.retry_max_delay,
+                || {
+                    let metadata = metadata.clone();
+                    let re_request = re_request.clone();
+                    let context = self.clone();
+                    async move {
+                        let mut client = context.grpc_clients.cas_client().await?;
+                        Ok(client
+                            .batch_read_blobs(with_re_metadata_timeout(
+                                re_request,
+                                metadata,
+                                context.use_fbcode_metadata,
+                                &context.request_metadata_tool_name,
+                                context.grpc_request_timeout,
+                            ))
+                            .await?
+                            .into_inner())
+                    }
+                },
+            ),
+        )
+        .await
+    }
+}
+
+/// One blob of a BatchReadBlobs answer, or the reason the CAS did not return it.
+type BlobRead = Result<Arc<[u8]>, SharedCallFailure>;
+
+/// The blobs of one or more BatchReadBlobs answers, by digest.
+type BlobReads = HashMap<TDigest, BlobRead>;
+
+/// Sends one BatchReadBlobs request with the given request metadata.
+type SendBatchRead = Arc<
+    dyn Fn(
+            RemoteExecutionMetadata,
+            BatchReadBlobsRequest,
+        ) -> BoxFuture<'static, anyhow::Result<BatchReadBlobsResponse>>
+        + Send
+        + Sync,
+>;
+
+/// What decides how blobs are packed into BatchReadBlobs requests.
+#[derive(Clone)]
+struct BatchReadShape {
+    instance_name: Arc<str>,
+    max_total_batch_size: usize,
+    bystream_compressor: Option<Compressor>,
+    remote_cache_compression_threshold: usize,
+    request_digest_function_config: DigestFunctionConfig,
+}
+
+impl BatchReadShape {
+    /// Whether `digest` is read through BatchReadBlobs: it has content, and fits in one request.
+    /// The rest are empty or go through ByteStream.
+    fn is_batched(&self, digest: &TDigest) -> bool {
+        digest.size_in_bytes > 0 && digest.size_in_bytes as usize <= self.max_total_batch_size
+    }
+
+    fn compressor_for(&self, digest: &TDigest) -> Option<Compressor> {
+        compression_for_blob(
+            self.bystream_compressor,
+            digest.size_in_bytes,
+            self.remote_cache_compression_threshold,
+        )
+    }
+
+    /// The BatchReadBlobs requests for the batched digests of `digests`, each read once, in
+    /// requests of at most `max_total_batch_size` bytes that ask for one compressor.
+    fn requests(&self, digests: impl IntoIterator<Item = TDigest>) -> Vec<BatchReadBlobsRequest> {
+        let new_read_blob_req =
+            |digests: &mut Vec<Digest>, batch_compressor: Option<Compressor>| {
+                let digest_function = self
+                    .request_digest_function_config
+                    .for_common_digest_function(digests);
+                let mut acceptable_compressors = vec![compressor::Value::Identity as i32];
+                if let Some(compressor) = batch_compressor {
+                    acceptable_compressors.push(compressor.as_grpc());
+                }
+                BatchReadBlobsRequest {
+                    instance_name: self.instance_name.to_string(),
+                    digests: std::mem::take(digests),
+                    acceptable_compressors,
+                    digest_function: digest_function_to_grpc(digest_function),
+                    ..Default::default()
+                }
+            };
+
+        let mut seen = HashSet::new();
+        let mut curr_size = 0;
+        let mut requests = vec![];
+        let mut curr_digests = vec![];
+        let mut curr_batch_compressor = None;
+        for digest in digests {
+            if !self.is_batched(&digest) || !seen.insert(digest.clone()) {
+                continue;
+            }
+            let digest_compressor = self.compressor_for(&digest);
+            let digest = tdigest_to(digest);
+            let would_exceed = curr_size + digest.size_bytes > self.max_total_batch_size as i64;
+            if !curr_digests.is_empty()
+                && (would_exceed || digest_compressor != curr_batch_compressor)
+            {
+                requests.push(new_read_blob_req(&mut curr_digests, curr_batch_compressor));
+                curr_size = digest.size_bytes;
+            } else {
+                curr_size += digest.size_bytes;
+            }
+            curr_digests.push(digest);
+            curr_batch_compressor = digest_compressor;
+        }
+
+        if !curr_digests.is_empty() {
+            requests.push(new_read_blob_req(&mut curr_digests, curr_batch_compressor));
+        }
+        requests
+    }
+}
+
+/// Sends `requests` one after another and answers with each blob they asked for. A failed RPC
+/// fails the whole read; a blob the CAS answered with a status other than OK, or whose data
+/// cannot be decompressed, fails only that blob.
+async fn read_blob_batches<Cas>(
+    requests: Vec<BatchReadBlobsRequest>,
+    cas_f: impl Fn(BatchReadBlobsRequest) -> Cas,
+) -> anyhow::Result<BlobReads>
+where
+    Cas: Future<Output = anyhow::Result<BatchReadBlobsResponse>>,
+{
+    let mut blobs = HashMap::new();
+    for read_blob_req in requests {
+        let requested_digests = read_blob_req.digests.clone();
+        let resp = cas_f(read_blob_req)
+            .await
+            .context("Failed to make BatchReadBlobs request")?;
+        validate_batch_read_blobs_response_digests(&requested_digests, &resp)?;
+        for r in resp.responses.into_iter() {
+            let digest = tdigest_from(r.digest.context("Response digest not found.")?);
+            let blob: anyhow::Result<Vec<u8>> = async {
+                check_status(r.status.unwrap_or_default())?;
+                match Compressor::from_grpc(r.compressor) {
+                    Some(compressor) => decompress_data(r.data, compressor)
+                        .await
+                        .with_context(|| format!("Failed to decompress batch blob `{digest}`")),
+                    None if r.compressor == compressor::Value::Identity as i32 => Ok(r.data),
+                    None => Err(anyhow::anyhow!(
+                        "Unsupported BatchReadBlobs response compressor `{}` for `{}`",
+                        r.compressor,
+                        digest
+                    )),
+                }
+            }
+            .await;
+            blobs.insert(
+                digest,
+                blob.map(Arc::from)
+                    .map_err(|err| SharedCallFailure::from_error(&err)),
+            );
+        }
+    }
+    Ok(blobs)
+}
+
+/// The small blobs read most recently, up to `max_bytes` of them. Content-addressed blobs never
+/// change, so an entry is never stale; it only ages out.
+struct SmallBlobCache {
+    entries: LruCache<TDigest, Arc<[u8]>>,
+    bytes: usize,
+    max_bytes: usize,
+    max_blob_bytes: usize,
+}
+
+impl SmallBlobCache {
+    /// None when either limit is 0, which turns the cache off.
+    fn new(max_bytes: usize, max_blob_bytes: usize) -> Option<Self> {
+        if max_bytes == 0 || max_blob_bytes == 0 {
+            return None;
+        }
+        Some(Self {
+            entries: LruCache::unbounded(),
+            bytes: 0,
+            max_bytes,
+            max_blob_bytes,
+        })
+    }
+
+    fn get(&mut self, digest: &TDigest) -> Option<Arc<[u8]>> {
+        self.entries.get(digest).cloned()
+    }
+
+    fn put(&mut self, digest: TDigest, blob: Arc<[u8]>) {
+        if blob.len() > self.max_blob_bytes
+            || blob.len() > self.max_bytes
+            || self.entries.contains(&digest)
+        {
+            return;
+        }
+        self.bytes += blob.len();
+        self.entries.put(digest, blob);
+        while self.bytes > self.max_bytes {
+            match self.entries.pop_lru() {
+                Some((_, evicted)) => self.bytes -= evicted.len(),
+                None => break,
+            }
+        }
+    }
+}
+
+/// Reads small blobs for every download of the client. A blob read recently comes from memory,
+/// a blob another download is reading already is waited for, and only the rest are asked of the
+/// CAS. The in-flight join is the registry uploads use, after Bazel's `AsyncTaskCache`
+/// (src/main/java/com/google/devtools/build/lib/remote/util/AsyncTaskCache.java).
+struct SmallBlobReader {
+    shape: BatchReadShape,
+    send: SendBatchRead,
+    cache: Option<Arc<Mutex<SmallBlobCache>>>,
+    in_flight: SharedCallRegistry<BlobReads>,
+}
+
+impl SmallBlobReader {
+    fn new(shape: BatchReadShape, send: SendBatchRead, cache: Option<SmallBlobCache>) -> Self {
+        Self {
+            shape,
+            send,
+            cache: cache.map(|cache| Arc::new(Mutex::new(cache))),
+            in_flight: SharedCallRegistry::new(),
+        }
+    }
+
+    /// The batched digests of `digests`. A failed RPC fails the read, and so does a failed
+    /// RPC this read joined. No failure is remembered: the next read of the digest asks again.
+    async fn read(
+        &self,
+        metadata: &RemoteExecutionMetadata,
+        digests: impl IntoIterator<Item = TDigest>,
+    ) -> anyhow::Result<BlobReads> {
+        let mut blobs = HashMap::new();
+        let mut to_read = Vec::new();
+        {
+            let mut seen = HashSet::new();
+            let mut cache = self.cache.as_ref().map(|cache| cache.lock().unwrap());
+            for digest in digests {
+                if !self.shape.is_batched(&digest) || !seen.insert(digest.clone()) {
+                    continue;
+                }
+                match cache.as_mut().and_then(|cache| cache.get(&digest)) {
+                    Some(blob) => {
+                        blobs.insert(digest, Ok(blob));
+                    }
+                    None => to_read.push(digest),
+                }
+            }
+        }
+        if to_read.is_empty() {
+            return Ok(blobs);
+        }
+
+        let (started, joined) = {
+            let mut calls = self.in_flight.lock();
+            let mut joined = Vec::new();
+            let mut own = Vec::new();
+            for digest in to_read {
+                match calls.get(&digest) {
+                    Some(call) => joined.push((digest, call)),
+                    None => own.push(digest),
+                }
+            }
+            let started = if own.is_empty() {
+                None
+            } else {
+                let call = self.read_from_cas(metadata.clone(), own.clone());
+                Some(calls.start(own, call))
+            };
+            (started, joined)
+        };
+
+        if let Some(call) = started {
+            let read = call.await.map_err(SharedCallFailure::into_error)?;
+            blobs.extend(
+                read.iter()
+                    .map(|(digest, blob)| (digest.clone(), blob.clone())),
+            );
+        }
+        for (digest, call) in joined {
+            let read = call.await.map_err(SharedCallFailure::into_error)?;
+            if let Some(blob) = read.get(&digest) {
+                blobs.insert(digest, blob.clone());
+            }
+        }
+        Ok(blobs)
+    }
+
+    /// Reads `digests` from the CAS and keeps the small blobs it gets in the cache.
+    fn read_from_cas(
+        &self,
+        metadata: RemoteExecutionMetadata,
+        digests: Vec<TDigest>,
+    ) -> BoxFuture<'static, anyhow::Result<BlobReads>> {
+        let requests = self.shape.requests(digests);
+        let send = self.send.dupe();
+        let cache = self.cache.dupe();
+        async move {
+            let blobs =
+                read_blob_batches(requests, |request| send(metadata.clone(), request)).await?;
+            if let Some(cache) = cache {
+                let mut cache = cache.lock().unwrap();
+                for (digest, blob) in &blobs {
+                    if let Ok(blob) = blob {
+                        cache.put(digest.clone(), blob.clone());
+                    }
+                }
+            }
+            Ok(blobs)
+        }
+        .boxed()
+    }
+}
+
 enum ActiveDownloadResult {
     Bytes(Vec<u8>),
     File(PathBuf),
@@ -5039,6 +5389,8 @@ pub struct REClient {
     shared_find_missing: SharedCallRegistry<HashSet<TDigest>>,
     /// Batches the FindMissingBlobs calls of checks that are not part of an upload.
     find_missing_batcher: FindMissingBatcher,
+    /// Reads the blobs small enough for BatchReadBlobs.
+    small_blob_reader: SmallBlobReader,
 }
 
 impl Drop for REClient {
@@ -5129,6 +5481,26 @@ impl REClient {
             runtime_opts.find_missing_blobs_batch_window,
             runtime_opts.find_missing_blobs_batch_size,
         );
+        let small_blob_reader = {
+            let context = cas_context.clone();
+            SmallBlobReader::new(
+                BatchReadShape {
+                    instance_name: Arc::from(instance_name.as_str()),
+                    max_total_batch_size: capabilities.max_total_batch_size,
+                    bystream_compressor,
+                    remote_cache_compression_threshold: runtime_opts
+                        .remote_cache_compression_threshold,
+                    request_digest_function_config: runtime_opts.request_digest_function_config,
+                },
+                Arc::new(move |metadata, request| {
+                    context.clone().batch_read_blobs(metadata, request).boxed()
+                }),
+                SmallBlobCache::new(
+                    runtime_opts.read_cache_bytes,
+                    runtime_opts.read_cache_max_blob_bytes,
+                ),
+            )
+        };
         REClient {
             runtime_opts,
             grpc_clients,
@@ -5150,6 +5522,7 @@ impl REClient {
             shared_batch_uploads: SharedCallRegistry::new(),
             shared_find_missing: SharedCallRegistry::new(),
             find_missing_batcher,
+            small_blob_reader,
         }
     }
 
@@ -6611,43 +6984,9 @@ impl REClient {
             self.runtime_opts.bytestream_progress_timeout,
             &self.active_downloads,
             self.shared_cache.as_ref(),
-            |re_request| {
+            |digests| {
                 let metadata = metadata.clone();
-                async move {
-                    let (digest_count, bytes) =
-                        request_stats_for_grpc_digests(re_request.digests.iter());
-                    let mut start = remote_request_start("CAS", "BatchReadBlobs", &metadata, None);
-                    start.digest_count = Some(digest_count);
-                    start.bytes = Some(bytes);
-                    remote_request_span(
-                        start,
-                        retry_grpc_request_with_client_reconnect(
-                            self.grpc_clients.clone(),
-                            GrpcClientKind::Cas,
-                            self.runtime_opts.retries,
-                            Duration::from_millis(self.runtime_opts.retry_max_delay_ms),
-                            || {
-                                let grpc_clients = self.grpc_clients.clone();
-                                let metadata = metadata.clone();
-                                let re_request = re_request.clone();
-                                async move {
-                                    let mut client = grpc_clients.cas_client().await?;
-                                    Ok(client
-                                        .batch_read_blobs(with_re_metadata_timeout(
-                                            re_request,
-                                            metadata,
-                                            self.runtime_opts.use_fbcode_metadata,
-                                            self.runtime_opts.request_metadata_tool_name.as_str(),
-                                            self.runtime_opts.grpc_request_timeout,
-                                        ))
-                                        .await?
-                                        .into_inner())
-                                }
-                            },
-                        ),
-                    )
-                    .await
-                }
+                async move { self.small_blob_reader.read(&metadata, digests).await }
             },
             |read_request| {
                 let metadata = metadata.clone();
@@ -7767,7 +8106,7 @@ async fn read_with_progress_timeout(
     }
 }
 
-async fn download_impl<Byt, BytRet, Cas, RetryFut>(
+async fn download_impl<Byt, BytRet, Reads, RetryFut>(
     instance_name: &InstanceName,
     request: DownloadRequest,
     bystream_compressor: Option<Compressor>,
@@ -7780,14 +8119,14 @@ async fn download_impl<Byt, BytRet, Cas, RetryFut>(
     bystream_progress_timeout: Duration,
     active_downloads: &ActiveTransferRegistry<ActiveDownloadResult>,
     shared_cache: Option<&SharedCasCache>,
-    cas_f: impl Fn(BatchReadBlobsRequest) -> Cas,
+    read_small_blobs: impl FnOnce(Vec<TDigest>) -> Reads,
     bystream_fut: impl Fn(ReadRequest) -> Byt + Sync + Send + Copy,
     bystream_retry_hook: impl Fn() -> RetryFut + Sync + Send + Copy,
 ) -> anyhow::Result<DownloadResponse>
 where
     Byt: Future<Output = anyhow::Result<Pin<Box<BytRet>>>>,
     BytRet: Stream<Item = Result<ReadResponse, tonic::Status>> + Send + 'static,
-    Cas: Future<Output = anyhow::Result<BatchReadBlobsResponse>>,
+    Reads: Future<Output = anyhow::Result<BlobReads>>,
     RetryFut: Future<Output = ()>,
 {
     fn resource_name(
@@ -7907,82 +8246,25 @@ where
         None => request.file_digests.unwrap_or_default(),
     };
 
-    let new_read_blob_req = |digests: &mut Vec<Digest>, batch_compressor: Option<Compressor>| {
-        let digest_function = request_digest_function_config.for_common_digest_function(digests);
-        let mut acceptable_compressors = vec![compressor::Value::Identity as i32];
-        if let Some(compressor) = batch_compressor {
-            acceptable_compressors.push(compressor.as_grpc());
-        }
-        BatchReadBlobsRequest {
-            instance_name: instance_name.as_str().to_owned(),
-            digests: std::mem::take(digests),
-            acceptable_compressors,
-            digest_function: digest_function_to_grpc(digest_function),
-            ..Default::default()
-        }
-    };
-
-    let mut curr_size = 0;
-    let mut requests = vec![];
-    let mut curr_digests = vec![];
-    let mut curr_batch_compressor = None;
-    for digest in file_digests
+    let small_digests = file_digests
         .iter()
         .map(|req| &req.named_digest.digest)
         .chain(inlined_digests.iter())
-        .map(|d| tdigest_to(d.clone()))
-        .filter(|d| d.size_bytes > 0)
-    {
-        if digest.size_bytes as usize > max_total_batch_size {
-            // digest is too big to download in a BatchReadBlobsRequest
-            // need to use the bytstream api
-            continue;
-        }
-        let digest_compressor = compression_for_blob(
-            bystream_compressor,
-            digest.size_bytes,
-            remote_cache_compression_threshold,
-        );
-        let would_exceed = curr_size + digest.size_bytes > max_total_batch_size as i64;
-        if !curr_digests.is_empty() && (would_exceed || digest_compressor != curr_batch_compressor)
-        {
-            requests.push(new_read_blob_req(&mut curr_digests, curr_batch_compressor));
-            curr_size = digest.size_bytes;
-        } else {
-            curr_size += digest.size_bytes;
-        }
-        curr_digests.push(digest.clone());
-        curr_batch_compressor = digest_compressor;
-    }
-
-    if !curr_digests.is_empty() {
-        requests.push(new_read_blob_req(&mut curr_digests, curr_batch_compressor));
-    }
-
-    let mut batched_blobs_response = HashMap::new();
-    for read_blob_req in requests {
-        let requested_digests = read_blob_req.digests.clone();
-        let resp = cas_f(read_blob_req)
-            .await
-            .context("Failed to make BatchReadBlobs request")?;
-        validate_batch_read_blobs_response_digests(&requested_digests, &resp)?;
-        for r in resp.responses.into_iter() {
-            let digest = tdigest_from(r.digest.context("Response digest not found.")?);
-            check_status(r.status.unwrap_or_default())?;
-            let data = match Compressor::from_grpc(r.compressor) {
-                Some(compressor) => decompress_data(r.data, compressor)
-                    .await
-                    .with_context(|| format!("Failed to decompress batch blob `{digest}`"))?,
-                None if r.compressor == compressor::Value::Identity as i32 => r.data,
-                None => {
-                    return Err(anyhow::anyhow!(
-                        "Unsupported BatchReadBlobs response compressor `{}` for `{}`",
-                        r.compressor,
-                        digest
-                    ));
-                }
-            };
-            batched_blobs_response.insert(digest, data);
+        .filter(|digest| {
+            digest.size_in_bytes > 0 && digest.size_in_bytes as usize <= max_total_batch_size
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    let batched_blobs_response = if small_digests.is_empty() {
+        HashMap::new()
+    } else {
+        read_small_blobs(small_digests.clone()).await?
+    };
+    // A blob the CAS did not return fails the download before any file is written, as one
+    // failed blob of a BatchReadBlobs answer always has.
+    for digest in &small_digests {
+        if let Some(Err(failure)) = batched_blobs_response.get(digest) {
+            return Err(failure.clone().into_error());
         }
     }
 
@@ -8002,10 +8284,15 @@ where
             return Ok(Vec::new());
         }
 
-        let data = batched_blobs_response
-            .get(digest)
-            .with_context(|| format!("Did not receive digest data for `{digest}`"))?
-            .clone();
+        let data = match batched_blobs_response.get(digest) {
+            Some(Ok(data)) => data.to_vec(),
+            Some(Err(failure)) => return Err(failure.clone().into_error()),
+            None => {
+                return Err(anyhow::anyhow!(
+                    "Did not receive digest data for `{digest}`"
+                ));
+            }
+        };
         validate_downloaded_blob(
             digest,
             &data,
@@ -9156,6 +9443,13 @@ mod tests {
         Cas: std::future::Future<Output = anyhow::Result<BatchReadBlobsResponse>>,
     {
         let active_downloads = ActiveTransferRegistry::new();
+        let shape = BatchReadShape {
+            instance_name: Arc::from(instance_name.as_str()),
+            max_total_batch_size,
+            bystream_compressor,
+            remote_cache_compression_threshold: DEFAULT_REMOTE_CACHE_COMPRESSION_THRESHOLD,
+            request_digest_function_config,
+        };
         download_impl(
             instance_name,
             request,
@@ -9169,7 +9463,7 @@ mod tests {
             Duration::from_secs(DEFAULT_BYTESTREAM_PROGRESS_TIMEOUT_SECS),
             &active_downloads,
             shared_cache,
-            cas_f,
+            |digests| read_blob_batches(shape.requests(digests), cas_f),
             bystream_fut,
             || async {},
         )
@@ -9793,6 +10087,8 @@ mod tests {
             cas_ttl_secs: 0,
             find_missing_blobs_batch_size: 100,
             find_missing_blobs_batch_window: Duration::ZERO,
+            read_cache_bytes: 0,
+            read_cache_max_blob_bytes: 0,
             remote_cache_chunking: false,
             remote_cache_compression_threshold: DEFAULT_REMOTE_CACHE_COMPRESSION_THRESHOLD,
             retries: 0,
@@ -13475,7 +13771,17 @@ mod tests {
         /// Errors the next FindMissingBlobs calls answer with, in order.
         find_missing_failures: Mutex<VecDeque<tonic::Status>>,
         batch_update_calls: AtomicUsize,
-        /// How long each FindMissingBlobs and BatchUpdateBlobs call takes to answer.
+        /// The contents of the blobs BatchReadBlobs can read, by hash.
+        readable: Mutex<HashMap<String, Vec<u8>>>,
+        /// How many BatchReadBlobs calls asked for each hash.
+        read: Mutex<HashMap<String, usize>>,
+        batch_read_calls: AtomicUsize,
+        /// How many digests the BatchReadBlobs calls asked for, in all.
+        batch_read_digests: AtomicUsize,
+        /// Errors the next BatchReadBlobs calls answer with, in order.
+        batch_read_failures: Mutex<VecDeque<tonic::Status>>,
+        /// How long each FindMissingBlobs, BatchUpdateBlobs and BatchReadBlobs call takes to
+        /// answer.
         delay: Duration,
         script: Mutex<VecDeque<FakeBatchUpdate>>,
     }
@@ -13497,6 +13803,20 @@ mod tests {
                 .get(&digest.hash)
                 .copied()
                 .unwrap_or(0)
+        }
+
+        /// Makes `data` readable, and answers with its digest.
+        fn holds(&self, data: &[u8]) -> TDigest {
+            let digest = digest_for_test_data(data);
+            self.readable
+                .lock()
+                .unwrap()
+                .insert(digest.hash.clone(), data.to_vec());
+            digest
+        }
+
+        fn batch_reads(&self) -> usize {
+            self.batch_read_calls.load(Ordering::SeqCst)
         }
     }
 
@@ -13579,9 +13899,42 @@ mod tests {
 
         async fn batch_read_blobs(
             &self,
-            _request: tonic::Request<BatchReadBlobsRequest>,
+            request: tonic::Request<BatchReadBlobsRequest>,
         ) -> Result<tonic::Response<BatchReadBlobsResponse>, tonic::Status> {
-            Err(tonic::Status::unimplemented("not used by these tests"))
+            let state = &self.0;
+            state.batch_read_calls.fetch_add(1, Ordering::SeqCst);
+            let digests = request.into_inner().digests;
+            state
+                .batch_read_digests
+                .fetch_add(digests.len(), Ordering::SeqCst);
+            for digest in &digests {
+                *state.read.lock().unwrap().entry(digest.hash.clone()).or_default() += 1;
+            }
+            tokio::time::sleep(state.delay).await;
+            if let Some(status) = state.batch_read_failures.lock().unwrap().pop_front() {
+                return Err(status);
+            }
+            let readable = state.readable.lock().unwrap();
+            Ok(tonic::Response::new(BatchReadBlobsResponse {
+                responses: digests
+                    .into_iter()
+                    .map(|digest| match readable.get(&digest.hash) {
+                        Some(data) => batch_read_blobs_response::Response {
+                            digest: Some(digest),
+                            data: data.clone(),
+                            ..Default::default()
+                        },
+                        None => batch_read_blobs_response::Response {
+                            digest: Some(digest),
+                            status: Some(Status {
+                                code: Code::NotFound as i32,
+                                ..Default::default()
+                            }),
+                            ..Default::default()
+                        },
+                    })
+                    .collect(),
+            }))
         }
 
         async fn get_tree(
@@ -14108,6 +14461,246 @@ mod tests {
         Ok(())
     }
 
+    fn inlined_read(digests: &[TDigest]) -> DownloadRequest {
+        DownloadRequest {
+            inlined_digests: Some(digests.to_vec()),
+            ..Default::default()
+        }
+    }
+
+    /// The bytes of each blob of `response`.
+    fn read_blobs(response: anyhow::Result<DownloadResponse>) -> anyhow::Result<Vec<Vec<u8>>> {
+        Ok(response?
+            .inlined_blobs
+            .unwrap_or_default()
+            .into_iter()
+            .map(|blob| blob.blob)
+            .collect())
+    }
+
+    #[tokio::test]
+    async fn concurrent_reads_of_one_blob_send_one_batch_read() -> anyhow::Result<()> {
+        let state = Arc::new(FakeCasState {
+            delay: Duration::from_millis(300),
+            ..Default::default()
+        });
+        let (client, _server) = fake_cas_client(state.clone(), Default::default()).await?;
+        let data = b"a stderr eight actions printed";
+        let digest = state.holds(data);
+        let metadata = RemoteExecutionMetadata::default();
+
+        let results = futures::future::join_all(
+            (0..8).map(|_| client.download(&metadata, inlined_read(std::slice::from_ref(&digest)))),
+        )
+        .await;
+
+        for result in results {
+            assert_eq!(read_blobs(result)?, vec![data.to_vec()]);
+        }
+        assert_eq!(state.batch_reads(), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_blob_asked_for_twice_in_one_download_is_read_once() -> anyhow::Result<()> {
+        let state = Arc::new(FakeCasState::default());
+        let (client, _server) = fake_cas_client(state.clone(), Default::default()).await?;
+        let data = b"a tree two outputs share";
+        let digest = state.holds(data);
+
+        let blobs = read_blobs(
+            client
+                .download(
+                    &RemoteExecutionMetadata::default(),
+                    inlined_read(&[digest.clone(), digest.clone()]),
+                )
+                .await,
+        )?;
+
+        assert_eq!(blobs, vec![data.to_vec(), data.to_vec()]);
+        assert_eq!(state.batch_read_digests.load(Ordering::SeqCst), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_small_blob_read_again_comes_from_memory() -> anyhow::Result<()> {
+        let state = Arc::new(FakeCasState::default());
+        let (client, _server) = fake_cas_client(state.clone(), Default::default()).await?;
+        let data = b"a stderr two actions printed, one after the other";
+        let digest = state.holds(data);
+        let metadata = RemoteExecutionMetadata::default();
+
+        for _ in 0..2 {
+            let blobs = read_blobs(
+                client
+                    .download(&metadata, inlined_read(std::slice::from_ref(&digest)))
+                    .await,
+            )?;
+            assert_eq!(blobs, vec![data.to_vec()]);
+        }
+        assert_eq!(state.batch_reads(), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_blob_over_the_cache_limits_is_read_each_time() -> anyhow::Result<()> {
+        for opts in [
+            Buck2OssReConfiguration {
+                read_cache_max_blob_bytes: Some(16),
+                ..Default::default()
+            },
+            Buck2OssReConfiguration {
+                read_cache_bytes: Some(16),
+                ..Default::default()
+            },
+            Buck2OssReConfiguration {
+                read_cache_bytes: Some(0),
+                ..Default::default()
+            },
+            Buck2OssReConfiguration {
+                read_cache_max_blob_bytes: Some(0),
+                ..Default::default()
+            },
+        ] {
+            let state = Arc::new(FakeCasState::default());
+            let (client, _server) = fake_cas_client(state.clone(), opts.clone()).await?;
+            let data = b"thirty-two bytes, over the limit";
+            let digest = state.holds(data);
+            let metadata = RemoteExecutionMetadata::default();
+
+            for _ in 0..2 {
+                let blobs = read_blobs(
+                    client
+                        .download(&metadata, inlined_read(std::slice::from_ref(&digest)))
+                        .await,
+                )?;
+                assert_eq!(blobs, vec![data.to_vec()]);
+            }
+            assert_eq!(state.batch_reads(), 2, "{opts:?}");
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_failed_read_reaches_every_waiter_and_is_not_remembered() -> anyhow::Result<()> {
+        let state = Arc::new(FakeCasState {
+            delay: Duration::from_millis(300),
+            batch_read_failures: Mutex::new(VecDeque::from([tonic::Status::permission_denied(
+                "not this instance",
+            )])),
+            ..Default::default()
+        });
+        let (client, _server) = fake_cas_client(
+            state.clone(),
+            Buck2OssReConfiguration {
+                retries: Some(0),
+                ..Default::default()
+            },
+        )
+        .await?;
+        let data = b"a blob whose first read fails";
+        let digest = state.holds(data);
+        let metadata = RemoteExecutionMetadata::default();
+
+        let results = futures::future::join_all(
+            (0..4).map(|_| client.download(&metadata, inlined_read(std::slice::from_ref(&digest)))),
+        )
+        .await;
+
+        for result in results {
+            let Err(err) = result else {
+                panic!("a read that shared the failed call succeeded");
+            };
+            assert_eq!(
+                err.downcast_ref::<REClientError>().map(|err| err.code),
+                Some(TCode::PERMISSION_DENIED),
+                "{err:#}"
+            );
+        }
+        assert_eq!(state.batch_reads(), 1);
+
+        let blobs = read_blobs(
+            client
+                .download(&metadata, inlined_read(std::slice::from_ref(&digest)))
+                .await,
+        )?;
+        assert_eq!(blobs, vec![data.to_vec()]);
+        assert_eq!(state.batch_reads(), 2);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_blob_the_cas_lacks_fails_its_read_and_is_asked_for_again() -> anyhow::Result<()> {
+        let state = Arc::new(FakeCasState::default());
+        let (client, _server) = fake_cas_client(state.clone(), Default::default()).await?;
+        let digest = digest_for_test_data(b"an output the CAS evicted");
+        let metadata = RemoteExecutionMetadata::default();
+
+        for _ in 0..2 {
+            let Err(err) = client
+                .download(&metadata, inlined_read(std::slice::from_ref(&digest)))
+                .await
+            else {
+                panic!("the CAS does not hold the blob");
+            };
+            assert_eq!(
+                err.downcast_ref::<REClientError>().map(|err| err.code),
+                Some(TCode::NOT_FOUND),
+                "{err:#}"
+            );
+        }
+        assert_eq!(state.batch_reads(), 2);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_file_whose_blob_is_in_memory_is_written_with_its_bytes_and_mode()
+    -> anyhow::Result<()> {
+        let state = Arc::new(FakeCasState::default());
+        let (client, _server) = fake_cas_client(state.clone(), Default::default()).await?;
+        let data = b"#!/bin/sh\necho an executable output\n";
+        let digest = state.holds(data);
+        let metadata = RemoteExecutionMetadata::default();
+        let work = tempfile::tempdir()?;
+        let executable = work.path().join("executable");
+        let executable = executable.to_str().context("tempdir is not utf8")?;
+        let plain = work.path().join("plain");
+        let plain = plain.to_str().context("tempdir is not utf8")?;
+
+        client
+            .download(&metadata, inlined_read(std::slice::from_ref(&digest)))
+            .await?;
+        client
+            .download(
+                &metadata,
+                DownloadRequest {
+                    file_digests: Some(vec![
+                        named(executable, &digest, true),
+                        named(plain, &digest, false),
+                    ]),
+                    ..Default::default()
+                },
+            )
+            .await?;
+
+        assert_eq!(state.batch_reads(), 1);
+        assert_eq!(tokio::fs::read(executable).await?, data.to_vec());
+        assert_eq!(tokio::fs::read(plain).await?, data.to_vec());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                tokio::fs::metadata(executable).await?.permissions().mode() & 0o111,
+                0o111
+            );
+            assert_eq!(
+                tokio::fs::metadata(plain).await?.permissions().mode() & 0o111,
+                0
+            );
+        }
+        Ok(())
+    }
+
     fn digest_for_test_data(data: &[u8]) -> TDigest {
         TDigest {
             hash: format!("{:x}", Sha256::digest(data)),
@@ -14553,22 +15146,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_download_multiple_batches() -> anyhow::Result<()> {
-        let blob_data = vec![0, 1, 2];
-        let digest1 = &digest_for_test_data(&blob_data);
-        let digest2 = &digest_for_test_data(&blob_data);
-        let digest3 = &digest_for_test_data(&blob_data);
-        let digest4 = &digest_for_test_data(&blob_data);
-        let digest5 = &digest_for_test_data(&blob_data);
-        let digest6 = &digest_for_test_data(&blob_data);
-
-        let digests = vec![
-            digest1.clone(),
-            digest2.clone(),
-            digest3.clone(),
-            digest4.clone(),
-            digest5.clone(),
-            digest6.clone(),
-        ];
+        let blobs = (0u8..6)
+            .map(|i| vec![i, i + 1, i + 2])
+            .map(|blob| (digest_for_test_data(&blob), blob))
+            .collect::<HashMap<_, _>>();
+        let digests = blobs.keys().cloned().collect::<Vec<_>>();
 
         let req = DownloadRequest {
             inlined_digests: Some(digests.clone()),
@@ -14589,7 +15171,7 @@ mod tests {
                 let res = BatchReadBlobsResponse {
                     responses: req.digests.map(|d| batch_read_blobs_response::Response {
                         digest: Some(d.clone()),
-                        data: blob_data.clone(),
+                        data: blobs[&tdigest_from(d.clone())].clone(),
                         ..Default::default()
                     }),
                 };
@@ -14711,7 +15293,7 @@ mod tests {
                 Duration::from_secs(DEFAULT_BYTESTREAM_PROGRESS_TIMEOUT_SECS),
                 &active_downloads,
                 None,
-                |_req| async { Ok(BatchReadBlobsResponse { responses: vec![] }) },
+                |_digests| async { Ok(BlobReads::new()) },
                 |req| {
                     reads.fetch_add(1, Ordering::Relaxed);
                     async move {
@@ -14763,7 +15345,7 @@ mod tests {
             Duration::from_secs(DEFAULT_BYTESTREAM_PROGRESS_TIMEOUT_SECS),
             &active_downloads,
             None,
-            |_req| async { Ok(BatchReadBlobsResponse { responses: vec![] }) },
+            |_digests| async { Ok(BlobReads::new()) },
             |req| {
                 let attempt = attempts.fetch_add(1, Ordering::Relaxed);
                 let digest = digest.clone();
