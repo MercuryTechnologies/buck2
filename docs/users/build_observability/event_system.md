@@ -82,6 +82,35 @@ through `PublishBuildToolEventStream`. The invocation trace ID is used as the
 BES build invocation ID so that a server can group all uploaded events for the
 same command.
 
+### When the stream breaks
+
+A stream whose connection breaks is reopened, and the events the server has
+not acknowledged are sent again from the first of them, with the same sequence
+numbers, so the server sees one stream. Buck2 keeps a copy of each event until
+the server acknowledges it. These `[bes]` keys bound that:
+
+```ini
+[bes]
+buffer_size = 10000
+retry_window_secs = 60
+replay_spill_max_bytes = 2147483648
+```
+
+- `buffer_size`: the queue between the build and the sink. A stream keeps ten
+  times this many copies in memory.
+- `retry_window_secs`: how long a stream may keep failing before Buck2 gives
+  up on it and drops its events. The default is 60.
+- `replay_spill_max_bytes`: past the in-memory copies, the daemon appends the
+  oldest ones to a file per stream under `buck-out/<isolation dir>/tmp/bes-replay-spill`
+  and reads them back for a replay. The files are deleted when the stream
+  closes, is given up, or has every event in the file acknowledged. The key
+  bounds the files of all streams together; the default is 2 GiB. Past it, or
+  when a file cannot be written or read, the stream lets its oldest copies go,
+  and a stream that then breaks cannot be replayed and is given up.
+
+Some servers, BuildBuddy among them, acknowledge nothing until the stream
+ends, so a long build relies on the spill to survive a broken connection.
+
 ## Bazel Build Event Service Integration
 
 This fork adds an optional BES event format:
