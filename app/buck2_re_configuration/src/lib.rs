@@ -894,11 +894,61 @@ impl BesConnection {
     }
 }
 
+/// The `[bes]` keys that bound what a broken stream keeps and for how long. The daemon's sink
+/// and the client's both read them; unset keys take the sink's defaults.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct BesReplaySettings {
+    pub retry_window_secs: Option<u64>,
+    pub replay_spill_max_bytes: Option<u64>,
+}
+
+impl BesReplaySettings {
+    pub fn from_legacy_config(legacy_config: &LegacyBuckConfig) -> buck2_error::Result<Self> {
+        Ok(Self {
+            retry_window_secs: legacy_config.parse(BuckconfigKeyRef {
+                section: "bes",
+                property: "retry_window_secs",
+            })?,
+            replay_spill_max_bytes: legacy_config.parse(BuckconfigKeyRef {
+                section: "bes",
+                property: "replay_spill_max_bytes",
+            })?,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use buck2_common::legacy_configs::configs::testing::parse;
 
     use super::*;
+
+    #[test]
+    fn bes_replay_settings_read_the_bes_keys() -> buck2_error::Result<()> {
+        let unset = parse(&[("config", "")], "config")?;
+        let set = parse(
+            &[(
+                "config",
+                "[bes]\nretry_window_secs = 300\nreplay_spill_max_bytes = 1048576\n",
+            )],
+            "config",
+        )?;
+
+        assert_eq!(
+            BesReplaySettings::from_legacy_config(&unset)?,
+            BesReplaySettings::default()
+        );
+        assert_eq!(
+            BesReplaySettings::from_legacy_config(&set)?,
+            BesReplaySettings {
+                retry_window_secs: Some(300),
+                replay_spill_max_bytes: Some(1048576),
+            }
+        );
+        let invalid = parse(&[("config", "[bes]\nretry_window_secs = soon\n")], "config")?;
+        assert!(BesReplaySettings::from_legacy_config(&invalid).is_err());
+        Ok(())
+    }
 
     #[test]
     fn oss_config_parses_engine_connection_count() -> buck2_error::Result<()> {

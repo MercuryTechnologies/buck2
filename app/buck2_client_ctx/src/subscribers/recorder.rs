@@ -424,7 +424,13 @@ impl InvocationRecorder {
                 retry_backoff: Duration::from_millis(500),
                 retry_attempts: 5,
                 #[cfg(not(fbcode_build))]
-                retry_window: Duration::from_secs(60),
+                retry_window: Duration::from_secs(
+                    buck2_events::sink::remote::DEFAULT_RETRY_WINDOW_SECS,
+                ),
+                #[cfg(not(fbcode_build))]
+                replay_spill_dir: None,
+                #[cfg(not(fbcode_build))]
+                replay_spill_max_bytes: buck2_events::sink::remote::DEFAULT_REPLAY_SPILL_MAX_BYTES,
                 message_batch_size: None,
                 #[cfg(fbcode_build)]
                 thrift_timeout: Duration::from_secs(2),
@@ -662,7 +668,13 @@ impl InvocationRecorder {
                 retry_backoff: Duration::from_millis(500),
                 retry_attempts: 5,
                 #[cfg(not(fbcode_build))]
-                retry_window: Duration::from_secs(60),
+                retry_window: Duration::from_secs(
+                    buck2_events::sink::remote::DEFAULT_RETRY_WINDOW_SECS,
+                ),
+                #[cfg(not(fbcode_build))]
+                replay_spill_dir: None,
+                #[cfg(not(fbcode_build))]
+                replay_spill_max_bytes: buck2_events::sink::remote::DEFAULT_REPLAY_SPILL_MAX_BYTES,
                 message_batch_size: None,
                 #[cfg(fbcode_build)]
                 thrift_timeout: Duration::from_secs(2),

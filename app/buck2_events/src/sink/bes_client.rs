@@ -85,6 +85,12 @@ const DEFAULT_GRPC_KEEPALIVE_TIME_SECS: u64 = 60;
 const DEFAULT_GRPC_KEEPALIVE_TIMEOUT_SECS: u64 = 20;
 const DEFAULT_GRPC_KEEPALIVE_WHILE_IDLE: bool = false;
 const DEFAULT_BYTESTREAM_PROGRESS_TIMEOUT_SECS: u64 = 60;
+pub const DEFAULT_RETRY_WINDOW_SECS: u64 = 60;
+/// `[bes] replay_spill_max_bytes` unset: the disk the sink's replay copies may take, across
+/// every stream of the daemon. At an assumed 1 to 2 KiB per Bazel-format event, 2 GiB holds one
+/// to two million copies: ten to twenty times the 100,000 the default `buffer_size` keeps in
+/// memory, and as many as `-c bes.buffer_size=100000` keeps there instead.
+pub const DEFAULT_REPLAY_SPILL_MAX_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 
 #[derive(Clone, Debug)]
 pub struct BesConfig {
@@ -93,7 +99,14 @@ pub struct BesConfig {
     pub retry_attempts: usize,
     /// How long one invocation's stream may keep failing before the sink gives up on it and
     /// drops its events. Past this the stream's memory is worth more than its events.
+    /// `[bes] retry_window_secs`.
     pub retry_window: Duration,
+    /// Where a stream keeps the replay copies past its in-memory bound, one file per stream.
+    /// `None` keeps none: a stream past the bound lets the oldest copies go, and a failure then
+    /// abandons it. Only the daemon sets it, to a directory no other process writes.
+    pub replay_spill_dir: Option<PathBuf>,
+    /// `[bes] replay_spill_max_bytes`: the most the spill files of all streams may hold.
+    pub replay_spill_max_bytes: u64,
     pub message_batch_size: Option<usize>,
     pub grpc_timeout: Duration,
     pub bes_backend: Option<String>,
@@ -172,7 +185,9 @@ impl Default for BesConfig {
             buffer_size: 10_000,
             retry_backoff: Duration::from_millis(500),
             retry_attempts: 5,
-            retry_window: Duration::from_secs(60),
+            retry_window: Duration::from_secs(DEFAULT_RETRY_WINDOW_SECS),
+            replay_spill_dir: None,
+            replay_spill_max_bytes: DEFAULT_REPLAY_SPILL_MAX_BYTES,
             message_batch_size: None,
             grpc_timeout: Duration::from_secs(10),
             bes_backend: None,
@@ -1078,6 +1093,18 @@ impl BesClient {
                 .map_err(|e| from_any_with_tag(e, ErrorTag::Input))?
                 .map(Arc::new),
         };
+        if let Some(dir) = &config.replay_spill_dir {
+            // Only this daemon writes there, so what is there is a dead daemon's.
+            if let Err(e) = std::fs::remove_dir_all(dir)
+                && e.kind() != std::io::ErrorKind::NotFound
+            {
+                tracing::warn!(
+                    "BES sink: could not clear the replay spill directory {}: {}",
+                    dir.display(),
+                    e
+                );
+            }
+        }
         let queue_capacity = config.buffer_size.max(1);
         let (tx, rx) = crossbeam_channel::bounded(queue_capacity);
         let (send_now_tx, send_now_rx) = crossbeam_channel::unbounded();
@@ -1415,10 +1442,18 @@ struct WorkerState {
     /// The credential helper's credentials were refreshed after a refusal, so the next refusal
     /// is final.
     refreshed_after_refusal: bool,
+    spill_target: Option<SpillTarget>,
 }
 
 impl WorkerState {
     fn new(config: BesConfig, connection: ConnectionConfig, counters: Arc<CounterState>) -> Self {
+        let spill_target = config.replay_spill_dir.clone().map(|dir| SpillTarget {
+            dir,
+            budget: Arc::new(SpillBudget {
+                max_bytes: config.replay_spill_max_bytes,
+                used_bytes: AtomicU64::new(0),
+            }),
+        });
         Self {
             config,
             connection,
@@ -1428,12 +1463,14 @@ impl WorkerState {
             closed: false,
             credentials_refused: false,
             refreshed_after_refusal: false,
+            spill_target,
         }
     }
 
-    /// How many events a stream keeps for replay. A server may hold every acknowledgement until
-    /// the client half-closes the stream, so a healthy stream can pass this; it then keeps
-    /// sending and lets the oldest copies go, which costs it only the ability to replay.
+    /// How many events a stream keeps in memory for replay. A server may hold every
+    /// acknowledgement until the client half-closes the stream, so a healthy stream can pass
+    /// this; it then spills the oldest copies to disk, or, past the spill's own bound, lets them
+    /// go, which costs it only the ability to replay.
     fn max_unacked(&self) -> usize {
         self.config.buffer_size.saturating_mul(UNACKED_EVENTS_PER_QUEUED_EVENT)
     }
@@ -1634,6 +1671,7 @@ impl WorkerState {
             upload_config,
             self.config.upload_successful_action_events,
             self.counters.clone(),
+            self.spill_target.clone(),
         );
         self.streams.insert(parsed.invocation_id.clone(), stream);
         Ok(())
@@ -1665,9 +1703,10 @@ impl WorkerState {
         Ok(())
     }
 
-    /// Brings a stream's `pending_unacked` back to `max_unacked` by dropping the oldest copies
-    /// already sent, and returns whether the stream lives on. A stream that is down needs every
-    /// copy to replay, and events never sent are the only copy, so either way it is abandoned.
+    /// Brings a stream's `pending_unacked` back to `max_unacked` by spilling the oldest copies
+    /// to disk, and returns whether the stream lives on. Without a spill it drops the oldest
+    /// copies already sent instead. A stream that is down needs every copy to replay, and events
+    /// never sent are the only copy, so without a spill either way it is abandoned.
     fn bound_unacked(&mut self, invocation_id: &str) -> bool {
         let max_unacked = self.max_unacked();
         let Some(stream) = self.streams.get_mut(invocation_id) else {
@@ -1676,6 +1715,19 @@ impl WorkerState {
         stream.prune_acked_requests();
         if stream.pending_unacked.len() <= max_unacked {
             return true;
+        }
+        match stream.spill_oldest_replay_copies(max_unacked) {
+            Some(Ok(())) => return true,
+            Some(Err(refusal)) => {
+                if !stream.give_up_spill(refusal) {
+                    self.abandon_stream(
+                        invocation_id,
+                        "its replay spill held events never sent, and the spill was given up",
+                    );
+                    return false;
+                }
+            }
+            None => {}
         }
         if stream.failing.is_some() {
             self.abandon_stream(
@@ -1769,9 +1821,14 @@ impl WorkerState {
         }
         self.credentials_refused = true;
         for stream in self.streams.values_mut() {
-            self.counters
-                .add_dropped(stream.pending_unacked.len() as u64);
+            self.counters.add_dropped(
+                stream.pending_unacked.len() as u64
+                    + stream.spill.as_ref().map_or(0, |spill| {
+                        spill.unacked_len(stream.last_acked_sequence_number())
+                    }),
+            );
             stream.pending_unacked = VecDeque::new();
+            stream.spill = None;
             stream.discard_transport();
             stream.failing = None;
             stream.abandoned = true;
@@ -1788,19 +1845,29 @@ impl WorkerState {
         let Some(stream) = self.streams.get_mut(invocation_id) else {
             return;
         };
-        let dropped = stream.pending_unacked.len();
+        let dropped = stream.pending_unacked.len() as u64
+            + stream.spill.as_ref().map_or(0, |spill| {
+                spill.unacked_len(stream.last_acked_sequence_number())
+            });
         tracing::warn!(
-            "Giving up on the BES stream for invocation {}: {}; dropping {} unacknowledged events and every later one; last failure: {}",
+            "Giving up on the BES stream for invocation {}: {}{}; dropping {} unacknowledged events and every later one; last failure: {}",
             invocation_id,
             reason,
+            stream
+                .spill_refused
+                .as_ref()
+                .map_or_else(String::new, |refused| format!(
+                    " (it stopped spilling to disk: {refused})"
+                )),
             dropped,
             stream.failing.as_ref().map_or_else(
                 || "none".to_owned(),
                 |failing| failing.last_status.to_string()
             ),
         );
-        self.counters.add_dropped(dropped as u64);
+        self.counters.add_dropped(dropped);
         stream.pending_unacked = VecDeque::new();
+        stream.spill = None;
         stream.discard_transport();
         stream.failing = None;
         stream.abandoned = true;
@@ -2195,6 +2262,11 @@ struct StreamState {
     /// The sequence number of the newest dropped copy. Until the server acknowledges it, a
     /// replay would leave a gap, so a failure abandons the stream instead of retrying.
     newest_dropped_replay_copy: i64,
+    /// Where copies past the in-memory bound go. `None` once spilling was refused, so a stream
+    /// whose spill filled or failed does not start another that would only fill or fail again.
+    spill_target: Option<SpillTarget>,
+    spill: Option<ReplaySpill>,
+    spill_refused: Option<String>,
 }
 
 /// What the HTTP/2 transport has taken from a stream's channel. hyper takes the next event
@@ -2240,6 +2312,197 @@ struct StreamFailure {
     last_status: Status,
 }
 
+/// The disk the spill files of one sink share, so concurrent streams cannot together pass
+/// `[bes] replay_spill_max_bytes`.
+struct SpillBudget {
+    max_bytes: u64,
+    used_bytes: AtomicU64,
+}
+
+impl SpillBudget {
+    fn try_reserve(&self, bytes: u64) -> bool {
+        self.used_bytes
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
+                used.checked_add(bytes)
+                    .filter(|total| *total <= self.max_bytes)
+            })
+            .is_ok()
+    }
+
+    fn release(&self, bytes: u64) {
+        self.used_bytes.fetch_sub(bytes, Ordering::Relaxed);
+    }
+}
+
+#[derive(Clone)]
+struct SpillTarget {
+    dir: PathBuf,
+    budget: Arc<SpillBudget>,
+}
+
+/// Why a stream stopped spilling. It then lets copies go as a stream without a spill does.
+enum SpillRefusal {
+    Full { max_bytes: u64 },
+    Io(std::io::Error),
+}
+
+impl std::fmt::Display for SpillRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Full { max_bytes } => write!(
+                f,
+                "the replay spill files reached `bes.replay_spill_max_bytes` ({max_bytes} bytes)"
+            ),
+            Self::Io(e) => write!(f, "the replay spill file failed: {e}"),
+        }
+    }
+}
+
+/// The oldest unacknowledged copies of one stream, older than every copy in `pending_unacked`
+/// and contiguous with them, as length-delimited `PublishBuildToolEventStreamRequest`s: the
+/// framing Bazel's `--build_event_binary_file` uses. The file goes when the value does, which
+/// is when the stream closes, is abandoned, or has every copy in it acknowledged.
+struct ReplaySpill {
+    path: PathBuf,
+    file: std::fs::File,
+    bytes: u64,
+    first_sequence_number: i64,
+    last_sequence_number: i64,
+    /// The acknowledged prefix found by the last replay: the copies through this sequence number
+    /// end at `acked_offset`, so the next replay starts reading there.
+    acked_through: i64,
+    acked_offset: u64,
+    budget: Arc<SpillBudget>,
+}
+
+static NEXT_SPILL_FILE: AtomicU64 = AtomicU64::new(0);
+
+impl ReplaySpill {
+    fn create(target: &SpillTarget, invocation_id: &str) -> std::io::Result<Self> {
+        std::fs::create_dir_all(&target.dir)?;
+        // A stream that closed can be followed by a new one for the same invocation, whose file
+        // must not be the old one's.
+        let path = target.dir.join(format!(
+            "{}-{}.bin",
+            invocation_id,
+            NEXT_SPILL_FILE.fetch_add(1, Ordering::Relaxed)
+        ));
+        let file = std::fs::File::options()
+            .append(true)
+            .create_new(true)
+            .open(&path)?;
+        Ok(Self {
+            path,
+            file,
+            bytes: 0,
+            first_sequence_number: 0,
+            last_sequence_number: 0,
+            acked_through: 0,
+            acked_offset: 0,
+            budget: target.budget.clone(),
+        })
+    }
+
+    fn append<'a>(
+        &mut self,
+        requests: impl Iterator<Item = &'a PublishBuildToolEventStreamRequest>,
+    ) -> Result<(), SpillRefusal> {
+        let mut encoded = Vec::new();
+        let mut first = None;
+        let mut last = 0;
+        for request in requests {
+            request
+                .encode_length_delimited(&mut encoded)
+                .map_err(|e| SpillRefusal::Io(std::io::Error::other(e)))?;
+            let sequence_number = request_sequence_number(request);
+            first.get_or_insert(sequence_number);
+            last = sequence_number;
+        }
+        let Some(first) = first else {
+            return Ok(());
+        };
+        let len = encoded.len() as u64;
+        if !self.budget.try_reserve(len) {
+            return Err(SpillRefusal::Full {
+                max_bytes: self.budget.max_bytes,
+            });
+        }
+        // Counted before the write, so a write that fails part way is still released on drop.
+        self.bytes += len;
+        std::io::Write::write_all(&mut self.file, &encoded).map_err(SpillRefusal::Io)?;
+        if self.first_sequence_number == 0 {
+            self.first_sequence_number = first;
+        }
+        self.last_sequence_number = last;
+        Ok(())
+    }
+
+    fn unacked_len(&self, acked: i64) -> u64 {
+        u64::try_from(self.last_sequence_number - acked.max(self.first_sequence_number - 1))
+            .unwrap_or(0)
+    }
+
+    fn reader(&self) -> std::io::Result<SpillReader> {
+        let mut file = std::fs::File::open(&self.path)?;
+        std::io::Seek::seek(&mut file, std::io::SeekFrom::Start(self.acked_offset))?;
+        Ok(SpillReader {
+            reader: std::io::BufReader::new(file),
+            offset: self.acked_offset,
+        })
+    }
+}
+
+impl Drop for ReplaySpill {
+    fn drop(&mut self) {
+        self.budget.release(self.bytes);
+        if let Err(e) = std::fs::remove_file(&self.path) {
+            tracing::warn!(
+                "BES sink: could not remove the replay spill file {}: {}",
+                self.path.display(),
+                e
+            );
+        }
+    }
+}
+
+struct SpillReader {
+    reader: std::io::BufReader<std::fs::File>,
+    offset: u64,
+}
+
+impl SpillReader {
+    fn next(&mut self) -> std::io::Result<Option<(PublishBuildToolEventStreamRequest, u64)>> {
+        let mut len: u64 = 0;
+        let mut header_len = 0;
+        loop {
+            let mut byte = [0u8; 1];
+            if self.reader.read(&mut byte)? == 0 {
+                if header_len == 0 {
+                    return Ok(None);
+                }
+                return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof));
+            }
+            if header_len == 10 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "length prefix is not a varint",
+                ));
+            }
+            len |= u64::from(byte[0] & 0x7f) << (7 * header_len);
+            header_len += 1;
+            if byte[0] & 0x80 == 0 {
+                break;
+            }
+        }
+        let mut encoded = vec![0u8; usize::try_from(len).map_err(std::io::Error::other)?];
+        self.reader.read_exact(&mut encoded)?;
+        let request = PublishBuildToolEventStreamRequest::decode(encoded.as_slice())
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        self.offset += header_len + len;
+        Ok(Some((request, self.offset)))
+    }
+}
+
 impl StreamState {
     fn new(
         parsed: &ParsedMessage,
@@ -2247,6 +2510,7 @@ impl StreamState {
         bazel_artifact_upload_config: Option<BazelArtifactUploadConfig>,
         upload_successful_action_events: bool,
         counters: Arc<CounterState>,
+        spill_target: Option<SpillTarget>,
     ) -> Self {
         Self {
             stream_id: StreamId {
@@ -2276,6 +2540,9 @@ impl StreamState {
             abandoned: false,
             replay_copies_dropped: 0,
             newest_dropped_replay_copy: 0,
+            spill_target,
+            spill: None,
+            spill_refused: None,
         }
     }
 
@@ -2367,7 +2634,9 @@ impl StreamState {
     fn has_unsent_events(&self) -> bool {
         self.pending_unacked
             .back()
-            .is_some_and(|request| request_sequence_number(request) > self.last_sent_sequence_number)
+            .map(request_sequence_number)
+            .or(self.spill.as_ref().map(|spill| spill.last_sequence_number))
+            .is_some_and(|newest| newest > self.last_sent_sequence_number)
     }
 
     fn transport_stalled(&self, now: Instant, bound: Duration) -> bool {
@@ -2405,6 +2674,7 @@ impl StreamState {
             }
         };
 
+        self.replay_spill(&sender, send_timeout).await?;
         let pending = self
             .pending_unacked
             .iter()
@@ -2412,34 +2682,155 @@ impl StreamState {
             .cloned()
             .collect::<Vec<_>>();
         for request in pending {
-            let sequence_number = request_sequence_number(&request);
-            let caught_up = self.progress.as_ref().is_none_or(|progress| {
-                progress.taken_sequence_number.load(Ordering::Relaxed)
-                    >= self.last_sent_sequence_number
-            });
-            if caught_up || self.oldest_untaken_handed_at.is_none() {
-                self.oldest_untaken_handed_at = Some(Instant::now());
-            }
-            // A server that stays connected but stops reading fills the channel; without a
-            // bound the worker thread would wait here for the rest of the daemon's life.
-            match tokio::time::timeout(send_timeout, sender.send(request)).await {
-                Ok(Ok(())) => {}
-                Ok(Err(_)) => {
-                    if let Some(status) = self.finished_ack_task_status().await {
-                        return Err(status);
-                    }
-                    return Err(Status::unavailable("BES stream was closed"));
-                }
-                Err(_) => {
-                    return Err(Status::deadline_exceeded(format!(
-                        "BES stream accepted no event for {:?}",
-                        send_timeout
-                    )));
-                }
-            }
-            self.last_sent_sequence_number = sequence_number;
+            self.hand_to_transport(&sender, request, send_timeout)
+                .await?;
         }
         Ok(())
+    }
+
+    async fn hand_to_transport(
+        &mut self,
+        sender: &mpsc::Sender<PublishBuildToolEventStreamRequest>,
+        request: PublishBuildToolEventStreamRequest,
+        send_timeout: Duration,
+    ) -> Result<(), Status> {
+        let sequence_number = request_sequence_number(&request);
+        let caught_up = self.progress.as_ref().is_none_or(|progress| {
+            progress.taken_sequence_number.load(Ordering::Relaxed) >= self.last_sent_sequence_number
+        });
+        if caught_up || self.oldest_untaken_handed_at.is_none() {
+            self.oldest_untaken_handed_at = Some(Instant::now());
+        }
+        // A server that stays connected but stops reading fills the channel; without a
+        // bound the worker thread would wait here for the rest of the daemon's life.
+        match tokio::time::timeout(send_timeout, sender.send(request)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(_)) => {
+                if let Some(status) = self.finished_ack_task_status().await {
+                    return Err(status);
+                }
+                return Err(Status::unavailable("BES stream was closed"));
+            }
+            Err(_) => {
+                return Err(Status::deadline_exceeded(format!(
+                    "BES stream accepted no event for {:?}",
+                    send_timeout
+                )));
+            }
+        }
+        self.last_sent_sequence_number = sequence_number;
+        Ok(())
+    }
+
+    /// Sends the spilled copies the transport has not had, read from disk in sequence order,
+    /// ahead of the ones in memory, which all come after them. A copy that cannot be read
+    /// leaves a gap, so the stream then fails as one whose copies were let go.
+    async fn replay_spill(
+        &mut self,
+        sender: &mpsc::Sender<PublishBuildToolEventStreamRequest>,
+        send_timeout: Duration,
+    ) -> Result<(), Status> {
+        let Some(spill) = &self.spill else {
+            return Ok(());
+        };
+        let last_spilled = spill.last_sequence_number;
+        if last_spilled <= self.last_sent_sequence_number {
+            return Ok(());
+        }
+        let mut reader = match spill.reader() {
+            Ok(reader) => reader,
+            Err(e) => return Err(self.lose_spill(SpillRefusal::Io(e))),
+        };
+        while self.last_sent_sequence_number < last_spilled {
+            let (request, end_offset) = match reader.next() {
+                Ok(Some(next)) => next,
+                Ok(None) => {
+                    return Err(self.lose_spill(SpillRefusal::Io(std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        format!("the file ends before sequence number {last_spilled}"),
+                    ))));
+                }
+                Err(e) => return Err(self.lose_spill(SpillRefusal::Io(e))),
+            };
+            let sequence_number = request_sequence_number(&request);
+            if sequence_number <= self.last_acked_sequence_number() {
+                if let Some(spill) = &mut self.spill {
+                    spill.acked_through = sequence_number;
+                    spill.acked_offset = end_offset;
+                }
+                continue;
+            }
+            if sequence_number <= self.last_sent_sequence_number {
+                continue;
+            }
+            if sequence_number != self.last_sent_sequence_number + 1 {
+                return Err(self.lose_spill(SpillRefusal::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "sequence number {sequence_number} follows {}",
+                        self.last_sent_sequence_number
+                    ),
+                ))));
+            }
+            self.hand_to_transport(sender, request, send_timeout)
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// Moves the oldest copies past `max` from `pending_unacked` to the spill file. Spilled
+    /// copies need not have been sent: the next flush sends them from the file.
+    fn spill_oldest_replay_copies(&mut self, max: usize) -> Option<Result<(), SpillRefusal>> {
+        let excess = self.pending_unacked.len().saturating_sub(max);
+        if excess == 0 {
+            return Some(Ok(()));
+        }
+        let target = self.spill_target.as_ref()?;
+        if self.spill.is_none() {
+            match ReplaySpill::create(target, &self.stream_id.invocation_id) {
+                Ok(spill) => self.spill = Some(spill),
+                Err(e) => return Some(Err(SpillRefusal::Io(e))),
+            }
+        }
+        let spill = self.spill.as_mut().expect("spill was created");
+        if let Err(refusal) = spill.append(self.pending_unacked.iter().take(excess)) {
+            return Some(Err(refusal));
+        }
+        self.pending_unacked.drain(..excess);
+        Some(Ok(()))
+    }
+
+    /// Stops spilling for good and deletes the file. Its copies count as copies let go, and
+    /// the stream lives on as one without a spill only if the server has had every one of them.
+    fn give_up_spill(&mut self, refusal: SpillRefusal) -> bool {
+        let reason = refusal.to_string();
+        self.spill_target = None;
+        let lived_on = match self.spill.take() {
+            None => true,
+            Some(spill) => {
+                let acked = self.last_acked_sequence_number();
+                self.replay_copies_dropped += spill.unacked_len(acked);
+                if spill.last_sequence_number > acked {
+                    self.newest_dropped_replay_copy = self
+                        .newest_dropped_replay_copy
+                        .max(spill.last_sequence_number);
+                }
+                spill.last_sequence_number <= self.last_sent_sequence_number
+            }
+        };
+        tracing::warn!(
+            "BES sink: the stream of invocation {} stops spilling replay copies to disk: {}; it lets the oldest copies go, as it would without a spill, and cannot be replayed until the server acknowledges past them",
+            self.stream_id.invocation_id,
+            reason,
+        );
+        self.spill_refused = Some(reason);
+        lived_on
+    }
+
+    fn lose_spill(&mut self, refusal: SpillRefusal) -> Status {
+        let status = Status::data_loss(refusal.to_string());
+        self.give_up_spill(refusal);
+        status
     }
 
     /// Drops the oldest entries of `pending_unacked` down to `max`, provided they were all sent:
@@ -2477,6 +2868,13 @@ impl StreamState {
         }
         if self.last_sent_sequence_number < acked {
             self.last_sent_sequence_number = acked;
+        }
+        if self
+            .spill
+            .as_ref()
+            .is_some_and(|spill| spill.last_sequence_number <= acked)
+        {
+            self.spill = None;
         }
     }
 
@@ -3411,7 +3809,7 @@ mod tests {
             command_start_data(),
         );
         let parsed = ParsedMessage::from_message(&message).expect("valid message");
-        let mut stream = StreamState::new(&parsed, &[], None, true, Arc::default());
+        let mut stream = StreamState::new(&parsed, &[], None, true, Arc::default(), None);
 
         let last_sequence = stream.enqueue_event(&parsed, BesEventFormat::Bazel).await;
 
@@ -4405,7 +4803,7 @@ mod tests {
             command_start_data(),
         );
         let parsed = ParsedMessage::from_message(&message).expect("valid message");
-        let mut stream = StreamState::new(&parsed, &[], None, true, Arc::default());
+        let mut stream = StreamState::new(&parsed, &[], None, true, Arc::default(), None);
         for _ in 0..10 {
             stream.enqueue_event(&parsed, BesEventFormat::Buck).await;
         }
@@ -4590,6 +4988,404 @@ mod tests {
             counters.snapshot().failures_pushed_back,
             failures_after_first + 1
         );
+    }
+
+    fn spill_worker_for(
+        endpoint: String,
+        spill_dir: &Path,
+        replay_spill_max_bytes: u64,
+    ) -> (WorkerState, Arc<CounterState>) {
+        let config = BesConfig {
+            buffer_size: 3,
+            retry_backoff: Duration::from_millis(20),
+            retry_window: Duration::from_secs(5),
+            grpc_timeout: Duration::from_secs(2),
+            replay_spill_dir: Some(spill_dir.to_owned()),
+            replay_spill_max_bytes,
+            ..BesConfig::default()
+        };
+        let connection = ConnectionConfig {
+            endpoint,
+            headers: Vec::new(),
+            tls: BesTls::default(),
+            credential_helper: None,
+        };
+        let counters = Arc::new(CounterState::default());
+        (
+            WorkerState::new(config, connection, counters.clone()),
+            counters,
+        )
+    }
+
+    fn spill_files(dir: &Path) -> Vec<PathBuf> {
+        std::fs::read_dir(dir)
+            .map(|entries| {
+                entries
+                    .filter_map(Result::ok)
+                    .map(|entry| entry.path())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Sends actions until the server has failed the first stream at `fail_at`, past the
+    /// stream's in-memory bound, and the failure's backoff is over.
+    async fn send_until_the_first_stream_fails(
+        worker: &mut WorkerState,
+        streams: &std::sync::Mutex<Vec<Vec<i64>>>,
+        trace_id: &str,
+        invocation_id: &str,
+        fail_at: i64,
+    ) {
+        let bound = worker.max_unacked();
+        while worker.streams[invocation_id].next_sequence_number <= fail_at {
+            send_queued_ok(worker, trace_id, action_start_data()).await;
+            let stream = &worker.streams[invocation_id];
+            assert!(!stream.abandoned);
+            assert!(stream.pending_unacked.len() <= bound);
+        }
+        let failed = tokio::time::timeout(Duration::from_secs(5), async {
+            while streams.lock().unwrap()[0].last() != Some(&fail_at) {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+        assert!(failed.is_ok(), "the server did not fail the first stream");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    async fn close_within(worker: &mut WorkerState, invocation_id: &str) -> bool {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while worker.streams.contains_key(invocation_id) {
+                worker.close_due_streams().await;
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .is_ok()
+    }
+
+    #[tokio::test]
+    async fn stream_past_the_bound_that_fails_replays_every_event_from_disk_and_memory() {
+        let spill_dir = tempfile::tempdir().expect("tempdir");
+        let (endpoint, streams) = serve_bes_that_acks_at_eof(Some(60)).await;
+        let (mut worker, counters) =
+            spill_worker_for(endpoint, spill_dir.path(), DEFAULT_REPLAY_SPILL_MAX_BYTES);
+        let bound = worker.max_unacked();
+        assert!(bound < 60, "the stream must pass its bound before it fails");
+        let trace_id = TraceId::new().to_string();
+
+        send_queued_ok(&mut worker, &trace_id, command_start_data()).await;
+        let invocation_id = worker.streams.keys().next().expect("stream opened").clone();
+        send_until_the_first_stream_fails(&mut worker, &streams, &trace_id, &invocation_id, 60)
+            .await;
+        for _ in 0..(2 * bound) {
+            send_queued_ok(&mut worker, &trace_id, action_start_data()).await;
+            let stream = &worker.streams[&invocation_id];
+            assert!(!stream.abandoned, "a stream with a spill was abandoned");
+            assert!(stream.pending_unacked.len() <= bound);
+        }
+        assert_eq!(spill_files(spill_dir.path()).len(), 1);
+        let sent = worker.streams[&invocation_id].next_sequence_number - 1;
+        send_queued_ok(&mut worker, &trace_id, command_end_data()).await;
+        send_queued_ok(&mut worker, &trace_id, invocation_record_data()).await;
+
+        assert!(
+            close_within(&mut worker, &invocation_id).await,
+            "the replayed stream closes once every event is acknowledged"
+        );
+        let events = sent + 2 + 1;
+        assert_eq!(
+            *streams.lock().unwrap(),
+            vec![
+                (1..=60).collect::<Vec<_>>(),
+                (1..=events).collect::<Vec<_>>()
+            ]
+        );
+        assert_eq!(counters.snapshot().dropped, 0);
+        assert!(spill_files(spill_dir.path()).is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_spill_is_trimmed_by_acknowledgements_and_replayed_ahead_of_memory() {
+        let spill_dir = tempfile::tempdir().expect("tempdir");
+        let budget = Arc::new(SpillBudget {
+            max_bytes: DEFAULT_REPLAY_SPILL_MAX_BYTES,
+            used_bytes: AtomicU64::new(0),
+        });
+        let message = make_message(
+            Some(&TraceId::new().to_string()),
+            Some(1),
+            command_start_data(),
+        );
+        let parsed = ParsedMessage::from_message(&message).expect("valid message");
+        let mut stream = StreamState::new(
+            &parsed,
+            &[],
+            None,
+            true,
+            Arc::default(),
+            Some(SpillTarget {
+                dir: spill_dir.path().to_owned(),
+                budget: budget.clone(),
+            }),
+        );
+        for _ in 0..10 {
+            stream.enqueue_event(&parsed, BesEventFormat::Buck).await;
+        }
+        stream.last_sent_sequence_number = 10;
+
+        assert!(matches!(stream.spill_oldest_replay_copies(4), Some(Ok(()))));
+        assert_eq!(stream.pending_unacked.len(), 4);
+        assert_eq!(request_sequence_number(&stream.pending_unacked[0]), 7);
+        assert!(!stream.replay_has_gap());
+        assert_eq!(spill_files(spill_dir.path()).len(), 1);
+        assert!(budget.used_bytes.load(Ordering::Relaxed) > 0);
+
+        // A reopen replays from the first unacknowledged event: the spilled copies after the
+        // acknowledged ones, then the ones in memory.
+        stream
+            .last_acked_sequence_number
+            .store(3, Ordering::Relaxed);
+        stream.prune_acked_requests();
+        stream.last_sent_sequence_number = 3;
+        let (tx, mut rx) = mpsc::channel(16);
+        stream.sender = Some(tx);
+        stream
+            .flush_pending(Duration::from_secs(1))
+            .await
+            .expect("replay");
+        let mut replayed = Vec::new();
+        while let Ok(request) = rx.try_recv() {
+            replayed.push(request_sequence_number(&request));
+        }
+        assert_eq!(replayed, (4..=10).collect::<Vec<_>>());
+        let spill = stream
+            .spill
+            .as_ref()
+            .expect("spill keeps unacknowledged copies");
+        assert_eq!(spill.acked_through, 3);
+        assert!(spill.acked_offset > 0);
+
+        stream
+            .last_acked_sequence_number
+            .store(6, Ordering::Relaxed);
+        stream.prune_acked_requests();
+        assert!(stream.spill.is_none());
+        assert!(spill_files(spill_dir.path()).is_empty());
+        assert_eq!(budget.used_bytes.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn a_closed_stream_removes_its_spill_file() {
+        let spill_dir = tempfile::tempdir().expect("tempdir");
+        let (endpoint, streams) = serve_bes_that_acks_at_eof(None).await;
+        let (mut worker, counters) =
+            spill_worker_for(endpoint, spill_dir.path(), DEFAULT_REPLAY_SPILL_MAX_BYTES);
+        let bound = worker.max_unacked();
+        let trace_id = TraceId::new().to_string();
+
+        send_queued_ok(&mut worker, &trace_id, command_start_data()).await;
+        let invocation_id = worker.streams.keys().next().expect("stream opened").clone();
+        let actions = 3 * bound;
+        for _ in 0..actions {
+            send_queued_ok(&mut worker, &trace_id, action_start_data()).await;
+        }
+        assert_eq!(spill_files(spill_dir.path()).len(), 1);
+        assert_eq!(worker.streams[&invocation_id].replay_copies_dropped, 0);
+        send_queued_ok(&mut worker, &trace_id, command_end_data()).await;
+        send_queued_ok(&mut worker, &trace_id, invocation_record_data()).await;
+
+        assert!(!worker.streams.contains_key(&invocation_id));
+        assert!(spill_files(spill_dir.path()).is_empty());
+        let events = (1 + actions + 2 + 1) as i64;
+        assert_eq!(
+            *streams.lock().unwrap(),
+            vec![(1..=events).collect::<Vec<_>>()]
+        );
+        assert_eq!(counters.snapshot().dropped, 0);
+        assert_eq!(
+            worker
+                .spill_target
+                .as_ref()
+                .expect("spill configured")
+                .budget
+                .used_bytes
+                .load(Ordering::Relaxed),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn a_full_spill_lets_copies_go_and_a_failure_then_abandons_the_stream() {
+        let spill_dir = tempfile::tempdir().expect("tempdir");
+        let (endpoint, streams) = serve_bes_that_acks_at_eof(Some(60)).await;
+        // Room for a few events, so the cap is reached well before the failure.
+        let (mut worker, _counters) = spill_worker_for(endpoint, spill_dir.path(), 300);
+        let trace_id = TraceId::new().to_string();
+
+        send_queued_ok(&mut worker, &trace_id, command_start_data()).await;
+        let invocation_id = worker.streams.keys().next().expect("stream opened").clone();
+        let abandoned = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                send_queued_ok(&mut worker, &trace_id, action_start_data()).await;
+                if worker.streams[&invocation_id].abandoned {
+                    return;
+                }
+                if worker.streams[&invocation_id].next_sequence_number > 60 {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            }
+        })
+        .await;
+        assert!(abandoned.is_ok(), "stream not abandoned after it failed");
+
+        let stream = &worker.streams[&invocation_id];
+        assert!(stream.replay_copies_dropped > 0);
+        assert!(stream.spill.is_none() && stream.spill_target.is_none());
+        assert!(
+            stream
+                .spill_refused
+                .as_deref()
+                .is_some_and(|reason| reason.contains("replay_spill_max_bytes")),
+            "{:?}",
+            stream.spill_refused
+        );
+        assert!(spill_files(spill_dir.path()).is_empty());
+        assert_eq!(streams.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_spill_directory_that_cannot_be_written_falls_back_without_failing() {
+        let scratch = tempfile::tempdir().expect("tempdir");
+        let file = scratch.path().join("file");
+        std::fs::write(&file, b"").expect("write");
+        let (endpoint, streams) = serve_bes_that_acks_at_eof(None).await;
+        let (mut worker, counters) = spill_worker_for(
+            endpoint,
+            &file.join("spill"),
+            DEFAULT_REPLAY_SPILL_MAX_BYTES,
+        );
+        let bound = worker.max_unacked();
+        let trace_id = TraceId::new().to_string();
+
+        send_queued_ok(&mut worker, &trace_id, command_start_data()).await;
+        let invocation_id = worker.streams.keys().next().expect("stream opened").clone();
+        let actions = 3 * bound;
+        for _ in 0..actions {
+            send_queued_ok(&mut worker, &trace_id, action_start_data()).await;
+            let stream = &worker.streams[&invocation_id];
+            assert!(!stream.abandoned);
+            assert!(stream.pending_unacked.len() <= bound);
+        }
+        let stream = &worker.streams[&invocation_id];
+        assert!(stream.replay_copies_dropped > 0);
+        assert!(
+            stream
+                .spill_refused
+                .as_deref()
+                .is_some_and(|reason| reason.contains("spill file failed"))
+        );
+        send_queued_ok(&mut worker, &trace_id, command_end_data()).await;
+        send_queued_ok(&mut worker, &trace_id, invocation_record_data()).await;
+
+        assert!(!worker.streams.contains_key(&invocation_id));
+        let events = (1 + actions + 2 + 1) as i64;
+        assert_eq!(
+            *streams.lock().unwrap(),
+            vec![(1..=events).collect::<Vec<_>>()]
+        );
+        assert_eq!(counters.snapshot().dropped, 0);
+    }
+
+    #[tokio::test]
+    async fn a_spill_file_that_cannot_be_read_abandons_the_stream_without_failing() {
+        let spill_dir = tempfile::tempdir().expect("tempdir");
+        let (endpoint, streams) = serve_bes_that_acks_at_eof(Some(60)).await;
+        let (mut worker, _counters) =
+            spill_worker_for(endpoint, spill_dir.path(), DEFAULT_REPLAY_SPILL_MAX_BYTES);
+        let trace_id = TraceId::new().to_string();
+
+        send_queued_ok(&mut worker, &trace_id, command_start_data()).await;
+        let invocation_id = worker.streams.keys().next().expect("stream opened").clone();
+        send_until_the_first_stream_fails(&mut worker, &streams, &trace_id, &invocation_id, 60)
+            .await;
+        for path in spill_files(spill_dir.path()) {
+            std::fs::remove_file(path).expect("remove spill file");
+        }
+        send_queued_ok(&mut worker, &trace_id, action_start_data()).await;
+
+        let stream = &worker.streams[&invocation_id];
+        assert!(
+            stream.abandoned,
+            "a replay that lost its spill must not leave a gap"
+        );
+        assert!(
+            stream
+                .spill_refused
+                .as_deref()
+                .is_some_and(|reason| reason.contains("spill file failed"))
+        );
+        send_queued_ok(&mut worker, &trace_id, command_end_data()).await;
+        send_queued_ok(&mut worker, &trace_id, invocation_record_data()).await;
+        assert!(!worker.streams.contains_key(&invocation_id));
+        assert!(
+            streams
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|stream| stream.iter().copied().eq(1..=stream.len() as i64)),
+            "no stream reached the server with a gap"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_stream_failing_within_its_retry_window_is_kept() {
+        let config = BesConfig {
+            retry_backoff: Duration::from_millis(30),
+            retry_window: Duration::from_secs(DEFAULT_RETRY_WINDOW_SECS),
+            grpc_timeout: Duration::from_millis(500),
+            ..BesConfig::default()
+        };
+        let connection = ConnectionConfig {
+            endpoint: "http://127.0.0.1:1".to_owned(),
+            headers: Vec::new(),
+            tls: BesTls::default(),
+            credential_helper: None,
+        };
+        let counters = Arc::new(CounterState::default());
+        let mut worker = WorkerState::new(config, connection, counters.clone());
+        let trace_id = TraceId::new().to_string();
+        let message = make_message(Some(&trace_id), Some(1), command_start_data());
+        let parsed = ParsedMessage::from_message(&message).expect("valid message");
+
+        assert!(
+            worker
+                .send_message_with_retry(&message, false)
+                .await
+                .is_ok()
+        );
+        // Past the 100 ms after which `stream_failing_for_the_retry_window_is_abandoned`
+        // abandons the same stream under a 100 ms window.
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        let message = make_message(Some(&trace_id), Some(1), action_start_data());
+        assert!(
+            worker
+                .send_message_with_retry(&message, false)
+                .await
+                .is_ok()
+        );
+
+        let stream = &worker.streams[&parsed.invocation_id];
+        assert!(!stream.abandoned);
+        assert!(
+            stream
+                .failing
+                .as_ref()
+                .is_some_and(|failing| failing.attempts >= 2)
+        );
+        assert_eq!(stream.pending_unacked.len(), 2);
+        assert_eq!(counters.snapshot().dropped, 0);
     }
 
     struct ByteStreamThatNeverAnswers;
