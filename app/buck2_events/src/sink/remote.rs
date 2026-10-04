@@ -21,6 +21,10 @@ pub use crate::sink::scribe::RemoteEventConfig;
 pub use crate::sink::bes_client::BesChannelSettings;
 #[cfg(not(fbcode_build))]
 pub use crate::sink::bes_client::BesTls;
+#[cfg(not(fbcode_build))]
+pub use crate::sink::bes_client::DEFAULT_REPLAY_SPILL_MAX_BYTES;
+#[cfg(not(fbcode_build))]
+pub use crate::sink::bes_client::DEFAULT_RETRY_WINDOW_SECS;
 pub use crate::sink::scribe::RemoteEventSink;
 pub(crate) use crate::sink::scribe::scribe_category;
 
