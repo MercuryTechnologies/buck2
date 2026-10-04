@@ -162,6 +162,11 @@ const DEFAULT_STALLED_OPERATION_TIMEOUT_SECS: u64 = 10 * 60;
 /// 1107e6e3) through a 5 ms window leaves 16,534 RPCs and makes a call wait 3.1 ms on average,
 /// against a median of 42 ms for the RPC itself; 10 ms gains 7 more points for twice the wait.
 const DEFAULT_FIND_MISSING_BLOBS_BATCH_WINDOW_MS: u64 = 5;
+/// BuildBuddy answers an Execute with an Operation as soon as it has looked the action up in the
+/// cache and dispatched or merged it, before any executor is involved (v2.310.0
+/// enterprise/server/remote_execution/execution_server/execution_server.go:1124-1197, 1297-1306),
+/// so its response headers take milliseconds to seconds. A minute is the unary request timeout.
+const DEFAULT_EXECUTE_RESPONSE_TIMEOUT_SECS: u64 = DEFAULT_GRPC_REQUEST_TIMEOUT_SECS;
 const DEFAULT_FAST_CDC_2020_AVG_CHUNK_SIZE: u64 = 512 * 1024;
 // Match Bazel's default gRPC remote-execution fanout: roughly 100 requests per
 // connection, with at most 100 connections unless explicitly overridden.
@@ -669,6 +674,15 @@ fn normalize_grpc_error(err: anyhow::Error) -> anyhow::Error {
     if err.downcast_ref::<REClientError>().is_some() {
         return err;
     }
+    if let Some(timed_out) = err.downcast_ref::<ExecuteResponseTimedOut>() {
+        return anyhow::Error::from(REClientError {
+            code: TCode::DEADLINE_EXCEEDED,
+            message: format!(
+                "{timed_out} on any attempt; failing the action instead of waiting on it"
+            ),
+            group: TCodeReasonGroup::UNKNOWN,
+        });
+    }
 
     let re_client_error = err
         .downcast_ref::<tonic::Status>()
@@ -761,7 +775,8 @@ fn is_broken_connection_error(err: &anyhow::Error) -> bool {
 /// CANCELLED is retried only when it came from the connection: buck2 cancelling a request drops
 /// its future, which leaves no Status to look at, and a CANCELLED from the server is its answer.
 fn is_retryable_grpc_error(err: &anyhow::Error) -> bool {
-    grpc_error_retry_delay(err).is_some()
+    err.is::<ExecuteResponseTimedOut>()
+        || grpc_error_retry_delay(err).is_some()
         || error_tcode(err).is_some_and(tcode_is_retryable)
         || (error_tcode(err) == Some(TCode::CANCELLED) && is_broken_connection_error(err))
 }
@@ -839,7 +854,7 @@ fn recovery_for_error(err: &anyhow::Error) -> Recovery {
     // would otherwise be the one to look at.
     if error_rejects_credentials(err) {
         Recovery::RefreshCredentials
-    } else if is_broken_connection_error(err) {
+    } else if is_broken_connection_error(err) || err.is::<ExecuteResponseTimedOut>() {
         Recovery::Reconnect
     } else {
         Recovery::None
@@ -1064,6 +1079,8 @@ async fn execute_stream(
     request: GExecuteRequest,
     retries: usize,
     retry_max_delay: Duration,
+    response_timeout: Duration,
+    retry_uncached: Option<&StalledReexecute<'_>>,
 ) -> anyhow::Result<tonic::Streaming<Operation>> {
     let mut start = remote_request_start(
         "Execution",
@@ -1081,6 +1098,7 @@ async fn execute_stream(
             .details
             .insert("priority".to_owned(), priority.to_string());
     }
+    let mut attempts = 0usize;
     remote_request_span(
         start,
         retry_grpc_request_with_client_reconnect(
@@ -1092,17 +1110,55 @@ async fn execute_stream(
                 let grpc_clients = grpc_clients.clone();
                 let metadata = metadata.clone();
                 let request = request.clone();
+                let attempt = attempts;
+                attempts += 1;
                 async move {
+                    // A retry here has no operation name yet, so the server may hold an
+                    // execution for the failed attempt that the same digest would merge into
+                    // and that will never answer (`StalledReexecute::before_operation`).
+                    let request = match retry_uncached {
+                        Some(reexecute) if attempt > 0 => {
+                            let uncached = reexecute.uncached_request(&request).await?;
+                            warn_re_execution_retry(format!(
+                                "Executing RE action {} again as action {} with do_not_cache set (Execute attempt {}/{}): the previous attempt failed before the server named an operation. The server does not merge this Execute into an execution the failed one may have left behind, and does not cache its result",
+                                execute_request_action(&request),
+                                execute_request_action(&uncached),
+                                attempt + 1,
+                                retries + 1,
+                            ));
+                            uncached
+                        }
+                        _ => request,
+                    };
+                    let action = execute_request_action(&request);
                     let mut client = grpc_clients.execution_client().await?;
-                    Ok(client
-                        .execute(with_re_metadata(
-                            request,
-                            &metadata,
-                            use_fbcode_metadata,
-                            request_metadata_tool_name,
-                        ))
-                        .await?
-                        .into_inner())
+                    // tonic returns the stream once the response headers are in, which the
+                    // server sends with its first Operation. Only that wait is bounded: a
+                    // grpc-timeout would end the whole stream, which lasts as long as the action.
+                    let execute = client.execute(with_re_metadata(
+                        request,
+                        &metadata,
+                        use_fbcode_metadata,
+                        request_metadata_tool_name,
+                    ));
+                    let response = if response_timeout.is_zero() {
+                        execute.await?
+                    } else {
+                        match tokio::time::timeout(response_timeout, execute).await {
+                            Ok(response) => response?,
+                            Err(_) => {
+                                let timed_out = ExecuteResponseTimedOut {
+                                    waited: response_timeout,
+                                };
+                                warn_re_execution_retry(format!(
+                                    "The Execute of RE action {action} got no response for {}s; its connection is treated as broken",
+                                    response_timeout.as_secs(),
+                                ));
+                                return Err(timed_out.into());
+                            }
+                        }
+                    };
+                    Ok(response.into_inner())
                 }
             },
         ),
@@ -1490,6 +1546,28 @@ impl std::fmt::Display for ResumptionStalled {
 
 impl std::error::Error for ResumptionStalled {}
 
+/// An Execute whose response headers did not arrive within the execute response timeout.
+/// BuildBuddy sends them with the Operation it answers every Execute with once the action is
+/// dispatched or merged (execution_server.go:1124-1197, 1297-1306), so the request is retried on
+/// a new connection, as one the connection lost would be, and as the uncached Action, as every
+/// retry of an Execute is.
+#[derive(Debug)]
+struct ExecuteResponseTimedOut {
+    waited: Duration,
+}
+
+impl std::fmt::Display for ExecuteResponseTimedOut {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "the Execute got no response for {}s",
+            self.waited.as_secs()
+        )
+    }
+}
+
+impl std::error::Error for ExecuteResponseTimedOut {}
+
 /// The connection and settings a stalled action's re-Execute is sent with.
 struct StalledReexecute<'a> {
     grpc_clients: Arc<GRPCClients>,
@@ -1499,6 +1577,7 @@ struct StalledReexecute<'a> {
     retries: usize,
     retry_max_delay: Duration,
     grpc_request_timeout: Duration,
+    execute_response_timeout: Duration,
 }
 
 impl StalledReexecute<'_> {
@@ -1553,6 +1632,8 @@ impl StalledReexecute<'_> {
             uncached.clone(),
             self.retries,
             self.retry_max_delay,
+            self.execute_response_timeout,
+            None,
         )
         .await
         .with_context(|| {
@@ -1560,6 +1641,43 @@ impl StalledReexecute<'_> {
                 "RE operation `{operation_name}` of action {action} made no progress for {waited}s, and the Execute of its uncached Action failed"
             )
         })?;
+        Ok((stream, uncached))
+    }
+
+    /// Executes the action of `request` again after its Execute stream failed before the server
+    /// named an operation, as an Action with `do_not_cache` set. BuildBuddy cancels the dispatch
+    /// of an Execute whose stream drops (execution_server.go:1144-1163), but between creating the
+    /// task and failing its enqueue it lets other Executes of the digest merge into it
+    /// (action_merger/action_merger.go:260-365), and on that failure marks the execution failed
+    /// on the cancelled context, so nothing is published for whoever merged
+    /// (execution_server.go:1157-1160, 1359-1376). A retry of the same digest follows the drop
+    /// within a second, inside that window. An Action with `do_not_cache` is never merged
+    /// (action_merger.go:260-263); its result is not written to the action cache
+    /// (execution_server.go:1693-1697). `attempt` and `reason` go into the console warning.
+    async fn before_operation(
+        &self,
+        request: &GExecuteRequest,
+        attempt: String,
+        reason: String,
+    ) -> anyhow::Result<(tonic::Streaming<Operation>, GExecuteRequest)> {
+        let uncached = self.uncached_request(request).await?;
+        warn_re_execution_retry(format!(
+            "Executing RE action {} again as action {} with do_not_cache set ({attempt}): {reason}. The server does not merge this Execute into an execution the failed one may have left behind, and does not cache its result",
+            execute_request_action(request),
+            execute_request_action(&uncached),
+        ));
+        let stream = execute_stream(
+            self.grpc_clients.clone(),
+            self.metadata.clone(),
+            self.use_fbcode_metadata,
+            self.request_metadata_tool_name,
+            uncached.clone(),
+            self.retries,
+            self.retry_max_delay,
+            self.execute_response_timeout,
+            None,
+        )
+        .await?;
         Ok((stream, uncached))
     }
 
@@ -1689,6 +1807,8 @@ async fn resume_or_retry_execute(
     mut execute_retry_attempts: usize,
     retries: usize,
     retry_max_delay: Duration,
+    execute_response_timeout: Duration,
+    uncached_retry: &StalledReexecute<'_>,
     wait_failure_context: String,
     queued: &mut QueuedDeadline,
     stalled: &mut StallDeadline,
@@ -1749,6 +1869,8 @@ async fn resume_or_retry_execute(
                     execute_request.clone(),
                     retries,
                     retry_max_delay,
+                    execute_response_timeout,
+                    Some(uncached_retry),
                 )
                 .await
                 {
@@ -1789,6 +1911,8 @@ async fn resume_or_retry_execute(
             execute_request.clone(),
             retries,
             retry_max_delay,
+            execute_response_timeout,
+            Some(uncached_retry),
         )
         .await
         .context(failure_context)?;
@@ -2021,6 +2145,9 @@ pub struct RERuntimeOpts {
     /// Time a claimed operation may make no progress before its action is executed again, once;
     /// zero is never.
     stalled_operation_timeout: Duration,
+    /// Time an Execute may wait for its response headers before it is sent again on a new
+    /// connection; zero is never.
+    execute_response_timeout: Duration,
     /// Digest function selected from user config and capabilities for download hash validation.
     download_hash_digest_function: Option<digest_function::Value>,
     /// Digest functions selected from daemon config for RE request fields.
@@ -3294,6 +3421,10 @@ impl REClientBuilder {
             opts.stalled_operation_timeout_secs
                 .unwrap_or(DEFAULT_STALLED_OPERATION_TIMEOUT_SECS),
         );
+        let execute_response_timeout = Duration::from_secs(
+            opts.execute_response_timeout_secs
+                .unwrap_or(DEFAULT_EXECUTE_RESPONSE_TIMEOUT_SECS),
+        );
 
         let capabilities = if opts.capabilities.unwrap_or(true) {
             Self::fetch_rbe_capabilities(
@@ -3465,6 +3596,7 @@ impl REClientBuilder {
                 bytestream_progress_timeout,
                 queued_operation_timeout,
                 stalled_operation_timeout,
+                execute_response_timeout,
                 download_hash_digest_function,
                 request_digest_function_config,
             },
@@ -5266,6 +5398,16 @@ impl REClient {
         };
         let request_metadata_tool_name = self.runtime_opts.request_metadata_tool_name.clone();
 
+        let initial_reexecute = StalledReexecute {
+            grpc_clients: self.grpc_clients.clone(),
+            metadata,
+            use_fbcode_metadata: self.runtime_opts.use_fbcode_metadata,
+            request_metadata_tool_name: request_metadata_tool_name.as_str(),
+            retries: self.runtime_opts.retries,
+            retry_max_delay: Duration::from_millis(self.runtime_opts.retry_max_delay_ms),
+            grpc_request_timeout: self.runtime_opts.grpc_request_timeout,
+            execute_response_timeout: self.runtime_opts.execute_response_timeout,
+        };
         let stream = execute_stream(
             self.grpc_clients.clone(),
             metadata.clone(),
@@ -5274,6 +5416,8 @@ impl REClient {
             grpc_request.clone(),
             self.runtime_opts.retries,
             Duration::from_millis(self.runtime_opts.retry_max_delay_ms),
+            self.runtime_opts.execute_response_timeout,
+            Some(&initial_reexecute),
         )
         .await?;
 
@@ -5284,6 +5428,7 @@ impl REClient {
         let retry_max_delay = Duration::from_millis(self.runtime_opts.retry_max_delay_ms);
         let cas_ttl_secs = self.runtime_opts.cas_ttl_secs;
         let grpc_request_timeout = self.runtime_opts.grpc_request_timeout;
+        let execute_response_timeout = self.runtime_opts.execute_response_timeout;
 
         let stream = futures::stream::try_unfold(
             Some(OperationStream {
@@ -5324,6 +5469,7 @@ impl REClient {
                         retries,
                         retry_max_delay,
                         grpc_request_timeout,
+                        execute_response_timeout,
                     };
                     loop {
                         let msg = loop {
@@ -5396,6 +5542,8 @@ impl REClient {
                                         grpc_request.clone(),
                                         retries,
                                         retry_max_delay,
+                                        execute_response_timeout,
+                                        Some(&stalled_reexecute),
                                     )
                                     .await
                                     {
@@ -5454,6 +5602,8 @@ impl REClient {
                                         execute_retry_attempts,
                                         retries,
                                         retry_max_delay,
+                                        execute_response_timeout,
+                                        &stalled_reexecute,
                                         "RE WaitExecution failed after Execute stream ended before completion".to_owned(),
                                         &mut queued,
                                         &mut stalled,
@@ -5499,6 +5649,21 @@ impl REClient {
                                         }
 
                                         execute_retry_attempts += 1;
+                                        if operation_name.is_none() {
+                                            let (next_stream, next_request) = stalled_reexecute
+                                                .before_operation(
+                                                    &grpc_request,
+                                                    format!("re-Execute {execute_retry_attempts}/{retries}"),
+                                                    format!("its Execute stream failed before the operation was created: {err:#}"),
+                                                )
+                                                .await
+                                                .context("RE Execute stream returned NOT_FOUND before operation creation, and Execute retry failed")?;
+                                            stream = next_stream;
+                                            grpc_request = next_request;
+                                            queued.start();
+                                            stalled.reset();
+                                            continue;
+                                        }
                                         warn_re_execution_retry(format!(
                                             "Executing RE action {} again (re-Execute {execute_retry_attempts}/{retries}): its operation stream failed: {err:#}",
                                             execute_request_action(&grpc_request),
@@ -5511,6 +5676,8 @@ impl REClient {
                                             grpc_request.clone(),
                                             retries,
                                             retry_max_delay,
+                                            execute_response_timeout,
+                                            Some(&stalled_reexecute),
                                         )
                                         .await
                                         .context("RE operation stream returned NOT_FOUND and Execute retry failed")?;
@@ -5542,23 +5709,18 @@ impl REClient {
                                         }
 
                                         execute_retry_attempts += 1;
-                                        warn_re_execution_retry(format!(
-                                            "Executing RE action {} again (re-Execute {execute_retry_attempts}/{retries}){reconnected}: its Execute stream failed before the operation was created: {err:#}",
-                                            execute_request_action(&grpc_request),
-                                        ));
-                                        stream = execute_stream(
-                                            grpc_clients.clone(),
-                                            metadata.clone(),
-                                            use_fbcode_metadata,
-                                            request_metadata_tool_name.as_str(),
-                                            grpc_request.clone(),
-                                            retries,
-                                            retry_max_delay,
-                                        )
-                                        .await
-                                        .context(
-                                            "Execute stream failed before operation creation and Execute retry failed",
-                                        )?;
+                                        let (next_stream, next_request) = stalled_reexecute
+                                            .before_operation(
+                                                &grpc_request,
+                                                format!("re-Execute {execute_retry_attempts}/{retries}{reconnected}"),
+                                                format!("its Execute stream failed before the operation was created: {err:#}"),
+                                            )
+                                            .await
+                                            .context(
+                                                "Execute stream failed before operation creation and Execute retry failed",
+                                            )?;
+                                        stream = next_stream;
+                                        grpc_request = next_request;
                                         queued.start();
                                         stalled.reset();
                                         continue;
@@ -5591,6 +5753,8 @@ impl REClient {
                                         execute_retry_attempts,
                                         retries,
                                         retry_max_delay,
+                                        execute_response_timeout,
+                                        &stalled_reexecute,
                                         format!("RE WaitExecution failed after Execute stream interruption ({err:#})"),
                                         &mut queued,
                                         &mut stalled,
@@ -5666,6 +5830,8 @@ impl REClient {
                                             grpc_request.clone(),
                                             retries,
                                             retry_max_delay,
+                                            execute_response_timeout,
+                                            Some(&stalled_reexecute),
                                         )
                                         .await
                                         .context(
@@ -5711,6 +5877,8 @@ impl REClient {
                                             grpc_request.clone(),
                                             retries,
                                             retry_max_delay,
+                                            execute_response_timeout,
+                                            Some(&stalled_reexecute),
                                         )
                                         .await
                                         .context(
@@ -9635,6 +9803,7 @@ mod tests {
             ),
             queued_operation_timeout: Duration::from_secs(DEFAULT_QUEUED_OPERATION_TIMEOUT_SECS),
             stalled_operation_timeout: Duration::from_secs(DEFAULT_STALLED_OPERATION_TIMEOUT_SECS),
+            execute_response_timeout: Duration::from_secs(DEFAULT_EXECUTE_RESPONSE_TIMEOUT_SECS),
             download_hash_digest_function: Some(digest_function::Value::Sha256),
             request_digest_function_config: digest_function_config,
         };
@@ -11107,6 +11276,11 @@ mod tests {
         /// trailers follow the last Operation after the delay of a `RawTrailers::After`; with any
         /// other `RawTrailers` the stream stays open.
         Operations(Vec<(Duration, Operation)>, RawTrailers),
+        /// `Operations`, whose response headers are sent with the first Operation, after its
+        /// delay, as grpc-go sends them.
+        HeadersWithFirst(Vec<(Duration, Operation)>, RawTrailers),
+        /// Sends the response headers, then closes the connection before any Operation.
+        HeadersThenClose,
         /// Holds the stream open without even its response headers.
         Nothing,
         /// Answers with one encoded message, as a unary call such as a CAS read does, and the
@@ -11272,6 +11446,16 @@ mod tests {
                             return Ok(());
                         }
                         RawReply::Nothing => continue,
+                        RawReply::HeadersThenClose => {
+                            frames.send(h2_frame(
+                                H2_HEADERS,
+                                H2_FLAG_END_HEADERS,
+                                stream,
+                                H2_RESPONSE_HEADERS,
+                            ))?;
+                            frames.send(Vec::new())?;
+                            return Ok(());
+                        }
                         RawReply::Unary(message) => {
                             frames.send(h2_frame(
                                 H2_HEADERS,
@@ -11285,18 +11469,38 @@ mod tests {
                             continue;
                         }
                         RawReply::Silence => return std::future::pending().await,
-                        RawReply::Operations(operations, trailers) => {
-                            frames.send(h2_frame(
-                                H2_HEADERS,
-                                H2_FLAG_END_HEADERS,
-                                stream,
-                                H2_RESPONSE_HEADERS,
-                            ))?;
+                        reply @ (RawReply::Operations(..) | RawReply::HeadersWithFirst(..)) => {
+                            let (operations, trailers, mut headers_sent) = match reply {
+                                RawReply::Operations(operations, trailers) => {
+                                    (operations, trailers, true)
+                                }
+                                RawReply::HeadersWithFirst(operations, trailers) => {
+                                    (operations, trailers, false)
+                                }
+                                _ => unreachable!(),
+                            };
+                            if headers_sent {
+                                frames.send(h2_frame(
+                                    H2_HEADERS,
+                                    H2_FLAG_END_HEADERS,
+                                    stream,
+                                    H2_RESPONSE_HEADERS,
+                                ))?;
+                            }
                             let (pending, frames, log) =
                                 (pending.clone(), frames.clone(), log.clone());
                             tokio::spawn(async move {
                                 for (delay, operation) in operations {
                                     tokio::time::sleep(delay).await;
+                                    if !headers_sent {
+                                        let _ = frames.send(h2_frame(
+                                            H2_HEADERS,
+                                            H2_FLAG_END_HEADERS,
+                                            stream,
+                                            H2_RESPONSE_HEADERS,
+                                        ));
+                                        headers_sent = true;
+                                    }
                                     let _ = frames.send(h2_frame(
                                         H2_DATA,
                                         0,
@@ -12396,8 +12600,30 @@ mod tests {
     async fn serve_stalling(
         reply: impl Fn(usize, Option<String>) -> RawReply + Send + Sync + 'static,
     ) -> anyhow::Result<(REClient, Arc<StallCalls>, tokio::task::JoinHandle<()>)> {
+        let (client, calls, _log, server) = serve_stalling_with(
+            Buck2OssReConfiguration {
+                retries: Some(2),
+                stalled_operation_timeout_secs: Some(1),
+                ..Default::default()
+            },
+            reply,
+        )
+        .await?;
+        Ok((client, calls, server))
+    }
+
+    /// `serve_stalling`, whose client is configured with `opts`, and the server's log.
+    async fn serve_stalling_with(
+        opts: Buck2OssReConfiguration,
+        reply: impl Fn(usize, Option<String>) -> RawReply + Send + Sync + 'static,
+    ) -> anyhow::Result<(
+        REClient,
+        Arc<StallCalls>,
+        Arc<RawH2Log>,
+        tokio::task::JoinHandle<()>,
+    )> {
         let calls = Arc::new(StallCalls::default());
-        let (address, _log, server) = serve_raw_h2({
+        let (address, log, server) = serve_raw_h2({
             let calls = calls.clone();
             move |body| match stall_request(body) {
                 StallRequest::Wait(name) => {
@@ -12437,16 +12663,8 @@ mod tests {
             }
         })
         .await?;
-        let client = raw_h2_client_with(
-            address,
-            Buck2OssReConfiguration {
-                retries: Some(2),
-                stalled_operation_timeout_secs: Some(1),
-                ..Default::default()
-            },
-        )
-        .await?;
-        Ok((client, calls, server))
+        let client = raw_h2_client_with(address, opts).await?;
+        Ok((client, calls, log, server))
     }
 
     /// Runs an action as `execute_raw_h2_action` does, and returns its outcome with the console
@@ -12692,6 +12910,254 @@ mod tests {
             assert_eq!(warnings.len(), 1, "{warnings:#?}");
             server.abort();
         }
+        Ok(())
+    }
+
+    /// The orphans of 2026-10-04 on BuildBuddy v2.310.0 (lab calibration jobs i05, i14, i25): an
+    /// Execute's stream dropped before the server named an operation, the server cancelled its
+    /// dispatch, and the retry of the same digest, sent within a second, merged into that
+    /// execution before its enqueue failed, so the retry was never answered past EXECUTING.
+    #[tokio::test]
+    async fn an_execute_stream_that_fails_before_its_operation_is_retried_uncached()
+    -> anyhow::Result<()> {
+        let (client, calls, server) = serve_stalling(|earlier, _| match earlier {
+            0 => RawReply::HeadersThenClose,
+            _ => RawReply::Operation(done_operation(), RawTrailers::After(Duration::ZERO)),
+        })
+        .await?;
+
+        let (completed, warnings) = execute_stalling_action(&client).await;
+
+        assert_eq!(completed?.status.code, TCode::OK);
+        let (action, uploaded) = uploaded_action(&calls);
+        assert!(action.do_not_cache);
+        assert_eq!(
+            Action {
+                do_not_cache: false,
+                ..action
+            },
+            stalling_action()
+        );
+        let original = Digest {
+            hash: "ab".repeat(32),
+            size_bytes: 1,
+        };
+        assert_eq!(
+            *calls.executes.lock().unwrap(),
+            vec![original, uploaded.clone()]
+        );
+        assert_eq!(warnings.len(), 1, "{warnings:#?}");
+        assert!(
+            warnings[0].starts_with(&format!(
+                "Executing RE action {}/1 again as action {}/{} with do_not_cache set (re-Execute 1/2 on a new connection): its Execute stream failed before the operation was created",
+                "ab".repeat(32),
+                uploaded.hash,
+                uploaded.size_bytes,
+            )),
+            "{}",
+            warnings[0]
+        );
+        server.abort();
+        Ok(())
+    }
+
+    /// A raw server as `serve_stalling`'s, and a client of it whose Executes may wait 1 s for
+    /// their response headers.
+    async fn serve_unanswered(
+        reply: impl Fn(usize, Option<String>) -> RawReply + Send + Sync + 'static,
+    ) -> anyhow::Result<(
+        REClient,
+        Arc<StallCalls>,
+        Arc<RawH2Log>,
+        tokio::task::JoinHandle<()>,
+    )> {
+        serve_stalling_with(
+            Buck2OssReConfiguration {
+                retries: Some(2),
+                execute_response_timeout_secs: Some(1),
+                ..Default::default()
+            },
+            reply,
+        )
+        .await
+    }
+
+    /// The orphan of 2026-10-04 in lab calibration job i18: the Execution connection broke
+    /// before the server answered the first Execute, and the retry of the same digest, sent
+    /// without a console warning, merged into the execution the server was cancelling.
+    #[tokio::test]
+    async fn an_execute_whose_connection_breaks_before_an_answer_is_retried_uncached()
+    -> anyhow::Result<()> {
+        let (client, calls, server) = serve_stalling(|earlier, _| match earlier {
+            0 => RawReply::Close,
+            _ => RawReply::Operation(done_operation(), RawTrailers::After(Duration::ZERO)),
+        })
+        .await?;
+
+        let (completed, warnings) = execute_stalling_action(&client).await;
+
+        assert_eq!(completed?.status.code, TCode::OK);
+        let (action, uploaded) = uploaded_action(&calls);
+        assert!(action.do_not_cache);
+        let original = Digest {
+            hash: "ab".repeat(32),
+            size_bytes: 1,
+        };
+        assert_eq!(
+            *calls.executes.lock().unwrap(),
+            vec![original, uploaded.clone()]
+        );
+        assert_eq!(
+            warnings,
+            vec![format!(
+                "Executing RE action {}/1 again as action {}/{} with do_not_cache set (Execute attempt 2/3): the previous attempt failed before the server named an operation. The server does not merge this Execute into an execution the failed one may have left behind, and does not cache its result",
+                "ab".repeat(32),
+                uploaded.hash,
+                uploaded.size_bytes,
+            )]
+        );
+        server.abort();
+        Ok(())
+    }
+
+    /// An Execute whose response headers never come is sent again on a new connection, as the
+    /// uncached Action, since it has no operation name yet, and the action takes the answer to
+    /// that one.
+    #[tokio::test]
+    async fn an_execute_without_response_headers_is_sent_again_on_a_new_connection()
+    -> anyhow::Result<()> {
+        let (client, calls, log, server) = serve_unanswered(|earlier, _| match earlier {
+            0 => RawReply::Nothing,
+            _ => RawReply::Operation(done_operation(), RawTrailers::After(Duration::ZERO)),
+        })
+        .await?;
+        let connections_before = log.connections.load(Ordering::SeqCst);
+
+        let started = Instant::now();
+        let (completed, warnings) = execute_stalling_action(&client).await;
+
+        assert_eq!(completed?.status.code, TCode::OK);
+        assert!(started.elapsed() >= Duration::from_secs(1));
+        let original = Digest {
+            hash: "ab".repeat(32),
+            size_bytes: 1,
+        };
+        let (action, uploaded) = uploaded_action(&calls);
+        assert!(action.do_not_cache);
+        assert_eq!(
+            *calls.executes.lock().unwrap(),
+            vec![original, uploaded.clone()]
+        );
+        assert!(
+            log.connections.load(Ordering::SeqCst) > connections_before,
+            "the second Execute goes out on a new connection"
+        );
+        assert_eq!(warnings.len(), 2, "{warnings:#?}");
+        assert_eq!(
+            warnings[0],
+            format!(
+                "The Execute of RE action {}/1 got no response for 1s; its connection is treated as broken",
+                "ab".repeat(32),
+            )
+        );
+        assert!(
+            warnings[1].contains(&format!(
+                "as action {}/{}",
+                uploaded.hash, uploaded.size_bytes
+            )),
+            "{}",
+            warnings[1]
+        );
+        server.abort();
+        Ok(())
+    }
+
+    /// A server that answers no Execute at all fails the action once the retries are spent,
+    /// rather than holding it.
+    #[tokio::test]
+    async fn an_execute_that_never_gets_a_response_fails_with_deadline_exceeded()
+    -> anyhow::Result<()> {
+        let (client, calls, _log, server) = serve_unanswered(|_, _| RawReply::Nothing).await?;
+
+        let started = Instant::now();
+        let (completed, warnings) = execute_stalling_action(&client).await;
+
+        let err = completed
+            .err()
+            .expect("an action whose Executes are never answered fails");
+        let err = err
+            .downcast_ref::<REClientError>()
+            .expect("an REClientError");
+        assert_eq!(err.code, TCode::DEADLINE_EXCEEDED, "{}", err.message);
+        assert!(started.elapsed() >= Duration::from_secs(3));
+        assert_eq!(calls.executes.lock().unwrap().len(), 3);
+        // Three timeouts, and the two retries sent as the uncached Action.
+        assert_eq!(warnings.len(), 5, "{warnings:#?}");
+        server.abort();
+        Ok(())
+    }
+
+    /// A slow server is not a missing one: headers that arrive before the deadline end the wait.
+    #[tokio::test]
+    async fn an_execute_answered_just_before_the_deadline_is_not_sent_again() -> anyhow::Result<()>
+    {
+        let (client, calls, _log, server) = serve_unanswered(|earlier, _| match earlier {
+            0 => RawReply::HeadersWithFirst(
+                vec![
+                    (
+                        Duration::from_millis(800),
+                        queued_operation("operations/slow"),
+                    ),
+                    (Duration::from_millis(400), done_operation()),
+                ],
+                RawTrailers::After(Duration::ZERO),
+            ),
+            _ => RawReply::Operation(done_operation(), RawTrailers::After(Duration::ZERO)),
+        })
+        .await?;
+
+        let started = Instant::now();
+        let (completed, warnings) = execute_stalling_action(&client).await;
+
+        assert_eq!(completed?.status.code, TCode::OK);
+        assert!(started.elapsed() >= Duration::from_millis(1200));
+        assert_eq!(calls.executes.lock().unwrap().len(), 1);
+        assert_eq!(warnings, Vec::<String>::new());
+        server.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn an_unset_execute_response_timeout_is_a_minute() -> anyhow::Result<()> {
+        let (address, _log, server) = serve_raw_h2(|_| RawReply::Close).await?;
+        let client = raw_h2_client(address, 0).await?;
+
+        assert_eq!(
+            client.runtime_opts.execute_response_timeout,
+            Duration::from_secs(60)
+        );
+        server.abort();
+        Ok(())
+    }
+
+    /// 0 turns the deadline off: an Execute without an answer is waited for, as before.
+    #[tokio::test]
+    async fn a_zero_execute_response_timeout_waits_for_the_response() -> anyhow::Result<()> {
+        let (client, calls, _log, server) = serve_stalling_with(
+            Buck2OssReConfiguration {
+                execute_response_timeout_secs: Some(0),
+                ..Default::default()
+            },
+            |_, _| RawReply::Nothing,
+        )
+        .await?;
+
+        let waited =
+            tokio::time::timeout(Duration::from_secs(2), execute_raw_h2_action(&client)).await;
+
+        assert!(waited.is_err(), "the Execute is still waited for");
+        assert_eq!(calls.executes.lock().unwrap().len(), 1);
+        server.abort();
         Ok(())
     }
 
