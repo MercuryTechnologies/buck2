@@ -2372,6 +2372,10 @@ struct ReplaySpill {
     /// end at `acked_offset`, so the next replay starts reading there.
     acked_through: i64,
     acked_offset: u64,
+    /// The copies through this sequence number, ending at `sent_offset`, went to the transport.
+    /// A flush cut short by a send timeout resumes reading there instead of at `acked_offset`.
+    sent_through: i64,
+    sent_offset: u64,
     budget: Arc<SpillBudget>,
 }
 
@@ -2399,6 +2403,8 @@ impl ReplaySpill {
             last_sequence_number: 0,
             acked_through: 0,
             acked_offset: 0,
+            sent_through: 0,
+            sent_offset: 0,
             budget: target.budget.clone(),
         })
     }
@@ -2442,12 +2448,22 @@ impl ReplaySpill {
             .unwrap_or(0)
     }
 
-    fn reader(&self) -> std::io::Result<SpillReader> {
+    /// Reads from the furthest point before which every copy was sent on the current transport.
+    /// A new transport sends again from the first unacknowledged copy (`attach_transport`), so a
+    /// `sent_through` past `last_sent_sequence_number` belongs to an old one and is ignored.
+    fn reader(&self, last_sent_sequence_number: i64) -> std::io::Result<SpillReader> {
+        let offset = if self.sent_through > self.acked_through
+            && self.sent_through <= last_sent_sequence_number
+        {
+            self.sent_offset
+        } else {
+            self.acked_offset
+        };
         let mut file = std::fs::File::open(&self.path)?;
-        std::io::Seek::seek(&mut file, std::io::SeekFrom::Start(self.acked_offset))?;
+        std::io::Seek::seek(&mut file, std::io::SeekFrom::Start(offset))?;
         Ok(SpillReader {
             reader: std::io::BufReader::new(file),
-            offset: self.acked_offset,
+            offset,
         })
     }
 }
@@ -2675,13 +2691,14 @@ impl StreamState {
         };
 
         self.replay_spill(&sender, send_timeout).await?;
-        let pending = self
-            .pending_unacked
-            .iter()
-            .filter(|request| request_sequence_number(request) > self.last_sent_sequence_number)
-            .cloned()
-            .collect::<Vec<_>>();
-        for request in pending {
+        // `pending_unacked` is in sequence order and holds every copy until it is acknowledged,
+        // which BuildBuddy does only at the end of the stream, so a scan of it on every flush
+        // costs the square of the stream's length. The unsent copies are its tail.
+        let first_unsent = self.pending_unacked.partition_point(|request| {
+            request_sequence_number(request) <= self.last_sent_sequence_number
+        });
+        for index in first_unsent..self.pending_unacked.len() {
+            let request = self.pending_unacked[index].clone();
             self.hand_to_transport(&sender, request, send_timeout)
                 .await?;
         }
@@ -2737,7 +2754,7 @@ impl StreamState {
         if last_spilled <= self.last_sent_sequence_number {
             return Ok(());
         }
-        let mut reader = match spill.reader() {
+        let mut reader = match spill.reader(self.last_sent_sequence_number) {
             Ok(reader) => reader,
             Err(e) => return Err(self.lose_spill(SpillRefusal::Io(e))),
         };
@@ -2774,6 +2791,10 @@ impl StreamState {
             }
             self.hand_to_transport(sender, request, send_timeout)
                 .await?;
+            if let Some(spill) = &mut self.spill {
+                spill.sent_through = sequence_number;
+                spill.sent_offset = end_offset;
+            }
         }
         Ok(())
     }
@@ -2903,7 +2924,14 @@ impl StreamState {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    static SEQUENCE_NUMBER_READS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
 fn request_sequence_number(request: &PublishBuildToolEventStreamRequest) -> i64 {
+    #[cfg(test)]
+    SEQUENCE_NUMBER_READS.with(|reads| reads.set(reads.get() + 1));
     request
         .ordered_build_event
         .as_ref()
@@ -5174,6 +5202,130 @@ mod tests {
         assert!(stream.spill.is_none());
         assert!(spill_files(spill_dir.path()).is_empty());
         assert_eq!(budget.used_bytes.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn a_flush_examines_only_the_copies_it_has_not_sent() {
+        let message = make_message(
+            Some(&TraceId::new().to_string()),
+            Some(1),
+            command_start_data(),
+        );
+        let parsed = ParsedMessage::from_message(&message).expect("valid message");
+        let mut stream = StreamState::new(&parsed, &[], None, true, Arc::default(), None);
+        let held = 4096;
+        let flushes = 64;
+        let (tx, mut rx) = mpsc::channel(held + flushes);
+        stream.sender = Some(tx);
+        for _ in 0..held {
+            stream.enqueue_event(&parsed, BesEventFormat::Buck).await;
+        }
+        stream
+            .flush_pending(Duration::from_secs(1))
+            .await
+            .expect("flush");
+
+        // The server acknowledges nothing, so every copy stays in `pending_unacked`, as it does
+        // against BuildBuddy until the client closes the stream.
+        let reads_before = SEQUENCE_NUMBER_READS.with(|reads| reads.get());
+        for _ in 0..flushes {
+            stream.enqueue_event(&parsed, BesEventFormat::Buck).await;
+            stream
+                .flush_pending(Duration::from_secs(1))
+                .await
+                .expect("flush");
+        }
+        let reads_per_flush =
+            (SEQUENCE_NUMBER_READS.with(|reads| reads.get()) - reads_before) / flushes as u64;
+        assert_eq!(stream.pending_unacked.len(), held + flushes);
+        assert!(
+            reads_per_flush < 64,
+            "a flush of one new event read {reads_per_flush} sequence numbers with {held} copies held"
+        );
+
+        let mut sent = Vec::new();
+        while let Ok(request) = rx.try_recv() {
+            sent.push(request_sequence_number(&request));
+        }
+        assert_eq!(sent, (1..=(held + flushes) as i64).collect::<Vec<_>>());
+    }
+
+    #[tokio::test]
+    async fn a_spill_replay_cut_short_resumes_where_it_stopped() {
+        let spill_dir = tempfile::tempdir().expect("tempdir");
+        let message = make_message(
+            Some(&TraceId::new().to_string()),
+            Some(1),
+            command_start_data(),
+        );
+        let parsed = ParsedMessage::from_message(&message).expect("valid message");
+        let mut stream = StreamState::new(
+            &parsed,
+            &[],
+            None,
+            true,
+            Arc::default(),
+            Some(SpillTarget {
+                dir: spill_dir.path().to_owned(),
+                budget: Arc::new(SpillBudget {
+                    max_bytes: DEFAULT_REPLAY_SPILL_MAX_BYTES,
+                    used_bytes: AtomicU64::new(0),
+                }),
+            }),
+        );
+        for _ in 0..10 {
+            stream.enqueue_event(&parsed, BesEventFormat::Buck).await;
+        }
+        assert!(matches!(stream.spill_oldest_replay_copies(4), Some(Ok(()))));
+        assert_eq!(
+            stream
+                .spill
+                .as_ref()
+                .map(|spill| spill.last_sequence_number),
+            Some(6)
+        );
+        assert_eq!(stream.last_sent_sequence_number, 0);
+
+        let drain = |rx: &mut mpsc::Receiver<PublishBuildToolEventStreamRequest>| {
+            let mut sent = Vec::new();
+            while let Ok(request) = rx.try_recv() {
+                sent.push(request_sequence_number(&request));
+            }
+            sent
+        };
+        let (tx, mut rx) = mpsc::channel(3);
+        stream.sender = Some(tx);
+        assert!(
+            stream
+                .flush_pending(Duration::from_millis(20))
+                .await
+                .is_err()
+        );
+        assert_eq!(drain(&mut rx), vec![1, 2, 3]);
+        let spill = stream.spill.as_ref().expect("spill");
+        assert_eq!(spill.sent_through, 3);
+
+        let (tx, mut rx) = mpsc::channel(16);
+        stream.sender = Some(tx);
+        stream
+            .flush_pending(Duration::from_secs(1))
+            .await
+            .expect("flush");
+        assert_eq!(drain(&mut rx), (4..=10).collect::<Vec<_>>());
+
+        // A new transport starts again from the first unacknowledged copy, behind the cursor.
+        stream
+            .last_acked_sequence_number
+            .store(2, Ordering::Relaxed);
+        stream.prune_acked_requests();
+        stream.last_sent_sequence_number = 2;
+        let (tx, mut rx) = mpsc::channel(16);
+        stream.sender = Some(tx);
+        stream
+            .flush_pending(Duration::from_secs(1))
+            .await
+            .expect("replay");
+        assert_eq!(drain(&mut rx), (3..=10).collect::<Vec<_>>());
     }
 
     #[tokio::test]
