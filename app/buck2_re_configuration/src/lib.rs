@@ -531,6 +531,12 @@ pub struct Buck2OssReConfiguration {
     /// upload waits for other checks to share its `FindMissingBlobs` RPC. 0 sends each check
     /// as its own RPC.
     pub find_missing_blobs_batch_window_ms: Option<u64>,
+    /// How many bytes of small blobs the client keeps in memory after reading them, so a blob
+    /// read again does not reach the CAS. 0 turns the cache off.
+    pub read_cache_bytes: Option<usize>,
+    /// The largest blob, in bytes, the client keeps in memory after reading it. 0 turns the
+    /// cache off.
+    pub read_cache_max_blob_bytes: Option<usize>,
     /// Time that digests are assumed to live in CAS after being touched.
     pub cas_ttl_secs: Option<i64>,
     /// Whether to chunk large remote-cache blobs using FastCDC 2020 and SpliceBlob.
@@ -747,6 +753,14 @@ impl Buck2OssReConfiguration {
             find_missing_blobs_batch_window_ms: legacy_config.parse(BuckconfigKeyRef {
                 section: BUCK2_RE_CLIENT_CFG_SECTION,
                 property: "find_missing_blobs_batch_window_ms",
+            })?,
+            read_cache_bytes: legacy_config.parse(BuckconfigKeyRef {
+                section: BUCK2_RE_CLIENT_CFG_SECTION,
+                property: "read_cache_bytes",
+            })?,
+            read_cache_max_blob_bytes: legacy_config.parse(BuckconfigKeyRef {
+                section: BUCK2_RE_CLIENT_CFG_SECTION,
+                property: "read_cache_max_blob_bytes",
             })?,
             cas_ttl_secs: legacy_config.parse(BuckconfigKeyRef {
                 section: BUCK2_RE_CLIENT_CFG_SECTION,
