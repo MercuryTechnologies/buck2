@@ -1520,12 +1520,20 @@ impl BazelEventConverter {
                         .output_artifacts_from_action_cache_count
                         .saturating_add(action.outputs.len() as u64);
                 }
-                if (!self.skip_successful_action_events || action.failed)
-                    && let Some(action_event) = action_event(event, span_end, action)
-                {
-                    self.remember_action(&action_event);
+                if !self.skip_successful_action_events || action.failed {
+                    if let Some(action_event) = action_event(event, span_end, action) {
+                        self.remember_action(&action_event);
+                        self.remember_target_outputs(action);
+                        events.push(action_event);
+                    }
+                } else if let Some(key) = action_target_key(action) {
+                    // Bazel without --build_event_publish_all_actions posts no ActionExecuted
+                    // for a successful action, but the action's outputs and its target's
+                    // completion still reach TargetComplete and NamedSetOfFiles.
+                    self.completed_targets
+                        .entry(key)
+                        .or_insert(CompletedTargetState { success: true });
                     self.remember_target_outputs(action);
-                    events.push(action_event);
                 }
             }
             Some(buck2_data::span_end_event::Data::TestDiscovery(test_discovery)) => {
@@ -2423,18 +2431,8 @@ impl BazelEventConverter {
     }
 
     fn remember_target_outputs(&mut self, action: &buck2_data::ActionExecutionEnd) {
-        let Some(key) = action.key.as_ref() else {
+        let Some(key) = action_target_key(action) else {
             return;
-        };
-        let Some(target) = action_owner(key) else {
-            return;
-        };
-        let Some(label) = label_for_configured_target(target) else {
-            return;
-        };
-        let key = TargetKey {
-            label,
-            configuration: configuration_id_for_target(target),
         };
         let outputs = self.target_outputs.entry(key.clone()).or_default();
         for output in &action.outputs {
@@ -7114,6 +7112,14 @@ fn first_line(value: &str) -> &str {
     value.lines().next().unwrap_or(value)
 }
 
+fn action_target_key(action: &buck2_data::ActionExecutionEnd) -> Option<TargetKey> {
+    let target = action_owner(action.key.as_ref()?)?;
+    Some(TargetKey {
+        label: label_for_configured_target(target)?,
+        configuration: configuration_id_for_target(target),
+    })
+}
+
 fn action_owner(key: &buck2_data::ActionKey) -> Option<&buck2_data::ConfiguredTargetLabel> {
     match key.owner.as_ref()? {
         buck2_data::action_key::Owner::TargetLabel(label)
@@ -8688,6 +8694,300 @@ mod tests {
         assert!(rendered.contains("Down:"));
         assert!(rendered.contains("77MiB"));
         assert!(rendered.contains("(reSessionID-123)"));
+    }
+
+    /// A build of two targets, one whose action succeeds and is then tested and one whose
+    /// action fails, converted with the given `[bes] upload_successful_action_events`.
+    fn convert_build_with_successful_and_failed_actions(
+        upload_successful_action_events: bool,
+    ) -> Vec<bep::BuildEvent> {
+        let mut converter = BazelEventConverter::new_with_options(
+            std::iter::empty::<(String, String)>(),
+            upload_successful_action_events,
+        );
+        let passing = configured_target_with_package("pkg", "passing", "cfg");
+        let failing = configured_target_with_package("pkg", "failing", "cfg");
+        let mut events = Vec::new();
+
+        events.extend(converter.convert(
+            1,
+            &trace_event(buck2_data::buck_event::Data::SpanStart(
+                buck2_data::SpanStartEvent {
+                    data: Some(buck2_data::span_start_event::Data::Command(
+                        buck2_data::CommandStart {
+                            data: Some(buck2_data::command_start::Data::Test(
+                                buck2_data::TestCommandStart::default(),
+                            )),
+                            ..Default::default()
+                        },
+                    )),
+                },
+            )),
+        ));
+        let mut sequence = 2;
+        for target in [&passing, &failing] {
+            events.extend(converter.convert(
+                sequence,
+                &trace_event(buck2_data::buck_event::Data::SpanStart(
+                    buck2_data::SpanStartEvent {
+                        data: Some(buck2_data::span_start_event::Data::Analysis(
+                            buck2_data::AnalysisStart {
+                                rule: "cxx_binary".to_owned(),
+                                target: Some(buck2_data::analysis_start::Target::StandardTarget(
+                                    target.clone(),
+                                )),
+                            },
+                        )),
+                    },
+                )),
+            ));
+            events.extend(converter.convert(
+                sequence + 1,
+                &trace_event(buck2_data::buck_event::Data::SpanEnd(
+                    buck2_data::SpanEndEvent {
+                        data: Some(buck2_data::span_end_event::Data::Analysis(
+                            buck2_data::AnalysisEnd {
+                                rule: "cxx_binary".to_owned(),
+                                target: Some(buck2_data::analysis_end::Target::StandardTarget(
+                                    target.clone(),
+                                )),
+                                ..Default::default()
+                            },
+                        )),
+                        ..Default::default()
+                    },
+                )),
+            ));
+            sequence += 2;
+        }
+        for (target, failed, stdout, stderr, exit_code) in [
+            (&passing, false, "linker stdout", "linker stderr", 0),
+            (&failing, true, "compiler stdout", "compile failed", 1),
+        ] {
+            events.extend(converter.convert(
+                sequence,
+                &trace_event(buck2_data::buck_event::Data::SpanEnd(
+                    buck2_data::SpanEndEvent {
+                        data: Some(buck2_data::span_end_event::Data::ActionExecution(Box::new(
+                            buck2_data::ActionExecutionEnd {
+                                key: Some(buck2_data::ActionKey {
+                                    key: "action-key".to_owned(),
+                                    owner: Some(buck2_data::action_key::Owner::TargetLabel(
+                                        target.clone(),
+                                    )),
+                                    ..Default::default()
+                                }),
+                                kind: buck2_data::ActionKind::Run as i32,
+                                name: Some(buck2_data::ActionName {
+                                    category: "cxx_link".to_owned(),
+                                    identifier: "main".to_owned(),
+                                }),
+                                execution_kind: buck2_data::ActionExecutionKind::Remote as i32,
+                                failed,
+                                outputs: vec![buck2_data::ActionOutput {
+                                    tiny_digest: "buck-out/main".to_owned(),
+                                    path: "buck-out/main".to_owned(),
+                                    digest: "abcd:10".to_owned(),
+                                    size: 10,
+                                    is_directory: false,
+                                }],
+                                commands: vec![buck2_data::CommandExecution {
+                                    details: Some(buck2_data::CommandExecutionDetails {
+                                        signed_exit_code: Some(exit_code),
+                                        cmd_stdout: stdout.to_owned(),
+                                        cmd_stderr: stderr.to_owned(),
+                                        ..Default::default()
+                                    }),
+                                    ..Default::default()
+                                }],
+                                ..Default::default()
+                            },
+                        ))),
+                        ..Default::default()
+                    },
+                )),
+            ));
+            sequence += 1;
+        }
+        events.extend(converter.convert(
+            sequence,
+            &trace_event(buck2_data::buck_event::Data::Instant(
+                buck2_data::InstantEvent {
+                    data: Some(buck2_data::instant_event::Data::TestResult(
+                        buck2_data::TestResult {
+                            name: "test_passes".to_owned(),
+                            status: buck2_data::TestStatus::Pass as i32,
+                            target_label: Some(passing.clone()),
+                            ..Default::default()
+                        },
+                    )),
+                },
+            )),
+        ));
+        events.extend(convert_through_end_of_results(
+            &mut converter,
+            sequence + 1,
+            &trace_event(buck2_data::buck_event::Data::SpanEnd(
+                buck2_data::SpanEndEvent {
+                    data: Some(buck2_data::span_end_event::Data::TestRun(
+                        buck2_data::TestRunEnd {
+                            suite: Some(buck2_data::TestSuite {
+                                suite_name: "suite".to_owned(),
+                                test_names: vec!["test_passes".to_owned()],
+                                target_label: Some(passing),
+                                labels: Vec::new(),
+                            }),
+                            command_report: Some(buck2_data::CommandExecution {
+                                details: Some(buck2_data::CommandExecutionDetails {
+                                    signed_exit_code: Some(0),
+                                    ..Default::default()
+                                }),
+                                status: Some(buck2_data::command_execution::Status::Success(
+                                    buck2_data::command_execution::Success {},
+                                )),
+                                ..Default::default()
+                            }),
+                            ..Default::default()
+                        },
+                    )),
+                    ..Default::default()
+                },
+            )),
+        ));
+        events.extend(converter.convert(
+            sequence + 3,
+            &trace_event(buck2_data::buck_event::Data::Record(
+                buck2_data::RecordEvent {
+                    data: Some(buck2_data::record_event::Data::InvocationRecord(Box::new(
+                        buck2_data::InvocationRecord {
+                            outcome: Some(buck2_data::InvocationOutcome::Failed as i32),
+                            ..Default::default()
+                        },
+                    ))),
+                },
+            )),
+        ));
+        events
+    }
+
+    fn action_payloads(events: &[bep::BuildEvent]) -> Vec<&bep::ActionExecuted> {
+        events
+            .iter()
+            .filter_map(|event| match event.payload.as_ref() {
+                Some(build_event::Payload::Action(action)) => Some(action),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn inline_contents(file: Option<&bep::File>) -> &str {
+        match file.and_then(|file| file.file.as_ref()) {
+            Some(bep::file::File::Contents(contents)) => {
+                std::str::from_utf8(contents).expect("utf8 contents")
+            }
+            other => panic!("expected inline contents, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn every_action_is_published_by_default() {
+        let events = convert_build_with_successful_and_failed_actions(true);
+        let actions = action_payloads(&events);
+        assert_eq!(actions.len(), 2);
+        assert!(actions.iter().any(|action| action.success));
+        assert!(actions.iter().any(|action| !action.success));
+    }
+
+    #[test]
+    fn only_failed_actions_are_published_without_successful_action_events() {
+        let all = convert_build_with_successful_and_failed_actions(true);
+        let failed_only = convert_build_with_successful_and_failed_actions(false);
+
+        let actions = action_payloads(&failed_only);
+        assert_eq!(actions.len(), 1);
+        let failed = actions[0];
+        assert!(!failed.success);
+        assert_eq!(failed.label, "//pkg:failing");
+        assert_eq!(failed.exit_code, 1);
+        assert_eq!(inline_contents(failed.stdout.as_ref()), "compiler stdout");
+        assert_eq!(inline_contents(failed.stderr.as_ref()), "compile failed");
+        assert!(failed.failure_detail.is_some());
+
+        // Every other event is the one a full stream carries, less the successful action's
+        // ActionExecuted and the TargetComplete children that name it.
+        let successful_action_ids = all
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event.payload.as_ref(),
+                    Some(build_event::Payload::Action(action)) if action.success
+                )
+            })
+            .filter_map(|event| event.id.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(successful_action_ids.len(), 1);
+        let expected = all
+            .into_iter()
+            .filter(|event| {
+                !successful_action_ids
+                    .iter()
+                    .any(|id| event.id.as_ref() == Some(id))
+            })
+            .map(|mut event| {
+                event
+                    .children
+                    .retain(|child| !successful_action_ids.contains(child));
+                event
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(failed_only, expected);
+
+        for (payload, wanted) in [
+            ("TargetConfigured", 2),
+            ("NamedSetOfFiles", 2),
+            ("TestResult", 1),
+            ("TestSummary", 1),
+        ] {
+            let count = failed_only
+                .iter()
+                .filter(|event| {
+                    matches!(
+                        (payload, event.payload.as_ref()),
+                        (
+                            "TargetConfigured",
+                            Some(build_event::Payload::Configured(_))
+                        ) | (
+                            "NamedSetOfFiles",
+                            Some(build_event::Payload::NamedSetOfFiles(_))
+                        ) | ("TestResult", Some(build_event::Payload::TestResult(_)))
+                            | ("TestSummary", Some(build_event::Payload::TestSummary(_)))
+                    )
+                })
+                .count();
+            assert!(
+                count >= wanted,
+                "{payload}: {count} events, wanted {wanted}"
+            );
+        }
+        let passing_completed = failed_only
+            .iter()
+            .filter_map(|event| {
+                match (
+                    event.id.as_ref().and_then(|id| id.id.as_ref()),
+                    event.payload.as_ref(),
+                ) {
+                    (
+                        Some(build_event_id::Id::TargetCompleted(id)),
+                        Some(build_event::Payload::Completed(completed)),
+                    ) if id.label == "//pkg:passing" => Some(completed),
+                    _ => None,
+                }
+            })
+            .next_back()
+            .expect("TargetComplete for the target whose action succeeded");
+        assert!(passing_completed.success);
+        assert_eq!(passing_completed.important_output.len(), 1);
+        assert_eq!(passing_completed.important_output[0].name, "buck-out/main");
     }
 
     #[test]
