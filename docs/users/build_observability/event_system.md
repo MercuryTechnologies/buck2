@@ -116,6 +116,28 @@ already present on the Buck2 command takes precedence over configured defaults.
 `header` and `build_metadata` values support `$VAR` and `${VAR}` environment
 variable expansion before Buck2 parses their `KEY=VALUE` entries.
 
+By default the Bazel converter sends an `ActionExecuted` event for every action
+it sees. Bazel sends one only for a failed action unless
+`--build_event_publish_all_actions` is set, and the same behaviour is available
+here:
+
+```ini
+[bes]
+event_format = bazel
+upload_successful_action_events = false
+```
+
+With `upload_successful_action_events = false`, a failed action still gets its
+`ActionExecuted` event, with its stdout and stderr, and a successful one gets
+none. The target, test and output events do not change:
+`TargetConfigured`, `TargetComplete`, `TestResult`, `TestSummary` and
+`NamedSetOfFiles` still carry every target's outputs, and `TargetComplete`
+lists as children only the actions whose events were sent. A large build
+sends far fewer events this way, and a BES server that acknowledges a stream
+only at its end needs Buck2 to hold far fewer of them for a retry. In the
+default `buck` format the key drops successful `ActionExecutionEnd` events from
+the stream.
+
 In `bazel` mode, Buck2 translates the event stream into
 `build_event_stream.BuildEvent` messages. The converter currently maps:
 
