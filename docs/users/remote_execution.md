@@ -99,6 +99,19 @@ Keys supported include:
   or an operation that ends with an error, is never retried by this timeout. A
   server whose executors send nothing while a command runs needs this set
   above its longest action, or to 0.
+- `execute_response_timeout_secs` - how long an `Execute` may wait for its
+  response headers, which the server sends with its first operation, in
+  seconds. Defaults to 60; 0 turns it off. BuildBuddy answers an `Execute`
+  within milliseconds to seconds, once it has dispatched the action or joined
+  it to a pending execution of the same action. An `Execute` without an answer
+  in time is treated as a broken connection: Buck2 shows a console warning,
+  reconnects and sends it again, within `retries`, and then fails the action
+  with `DEADLINE_EXCEEDED`. Like every re-send of an `Execute` before the
+  server has named an operation, the new one sends the action with
+  `do_not_cache` set, under its own digest, so it cannot join an execution the
+  first one left behind; its result is not written to the action cache. A
+  `WaitExecution` has no such timeout, because the server answers it only when
+  the execution next reports a status.
 
 ## Credential helpers
 
