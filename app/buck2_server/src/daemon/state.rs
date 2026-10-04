@@ -1494,6 +1494,9 @@ impl DaemonState {
                     property: "bytestream_progress_timeout_secs",
                 })?,
             };
+            #[cfg(not(fbcode_build))]
+            let bes_replay =
+                buck2_re_configuration::BesReplaySettings::from_legacy_config(root_config)?;
             tracing::info!("Initializing scribe sink...");
             let scribe_sink = Self::init_scribe_sink(
                 fb,
@@ -1502,7 +1505,22 @@ impl DaemonState {
                     retry_backoff,
                     retry_attempts,
                     #[cfg(not(fbcode_build))]
-                    retry_window: Duration::from_secs(60),
+                    retry_window: Duration::from_secs(
+                        bes_replay
+                            .retry_window_secs
+                            .unwrap_or(remote::DEFAULT_RETRY_WINDOW_SECS),
+                    ),
+                    #[cfg(not(fbcode_build))]
+                    replay_spill_dir: Some(
+                        invocation_paths
+                            .tmp_dir()
+                            .join(ForwardRelativePath::unchecked_new("bes-replay-spill"))
+                            .into_path_buf(),
+                    ),
+                    #[cfg(not(fbcode_build))]
+                    replay_spill_max_bytes: bes_replay
+                        .replay_spill_max_bytes
+                        .unwrap_or(remote::DEFAULT_REPLAY_SPILL_MAX_BYTES),
                     message_batch_size,
                     #[cfg(fbcode_build)]
                     thrift_timeout: Duration::from_secs(1),

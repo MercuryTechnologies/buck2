@@ -18,7 +18,10 @@ rust_library(
             },
         },
     },
-    test_deps = ["fbsource//third-party/rust:tokio"],
+    test_deps = [
+        "fbsource//third-party/rust:tempfile",
+        "fbsource//third-party/rust:tokio",
+    ],
     deps = [
         "fbsource//third-party/rust:async-trait",
         "fbsource//third-party/rust:chrono",
