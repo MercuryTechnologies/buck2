@@ -36,6 +36,7 @@ struct BuckconfigBesSettings {
     bazel_artifact_upload_max_bytes: Option<usize>,
     bes_results_url: Option<String>,
     channel: BesChannelSettings,
+    replay: buck2_re_configuration::BesReplaySettings,
 }
 
 #[cfg(not(fbcode_build))]
@@ -80,6 +81,9 @@ pub fn with_buckconfig_overrides(
                 config.bazel_artifact_upload_max_bytes = max_bytes;
             }
             config.channel = settings.channel;
+            if let Some(secs) = settings.replay.retry_window_secs {
+                config.retry_window = std::time::Duration::from_secs(secs);
+            }
             config
         }
         Err(e) => {
@@ -143,6 +147,7 @@ fn read_buckconfig_bes_settings(
             bazel_artifact_upload_max_bytes: None,
             bes_results_url: None,
             channel: BesChannelSettings::default(),
+            replay: Default::default(),
         });
     };
     let fs = paths.project_root();
@@ -321,6 +326,7 @@ fn read_buckconfig_bes_settings(
                 property: "bytestream_progress_timeout_secs",
             })?,
         },
+        replay: buck2_re_configuration::BesReplaySettings::from_legacy_config(&root_config)?,
     })
 }
 

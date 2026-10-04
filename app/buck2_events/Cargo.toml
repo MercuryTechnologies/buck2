@@ -54,5 +54,8 @@ sys-info.workspace = true
 [target.'cfg(target_os = "windows")'.dependencies]
 winver.workspace = true
 
+[dev-dependencies]
+tempfile.workspace = true
+
 [lints]
 workspace = true
