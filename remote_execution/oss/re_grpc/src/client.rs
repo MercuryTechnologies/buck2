@@ -45,6 +45,7 @@ use dupe::Dupe;
 use futures::Stream;
 use futures::future::BoxFuture;
 use futures::future::Future;
+use futures::future::FutureExt;
 use futures::stream::BoxStream;
 use futures::stream::StreamExt;
 use futures::stream::TryStreamExt;
@@ -989,9 +990,10 @@ where
     .await
 }
 
-/// `retry_grpc_request_with_client_reconnect` for an idempotent read, GetActionResult or
-/// FindMissingBlobs, which also retries a request that timed out on the client's side.
-async fn retry_idempotent_read_with_client_reconnect<T, Fut, F>(
+/// `retry_grpc_request_with_client_reconnect` for an idempotent call, which also retries a
+/// request that timed out on the client's side: a read, GetActionResult or FindMissingBlobs, or a
+/// CAS write, whose content address makes a second write of the same blob a no-op.
+async fn retry_idempotent_with_client_reconnect<T, Fut, F>(
     grpc_clients: Arc<GRPCClients>,
     kind: GrpcClientKind,
     retries: usize,
@@ -4304,6 +4306,288 @@ impl<T> Drop for ActiveTransferLeader<'_, T> {
     }
 }
 
+/// How a CAS call that several callers share ended, as each of them sees it.
+#[derive(Clone, Debug)]
+struct SharedCallFailure {
+    message: String,
+    /// The gRPC code, kept so the error each caller gets is classified as the original was.
+    code: Option<TCode>,
+    group: TCodeReasonGroup,
+    /// The server answered about the digests themselves, so a caller that sent the call again
+    /// would get the same answer. Any other failure, a timeout, a broken connection, an error
+    /// reading the starter's own copy of a blob, says nothing about another caller's attempt,
+    /// so a caller that only joined the call makes its own.
+    final_for_every_caller: bool,
+}
+
+impl SharedCallFailure {
+    fn from_error(err: &anyhow::Error) -> Self {
+        Self {
+            message: format!("{err:#}"),
+            code: error_tcode(err),
+            group: err
+                .downcast_ref::<REClientError>()
+                .map_or(TCodeReasonGroup::UNKNOWN, |err| err.group),
+            final_for_every_caller: error_is_the_servers_answer(err),
+        }
+    }
+
+    fn into_error(self) -> anyhow::Error {
+        match self.code {
+            Some(code) => anyhow::Error::from(REClientError {
+                code,
+                message: self.message,
+                group: self.group,
+            }),
+            None => anyhow::anyhow!(self.message),
+        }
+    }
+}
+
+/// A gRPC status the retry policy would not repeat. CANCELLED is the client's own doing, a
+/// request timing out or being dropped, so it is not the server's answer.
+fn error_is_the_servers_answer(err: &anyhow::Error) -> bool {
+    error_tcode(err).is_some_and(|code| code != TCode::CANCELLED && !tcode_is_retryable(code))
+        && grpc_error_retry_delay(err).is_none()
+        && !is_broken_connection_error(err)
+}
+
+type SharedCallFuture<T> = BoxFuture<'static, Result<Arc<T>, SharedCallFailure>>;
+type SharedCall<T> = futures::future::Shared<SharedCallFuture<T>>;
+
+struct SharedCallMap<T> {
+    next_id: u64,
+    calls: HashMap<TDigest, (u64, futures::future::WeakShared<SharedCallFuture<T>>)>,
+}
+
+/// The CAS calls in flight for each digest, shared by every caller in the client that needs the
+/// same digest, as Bazel's `AsyncTaskCache` shares one execution among its subscribers
+/// (src/main/java/com/google/devtools/build/lib/remote/util/AsyncTaskCache.java). Each caller
+/// awaits its own handle and any of them drives the call; the map holds only weak handles, so the
+/// call is dropped, and its request cancelled, when the last caller waiting on it is dropped.
+/// A call leaves the map when it finishes or is dropped, so the map holds what is in flight and
+/// nothing more: what is known to be on the remote is `FindMissingCache`'s to remember.
+struct SharedCallRegistry<T> {
+    map: Arc<Mutex<SharedCallMap<T>>>,
+}
+
+impl<T: Send + Sync + 'static> SharedCallRegistry<T> {
+    fn new() -> Self {
+        Self {
+            map: Arc::new(Mutex::new(SharedCallMap {
+                next_id: 0,
+                calls: HashMap::new(),
+            })),
+        }
+    }
+
+    /// Callers decide what to join and what to start under one lock, so two of them cannot both
+    /// start a call for a digest.
+    ///
+    /// No handle may be dropped while the guard is held: the last handle's drop runs the call's
+    /// removal from the map, which takes the same lock. `get` and `start` hand every handle they
+    /// make to the caller for that reason.
+    fn lock(&self) -> SharedCallGuard<'_, T> {
+        SharedCallGuard {
+            map: &self.map,
+            guard: self.map.lock().unwrap(),
+        }
+    }
+}
+
+struct SharedCallGuard<'a, T> {
+    map: &'a Arc<Mutex<SharedCallMap<T>>>,
+    guard: std::sync::MutexGuard<'a, SharedCallMap<T>>,
+}
+
+impl<T: Send + Sync + 'static> SharedCallGuard<'_, T> {
+    /// The call in flight for `digest`, to join.
+    fn get(&self, digest: &TDigest) -> Option<SharedCall<T>> {
+        self.guard
+            .calls
+            .get(digest)
+            .and_then(|(_, call)| call.upgrade())
+    }
+
+    /// Registers `call` as the one in flight for every digest of `digests`. It is not polled
+    /// until a caller awaits the handle.
+    fn start(
+        &mut self,
+        digests: Vec<TDigest>,
+        call: impl Future<Output = anyhow::Result<T>> + Send + 'static,
+    ) -> SharedCall<T> {
+        let id = self.guard.next_id;
+        self.guard.next_id += 1;
+        let removal = SharedCallRemoval {
+            map: Arc::downgrade(self.map),
+            id,
+            digests: digests.clone(),
+        };
+        let call: SharedCall<T> = async move {
+            let _removal = removal;
+            call.await
+                .map(Arc::new)
+                .map_err(|err| SharedCallFailure::from_error(&err))
+        }
+        .boxed()
+        .shared();
+        let weak = call
+            .downgrade()
+            .expect("a call that was never polled has no output");
+        for digest in digests {
+            self.guard.calls.insert(digest, (id, weak.clone()));
+        }
+        call
+    }
+}
+
+/// Takes a call's digests out of the map when the call finishes or is dropped, unless a later
+/// call has replaced them.
+struct SharedCallRemoval<T> {
+    map: std::sync::Weak<Mutex<SharedCallMap<T>>>,
+    id: u64,
+    digests: Vec<TDigest>,
+}
+
+impl<T> Drop for SharedCallRemoval<T> {
+    fn drop(&mut self) {
+        let Some(map) = self.map.upgrade() else {
+            return;
+        };
+        let mut map = map.lock().unwrap();
+        for digest in &self.digests {
+            if map.calls.get(digest).is_some_and(|(id, _)| *id == self.id) {
+                map.calls.remove(digest);
+            }
+        }
+    }
+}
+
+/// What a CAS call needs from the client, owned, so a call several callers share outlives the
+/// caller that started it.
+#[derive(Clone)]
+struct CasCallContext {
+    grpc_clients: Arc<GRPCClients>,
+    instance_name: Arc<str>,
+    retries: usize,
+    retry_max_delay: Duration,
+    use_fbcode_metadata: bool,
+    request_metadata_tool_name: Arc<str>,
+    grpc_request_timeout: Duration,
+    request_digest_function_config: DigestFunctionConfig,
+}
+
+impl CasCallContext {
+    /// FindMissingBlobs for `digests`, answering with the ones the CAS lacks.
+    async fn find_missing_blobs(
+        self,
+        metadata: RemoteExecutionMetadata,
+        digests: Vec<TDigest>,
+    ) -> anyhow::Result<HashSet<TDigest>> {
+        tracing::debug!(num_digests = digests.len(), "FindMissingBlobs");
+        let requested_digests = digests
+            .iter()
+            .map(|digest| tdigest_to(digest.clone()))
+            .collect::<Vec<_>>();
+        let request_digest_function = digest_function_to_grpc(
+            self.request_digest_function_config
+                .for_common_digest_function(&requested_digests),
+        );
+        let (digest_count, bytes) = request_stats_for_grpc_digests(requested_digests.iter());
+        let mut start = remote_request_start("CAS", "FindMissingBlobs", &metadata, None);
+        start.digest_count = Some(digest_count);
+        start.bytes = Some(bytes);
+        let missing_blobs = remote_request_span(
+            start,
+            retry_idempotent_with_client_reconnect(
+                self.grpc_clients.clone(),
+                GrpcClientKind::Cas,
+                self.retries,
+                self.retry_max_delay,
+                || {
+                    let metadata = metadata.clone();
+                    let requested_digests = requested_digests.clone();
+                    let context = self.clone();
+                    async move {
+                        let mut cas_client = context.grpc_clients.cas_client().await?;
+                        cas_client
+                            .find_missing_blobs(with_re_metadata_timeout(
+                                FindMissingBlobsRequest {
+                                    instance_name: context.instance_name.to_string(),
+                                    blob_digests: requested_digests,
+                                    digest_function: request_digest_function,
+                                    ..Default::default()
+                                },
+                                metadata,
+                                context.use_fbcode_metadata,
+                                &context.request_metadata_tool_name,
+                                context.grpc_request_timeout,
+                            ))
+                            .await
+                            .map_err(anyhow::Error::from)
+                    }
+                },
+            ),
+        )
+        .await
+        .context("Failed to request what blobs are not present on remote")?;
+        let resp: FindMissingBlobsResponse = missing_blobs.into_inner();
+        validate_find_missing_blobs_response_digests(&requested_digests, &resp)?;
+        Ok(resp
+            .missing_blob_digests
+            .into_iter()
+            .map(tdigest_from)
+            .collect())
+    }
+
+    /// BatchUpdateBlobs, retried on the codes Bazel's `RemoteRetrier` retries and on a request
+    /// that timed out on the client's side: writing a blob under its content address again
+    /// leaves the CAS as it was.
+    async fn batch_update_blobs(
+        self,
+        metadata: RemoteExecutionMetadata,
+        re_request: BatchUpdateBlobsRequest,
+    ) -> anyhow::Result<BatchUpdateBlobsResponse> {
+        let mut start = remote_request_start("CAS", "BatchUpdateBlobs", &metadata, None);
+        start.digest_count = Some(re_request.requests.len() as u64);
+        start.bytes = Some(
+            re_request
+                .requests
+                .iter()
+                .map(|request| request.data.len() as u64)
+                .sum(),
+        );
+        remote_request_span(
+            start,
+            retry_idempotent_with_client_reconnect(
+                self.grpc_clients.clone(),
+                GrpcClientKind::Cas,
+                self.retries,
+                self.retry_max_delay,
+                || {
+                    let metadata = metadata.clone();
+                    let re_request = re_request.clone();
+                    let context = self.clone();
+                    async move {
+                        let mut cas_client = context.grpc_clients.cas_client().await?;
+                        Ok(cas_client
+                            .batch_update_blobs(with_re_metadata_timeout(
+                                re_request,
+                                metadata,
+                                context.use_fbcode_metadata,
+                                &context.request_metadata_tool_name,
+                                context.grpc_request_timeout,
+                            ))
+                            .await?
+                            .into_inner())
+                    }
+                },
+            ),
+        )
+        .await
+    }
+}
+
 enum ActiveDownloadResult {
     Bytes(Vec<u8>),
     File(PathBuf),
@@ -4406,6 +4690,12 @@ pub struct REClient {
     query_write_status_supported: AtomicBool,
     active_uploads: ActiveTransferRegistry<()>,
     active_downloads: ActiveTransferRegistry<ActiveDownloadResult>,
+    cas_context: CasCallContext,
+    /// The BatchUpdateBlobs calls in flight, by the digests they carry.
+    shared_batch_uploads: SharedCallRegistry<()>,
+    /// The FindMissingBlobs calls in flight, by the digests they ask about, answering with the
+    /// ones the CAS lacks.
+    shared_find_missing: SharedCallRegistry<HashSet<TDigest>>,
 }
 
 impl Drop for REClient {
@@ -4481,9 +4771,20 @@ impl REClient {
         shared_cache: Option<SharedCasCache>,
     ) -> Self {
         let find_missing_cache_ttl = Duration::from_secs(runtime_opts.cas_ttl_secs.max(0) as u64);
+        let grpc_clients = Arc::new(grpc_clients);
+        let cas_context = CasCallContext {
+            grpc_clients: grpc_clients.clone(),
+            instance_name: Arc::from(instance_name.as_str()),
+            retries: runtime_opts.retries,
+            retry_max_delay: Duration::from_millis(runtime_opts.retry_max_delay_ms),
+            use_fbcode_metadata: runtime_opts.use_fbcode_metadata,
+            request_metadata_tool_name: Arc::from(runtime_opts.request_metadata_tool_name.as_str()),
+            grpc_request_timeout: runtime_opts.grpc_request_timeout,
+            request_digest_function_config: runtime_opts.request_digest_function_config,
+        };
         REClient {
             runtime_opts,
-            grpc_clients: Arc::new(grpc_clients),
+            grpc_clients,
             capabilities,
             instance_name,
             find_missing_cache: Mutex::new(FindMissingCache {
@@ -4498,6 +4799,9 @@ impl REClient {
             query_write_status_supported: AtomicBool::new(true),
             active_uploads: ActiveTransferRegistry::new(),
             active_downloads: ActiveTransferRegistry::new(),
+            cas_context,
+            shared_batch_uploads: SharedCallRegistry::new(),
+            shared_find_missing: SharedCallRegistry::new(),
         }
     }
 
@@ -5302,6 +5606,12 @@ impl REClient {
             request = self
                 .filter_upload_request_to_missing(metadata.clone(), request)
                 .await?;
+        } else {
+            // A caller that asked FindMissingBlobs itself may have heard "missing" before
+            // another action's upload of the same digest finished. As Bazel's
+            // RemoteExecutionCache replaces the cached "missing" with "present" once an upload
+            // completes, an upload the client knows has happened is not sent again.
+            request = self.without_digests_known_on_remote(request);
         }
         let (request, spliced_digests) = self
             .upload_chunked_inlined_blobs(metadata.clone(), request)
@@ -5322,6 +5632,8 @@ impl REClient {
     ) -> anyhow::Result<UploadResponse> {
         validate_upload_request_sizes(&request, self.capabilities.max_cas_blob_size_bytes)?;
         let uploaded_digests = upload_payload_digests(&request);
+        let cas_context = self.cas_context.clone();
+        let batch_metadata = metadata.clone();
         let response = upload_impl(
             &self.instance_name,
             request,
@@ -5332,48 +5644,11 @@ impl REClient {
             self.runtime_opts.max_concurrent_uploads_per_action,
             self.runtime_opts.request_digest_function_config,
             &self.active_uploads,
-            |re_request| {
-                let metadata = metadata.clone();
-                async move {
-                    let mut start =
-                        remote_request_start("CAS", "BatchUpdateBlobs", &metadata, None);
-                    start.digest_count = Some(re_request.requests.len() as u64);
-                    start.bytes = Some(
-                        re_request
-                            .requests
-                            .iter()
-                            .map(|request| request.data.len() as u64)
-                            .sum(),
-                    );
-                    remote_request_span(
-                        start,
-                        retry_grpc_request_with_client_reconnect(
-                            self.grpc_clients.clone(),
-                            GrpcClientKind::Cas,
-                            self.runtime_opts.retries,
-                            Duration::from_millis(self.runtime_opts.retry_max_delay_ms),
-                            || {
-                                let grpc_clients = self.grpc_clients.clone();
-                                let metadata = metadata.clone();
-                                let re_request = re_request.clone();
-                                async move {
-                                    let mut cas_client = grpc_clients.cas_client().await?;
-                                    Ok(cas_client
-                                        .batch_update_blobs(with_re_metadata_timeout(
-                                            re_request,
-                                            metadata,
-                                            self.runtime_opts.use_fbcode_metadata,
-                                            self.runtime_opts.request_metadata_tool_name.as_str(),
-                                            self.runtime_opts.grpc_request_timeout,
-                                        ))
-                                        .await?
-                                        .into_inner())
-                                }
-                            },
-                        ),
-                    )
-                    .await
-                }
+            &self.shared_batch_uploads,
+            move |re_request| {
+                cas_context
+                    .clone()
+                    .batch_update_blobs(batch_metadata.clone(), re_request)
             },
             |segments| {
                 let metadata = metadata.clone();
@@ -5393,7 +5668,7 @@ impl REClient {
                     }
                     remote_request_span(
                         start,
-                        retry_grpc_request_with_client_reconnect(
+                        retry_idempotent_with_client_reconnect(
                             self.grpc_clients.clone(),
                             GrpcClientKind::ByteStream,
                             self.runtime_opts.retries,
@@ -5725,6 +6000,20 @@ impl REClient {
             .collect::<HashSet<_>>();
 
         Ok(filter_upload_request_by_missing_digests(request, &missing))
+    }
+
+    fn without_digests_known_on_remote(&self, mut request: UploadRequest) -> UploadRequest {
+        let mut find_missing_cache = self.find_missing_cache.lock().unwrap();
+        let mut known = |digest: &TDigest| {
+            find_missing_cache.get(digest) == Some(DigestRemoteState::ExistsOnRemote)
+        };
+        if let Some(blobs) = &mut request.inlined_blobs_with_digest {
+            blobs.retain(|blob| !known(&blob.digest));
+        }
+        if let Some(files) = &mut request.files_with_digest {
+            files.retain(|file| !known(&file.digest));
+        }
+        request
     }
 
     fn mark_digests_exist_on_remote(&self, digests: impl IntoIterator<Item = TDigest>) {
@@ -6330,94 +6619,104 @@ impl REClient {
         request: GetDigestsTtlRequest,
     ) -> anyhow::Result<GetDigestsTtlResponse> {
         let mut remote_results: HashMap<TDigest, DigestRemoteState> = HashMap::new();
-        let mut digests_to_check: Vec<TDigest> = Vec::new();
+        let mut to_resolve = request.digests.clone();
 
-        let batch_size = self.runtime_opts.find_missing_blobs_batch_size;
-        let mut digest_iter = request.digests.iter();
-        while digest_iter.len() > 0 {
-            // Sort our blobs based on what action we need to take
+        // Each round answers what it can from the cache, joins the FindMissingBlobs calls and
+        // uploads already in flight for other digests, as Bazel's RemoteExecutionCache shares
+        // one find-missing-then-upload task per digest through its `findMissingCache`
+        // (src/main/java/com/google/devtools/build/lib/remote/RemoteExecutionCache.java), and
+        // asks the CAS about the rest. A digest whose joined call failed, other than with the
+        // server's answer, goes round again, and the next round asks about it itself.
+        while !to_resolve.is_empty() {
+            let mut to_check = Vec::new();
+            let mut uploads = Vec::new();
             {
                 let mut find_missing_cache = self.find_missing_cache.lock().unwrap();
-                for digest in digest_iter.by_ref() {
-                    if let Some(rs) = find_missing_cache.get(digest) {
-                        // We have our final result already cached
-                        remote_results.insert(digest.clone(), rs);
-                    } else if digests_to_check.contains(digest) {
-                        // This digest is already part of the in-flight request. The
-                        // final response is rebuilt from the original request, so this
-                        // duplicate will still get a matching TTL entry.
-                    } else {
-                        // We can check this blob
-                        digests_to_check.push(digest.clone());
+                let shared_batch_uploads = self.shared_batch_uploads.lock();
+                for digest in to_resolve.drain(..) {
+                    if remote_results.contains_key(&digest) {
+                        continue;
                     }
-                    if digests_to_check.len() >= batch_size {
-                        break;
+                    if let Some(state) = find_missing_cache.get(&digest) {
+                        remote_results.insert(digest, state);
+                    } else if let Some(upload) = shared_batch_uploads.get(&digest) {
+                        uploads.push((digest, upload));
+                    } else {
+                        to_check.push(digest);
                     }
                 }
             }
 
-            // Send a request and notify others of the result
-            if !digests_to_check.is_empty() {
-                tracing::debug!(num_digests = digests_to_check.len(), "FindMissingBlobs");
-                let requested_digests = digests_to_check
-                    .iter()
-                    .map(|digest| tdigest_to(digest.clone()))
+            let (started, joined) = {
+                let mut calls = self.shared_find_missing.lock();
+                let mut claimed = HashSet::new();
+                let mut joined = Vec::new();
+                let mut own = Vec::new();
+                for digest in to_check {
+                    if claimed.contains(&digest) {
+                        continue;
+                    }
+                    match calls.get(&digest) {
+                        Some(call) => joined.push((digest, call)),
+                        None => {
+                            claimed.insert(digest.clone());
+                            own.push(digest);
+                        }
+                    }
+                }
+                let started = own
+                    .chunks(self.runtime_opts.find_missing_blobs_batch_size.max(1))
+                    .map(|chunk| {
+                        let call = calls.start(
+                            chunk.to_vec(),
+                            self.cas_context
+                                .clone()
+                                .find_missing_blobs(metadata.clone(), chunk.to_vec()),
+                        );
+                        (chunk.to_vec(), call)
+                    })
                     .collect::<Vec<_>>();
-                let request_digest_function = self
-                    .runtime_opts
-                    .request_digest_function_config
-                    .for_common_digest_function(&requested_digests);
-                let request_digest_function = digest_function_to_grpc(request_digest_function);
-                let (digest_count, bytes) =
-                    request_stats_for_grpc_digests(requested_digests.iter());
-                let mut start = remote_request_start("CAS", "FindMissingBlobs", &metadata, None);
-                start.digest_count = Some(digest_count);
-                start.bytes = Some(bytes);
-                let missing_blobs = remote_request_span(
-                    start,
-                    retry_idempotent_read_with_client_reconnect(
-                        self.grpc_clients.clone(),
-                        GrpcClientKind::Cas,
-                        self.runtime_opts.retries,
-                        Duration::from_millis(self.runtime_opts.retry_max_delay_ms),
-                        || {
-                            let metadata = metadata.clone();
-                            let requested_digests = requested_digests.clone();
-                            let grpc_clients = self.grpc_clients.clone();
-                            async move {
-                                let mut cas_client = grpc_clients.cas_client().await?;
-                                cas_client
-                                    .find_missing_blobs(with_re_metadata_timeout(
-                                        FindMissingBlobsRequest {
-                                            instance_name: self.instance_name.as_str().to_owned(),
-                                            blob_digests: requested_digests,
-                                            digest_function: request_digest_function,
-                                            ..Default::default()
-                                        },
-                                        metadata,
-                                        self.runtime_opts.use_fbcode_metadata,
-                                        self.runtime_opts.request_metadata_tool_name.as_str(),
-                                        self.runtime_opts.grpc_request_timeout,
-                                    ))
-                                    .await
-                                    .map_err(anyhow::Error::from)
-                            }
-                        },
-                    ),
-                )
-                .await
-                .context("Failed to request what blobs are not present on remote")?;
-                let resp: FindMissingBlobsResponse = missing_blobs.into_inner();
-                validate_find_missing_blobs_response_digests(&requested_digests, &resp)?;
+                (started, joined)
+            };
 
+            for (digests, call) in started {
+                let missing = call.await.map_err(SharedCallFailure::into_error)?;
                 let mut find_missing_cache = self.find_missing_cache.lock().unwrap();
                 record_find_missing_results(
-                    &digests_to_check,
-                    &resp,
+                    &digests,
+                    &missing,
                     &mut remote_results,
                     &mut find_missing_cache,
                 );
-                digests_to_check.clear();
+            }
+            for (digest, call) in joined {
+                match call.await {
+                    Ok(missing) => {
+                        let mut find_missing_cache = self.find_missing_cache.lock().unwrap();
+                        record_find_missing_results(
+                            std::slice::from_ref(&digest),
+                            &missing,
+                            &mut remote_results,
+                            &mut find_missing_cache,
+                        );
+                    }
+                    Err(failure) if failure.final_for_every_caller => {
+                        return Err(failure
+                            .into_error()
+                            .context("Failed to request what blobs are not present on remote"));
+                    }
+                    Err(_) => to_resolve.push(digest),
+                }
+            }
+            for (digest, upload) in uploads {
+                match upload.await {
+                    // `upload_direct` marks the digest present in the cache too, once the
+                    // whole request it was part of is stored.
+                    Ok(_) => {
+                        remote_results.insert(digest, DigestRemoteState::ExistsOnRemote);
+                    }
+                    Err(_) => to_resolve.push(digest),
+                }
             }
         }
 
@@ -6614,16 +6913,10 @@ fn digests_with_ttl_for_requested_digests(
 
 fn record_find_missing_results(
     digests_to_check: &[TDigest],
-    resp: &FindMissingBlobsResponse,
+    missing: &HashSet<TDigest>,
     remote_results: &mut HashMap<TDigest, DigestRemoteState>,
     find_missing_cache: &mut FindMissingCache,
 ) {
-    let missing = resp
-        .missing_blob_digests
-        .iter()
-        .map(|digest| tdigest_from(digest.clone()))
-        .collect::<HashSet<_>>();
-
     for digest in digests_to_check {
         if missing.contains(digest) {
             remote_results.insert(digest.clone(), DigestRemoteState::Missing);
@@ -6760,7 +7053,9 @@ fn validate_batch_update_blobs_response(
         missing_digests.swap_remove(index);
 
         let status = response.status.as_ref().cloned().unwrap_or_default();
-        if status.code != Code::Ok as i32 {
+        // ALREADY_EXISTS says the blob is stored, which is what the upload was for; Bazel's
+        // RemoteRetrier counts it a success too.
+        if status.code != Code::Ok as i32 && status.code != Code::AlreadyExists as i32 {
             failures.push(format!(
                 "Unable to upload blob '{}', rpc status code: {}, message: \"{}\"",
                 digest_name(digest),
@@ -7711,10 +8006,10 @@ async fn warm_shared_cache<Byt, BytRet>(
 async fn send_batch_update_blobs<Cas>(
     mut request: BatchUpdateBlobsRequest,
     request_digest_function_config: DigestFunctionConfig,
-    cas_f: impl Fn(BatchUpdateBlobsRequest) -> Cas + Sync + Send + Copy,
+    cas_f: &impl Fn(BatchUpdateBlobsRequest) -> Cas,
 ) -> anyhow::Result<Vec<String>>
 where
-    Cas: Future<Output = anyhow::Result<BatchUpdateBlobsResponse>> + Send,
+    Cas: Future<Output = anyhow::Result<BatchUpdateBlobsResponse>>,
 {
     if request.requests.is_empty() {
         return Ok(Vec::new());
@@ -7739,6 +8034,186 @@ where
     Ok(blob_hashes)
 }
 
+impl BatchUploadRequest {
+    fn digest(&self) -> &TDigest {
+        match self {
+            BatchUploadRequest::Blob(blob) => &blob.digest,
+            BatchUploadRequest::File(file) => &file.digest,
+        }
+    }
+
+    fn duplicate(&self) -> Self {
+        match self {
+            BatchUploadRequest::Blob(blob) => BatchUploadRequest::Blob(InlinedBlobWithDigest {
+                blob: blob.blob.clone(),
+                digest: blob.digest.clone(),
+                ..Default::default()
+            }),
+            BatchUploadRequest::File(file) => BatchUploadRequest::File(NamedDigest {
+                name: file.name.clone(),
+                digest: file.digest.clone(),
+                ..Default::default()
+            }),
+        }
+    }
+}
+
+/// Everything a BatchUpdateBlobs upload needs, owned, so that a call several actions share
+/// outlives the action that started it.
+#[derive(Clone)]
+struct BatchUploader<F> {
+    instance_name: Arc<str>,
+    batch_update_compressor: Option<Compressor>,
+    max_total_batch_size: usize,
+    remote_cache_compression_threshold: usize,
+    request_digest_function_config: DigestFunctionConfig,
+    cas_f: F,
+}
+
+impl<F, Cas> BatchUploader<F>
+where
+    F: Fn(BatchUpdateBlobsRequest) -> Cas,
+    Cas: Future<Output = anyhow::Result<BatchUpdateBlobsResponse>>,
+{
+    /// Sends `batch` in BatchUpdateBlobs requests of at most `max_total_batch_size` bytes each.
+    async fn upload(self, batch: Vec<BatchUploadRequest>) -> anyhow::Result<()> {
+        let request_digest_function_config = self.request_digest_function_config;
+        let new_request = || BatchUpdateBlobsRequest {
+            instance_name: self.instance_name.to_string(),
+            requests: vec![],
+            ..Default::default()
+        };
+        let mut re_request = new_request();
+        let mut request_size = 0usize;
+        for blob in batch {
+            let (digest, data) = match blob {
+                BatchUploadRequest::Blob(blob) => {
+                    let digest = blob.digest;
+                    let data = blob.blob;
+                    validate_upload_blob(
+                        &digest,
+                        &data,
+                        request_digest_function_config.for_hash(&digest.hash),
+                    )?;
+                    (digest, data)
+                }
+                BatchUploadRequest::File(file) => {
+                    // These should be small files, so no need to use a buffered reader.
+                    let mut fin = tokio::fs::File::open(&file.name)
+                        .await
+                        .with_context(|| format!("Opening {} for reading failed", file.name))?;
+                    let mut data = vec![];
+                    fin.read_to_end(&mut data).await?;
+                    validate_upload_blob(
+                        &file.digest,
+                        &data,
+                        request_digest_function_config.for_hash(&file.digest.hash),
+                    )?;
+                    (file.digest, data)
+                }
+            };
+            let blob_compressor = compression_for_blob(
+                self.batch_update_compressor,
+                digest.size_in_bytes,
+                self.remote_cache_compression_threshold,
+            );
+            let data = if let Some(compressor) = blob_compressor {
+                compress_data(data, compressor).await.with_context(|| {
+                    format!("Failed to compress BatchUpdateBlobs request for `{digest}`")
+                })?
+            } else {
+                data
+            };
+            let additional_size = data.len();
+            if !re_request.requests.is_empty()
+                && request_size + additional_size > self.max_total_batch_size
+            {
+                send_batch_update_blobs(re_request, request_digest_function_config, &self.cas_f)
+                    .await?;
+                re_request = new_request();
+                request_size = 0;
+            }
+            re_request.requests.push(Request {
+                digest: Some(tdigest_to(digest)),
+                data,
+                compressor: blob_compressor
+                    .map(|compressor| compressor.as_grpc())
+                    .unwrap_or(compressor::Value::Identity as i32),
+            });
+            request_size += additional_size;
+        }
+        send_batch_update_blobs(re_request, request_digest_function_config, &self.cas_f).await?;
+        Ok(())
+    }
+}
+
+/// Waits for the upload another caller started of `upload`'s digest. A waiter never takes a
+/// failed upload for a stored blob, as Bazel's RemoteExecutionCache invalidates a digest whose
+/// upload failed (src/main/java/com/google/devtools/build/lib/remote/RemoteExecutionCache.java,
+/// `maybeCreateUploadTask`). A failure that is the server's answer about the blob is this
+/// caller's answer too. After any other, this caller joins the next upload of the digest, or
+/// starts one itself, and its own upload's result is final, so the loop ends.
+async fn follow_batch_upload<F, Cas>(
+    shared_batch_uploads: &SharedCallRegistry<()>,
+    batch_uploader: BatchUploader<F>,
+    upload: BatchUploadRequest,
+    mut call: SharedCall<()>,
+) -> anyhow::Result<()>
+where
+    F: Fn(BatchUpdateBlobsRequest) -> Cas + Clone + Send + Sync + 'static,
+    Cas: Future<Output = anyhow::Result<BatchUpdateBlobsResponse>> + Send + 'static,
+{
+    // A caller whose own copy is wrong or gone fails as it would have uploading it, as a
+    // ByteStream follower does.
+    match &upload {
+        BatchUploadRequest::Blob(blob) => validate_upload_blob(
+            &blob.digest,
+            &blob.blob,
+            batch_uploader
+                .request_digest_function_config
+                .for_hash(&blob.digest.hash),
+        )?,
+        BatchUploadRequest::File(file) => {
+            tokio::fs::metadata(&file.name)
+                .await
+                .with_context(|| format!("Opening {} for reading failed", file.name))?;
+        }
+    }
+    loop {
+        match call.await {
+            Ok(_) => return Ok(()),
+            Err(failure) if failure.final_for_every_caller => return Err(failure.into_error()),
+            Err(failure) => {
+                tracing::debug!(
+                    digest = %upload.digest(),
+                    error = %failure.message,
+                    "Uploading a blob again after the upload this caller waited on failed"
+                );
+            }
+        }
+        let (next, own) = {
+            let mut calls = shared_batch_uploads.lock();
+            match calls.get(upload.digest()) {
+                Some(next) => (next, false),
+                None => (
+                    calls.start(
+                        vec![upload.digest().clone()],
+                        batch_uploader.clone().upload(vec![upload.duplicate()]),
+                    ),
+                    true,
+                ),
+            }
+        };
+        if own {
+            return next
+                .await
+                .map(|_| ())
+                .map_err(SharedCallFailure::into_error);
+        }
+        call = next;
+    }
+}
+
 async fn upload_impl<Byt, Cas>(
     instance_name: &InstanceName,
     request: UploadRequest,
@@ -7749,11 +8224,12 @@ async fn upload_impl<Byt, Cas>(
     max_concurrent_uploads: Option<usize>,
     request_digest_function_config: DigestFunctionConfig,
     active_uploads: &ActiveTransferRegistry<()>,
-    cas_f: impl Fn(BatchUpdateBlobsRequest) -> Cas + Sync + Send + Copy,
+    shared_batch_uploads: &SharedCallRegistry<()>,
+    cas_f: impl Fn(BatchUpdateBlobsRequest) -> Cas + Clone + Sync + Send + 'static,
     bystream_fut: impl Fn(Vec<WriteRequest>) -> Byt + Sync + Send + Copy,
 ) -> anyhow::Result<UploadResponse>
 where
-    Cas: Future<Output = anyhow::Result<BatchUpdateBlobsResponse>> + Send,
+    Cas: Future<Output = anyhow::Result<BatchUpdateBlobsResponse>> + Send + 'static,
     Byt: Future<Output = anyhow::Result<WriteResponse>> + Send,
 {
     fn resource_name(
@@ -7811,7 +8287,7 @@ where
 
     // For small file uploads the client should group them together and call `BatchUpdateBlobs`
     // https://github.com/bazelbuild/remote-apis/blob/main/build/bazel/remote/execution/v2/remote_execution.proto#L205
-    let mut batched_blob_updates = BatchUploadReqAggregator::new(max_total_batch_size);
+    let mut small_uploads = Vec::new();
 
     // Adapt the given bystream_fut to take in an AsyncBufRead
     let bystream_fut = |resource_name: String,
@@ -7890,7 +8366,7 @@ where
         let size = blob.digest.size_in_bytes;
 
         if size <= max_total_batch_size as i64 {
-            batched_blob_updates.push(BatchUploadRequest::Blob(blob));
+            small_uploads.push(BatchUploadRequest::Blob(blob));
             continue;
         }
 
@@ -7945,7 +8421,7 @@ where
         let size = file.digest.size_in_bytes;
         let name = file.name.clone();
         if size <= max_total_batch_size as i64 {
-            batched_blob_updates.push(BatchUploadRequest::File(file));
+            small_uploads.push(BatchUploadRequest::File(file));
             continue;
         }
         let blob_compressor = compression_for_blob(
@@ -7995,88 +8471,65 @@ where
         upload_futures.push(Box::pin(fut));
     }
 
-    // Create futures for any files small enough that they
-    // should be uploaded in batches.
-    let batched_blob_updates = batched_blob_updates.done();
-    for batch in batched_blob_updates {
-        let fut = async move {
-            let new_request = || BatchUpdateBlobsRequest {
-                instance_name: instance_name.as_str().to_owned(),
-                requests: vec![],
-                ..Default::default()
-            };
-            let mut re_request = BatchUpdateBlobsRequest {
-                instance_name: instance_name.as_str().to_owned(),
-                requests: vec![],
-                ..Default::default()
-            };
-            let mut request_size = 0usize;
-            let mut blob_hashes = Vec::new();
-            for blob in batch {
-                let (digest, data) = match blob {
-                    BatchUploadRequest::Blob(blob) => {
-                        let digest = blob.digest;
-                        let data = blob.blob;
-                        validate_upload_blob(
-                            &digest,
-                            &data,
-                            request_digest_function_config.for_hash(&digest.hash),
-                        )?;
-                        (digest, data)
-                    }
-                    BatchUploadRequest::File(file) => {
-                        // These should be small files, so no need to use a buffered reader.
-                        let mut fin = tokio::fs::File::open(&file.name)
-                            .await
-                            .with_context(|| format!("Opening {} for reading failed", file.name))?;
-                        let mut data = vec![];
-                        fin.read_to_end(&mut data).await?;
-                        validate_upload_blob(
-                            &file.digest,
-                            &data,
-                            request_digest_function_config.for_hash(&file.digest.hash),
-                        )?;
-                        (file.digest, data)
-                    }
-                };
-                let blob_compressor = compression_for_blob(
-                    batch_update_compressor,
-                    digest.size_in_bytes,
-                    remote_cache_compression_threshold,
-                );
-                let data = if let Some(compressor) = blob_compressor {
-                    compress_data(data, compressor).await.with_context(|| {
-                        format!("Failed to compress BatchUpdateBlobs request for `{digest}`")
-                    })?
-                } else {
-                    data
-                };
-                let additional_size = data.len();
-                if !re_request.requests.is_empty()
-                    && request_size + additional_size > max_total_batch_size
-                {
-                    blob_hashes.extend(
-                        send_batch_update_blobs(re_request, request_digest_function_config, cas_f)
-                            .await?,
-                    );
-                    re_request = new_request();
-                    request_size = 0;
-                }
-                re_request.requests.push(Request {
-                    digest: Some(tdigest_to(digest)),
-                    data,
-                    compressor: blob_compressor
-                        .map(|compressor| compressor.as_grpc())
-                        .unwrap_or(compressor::Value::Identity as i32),
-                });
-                request_size += additional_size;
+    // Small blobs go out in BatchUpdateBlobs calls the whole client shares: a digest another
+    // action is already uploading is waited for rather than sent again. Actions that start
+    // together, such as the links of many tests of one library, need the same directory blobs
+    // and each heard from FindMissingBlobs that they were missing.
+    let batch_uploader = BatchUploader {
+        instance_name: Arc::from(instance_name.as_str()),
+        batch_update_compressor,
+        max_total_batch_size,
+        remote_cache_compression_threshold,
+        request_digest_function_config,
+        cas_f,
+    };
+    let (started, joined) = {
+        let mut calls = shared_batch_uploads.lock();
+        let mut batches = BatchUploadReqAggregator::new(max_total_batch_size);
+        let mut claimed = HashSet::new();
+        let mut joined = Vec::new();
+        for upload in small_uploads {
+            let digest = upload.digest();
+            // An empty blob is never sent, and a digest twice in this request goes out once.
+            if digest.size_in_bytes == 0 || claimed.contains(digest) {
+                continue;
             }
-            blob_hashes.extend(
-                send_batch_update_blobs(re_request, request_digest_function_config, cas_f).await?,
-            );
-            Ok(blob_hashes)
-        };
-        upload_futures.push(Box::pin(fut));
+            match calls.get(digest) {
+                Some(call) => joined.push((upload, call)),
+                None => {
+                    claimed.insert(digest.clone());
+                    batches.push(upload);
+                }
+            }
+        }
+        let started = batches
+            .done()
+            .into_iter()
+            .map(|batch| {
+                let digests = batch
+                    .iter()
+                    .map(|upload| upload.digest().clone())
+                    .collect::<Vec<_>>();
+                let hashes = digests.iter().map(|digest| digest.hash.clone()).collect();
+                let call = calls.start(digests, batch_uploader.clone().upload(batch));
+                (hashes, call)
+            })
+            .collect::<Vec<_>>();
+        (started, joined)
+    };
+    for (hashes, call) in started {
+        upload_futures.push(Box::pin(async move {
+            call.await.map_err(SharedCallFailure::into_error)?;
+            Ok(hashes)
+        }));
+    }
+    for (upload, call) in joined {
+        let batch_uploader = batch_uploader.clone();
+        upload_futures.push(Box::pin(async move {
+            let hash = upload.digest().hash.clone();
+            follow_batch_upload(shared_batch_uploads, batch_uploader, upload, call).await?;
+            Ok(vec![hash])
+        }));
     }
 
     let blob_hashes = if let Some(concurrency_limit) = max_concurrent_uploads {
@@ -8250,6 +8703,7 @@ fn substitute_env_vars_impl(
 #[cfg(test)]
 mod tests {
     use core::sync::atomic::Ordering;
+    use std::collections::VecDeque;
     use std::sync::atomic::AtomicU16;
 
     use re_grpc_proto::build::bazel::remote::execution::v2::ActionCacheUpdateCapabilities;
@@ -8335,14 +8789,15 @@ mod tests {
         max_total_batch_size: usize,
         max_concurrent_uploads: Option<usize>,
         request_digest_function_config: DigestFunctionConfig,
-        cas_f: impl Fn(BatchUpdateBlobsRequest) -> Cas + Sync + Send + Copy,
+        cas_f: impl Fn(BatchUpdateBlobsRequest) -> Cas + Clone + Sync + Send + 'static,
         bystream_fut: impl Fn(Vec<WriteRequest>) -> Byt + Sync + Send + Copy,
     ) -> anyhow::Result<UploadResponse>
     where
-        Cas: Future<Output = anyhow::Result<BatchUpdateBlobsResponse>> + Send,
+        Cas: Future<Output = anyhow::Result<BatchUpdateBlobsResponse>> + Send + 'static,
         Byt: Future<Output = anyhow::Result<WriteResponse>> + Send,
     {
         let active_uploads = ActiveTransferRegistry::new();
+        let shared_batch_uploads = SharedCallRegistry::new();
         super::upload_impl(
             instance_name,
             request,
@@ -8353,6 +8808,7 @@ mod tests {
             max_concurrent_uploads,
             request_digest_function_config,
             &active_uploads,
+            &shared_batch_uploads,
             cas_f,
             bystream_fut,
         )
@@ -9616,9 +10072,7 @@ mod tests {
 
         record_find_missing_results(
             &[present.clone(), missing.clone()],
-            &FindMissingBlobsResponse {
-                missing_blob_digests: vec![tdigest_to(missing.clone())],
-            },
+            &HashSet::from([missing.clone()]),
             &mut remote_results,
             &mut cache,
         );
@@ -12308,6 +12762,450 @@ mod tests {
         Ok(())
     }
 
+    /// What `FakeCas` does with the next BatchUpdateBlobs call.
+    enum FakeBatchUpdate {
+        Fail(tonic::Status),
+        /// Never answers, so the client's request timeout ends the call.
+        Silence,
+        /// Answers every blob with this code.
+        BlobStatus(Code),
+    }
+
+    #[derive(Default)]
+    struct FakeCasState {
+        stored: Mutex<HashSet<String>>,
+        /// How many FindMissingBlobs calls asked about each hash.
+        asked: Mutex<HashMap<String, usize>>,
+        /// How many BatchUpdateBlobs calls carried each hash.
+        uploaded: Mutex<HashMap<String, usize>>,
+        batch_update_calls: AtomicUsize,
+        /// How long each FindMissingBlobs and BatchUpdateBlobs call takes to answer.
+        delay: Duration,
+        script: Mutex<VecDeque<FakeBatchUpdate>>,
+    }
+
+    impl FakeCasState {
+        fn asked(&self, digest: &TDigest) -> usize {
+            self.asked
+                .lock()
+                .unwrap()
+                .get(&digest.hash)
+                .copied()
+                .unwrap_or(0)
+        }
+
+        fn uploaded(&self, digest: &TDigest) -> usize {
+            self.uploaded
+                .lock()
+                .unwrap()
+                .get(&digest.hash)
+                .copied()
+                .unwrap_or(0)
+        }
+    }
+
+    /// A CAS that stores what BatchUpdateBlobs sends it and counts, per digest, the calls that
+    /// asked about it and the calls that uploaded it.
+    struct FakeCas(Arc<FakeCasState>);
+
+    #[tonic::async_trait]
+    impl re_grpc_proto::build::bazel::remote::execution::v2::content_addressable_storage_server::ContentAddressableStorage
+        for FakeCas
+    {
+        type GetTreeStream = futures::stream::BoxStream<
+            'static,
+            Result<re_grpc_proto::build::bazel::remote::execution::v2::GetTreeResponse, tonic::Status>,
+        >;
+
+        async fn find_missing_blobs(
+            &self,
+            request: tonic::Request<FindMissingBlobsRequest>,
+        ) -> Result<tonic::Response<FindMissingBlobsResponse>, tonic::Status> {
+            let state = &self.0;
+            let digests = request.into_inner().blob_digests;
+            for digest in &digests {
+                *state.asked.lock().unwrap().entry(digest.hash.clone()).or_default() += 1;
+            }
+            tokio::time::sleep(state.delay).await;
+            let stored = state.stored.lock().unwrap();
+            Ok(tonic::Response::new(FindMissingBlobsResponse {
+                missing_blob_digests: digests
+                    .into_iter()
+                    .filter(|digest| !stored.contains(&digest.hash))
+                    .collect(),
+            }))
+        }
+
+        async fn batch_update_blobs(
+            &self,
+            request: tonic::Request<BatchUpdateBlobsRequest>,
+        ) -> Result<tonic::Response<BatchUpdateBlobsResponse>, tonic::Status> {
+            let state = &self.0;
+            state.batch_update_calls.fetch_add(1, Ordering::SeqCst);
+            let requests = request.into_inner().requests;
+            for request in &requests {
+                let hash = request.digest.as_ref().unwrap().hash.clone();
+                *state.uploaded.lock().unwrap().entry(hash).or_default() += 1;
+            }
+            let next = state.script.lock().unwrap().pop_front();
+            tokio::time::sleep(state.delay).await;
+            let code = match next {
+                Some(FakeBatchUpdate::Fail(status)) => return Err(status),
+                Some(FakeBatchUpdate::Silence) => {
+                    tokio::time::sleep(Duration::from_secs(600)).await;
+                    return Err(tonic::Status::internal("unreachable"));
+                }
+                Some(FakeBatchUpdate::BlobStatus(code)) => code,
+                None => Code::Ok,
+            };
+            let mut stored = state.stored.lock().unwrap();
+            Ok(tonic::Response::new(BatchUpdateBlobsResponse {
+                responses: requests
+                    .into_iter()
+                    .map(|request| {
+                        let digest = request.digest.unwrap();
+                        stored.insert(digest.hash.clone());
+                        batch_update_blobs_response::Response {
+                            digest: Some(digest),
+                            status: Some(Status {
+                                code: code as i32,
+                                ..Default::default()
+                            }),
+                        }
+                    })
+                    .collect(),
+            }))
+        }
+
+        async fn batch_read_blobs(
+            &self,
+            _request: tonic::Request<BatchReadBlobsRequest>,
+        ) -> Result<tonic::Response<BatchReadBlobsResponse>, tonic::Status> {
+            Err(tonic::Status::unimplemented("not used by these tests"))
+        }
+
+        async fn get_tree(
+            &self,
+            _request: tonic::Request<re_grpc_proto::build::bazel::remote::execution::v2::GetTreeRequest>,
+        ) -> Result<tonic::Response<Self::GetTreeStream>, tonic::Status> {
+            Err(tonic::Status::unimplemented("not used by these tests"))
+        }
+
+        async fn split_blob(
+            &self,
+            _request: tonic::Request<re_grpc_proto::build::bazel::remote::execution::v2::SplitBlobRequest>,
+        ) -> Result<
+            tonic::Response<re_grpc_proto::build::bazel::remote::execution::v2::SplitBlobResponse>,
+            tonic::Status,
+        > {
+            Err(tonic::Status::unimplemented("not used by these tests"))
+        }
+
+        async fn splice_blob(
+            &self,
+            _request: tonic::Request<re_grpc_proto::build::bazel::remote::execution::v2::SpliceBlobRequest>,
+        ) -> Result<
+            tonic::Response<re_grpc_proto::build::bazel::remote::execution::v2::SpliceBlobResponse>,
+            tonic::Status,
+        > {
+            Err(tonic::Status::unimplemented("not used by these tests"))
+        }
+    }
+
+    /// A client of a `FakeCas` with `state`, configured by `opts` otherwise.
+    async fn fake_cas_client(
+        state: Arc<FakeCasState>,
+        opts: Buck2OssReConfiguration,
+    ) -> anyhow::Result<(REClient, tokio::task::JoinHandle<()>)> {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let address = format!("grpc://{}", listener.local_addr()?);
+        let server = tokio::spawn(async move {
+            let _ = tonic::transport::Server::builder()
+                .add_service(
+                    re_grpc_proto::build::bazel::remote::execution::v2::content_addressable_storage_server::ContentAddressableStorageServer::new(
+                        FakeCas(state),
+                    ),
+                )
+                .serve_with_incoming(TcpListenerStream::new(listener))
+                .await;
+        });
+        Ok((raw_h2_client_with(address, opts).await?, server))
+    }
+
+    fn small_blob_upload(data: &[u8]) -> UploadRequest {
+        UploadRequest {
+            inlined_blobs_with_digest: Some(vec![InlinedBlobWithDigest {
+                blob: data.to_vec(),
+                digest: digest_for_test_data(data),
+                ..Default::default()
+            }]),
+            ..Default::default()
+        }
+    }
+
+    fn ttl_request(digest: &TDigest) -> GetDigestsTtlRequest {
+        GetDigestsTtlRequest {
+            digests: vec![digest.clone()],
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn concurrent_uploads_of_one_missing_blob_send_it_once() -> anyhow::Result<()> {
+        let state = Arc::new(FakeCasState {
+            delay: Duration::from_millis(300),
+            ..Default::default()
+        });
+        let (client, _server) = fake_cas_client(state.clone(), Default::default()).await?;
+        let data = b"a directory blob that eight actions need";
+        let metadata = RemoteExecutionMetadata::default();
+
+        let results = futures::future::join_all(
+            (0..8).map(|_| client.upload(metadata.clone(), small_blob_upload(data))),
+        )
+        .await;
+
+        assert!(results.iter().all(|result| result.is_ok()), "{results:?}");
+        assert_eq!(state.uploaded(&digest_for_test_data(data)), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn waiters_upload_again_after_the_upload_they_waited_on_fails() -> anyhow::Result<()> {
+        let state = Arc::new(FakeCasState {
+            delay: Duration::from_millis(300),
+            script: Mutex::new(VecDeque::from([FakeBatchUpdate::Fail(
+                tonic::Status::unavailable("the CAS is busy"),
+            )])),
+            ..Default::default()
+        });
+        // No retries, so the first upload fails and what follows is the waiters' doing.
+        let (client, _server) = fake_cas_client(
+            state.clone(),
+            Buck2OssReConfiguration {
+                retries: Some(0),
+                ..Default::default()
+            },
+        )
+        .await?;
+        let data = b"a blob whose first upload fails";
+        let metadata = RemoteExecutionMetadata::default();
+
+        let results = futures::future::join_all(
+            (0..4).map(|_| client.upload(metadata.clone(), small_blob_upload(data))),
+        )
+        .await;
+
+        let failed = results.iter().filter(|result| result.is_err()).count();
+        assert_eq!(
+            failed, 1,
+            "only the caller whose upload failed fails: {results:?}"
+        );
+        assert_eq!(state.uploaded(&digest_for_test_data(data)), 2);
+        assert!(
+            state
+                .stored
+                .lock()
+                .unwrap()
+                .contains(&digest_for_test_data(data).hash)
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn find_missing_for_a_digest_already_asked_about_is_not_sent_again() -> anyhow::Result<()>
+    {
+        let state = Arc::new(FakeCasState {
+            delay: Duration::from_millis(300),
+            ..Default::default()
+        });
+        let (client, _server) = fake_cas_client(state.clone(), Default::default()).await?;
+        let digest = digest_for_test_data(b"a digest six actions ask about");
+        let metadata = RemoteExecutionMetadata::default();
+
+        let results = futures::future::join_all(
+            (0..6).map(|_| client.get_digests_ttl(&metadata, ttl_request(&digest))),
+        )
+        .await;
+
+        for result in results {
+            assert_eq!(result?.digests_with_ttl[0].ttl, 0);
+        }
+        assert_eq!(state.asked(&digest), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn find_missing_for_a_digest_being_uploaded_waits_for_the_upload() -> anyhow::Result<()> {
+        let state = Arc::new(FakeCasState {
+            delay: Duration::from_millis(300),
+            ..Default::default()
+        });
+        let (client, _server) = fake_cas_client(state.clone(), Default::default()).await?;
+        let data = b"a blob one action uploads while another asks about it";
+        let digest = digest_for_test_data(data);
+        let metadata = RemoteExecutionMetadata::default();
+
+        let (uploaded, ttl) = futures::future::join(
+            client.upload(metadata.clone(), small_blob_upload(data)),
+            async {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                client
+                    .get_digests_ttl(&metadata, ttl_request(&digest))
+                    .await
+            },
+        )
+        .await;
+
+        uploaded?;
+        assert!(ttl?.digests_with_ttl[0].ttl > 0);
+        assert_eq!(state.asked(&digest), 0);
+        assert_eq!(state.uploaded(&digest), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn an_upload_that_times_out_on_the_client_is_retried() -> anyhow::Result<()> {
+        let state = Arc::new(FakeCasState {
+            script: Mutex::new(VecDeque::from([FakeBatchUpdate::Silence])),
+            ..Default::default()
+        });
+        let (client, _server) = fake_cas_client(
+            state.clone(),
+            Buck2OssReConfiguration {
+                retries: Some(2),
+                grpc_request_timeout_secs: Some(1),
+                ..Default::default()
+            },
+        )
+        .await?;
+        let data = b"a blob whose first upload is never answered";
+
+        client
+            .upload(RemoteExecutionMetadata::default(), small_blob_upload(data))
+            .await?;
+
+        assert_eq!(state.batch_update_calls.load(Ordering::SeqCst), 2);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn an_upload_the_server_rejects_is_not_sent_again() -> anyhow::Result<()> {
+        let state = Arc::new(FakeCasState {
+            delay: Duration::from_millis(300),
+            script: Mutex::new(VecDeque::from([FakeBatchUpdate::Fail(
+                tonic::Status::invalid_argument("the blob does not match its digest"),
+            )])),
+            ..Default::default()
+        });
+        let (client, _server) = fake_cas_client(
+            state.clone(),
+            Buck2OssReConfiguration {
+                retries: Some(3),
+                ..Default::default()
+            },
+        )
+        .await?;
+        let data = b"a blob the CAS refuses";
+        let metadata = RemoteExecutionMetadata::default();
+
+        let results = futures::future::join_all(
+            (0..4).map(|_| client.upload(metadata.clone(), small_blob_upload(data))),
+        )
+        .await;
+
+        for result in results {
+            let err = result.unwrap_err();
+            assert_eq!(
+                err.downcast_ref::<REClientError>().map(|err| err.code),
+                Some(TCode::INVALID_ARGUMENT),
+                "{err:#}"
+            );
+        }
+        assert_eq!(state.batch_update_calls.load(Ordering::SeqCst), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_blob_the_cas_already_has_is_uploaded() -> anyhow::Result<()> {
+        let state = Arc::new(FakeCasState {
+            script: Mutex::new(VecDeque::from([FakeBatchUpdate::BlobStatus(
+                Code::AlreadyExists,
+            )])),
+            ..Default::default()
+        });
+        let (client, _server) = fake_cas_client(state.clone(), Default::default()).await?;
+
+        client
+            .upload(
+                RemoteExecutionMetadata::default(),
+                small_blob_upload(b"a blob the CAS already has"),
+            )
+            .await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn an_upload_outlives_its_starter_while_another_caller_waits() -> anyhow::Result<()> {
+        let state = Arc::new(FakeCasState {
+            delay: Duration::from_millis(500),
+            ..Default::default()
+        });
+        let (client, _server) = fake_cas_client(state.clone(), Default::default()).await?;
+        let data = b"a blob whose first uploader is cancelled";
+        let metadata = RemoteExecutionMetadata::default();
+
+        let (starter, waiter) = futures::future::join(
+            tokio::time::timeout(
+                Duration::from_millis(100),
+                client.upload(metadata.clone(), small_blob_upload(data)),
+            ),
+            client.upload(metadata.clone(), small_blob_upload(data)),
+        )
+        .await;
+
+        assert!(starter.is_err(), "the starter was cancelled");
+        waiter?;
+        assert_eq!(state.uploaded(&digest_for_test_data(data)), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn an_upload_every_caller_dropped_is_cancelled_and_forgotten() -> anyhow::Result<()> {
+        let state = Arc::new(FakeCasState {
+            delay: Duration::from_millis(500),
+            ..Default::default()
+        });
+        let (client, _server) = fake_cas_client(state.clone(), Default::default()).await?;
+        let data = b"a blob every uploader gives up on";
+        let metadata = RemoteExecutionMetadata::default();
+
+        let cancelled = tokio::time::timeout(
+            Duration::from_millis(100),
+            futures::future::join(
+                client.upload(metadata.clone(), small_blob_upload(data)),
+                client.upload(metadata.clone(), small_blob_upload(data)),
+            ),
+        )
+        .await;
+        assert!(cancelled.is_err());
+        assert!(
+            client
+                .shared_batch_uploads
+                .map
+                .lock()
+                .unwrap()
+                .calls
+                .is_empty()
+        );
+
+        client
+            .upload(metadata.clone(), small_blob_upload(data))
+            .await?;
+        assert_eq!(state.uploaded(&digest_for_test_data(data)), 2);
+        Ok(())
+    }
+
     fn digest_for_test_data(data: &[u8]) -> TDigest {
         TDigest {
             hash: format!("{:x}", Sha256::digest(data)),
@@ -13392,7 +14290,7 @@ mod tests {
             10000,
             None,
             DigestFunctionConfig::default(),
-            |req| {
+            move |req: BatchUpdateBlobsRequest| {
                 let res = res.clone();
                 let digest1 = digest1.clone();
                 let digest2 = digest2.clone();
@@ -13435,7 +14333,8 @@ mod tests {
             None,
             DigestFunctionConfig::default(),
             &active_uploads,
-            |req| {
+            &SharedCallRegistry::new(),
+            move |req: BatchUpdateBlobsRequest| {
                 let digest = digest.clone();
                 let blob = blob.clone();
                 async move {
@@ -13482,7 +14381,8 @@ mod tests {
             None,
             DigestFunctionConfig::default(),
             &active_uploads,
-            |req| {
+            &SharedCallRegistry::new(),
+            move |req: BatchUpdateBlobsRequest| {
                 let digest = digest.clone();
                 let blob = blob.clone();
                 async move {
@@ -13565,7 +14465,7 @@ mod tests {
             10, // kept small to simulate a large file upload
             None,
             DigestFunctionConfig::default(),
-            |req| {
+            move |req: BatchUpdateBlobsRequest| {
                 let res = res.clone();
                 let digest1 = digest1.clone();
                 async move {
@@ -13705,7 +14605,7 @@ mod tests {
             10, // kept small to simulate a large inlined upload
             None,
             DigestFunctionConfig::default(),
-            |req| {
+            move |req: BatchUpdateBlobsRequest| {
                 let res = res.clone();
                 let digest1 = digest1.clone();
                 let blob_data1 = blob_data1.clone();
@@ -14042,17 +14942,20 @@ mod tests {
             10000,
             None,
             config,
-            |req| {
+            {
                 let digest = digest.clone();
-                async move {
-                    assert_eq!(req.digest_function, digest_function::Value::Blake3 as i32);
-                    assert_eq!(req.requests.len(), 1);
-                    Ok(BatchUpdateBlobsResponse {
-                        responses: vec![batch_update_blobs_response::Response {
-                            digest: Some(tdigest_to(digest)),
-                            status: Some(Status::default()),
-                        }],
-                    })
+                move |req: BatchUpdateBlobsRequest| {
+                    let digest = digest.clone();
+                    async move {
+                        assert_eq!(req.digest_function, digest_function::Value::Blake3 as i32);
+                        assert_eq!(req.requests.len(), 1);
+                        Ok(BatchUpdateBlobsResponse {
+                            responses: vec![batch_update_blobs_response::Response {
+                                digest: Some(tdigest_to(digest)),
+                                status: Some(Status::default()),
+                            }],
+                        })
+                    }
                 }
             },
             |_req| async { panic!("not called") },
@@ -14136,6 +15039,7 @@ mod tests {
             None,
             DigestFunctionConfig::default(),
             &active_uploads,
+            &SharedCallRegistry::new(),
             |_req| async move {
                 panic!("Not called");
             },
@@ -14526,6 +15430,7 @@ async fn test_upload_compressed() -> anyhow::Result<()> {
         None,
         DigestFunctionConfig::default(),
         &active_uploads,
+        &SharedCallRegistry::new(),
         |_req| async move {
             panic!("Not called");
         },
