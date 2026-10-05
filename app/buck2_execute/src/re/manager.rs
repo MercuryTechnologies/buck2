@@ -376,17 +376,6 @@ impl ManagedRemoteExecutionClient {
             .await
     }
 
-    pub async fn record_missing_remote_cas_digests_from_action_result(
-        &self,
-        action_result: &TActionResult2,
-    ) -> buck2_error::Result<()> {
-        self.lock()?
-            .get()
-            .await?
-            .record_missing_remote_cas_digests_from_action_result(action_result);
-        Ok(())
-    }
-
     pub async fn record_missing_remote_cas_digest(
         &self,
         digest: TDigest,

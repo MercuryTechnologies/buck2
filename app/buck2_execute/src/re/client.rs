@@ -234,15 +234,6 @@ impl RemoteExecutionClient {
         self.data.client.record_missing_remote_cas_digest(digest);
     }
 
-    pub fn record_missing_remote_cas_digests_from_action_result(
-        &self,
-        action_result: &TActionResult2,
-    ) {
-        self.data
-            .client
-            .record_missing_remote_cas_digests_from_action_result(action_result);
-    }
-
     pub async fn new_retry(re_config: &RemoteExecutionConfig) -> buck2_error::Result<Self> {
         // Loop happens times-1 times at most
         for i in 1..re_config.connection_retries {
@@ -553,7 +544,38 @@ struct RemoteExecutionClientImpl {
     respect_file_symlinks: bool,
     persistent_cache_mode: Option<String>,
     #[allocative(skip)]
-    missing_remote_cas_digests: Mutex<StdBuckHashSet<TDigest>>,
+    missing_remote_cas_digests: MissingCasDigests,
+}
+
+/// CAS digests that a stale action cache hit was found to lack. A later hit naming one of them is
+/// not served. A fresh execution whose result names one has just uploaded that blob, so the digest
+/// is forgotten then: an action's stderr often has the same digest as many others', and keeping it
+/// would turn every hit that shares it into an execution for the daemon's life.
+#[derive(Default)]
+struct MissingCasDigests(Mutex<StdBuckHashSet<TDigest>>);
+
+impl MissingCasDigests {
+    fn lock(&self) -> std::sync::MutexGuard<'_, StdBuckHashSet<TDigest>> {
+        self.0.lock().expect("missing CAS digest mutex was poisoned")
+    }
+
+    fn record(&self, digest: TDigest) {
+        self.lock().insert(digest);
+    }
+
+    fn forget_uploaded_by(&self, action_result: &TActionResult2) {
+        let mut missing = self.lock();
+        if missing.is_empty() {
+            return;
+        }
+        for digest in action_result_cas_digests(action_result) {
+            missing.remove(&digest);
+        }
+    }
+
+    fn referenced_by(&self, action_result: &TActionResult2) -> Option<TDigest> {
+        action_result_references_any_digest(action_result, &self.lock())
+    }
 }
 
 fn re_platform(x: &RE::Platform) -> remote_execution::TPlatform {
@@ -1062,7 +1084,7 @@ impl RemoteExecutionClientImpl {
                 download_chunk_size,
                 respect_file_symlinks,
                 persistent_cache_mode,
-                missing_remote_cas_digests: Mutex::new(StdBuckHashSet::default()),
+                missing_remote_cas_digests: MissingCasDigests::default(),
             }
         };
 
@@ -1084,33 +1106,15 @@ impl RemoteExecutionClientImpl {
     }
 
     fn record_missing_remote_cas_digest(&self, digest: TDigest) {
-        self.missing_remote_cas_digests
-            .lock()
-            .expect("missing CAS digest mutex was poisoned")
-            .insert(digest);
-    }
-
-    fn record_missing_remote_cas_digests_from_action_result(&self, action_result: &TActionResult2) {
-        let digests = action_result_cas_digests(action_result);
-        if digests.is_empty() {
-            return;
-        }
-
-        self.missing_remote_cas_digests
-            .lock()
-            .expect("missing CAS digest mutex was poisoned")
-            .extend(digests);
+        self.missing_remote_cas_digests.record(digest);
     }
 
     fn action_result_references_missing_cas(
         &self,
         response: &ActionResultResponse,
     ) -> Option<TDigest> {
-        let missing_digests = self
-            .missing_remote_cas_digests
-            .lock()
-            .expect("missing CAS digest mutex was poisoned");
-        action_result_references_any_digest(&response.action_result, &missing_digests)
+        self.missing_remote_cas_digests
+            .referenced_by(&response.action_result)
     }
 
     async fn action_cache(
@@ -1845,6 +1849,12 @@ impl RemoteExecutionClientImpl {
             Ok(ExecuteResponseOrCancelled::Cancelled(_, _, ExecutionStarted::No)) => None,
             Err(_) => None,
         };
+        if let Ok(ExecuteResponseOrCancelled::Response(r)) = &res
+            && !r.execute_response.cached_result
+        {
+            self.missing_remote_cas_digests
+                .forget_uploaded_by(&r.execute_response.action_result);
+        }
         if let Some((event, ttl, subtype, storage_cost_bytes, compute_cost_ms)) = trace {
             trace_action_digest(
                 &action_digest,
@@ -2429,6 +2439,69 @@ mod tests {
         assert_eq!(
             action_result_references_any_digest(&action_result, &missing_digests),
             Some(missing)
+        );
+    }
+
+    fn action_result_with_streams(
+        output_file: TDigest,
+        stdout: TDigest,
+        stderr: TDigest,
+    ) -> TActionResult2 {
+        TActionResult2 {
+            output_files: vec![remote_execution::TFile {
+                digest: remote_execution::DigestWithStatus {
+                    digest: output_file,
+                    ..Default::default()
+                },
+                ..Default::default()
+            }],
+            stdout_digest: Some(stdout),
+            stderr_digest: Some(stderr),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_missing_stderr_does_not_stop_hits_on_its_action_s_present_blobs() {
+        let output_file = test_digest_with_hash("a", 1);
+        let stdout = test_digest_with_hash("b", 2);
+        let stderr = test_digest_with_hash("c", 5112);
+        let other_stderr = test_digest_with_hash("d", 3);
+        let missing = MissingCasDigests::default();
+
+        missing.record(stderr.clone());
+
+        assert_eq!(
+            missing.referenced_by(&action_result_with_streams(
+                output_file.clone(),
+                stdout.clone(),
+                other_stderr
+            )),
+            None
+        );
+        assert_eq!(
+            missing.referenced_by(&action_result_with_streams(output_file, stdout, stderr.clone())),
+            Some(stderr)
+        );
+    }
+
+    #[test]
+    fn a_digest_a_fresh_execution_uploaded_is_served_again() {
+        let output_file = test_digest_with_hash("a", 1);
+        let stdout = test_digest_with_hash("b", 2);
+        let stderr = test_digest_with_hash("c", 5112);
+        let missing = MissingCasDigests::default();
+        missing.record(stderr.clone());
+
+        missing.forget_uploaded_by(&action_result_with_streams(
+            test_digest_with_hash("e", 4),
+            test_digest_with_hash("f", 5),
+            stderr.clone(),
+        ));
+
+        assert_eq!(
+            missing.referenced_by(&action_result_with_streams(output_file, stdout, stderr)),
+            None
         );
     }
 
