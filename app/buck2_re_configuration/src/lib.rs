@@ -537,6 +537,9 @@ pub struct Buck2OssReConfiguration {
     /// The largest blob, in bytes, the client keeps in memory after reading it. 0 turns the
     /// cache off.
     pub read_cache_max_blob_bytes: Option<usize>,
+    /// How long, in milliseconds, a read of blobs small enough for `BatchReadBlobs` waits for
+    /// other reads to share its RPC. 0 sends each read as its own RPC.
+    pub batch_read_blobs_window_ms: Option<u64>,
     /// Time that digests are assumed to live in CAS after being touched.
     pub cas_ttl_secs: Option<i64>,
     /// Whether to chunk large remote-cache blobs using FastCDC 2020 and SpliceBlob.
@@ -761,6 +764,10 @@ impl Buck2OssReConfiguration {
             read_cache_max_blob_bytes: legacy_config.parse(BuckconfigKeyRef {
                 section: BUCK2_RE_CLIENT_CFG_SECTION,
                 property: "read_cache_max_blob_bytes",
+            })?,
+            batch_read_blobs_window_ms: legacy_config.parse(BuckconfigKeyRef {
+                section: BUCK2_RE_CLIENT_CFG_SECTION,
+                property: "batch_read_blobs_window_ms",
             })?,
             cas_ttl_secs: legacy_config.parse(BuckconfigKeyRef {
                 section: BUCK2_RE_CLIENT_CFG_SECTION,
