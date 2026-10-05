@@ -4783,7 +4783,8 @@ impl FindMissingBatcher {
     }
 
     /// Spawns the task that sends batch `id` when its window ends or it fills, whichever comes
-    /// first.
+    /// first. The task reports to the first caller's event dispatcher, so the RPC shows in the
+    /// build's event log as the separate checks did.
     fn start_batch(
         &self,
         id: u64,
@@ -4796,7 +4797,7 @@ impl FindMissingBatcher {
         let open = self.open.dupe();
         let window = self.window;
         let context = context.clone();
-        tokio::spawn(async move {
+        let task = async move {
             let digests = match tokio::time::timeout(window, &mut filled).await {
                 Ok(digests) => digests,
                 Err(_elapsed) => {
@@ -4823,7 +4824,11 @@ impl FindMissingBatcher {
                 .map(Arc::new)
                 .map_err(|err| SharedCallFailure::from_error(&err));
             drop(answer_sender.send(result));
-        });
+        };
+        match get_dispatcher_opt() {
+            Some(dispatcher) => tokio::spawn(with_dispatcher_async(dispatcher, task)),
+            None => tokio::spawn(task),
+        };
         OpenFindMissingBatch {
             id,
             digests: Vec::new(),
@@ -14609,6 +14614,81 @@ mod tests {
         assert_eq!(reported_missing(&response), vec![outputs[1][0].clone()]);
         assert_eq!(state.find_missing_calls.load(Ordering::SeqCst), 1);
         assert_eq!(state.asked(&outputs[1][0]), 1);
+        Ok(())
+    }
+
+    /// Runs `fut` under a dispatcher of its own, and answers with its output and the method and
+    /// digest count of each RemoteRequest span it started.
+    async fn with_remote_request_spans<T>(
+        fut: impl Future<Output = T>,
+    ) -> (T, Vec<(String, Option<u64>)>) {
+        let (mut events, sink) = buck2_events::create_source_sink_pair();
+        let dispatcher = buck2_events::dispatch::EventDispatcher::new(
+            buck2_wrapper_common::invocation_id::TraceId::null(),
+            buck2_events::daemon_id::DaemonId::null(),
+            sink,
+        );
+        let output = buck2_events::dispatch::with_dispatcher_async(dispatcher, fut).await;
+        let mut spans = Vec::new();
+        while let Some(event) = events.try_receive() {
+            if let buck2_events::Event::Buck(event) = event
+                && let buck2_data::buck_event::Data::SpanStart(buck2_data::SpanStartEvent {
+                    data: Some(buck2_data::span_start_event::Data::RemoteRequest(start)),
+                }) = event.data()
+            {
+                spans.push((start.method.clone(), start.digest_count));
+            }
+        }
+        (output, spans)
+    }
+
+    #[tokio::test]
+    async fn a_shared_find_missing_reaches_the_event_log() -> anyhow::Result<()> {
+        let state = Arc::new(FakeCasState::default());
+        let (client, _server) = fake_cas_client(state.clone(), Default::default()).await?;
+        let outputs = cache_hit_outputs(&state, 4, &[]);
+        let metadata = RemoteExecutionMetadata::default();
+
+        let (results, spans) = with_remote_request_spans(futures::future::join_all(
+            outputs
+                .iter()
+                .map(|digests| client.get_digests_ttl(&metadata, expiration_check(digests))),
+        ))
+        .await;
+
+        for result in results {
+            result?;
+        }
+        assert_eq!(state.find_missing_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(spans, vec![("FindMissingBlobs".to_owned(), Some(12))]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_shared_batch_read_reaches_the_event_log() -> anyhow::Result<()> {
+        let state = Arc::new(FakeCasState::default());
+        let (client, _server) = fake_cas_client(state.clone(), Default::default()).await?;
+        let blobs = held_blobs(&state, 4);
+
+        let client = &client;
+        let (results, spans) =
+            with_remote_request_spans(futures::future::join_all(blobs.iter().enumerate().map(
+                |(action, (digest, _))| async move {
+                    client
+                        .download(
+                            &action_metadata(action),
+                            inlined_read(std::slice::from_ref(digest)),
+                        )
+                        .await
+                },
+            )))
+            .await;
+
+        for result in results {
+            read_blobs(result)?;
+        }
+        assert_eq!(state.batch_reads(), 1);
+        assert_eq!(spans, vec![("BatchReadBlobs".to_owned(), Some(4))]);
         Ok(())
     }
 
