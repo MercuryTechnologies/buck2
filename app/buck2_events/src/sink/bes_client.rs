@@ -477,6 +477,9 @@ struct BazelArtifactUploader {
     /// An upload of this stream's ran out of time. The rest of its files are not uploaded: each
     /// would hold the worker, and every event queued behind it, for as long again.
     timed_out: bool,
+    /// A failed upload has been reported. The files stay inline, where BuildBuddy shows none of
+    /// them, so one warning says why; one per file would bury the console.
+    reported_failure: bool,
     repo_path: Option<PathBuf>,
     directory_outputs: HashSet<BepFileIdentity>,
     #[cfg(test)]
@@ -509,6 +512,7 @@ impl BazelArtifactUploader {
             counters,
             client: None,
             timed_out: false,
+            reported_failure: false,
             repo_path: None,
             directory_outputs: HashSet::new(),
             #[cfg(test)]
@@ -814,6 +818,17 @@ impl BazelArtifactUploader {
             ));
         }
         let result = self.write_with_progress_timeout(outbound).await;
+        if let Err(status) = &result
+            && status.code() != tonic::Code::DeadlineExceeded
+            && !self.reported_failure
+        {
+            self.reported_failure = true;
+            tracing::warn!(
+                "BES sink: artifact upload to {} failed, and the file stays inline: {}",
+                self.config.endpoint,
+                status
+            );
+        }
         if let Err(status) = &result
             && status.code() == tonic::Code::DeadlineExceeded
         {
@@ -3852,6 +3867,58 @@ mod tests {
             uri,
             &format!("bytestream://localhost:1985/remote/instance/blobs/{hash}/3")
         );
+    }
+
+    /// BuildBuddy's Timing tab reads the profile only from a `command.profile.gz` tool log with a
+    /// `bytestream://` URI (app/invocation/invocation_timing_card.tsx at v2.310.0); one left
+    /// inline reads as "Could not find profile info".
+    #[tokio::test]
+    async fn upload_event_files_moves_the_command_profile_into_the_cas() {
+        let profile = b"\x1f\x8b profile".to_vec();
+        let hash = format!("{:x}", Sha256::digest(&profile));
+        let mut uploader =
+            BazelArtifactUploader::new(test_artifact_upload_config(), Arc::default());
+        let mut event = bazel_bep_proto::build_event_stream::BuildEvent {
+            id: None,
+            children: Vec::new(),
+            payload: Some(
+                bazel_bep_proto::build_event_stream::build_event::Payload::BuildToolLogs(
+                    bazel_bep_proto::build_event_stream::BuildToolLogs {
+                        log: vec![bazel_bep_proto::build_event_stream::File {
+                            name: "command.profile.gz".to_owned(),
+                            path_prefix: Vec::new(),
+                            file: Some(bazel_bep_proto::build_event_stream::file::File::Contents(
+                                profile.clone(),
+                            )),
+                            digest: String::new(),
+                            length: 0,
+                        }],
+                    },
+                ),
+            ),
+            last_message: true,
+        };
+
+        uploader.upload_event_files(&mut event).await;
+
+        let Some(bazel_bep_proto::build_event_stream::build_event::Payload::BuildToolLogs(logs)) =
+            event.payload
+        else {
+            panic!("expected build tool logs");
+        };
+        let log = &logs.log[0];
+        assert_eq!(log.name, "command.profile.gz");
+        assert_eq!(
+            log.file,
+            Some(bazel_bep_proto::build_event_stream::file::File::Uri(
+                format!(
+                    "bytestream://localhost:1985/remote/instance/blobs/{hash}/{}",
+                    profile.len()
+                )
+            ))
+        );
+        assert_eq!(uploader.test_writes.len(), 1);
+        assert_eq!(uploader.test_writes[0].data, profile);
     }
 
     #[tokio::test]

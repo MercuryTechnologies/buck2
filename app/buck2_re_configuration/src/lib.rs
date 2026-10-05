@@ -902,19 +902,9 @@ impl BesConnection {
         else {
             return Ok(None);
         };
-        let (scheme, host) = match engine.split_once("://") {
-            Some((scheme, host)) => (Some(scheme.to_ascii_lowercase()), host),
-            None => (None, engine),
-        };
-        let tls = config
-            .tls
-            .unwrap_or_else(|| !matches!(scheme.as_deref(), Some("grpc") | Some("http")));
+        let (backend, tls) = grpc_backend(engine, config.tls);
         Ok(Some(Self {
-            backend: format!(
-                "{}://{}",
-                if tls { "grpcs" } else { "grpc" },
-                host.trim_end_matches('/')
-            ),
+            backend,
             headers: config
                 .http_headers
                 .iter()
@@ -929,6 +919,49 @@ impl BesConnection {
             ),
         }))
     }
+}
+
+/// Where the Build Event Service sink uploads the files of a Bazel-format stream when no
+/// `[bes] bazel_artifact_upload_backend` is set: the remote execution CAS, spelled as
+/// `[bes] backend` is. The scheme alone does not say whether that CAS takes TLS, because
+/// `tls = true` beside `grpc://host:443` turns it on, so a sink that read only the address
+/// dialled a TLS port in plaintext and uploaded nothing.
+pub fn bes_cas_address(legacy_config: &LegacyBuckConfig) -> buck2_error::Result<Option<String>> {
+    let address = legacy_config
+        .parse::<String>(BuckconfigKeyRef {
+            section: BUCK2_RE_CLIENT_CFG_SECTION,
+            property: "cas_address",
+        })?
+        .or(legacy_config.parse::<String>(BuckconfigKeyRef {
+            section: BUCK2_RE_CLIENT_CFG_SECTION,
+            property: "address",
+        })?);
+    let Some(address) = address.as_deref().map(str::trim).filter(|s| !s.is_empty()) else {
+        return Ok(None);
+    };
+    let tls = legacy_config.parse::<bool>(BuckconfigKeyRef {
+        section: BUCK2_RE_CLIENT_CFG_SECTION,
+        property: "tls",
+    })?;
+    Ok(Some(grpc_backend(address, tls).0))
+}
+
+/// `grpcs://host` or `grpc://host` for a remote execution address, and whether that is TLS.
+/// The `tls` key wins over the scheme, as it does for the remote execution client.
+fn grpc_backend(address: &str, tls: Option<bool>) -> (String, bool) {
+    let (scheme, host) = match address.split_once("://") {
+        Some((scheme, host)) => (Some(scheme.to_ascii_lowercase()), host),
+        None => (None, address),
+    };
+    let tls = tls.unwrap_or_else(|| !matches!(scheme.as_deref(), Some("grpc") | Some("http")));
+    (
+        format!(
+            "{}://{}",
+            if tls { "grpcs" } else { "grpc" },
+            host.trim_end_matches('/')
+        ),
+        tls,
+    )
 }
 
 /// The `[bes]` keys that bound what a broken stream keeps and for how long. The daemon's sink
@@ -1196,6 +1229,34 @@ mod tests {
         let connection = BesConnection::from_re_client(&plain)?.expect("engine configured");
         assert_eq!(connection.backend, "grpc://localhost:8980");
         assert_eq!(connection.tls_client_cert, None);
+        Ok(())
+    }
+
+    #[test]
+    fn bes_cas_address_takes_tls_from_the_tls_key_over_the_scheme() -> buck2_error::Result<()> {
+        let legacy_config = parse(
+            &[(
+                "config",
+                "[buck2_re_client]\nengine_address = grpc://reapi.example:443\ncas_address = grpc://cas.example:443\ntls = true\n",
+            )],
+            "config",
+        )?;
+        assert_eq!(
+            bes_cas_address(&legacy_config)?.as_deref(),
+            Some("grpcs://cas.example:443")
+        );
+
+        let shared = parse(
+            &[("config", "[buck2_re_client]\naddress = grpc://localhost:1985\n")],
+            "config",
+        )?;
+        assert_eq!(
+            bes_cas_address(&shared)?.as_deref(),
+            Some("grpc://localhost:1985")
+        );
+
+        let unset = parse(&[("config", "")], "config")?;
+        assert_eq!(bes_cas_address(&unset)?, None);
         Ok(())
     }
 
