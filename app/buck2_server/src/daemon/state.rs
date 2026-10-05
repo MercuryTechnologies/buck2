@@ -484,18 +484,7 @@ impl DaemonState {
                 })?
                 .unwrap_or_default();
             #[cfg(not(fbcode_build))]
-            let re_client_default_address: Option<String> =
-                root_config.parse(BuckconfigKeyRef {
-                    section: "buck2_re_client",
-                    property: "address",
-                })?;
-            #[cfg(not(fbcode_build))]
-            let re_client_cas_address = root_config
-                .parse::<String>(BuckconfigKeyRef {
-                    section: "buck2_re_client",
-                    property: "cas_address",
-                })?
-                .or(re_client_default_address);
+            let re_client_cas_address = buck2_re_configuration::bes_cas_address(root_config)?;
             #[cfg(not(fbcode_build))]
             let re_client_instance_name = root_config.parse(BuckconfigKeyRef {
                 section: "buck2_re_client",
