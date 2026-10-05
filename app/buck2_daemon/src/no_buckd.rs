@@ -44,7 +44,12 @@ pub fn start_in_process_daemon(
                 )
                 .await?;
 
-                kill_command_impl(&lifecycle_lock, "A command with `--no-buckd` is invoked").await
+                kill_command_impl(
+                    &lifecycle_lock,
+                    "A command with `--no-buckd` is invoked",
+                    std::time::Duration::ZERO,
+                )
+                .await
             })
         })?;
 
