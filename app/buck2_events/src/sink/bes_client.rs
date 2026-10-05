@@ -61,6 +61,10 @@ use tonic::transport::ClientTlsConfig;
 use tonic::transport::Endpoint;
 use tonic::transport::Identity;
 
+use crate::DrainReport;
+use crate::DrainScope;
+use crate::StreamDrain;
+use crate::StreamDrainOutcome;
 use crate::sink::bazel_converter::BazelEventConverter;
 use crate::sink::bazel_converter::encode_bep_event;
 use crate::sink::bazel_converter::interrupted_finish_event;
@@ -72,6 +76,7 @@ const CLOSE_ACK_TIMEOUT_MULTIPLIER: u32 = 30;
 const MIN_CLOSE_ACK_TIMEOUT: Duration = Duration::from_secs(30);
 const COMMAND_END_CLOSE_GRACE: Duration = Duration::from_millis(500);
 const COMMAND_END_CLOSE_POLL_INTERVAL: Duration = Duration::from_millis(100);
+const DRAIN_ANSWER_MARGIN: Duration = Duration::from_millis(250);
 const DEFAULT_BAZEL_ARTIFACT_UPLOAD_MAX_BYTES: usize = 10 * 1024 * 1024;
 // The remote execution client's defaults for the same `[buck2_re_client]` keys
 // (remote_execution/oss/re_grpc/src/client.rs:146-150). The artifact uploads go to that client's
@@ -239,12 +244,22 @@ pub struct Message {
     pub message_key: Option<i64>,
 }
 
+enum WorkerRequest {
+    Send(SendNowRequest),
+    Drain(DrainRequest),
+}
+
 struct SendNowRequest {
     messages: Vec<Message>,
     wait_for_acks: bool,
-    /// Close every stream after sending: the daemon is shutting down.
-    close_all: bool,
     done: SendNowReply,
+}
+
+struct DrainRequest {
+    scope: DrainScope,
+    deadline: Instant,
+    /// Dropped by a caller that stopped waiting, which ends the drain's wait early.
+    done: oneshot::Sender<DrainReport>,
 }
 
 /// Where the worker reports a priority send: to an awaiting task, or to a thread that waits
@@ -1075,8 +1090,9 @@ fn file_digest_and_size(file: &bazel_bep_proto::build_event_stream::File) -> Opt
 
 pub struct BesClient {
     tx: crossbeam_channel::Sender<Message>,
-    send_now_tx: crossbeam_channel::Sender<SendNowRequest>,
+    send_now_tx: crossbeam_channel::Sender<WorkerRequest>,
     counters: Arc<CounterState>,
+    grpc_timeout: Duration,
 }
 
 impl BesClient {
@@ -1134,7 +1150,7 @@ impl BesClient {
                         loop {
                             match send_now_rx.try_recv() {
                                 Ok(request) => {
-                                    process_send_now_request(&runtime, &mut worker, request);
+                                    process_request(&runtime, &mut worker, request, &rx);
                                 }
                                 Err(crossbeam_channel::TryRecvError::Empty) => break,
                                 Err(crossbeam_channel::TryRecvError::Disconnected) => {
@@ -1149,7 +1165,7 @@ impl BesClient {
                         crossbeam_channel::select! {
                             recv(send_now_rx) -> request => match request {
                                 Ok(request) => {
-                                    process_send_now_request(&runtime, &mut worker, request);
+                                    process_request(&runtime, &mut worker, request, &rx);
                                 }
                                 Err(_) => {
                                     send_now_open = false;
@@ -1164,10 +1180,11 @@ impl BesClient {
                                             match send_now_rx.try_recv() {
                                                 Ok(request) => {
                                                     handled_send_now = true;
-                                                    process_send_now_request(
+                                                    process_request(
                                                         &runtime,
                                                         &mut worker,
                                                         request,
+                                                        &rx,
                                                     );
                                                 }
                                                 Err(crossbeam_channel::TryRecvError::Empty) => break,
@@ -1213,7 +1230,8 @@ impl BesClient {
                         }
                     }
                 }
-                runtime.block_on(worker.close_all_streams());
+                let deadline = Instant::now() + close_ack_timeout(worker.config.grpc_timeout);
+                runtime.block_on(worker.drain(DrainScope::Shutdown, deadline, std::future::pending()));
             })
             .map_err(|e| {
                 buck2_error::buck2_error!(ErrorTag::Tier0, "Failed to start BES worker thread: {e}")
@@ -1223,6 +1241,7 @@ impl BesClient {
             tx,
             send_now_tx,
             counters,
+            grpc_timeout: config.grpc_timeout,
         })
     }
 
@@ -1249,12 +1268,11 @@ impl BesClient {
 
         let (done_tx, done_rx) = oneshot::channel();
         self.send_now_tx
-            .send(SendNowRequest {
+            .send(WorkerRequest::Send(SendNowRequest {
                 messages,
                 wait_for_acks,
-                close_all: false,
                 done: SendNowReply::Await(done_tx),
-            })
+            }))
             .map_err(|_| {
                 buck2_error::buck2_error!(
                     ErrorTag::Tier0,
@@ -1287,12 +1305,11 @@ impl BesClient {
         let (done_tx, done_rx) = crossbeam_channel::bounded(1);
         if self
             .send_now_tx
-            .send(SendNowRequest {
+            .send(WorkerRequest::Send(SendNowRequest {
                 messages,
                 wait_for_acks: false,
-                close_all: false,
                 done: SendNowReply::Block(done_tx),
-            })
+            }))
             .is_err()
         {
             return PrioritySend::Done(Err(buck2_error::buck2_error!(
@@ -1320,23 +1337,54 @@ impl BesClient {
     /// the worker would close streams when this client is dropped, but the process exits
     /// first, and a stream left open shows as a build still running on the server.
     pub async fn close_all_streams(&self) -> buck2_error::Result<()> {
+        let timeout = close_ack_timeout(self.grpc_timeout);
+        let report = self.drain(DrainScope::Shutdown, timeout).await?;
+        if report.is_complete() {
+            return Ok(());
+        }
+        Err(buck2_error::buck2_error!(
+            ErrorTag::Tier0,
+            "{} BES events of invocations {} were not acknowledged",
+            report.unacked_events(),
+            report.unacked_invocations().join(", ")
+        ))
+    }
+
+    /// Sends what every stream in `scope` holds, closes those streams, and waits until the
+    /// server has acknowledged every event or `timeout` passes. Nothing is dropped at the
+    /// deadline: what is still unacknowledged stays held, and a stream already closing goes
+    /// on waiting for its server under its own `close_ack_timeout`. The worker has one
+    /// thread, and an event it is sending when the request arrives can hold it for up to
+    /// `grpc_timeout`; a drain it has not started by the deadline is an error.
+    pub async fn drain(
+        &self,
+        scope: DrainScope,
+        timeout: Duration,
+    ) -> buck2_error::Result<DrainReport> {
+        let deadline = Instant::now() + timeout;
         let (done_tx, done_rx) = oneshot::channel();
         self.send_now_tx
-            .send(SendNowRequest {
-                messages: Vec::new(),
-                wait_for_acks: true,
-                close_all: true,
-                done: SendNowReply::Await(done_tx),
-            })
+            .send(WorkerRequest::Drain(DrainRequest {
+                scope,
+                deadline,
+                done: done_tx,
+            }))
             .map_err(|_| {
-                buck2_error::buck2_error!(ErrorTag::Tier0, "Failed to enqueue BES close request")
+                buck2_error::buck2_error!(ErrorTag::Tier0, "Failed to enqueue BES drain request")
             })?;
-        done_rx.await.map_err(|_| {
-            buck2_error::buck2_error!(
+        // The worker answers at its deadline; the margin is for the answer to cross threads.
+        match tokio::time::timeout_at((deadline + DRAIN_ANSWER_MARGIN).into(), done_rx).await {
+            Ok(Ok(report)) => Ok(report),
+            Ok(Err(_)) => Err(buck2_error::buck2_error!(
                 ErrorTag::Tier0,
-                "BES worker dropped close response channel"
-            )
-        })?
+                "BES worker dropped drain response channel"
+            )),
+            Err(_) => Err(buck2_error::buck2_error!(
+                ErrorTag::Tier0,
+                "The BES worker did not start the drain within {:?}: it was still sending an earlier event",
+                timeout
+            )),
+        }
     }
 }
 
@@ -1359,16 +1407,37 @@ fn process_queued_message(
     drop(runtime.block_on(worker.send_message_with_retry(&message, false)));
 }
 
+fn process_request(
+    runtime: &tokio::runtime::Runtime,
+    worker: &mut WorkerState,
+    request: WorkerRequest,
+    queued: &crossbeam_channel::Receiver<Message>,
+) {
+    match request {
+        WorkerRequest::Send(request) => process_send_now_request(runtime, worker, request),
+        WorkerRequest::Drain(DrainRequest {
+            scope,
+            deadline,
+            mut done,
+        }) => {
+            // A drain comes through the priority lane, ahead of the events queued before it,
+            // which are what it is for.
+            while Instant::now() < deadline
+                && let Ok(message) = queued.try_recv()
+            {
+                process_queued_message(runtime, worker, message);
+            }
+            let report = runtime.block_on(worker.drain(scope, deadline, done.closed()));
+            drop(done.send(report));
+        }
+    }
+}
+
 fn process_send_now_request(
     runtime: &tokio::runtime::Runtime,
     worker: &mut WorkerState,
     request: SendNowRequest,
 ) {
-    if request.close_all {
-        runtime.block_on(worker.close_all_streams_for_shutdown());
-        request.done.send(Ok(()));
-        return;
-    }
     // Desired behavior for the ACK-waiting path (mirroring Bazel's BES
     // uploader semantics):
     //
@@ -1410,7 +1479,8 @@ fn process_send_now_request(
         }
     }
     if request.wait_for_acks && result.is_ok() && !ack_targets.is_empty() {
-        if let Err(status) = runtime.block_on(worker.wait_for_acks(&ack_targets)) {
+        let deadline = Instant::now() + close_ack_timeout(worker.config.grpc_timeout);
+        if let Err(status) = runtime.block_on(worker.wait_for_acks(&ack_targets, deadline)) {
             worker.record_status_failure(&status);
             result = Err(buck2_error::buck2_error!(
                 ErrorTag::Tier0,
@@ -1428,6 +1498,11 @@ struct WorkerState {
     connection: ConnectionConfig,
     counters: Arc<CounterState>,
     streams: HashMap<String, StreamState>,
+    /// Streams sent their last event and half-closed, whose server has not ended them yet.
+    /// The worker goes on while their acknowledgements come in, because BuildBuddy
+    /// acknowledges a stream only once it ends, and waiting here would hold up every other
+    /// stream and every drain for as long as that server is slow. A drain waits for them.
+    closing: Vec<ClosingStream>,
     /// The remote answered UNAUTHENTICATED since the last stream was opened, so the next one
     /// asks the credential helper afresh instead of reusing what it cached.
     credentials_rejected: bool,
@@ -1459,6 +1534,7 @@ impl WorkerState {
             connection,
             counters,
             streams: HashMap::new(),
+            closing: Vec::new(),
             credentials_rejected: false,
             closed: false,
             credentials_refused: false,
@@ -2000,6 +2076,7 @@ impl WorkerState {
 
     async fn close_due_streams(&mut self) {
         self.fail_stalled_streams();
+        drop(self.reap_closing_streams().await);
         let now = Instant::now();
         let due = self
             .streams
@@ -2014,10 +2091,39 @@ impl WorkerState {
             .collect::<Vec<_>>();
 
         for (invocation_id, event_time) in due {
-            if let Err(status) = self.close_stream(&invocation_id, event_time).await {
-                self.stream_failed(&invocation_id, &status);
+            match self.half_close_stream(&invocation_id, event_time).await {
+                Ok(Some(closing)) => self.closing.push(closing),
+                Ok(None) => {}
+                Err(status) => self.stream_failed(&invocation_id, &status),
             }
         }
+    }
+
+    async fn reap_closing_streams(&mut self) -> Vec<StreamDrain> {
+        let now = Instant::now();
+        let (ended, closing): (Vec<_>, Vec<_>) = std::mem::take(&mut self.closing)
+            .into_iter()
+            .partition(|closing| closing.ended() || closing.deadline <= now);
+        self.closing = closing;
+        let mut outcomes = Vec::with_capacity(ended.len());
+        for closing in ended {
+            let invocation_id = closing.invocation_id.clone();
+            let outcome = match closing.finish().await {
+                Ok(()) => StreamDrainOutcome::Acked,
+                Err((status, events)) => {
+                    self.record_status_failure(&status);
+                    StreamDrainOutcome::Failed {
+                        events,
+                        error: status.to_string(),
+                    }
+                }
+            };
+            outcomes.push(StreamDrain {
+                invocation_id,
+                outcome,
+            });
+        }
+        outcomes
     }
 
     /// A stream whose connection takes no event for `grpc_timeout` is reset and later replayed
@@ -2046,16 +2152,30 @@ impl WorkerState {
         }
     }
 
+    /// Closes the stream and waits for its server to end it, for up to `close_ack_timeout`.
     async fn close_stream(
         &mut self,
         invocation_id: &str,
         event_time: Option<Timestamp>,
     ) -> Result<(), Status> {
+        match self.half_close_stream(invocation_id, event_time).await? {
+            Some(closing) => closing.finish().await.map_err(|(status, _)| status),
+            None => Ok(()),
+        }
+    }
+
+    /// Sends the stream its finish and everything it holds, then half-closes it. `None` when
+    /// there was no stream to close: it was never opened, or it was abandoned and is dropped.
+    async fn half_close_stream(
+        &mut self,
+        invocation_id: &str,
+        event_time: Option<Timestamp>,
+    ) -> Result<Option<ClosingStream>, Status> {
         match self.streams.get(invocation_id) {
-            None => return Ok(()),
+            None => return Ok(None),
             Some(stream) if stream.abandoned => {
                 self.streams.remove(invocation_id);
-                return Ok(());
+                return Ok(None);
             }
             Some(_) => {}
         }
@@ -2092,31 +2212,21 @@ impl WorkerState {
         }
 
         let Some(mut stream) = self.streams.remove(invocation_id) else {
-            return Ok(());
+            return Ok(None);
         };
         drop(stream.sender.take());
-
-        let close_timeout = close_ack_timeout(self.config.grpc_timeout);
-        let Some(mut ack_task) = stream.ack_task.take() else {
+        if stream.ack_task.is_none() {
             return Err(Status::unavailable(
                 "BES stream was closed before finish acknowledgement",
             ));
-        };
-        let joined = tokio::time::timeout(close_timeout, &mut ack_task).await;
-        // Dropping the handle would leave the task, and the RPC with it, running: the server
-        // would keep the stream open.
-        ack_task.abort();
-        match joined {
-            Ok(joined) => match joined {
-                Ok(Ok(())) => Ok(()),
-                Ok(Err(status)) => Err(status),
-                Err(e) => Err(Status::internal(e.to_string())),
-            },
-            Err(_) => Err(Status::deadline_exceeded(format!(
-                "Timed out waiting for BES stream acknowledgements after {:?}",
-                close_timeout
-            ))),
         }
+        let close_timeout = close_ack_timeout(self.config.grpc_timeout);
+        Ok(Some(ClosingStream {
+            invocation_id: invocation_id.to_owned(),
+            stream,
+            deadline: Instant::now() + close_timeout,
+            close_timeout,
+        }))
     }
 
     fn discard_stream_transport(&mut self, invocation_id: &str) {
@@ -2129,40 +2239,184 @@ impl WorkerState {
     /// Shutdown: a stream whose command never ended gets the final event the server keys on,
     /// marked interrupted, before the stream is finished. Without it the server has no
     /// `BuildFinished` and shows the build running forever.
-    async fn close_all_streams_for_shutdown(&mut self) {
-        if self.config.event_format == BesEventFormat::Bazel {
-            let now: Option<Timestamp> = Some(SystemTime::now().into());
-            for stream in self.streams.values_mut() {
-                if !stream.saw_command_end && !stream.stream_finished_enqueued {
-                    stream.enqueue_raw_event(BuildEvent {
-                        event_time: now.clone(),
-                        event: Some(build_event::Event::BazelEvent(encode_bep_event(
-                            &interrupted_finish_event(now.clone()),
-                        ))),
-                    });
-                    stream.saw_command_end = true;
+    fn finish_interrupted_streams(&mut self) {
+        if self.config.event_format != BesEventFormat::Bazel {
+            return;
+        }
+        let now: Option<Timestamp> = Some(SystemTime::now().into());
+        for stream in self.streams.values_mut() {
+            if !stream.saw_command_end && !stream.stream_finished_enqueued {
+                stream.enqueue_raw_event(BuildEvent {
+                    event_time: now.clone(),
+                    event: Some(build_event::Event::BazelEvent(encode_bep_event(
+                        &interrupted_finish_event(now.clone()),
+                    ))),
+                });
+                stream.saw_command_end = true;
+            }
+        }
+    }
+
+    /// Closes the streams `scope` names, sends the rest what they hold, and waits until the
+    /// server has acknowledged every event, `deadline` passes or `cancelled` resolves. Sending
+    /// is bounded by the deadline too: a stream whose send it cuts short is reset and replayed
+    /// later, as after any failed send.
+    async fn drain(
+        &mut self,
+        scope: DrainScope,
+        deadline: Instant,
+        cancelled: impl Future<Output = ()>,
+    ) -> DrainReport {
+        let mut report = DrainReport::default();
+        if scope == DrainScope::Shutdown {
+            self.finish_interrupted_streams();
+        }
+        let mut to_close = Vec::new();
+        let mut open = Vec::new();
+        for (invocation_id, stream) in &self.streams {
+            if stream.abandoned {
+                report.streams.push(StreamDrain {
+                    invocation_id: invocation_id.clone(),
+                    outcome: StreamDrainOutcome::Failed {
+                        events: 0,
+                        error: "the sink gave up on this stream earlier and dropped its events"
+                            .to_owned(),
+                    },
+                });
+            }
+            if scope == DrainScope::Shutdown || stream.saw_command_end {
+                to_close.push((
+                    invocation_id.clone(),
+                    stream
+                        .pending_close
+                        .as_ref()
+                        .and_then(|close| close.event_time),
+                ));
+            } else if !stream.abandoned {
+                open.push(invocation_id.clone());
+            }
+        }
+
+        let tokio_deadline = tokio::time::Instant::from_std(deadline);
+        for (invocation_id, event_time) in to_close {
+            let sent = tokio::time::timeout_at(
+                tokio_deadline,
+                self.half_close_stream(&invocation_id, event_time),
+            )
+            .await;
+            match sent {
+                Ok(Ok(Some(closing))) => self.closing.push(closing),
+                Ok(Ok(None)) => {}
+                Ok(Err(status)) => self.drain_send_failed(&invocation_id, status, &mut report),
+                Err(_) => self.drain_send_failed(
+                    &invocation_id,
+                    Status::deadline_exceeded("the drain's deadline passed while sending"),
+                    &mut report,
+                ),
+            }
+        }
+        let mut ack_targets = HashMap::new();
+        for invocation_id in open {
+            match tokio::time::timeout_at(tokio_deadline, self.flush_stream(&invocation_id)).await {
+                Ok(Ok(())) => {
+                    let sent = self.streams[&invocation_id].next_sequence_number - 1;
+                    ack_targets.insert(invocation_id, sent);
                 }
+                Ok(Err(status)) => self.drain_send_failed(&invocation_id, status, &mut report),
+                Err(_) => self.drain_send_failed(
+                    &invocation_id,
+                    Status::deadline_exceeded("the drain's deadline passed while sending"),
+                    &mut report,
+                ),
             }
         }
-        self.close_all_streams().await;
-        self.closed = true;
-    }
 
-    async fn close_all_streams(&mut self) {
-        let invocation_ids = self.streams.keys().cloned().collect::<Vec<_>>();
-        for invocation_id in invocation_ids {
-            if let Err(status) = self.close_stream(&invocation_id, None).await {
-                self.record_status_failure(&status);
+        let waited = async {
+            while Instant::now() < deadline && !self.closing.iter().all(ClosingStream::ended) {
+                tokio::time::sleep(COMMAND_END_CLOSE_POLL_INTERVAL).await;
             }
+            for (invocation_id, sequence_number) in &ack_targets {
+                drop(
+                    self.wait_for_acks(
+                        &HashMap::from([(invocation_id.clone(), *sequence_number)]),
+                        deadline,
+                    )
+                    .await,
+                );
+            }
+        };
+        tokio::select! {
+            () = waited => {}
+            () = cancelled => {}
         }
+
+        report.streams.extend(self.reap_closing_streams().await);
+        for closing in &self.closing {
+            report.streams.push(StreamDrain {
+                invocation_id: closing.invocation_id.clone(),
+                outcome: StreamDrainOutcome::Pending {
+                    events: closing.stream.unacked_events(),
+                },
+            });
+        }
+        for (invocation_id, sequence_number) in ack_targets {
+            let Some(stream) = self.streams.get(&invocation_id) else {
+                continue;
+            };
+            let outcome = if stream.last_acked_sequence_number() >= sequence_number {
+                StreamDrainOutcome::Acked
+            } else {
+                StreamDrainOutcome::Pending {
+                    events: stream.unacked_events(),
+                }
+            };
+            report.streams.push(StreamDrain {
+                invocation_id,
+                outcome,
+            });
+        }
+        if scope == DrainScope::Shutdown {
+            self.closed = true;
+        }
+        if !report.is_complete() {
+            tracing::warn!(
+                "BES sink: {} events of invocations {} were not acknowledged when the drain ended",
+                report.unacked_events(),
+                report.unacked_invocations().join(", ")
+            );
+        }
+        report
     }
 
-    async fn wait_for_acks(&self, ack_targets: &HashMap<String, i64>) -> Result<(), Status> {
-        let deadline = Instant::now() + close_ack_timeout(self.config.grpc_timeout);
+    fn drain_send_failed(&mut self, invocation_id: &str, status: Status, report: &mut DrainReport) {
+        let events = self
+            .streams
+            .get(invocation_id)
+            .map_or(0, StreamState::unacked_events);
+        self.stream_failed(invocation_id, &status);
+        report.streams.push(StreamDrain {
+            invocation_id: invocation_id.to_owned(),
+            outcome: StreamDrainOutcome::Failed {
+                events,
+                error: status.to_string(),
+            },
+        });
+    }
+
+    async fn wait_for_acks(
+        &self,
+        ack_targets: &HashMap<String, i64>,
+        deadline: Instant,
+    ) -> Result<(), Status> {
         loop {
             let mut all_acked = true;
             for (invocation_id, target_sequence_number) in ack_targets {
-                let Some(stream) = self.streams.get(invocation_id) else {
+                let Some(stream) = self.streams.get(invocation_id).or_else(|| {
+                    self.closing
+                        .iter()
+                        .find(|closing| closing.invocation_id == *invocation_id)
+                        .map(|closing| &closing.stream)
+                }) else {
                     continue;
                 };
                 let acked = stream.last_acked_sequence_number();
@@ -2187,10 +2441,9 @@ impl WorkerState {
                 return Ok(());
             }
             if Instant::now() >= deadline {
-                return Err(Status::deadline_exceeded(format!(
-                    "Timed out waiting for BES acknowledgements after {:?}",
-                    close_ack_timeout(self.config.grpc_timeout)
-                )));
+                return Err(Status::deadline_exceeded(
+                    "Timed out waiting for BES acknowledgements",
+                ));
             }
 
             tokio::time::sleep(COMMAND_END_CLOSE_POLL_INTERVAL).await;
@@ -2303,6 +2556,56 @@ struct StreamTransport {
 struct PendingClose {
     close_after: Instant,
     event_time: Option<Timestamp>,
+}
+
+/// A stream half-closed, whose `ack_task` runs until its server ends it.
+struct ClosingStream {
+    invocation_id: String,
+    stream: StreamState,
+    deadline: Instant,
+    close_timeout: Duration,
+}
+
+impl ClosingStream {
+    fn ended(&self) -> bool {
+        self.stream
+            .ack_task
+            .as_ref()
+            .is_none_or(|task| task.is_finished())
+    }
+
+    /// Waits for the server to end the stream, until the deadline. An error carries the
+    /// number of events the server did not acknowledge.
+    async fn finish(mut self) -> Result<(), (Status, u64)> {
+        let Some(ack_task) = self.stream.ack_task.as_mut() else {
+            return Err((
+                Status::unavailable("BES stream was closed before finish acknowledgement"),
+                self.stream.unacked_events(),
+            ));
+        };
+        let joined = tokio::time::timeout_at(
+            tokio::time::Instant::from_std(self.deadline),
+            &mut *ack_task,
+        )
+        .await;
+        // Dropping the handle would leave the task, and the RPC with it, running: the server
+        // would keep the stream open.
+        ack_task.abort();
+        let unacked = self.stream.unacked_events();
+        let status = match joined {
+            Ok(Ok(Ok(()))) if unacked == 0 => return Ok(()),
+            Ok(Ok(Ok(()))) => Status::unavailable(format!(
+                "the BES server ended the stream with {unacked} events unacknowledged"
+            )),
+            Ok(Ok(Err(status))) => status,
+            Ok(Err(e)) => Status::internal(e.to_string()),
+            Err(_) => Status::deadline_exceeded(format!(
+                "Timed out waiting for BES stream acknowledgements after {:?}",
+                self.close_timeout
+            )),
+        };
+        Err((status, unacked))
+    }
 }
 
 struct StreamFailure {
@@ -2907,6 +3210,11 @@ impl StreamState {
 
     fn last_acked_sequence_number(&self) -> i64 {
         self.last_acked_sequence_number.load(Ordering::Relaxed)
+    }
+
+    fn unacked_events(&self) -> u64 {
+        u64::try_from(self.next_sequence_number - 1 - self.last_acked_sequence_number())
+            .unwrap_or(0)
     }
 
     async fn finished_ack_task_status(&mut self) -> Option<Status> {
@@ -4682,7 +4990,10 @@ mod tests {
         assert_eq!(target, (invocation_id, 2));
         let waited = tokio::time::timeout(
             Duration::from_millis(500),
-            worker.wait_for_acks(&HashMap::from([target])),
+            worker.wait_for_acks(
+                &HashMap::from([target]),
+                Instant::now() + Duration::from_secs(60),
+            ),
         )
         .await;
         assert!(
@@ -4758,7 +5069,7 @@ mod tests {
         // A send that meets the failure backs off without closing; the worker's poll loop
         // closes the stream after it.
         let closed = tokio::time::timeout(Duration::from_secs(5), async {
-            while worker.streams.contains_key(&invocation_id) {
+            while still_closing(&worker, &invocation_id) {
                 worker.close_due_streams().await;
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
@@ -5082,9 +5393,17 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 
+    fn still_closing(worker: &WorkerState, invocation_id: &str) -> bool {
+        worker.streams.contains_key(invocation_id)
+            || worker
+                .closing
+                .iter()
+                .any(|closing| closing.invocation_id == invocation_id)
+    }
+
     async fn close_within(worker: &mut WorkerState, invocation_id: &str) -> bool {
         tokio::time::timeout(Duration::from_secs(5), async {
-            while worker.streams.contains_key(invocation_id) {
+            while still_closing(worker, invocation_id) {
                 worker.close_due_streams().await;
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
@@ -5855,5 +6174,345 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(200)).await;
 
         assert_eq!(log.opened.load(Ordering::SeqCst), 0);
+    }
+
+    /// Acknowledges nothing until the client half-closes the stream, as BuildBuddy does, and
+    /// then, after `ack_after` or never, every sequence number the stream carried: an app slow
+    /// to finalize an invocation, or one that never does.
+    struct BesThatHoldsAcksPastEof {
+        ack_after: Option<Duration>,
+    }
+
+    #[tonic::async_trait]
+    impl PublishBuildEvent for BesThatHoldsAcksPastEof {
+        async fn publish_lifecycle_event(
+            &self,
+            _request: tonic::Request<PublishLifecycleEventRequest>,
+        ) -> Result<tonic::Response<()>, Status> {
+            Ok(tonic::Response::new(()))
+        }
+
+        type PublishBuildToolEventStreamStream =
+            ReceiverStream<Result<PublishBuildToolEventStreamResponse, Status>>;
+
+        async fn publish_build_tool_event_stream(
+            &self,
+            request: tonic::Request<tonic::Streaming<PublishBuildToolEventStreamRequest>>,
+        ) -> Result<tonic::Response<Self::PublishBuildToolEventStreamStream>, Status> {
+            let mut inbound = request.into_inner();
+            let (tx, rx) = mpsc::channel(1024);
+            let ack_after = self.ack_after;
+            tokio::spawn(async move {
+                let mut received = Vec::new();
+                while let Ok(Some(request)) = inbound.message().await {
+                    received.push((
+                        request_sequence_number(&request),
+                        request
+                            .ordered_build_event
+                            .and_then(|ordered| ordered.stream_id),
+                    ));
+                }
+                let Some(ack_after) = ack_after else {
+                    // Holding the sender keeps the response stream open.
+                    tx.closed().await;
+                    return;
+                };
+                tokio::time::sleep(ack_after).await;
+                for (sequence_number, stream_id) in received {
+                    let response = PublishBuildToolEventStreamResponse {
+                        stream_id,
+                        sequence_number,
+                    };
+                    if tx.send(Ok(response)).await.is_err() {
+                        return;
+                    }
+                }
+            });
+            Ok(tonic::Response::new(ReceiverStream::new(rx)))
+        }
+    }
+
+    async fn serve_bes_that_holds_acks_past_eof(ack_after: Option<Duration>) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let endpoint = format!("http://{}", listener.local_addr().expect("local addr"));
+        tokio::spawn(
+            tonic::transport::Server::builder()
+                .add_service(PublishBuildEventServer::new(BesThatHoldsAcksPastEof {
+                    ack_after,
+                }))
+                .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener)),
+        );
+        endpoint
+    }
+
+    const COMMAND_EVENTS_WITH_FINISH: u64 = 4;
+
+    async fn run_a_command(worker: &mut WorkerState) -> String {
+        let trace_id = TraceId::new().to_string();
+        send_queued_ok(worker, &trace_id, command_start_data()).await;
+        send_queued_ok(worker, &trace_id, action_start_data()).await;
+        send_queued_ok(worker, &trace_id, command_end_data()).await;
+        normalize_invocation_id(&trace_id)
+    }
+
+    fn drained(invocation_id: &str, outcome: StreamDrainOutcome) -> StreamDrain {
+        StreamDrain {
+            invocation_id: invocation_id.to_owned(),
+            outcome,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_drain_closes_a_finished_command_and_waits_for_a_server_that_acks_at_eof() {
+        let (endpoint, streams) = serve_bes_that_acks_at_eof(None).await;
+        let (mut worker, counters) = worker_for(endpoint);
+        let invocation_id = run_a_command(&mut worker).await;
+
+        let report = worker
+            .drain(
+                DrainScope::FinishedCommands,
+                Instant::now() + Duration::from_secs(5),
+                std::future::pending(),
+            )
+            .await;
+
+        assert_eq!(
+            report.streams,
+            vec![drained(&invocation_id, StreamDrainOutcome::Acked)]
+        );
+        assert!(report.is_complete());
+        assert!(worker.streams.is_empty() && worker.closing.is_empty());
+        assert_eq!(
+            *streams.lock().unwrap(),
+            vec![(1..=COMMAND_EVENTS_WITH_FINISH as i64).collect::<Vec<_>>()]
+        );
+        assert_eq!(failures(&counters), 0);
+    }
+
+    #[tokio::test]
+    async fn a_drain_waits_for_a_close_already_waiting_on_a_slow_server() {
+        let endpoint = serve_bes_that_holds_acks_past_eof(Some(Duration::from_secs(1))).await;
+        let (mut worker, _counters) = worker_for(endpoint);
+        let invocation_id = run_a_command(&mut worker).await;
+        tokio::time::sleep(COMMAND_END_CLOSE_GRACE).await;
+        let started = Instant::now();
+        worker.close_due_streams().await;
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "closing a stream waited {:?} for its server",
+            started.elapsed()
+        );
+        assert!(worker.streams.is_empty());
+        assert_eq!(worker.closing.len(), 1);
+
+        let report = worker
+            .drain(
+                DrainScope::FinishedCommands,
+                Instant::now() + Duration::from_secs(10),
+                std::future::pending(),
+            )
+            .await;
+
+        assert_eq!(
+            report.streams,
+            vec![drained(&invocation_id, StreamDrainOutcome::Acked)]
+        );
+        assert!(worker.closing.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_drain_returns_at_its_deadline_holding_what_a_server_never_acked() {
+        let endpoint = serve_bes_that_holds_acks_past_eof(None).await;
+        let (mut worker, _counters) = worker_for(endpoint);
+        let invocation_id = run_a_command(&mut worker).await;
+
+        let started = Instant::now();
+        let report = worker
+            .drain(
+                DrainScope::FinishedCommands,
+                Instant::now() + Duration::from_secs(1),
+                std::future::pending(),
+            )
+            .await;
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed >= Duration::from_secs(1) && elapsed < Duration::from_millis(1500),
+            "a drain bounded to 1 s returned after {elapsed:?}"
+        );
+        assert_eq!(
+            report.streams,
+            vec![drained(
+                &invocation_id,
+                StreamDrainOutcome::Pending {
+                    events: COMMAND_EVENTS_WITH_FINISH
+                }
+            )]
+        );
+        assert!(!report.is_complete());
+        assert_eq!(report.unacked_events(), COMMAND_EVENTS_WITH_FINISH);
+        // Still closing, not dropped: a later drain or the shutdown can still see it acked.
+        assert_eq!(worker.closing.len(), 1);
+        assert!(!worker.closing[0].ended());
+    }
+
+    #[tokio::test]
+    async fn a_drain_sends_a_running_command_what_it_holds_and_leaves_it_open() {
+        let (endpoint, streams) = serve_bes_that_acks_at_eof(None).await;
+        let (mut worker, _counters) = worker_for(endpoint);
+        let trace_id = TraceId::new().to_string();
+        send_queued_ok(&mut worker, &trace_id, command_start_data()).await;
+        send_queued_ok(&mut worker, &trace_id, action_start_data()).await;
+        let invocation_id = normalize_invocation_id(&trace_id);
+
+        let report = worker
+            .drain(
+                DrainScope::FinishedCommands,
+                Instant::now() + Duration::from_secs(1),
+                std::future::pending(),
+            )
+            .await;
+
+        assert_eq!(
+            report.streams,
+            vec![drained(
+                &invocation_id,
+                StreamDrainOutcome::Pending { events: 2 }
+            )]
+        );
+        assert!(worker.streams[&invocation_id].sender.is_some());
+        assert!(worker.closing.is_empty());
+        assert!(!worker.closed);
+        let delivered = tokio::time::timeout(Duration::from_secs(5), async {
+            while *streams.lock().unwrap() != vec![vec![1, 2]] {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        assert!(delivered.is_ok(), "got {:?}", streams.lock().unwrap());
+    }
+
+    #[tokio::test]
+    async fn a_shutdown_drain_finishes_a_running_command_and_waits_for_its_acks() {
+        let (endpoint, streams) = serve_bes_that_acks_at_eof(None).await;
+        let (mut worker, _counters) = worker_for(endpoint);
+        let trace_id = TraceId::new().to_string();
+        send_queued_ok(&mut worker, &trace_id, command_start_data()).await;
+        let invocation_id = normalize_invocation_id(&trace_id);
+
+        let report = worker
+            .drain(
+                DrainScope::Shutdown,
+                Instant::now() + Duration::from_secs(5),
+                std::future::pending(),
+            )
+            .await;
+
+        assert_eq!(
+            report.streams,
+            vec![drained(&invocation_id, StreamDrainOutcome::Acked)]
+        );
+        assert!(worker.closed);
+        assert_eq!(*streams.lock().unwrap(), vec![vec![1, 2]]);
+    }
+
+    #[tokio::test]
+    async fn a_drain_reports_a_stream_its_server_ended_unacknowledged_as_failed() {
+        let endpoint = serve_bes_that_withholds_acks(0).await;
+        let (mut worker, counters) = worker_for(endpoint);
+        let invocation_id = run_a_command(&mut worker).await;
+
+        let report = worker
+            .drain(
+                DrainScope::FinishedCommands,
+                Instant::now() + Duration::from_secs(5),
+                std::future::pending(),
+            )
+            .await;
+
+        assert_eq!(report.streams.len(), 1);
+        assert_eq!(report.streams[0].invocation_id, invocation_id);
+        assert!(
+            matches!(
+                report.streams[0].outcome,
+                StreamDrainOutcome::Failed {
+                    events: COMMAND_EVENTS_WITH_FINISH,
+                    ..
+                }
+            ),
+            "{:?}",
+            report.streams[0].outcome
+        );
+        assert_eq!(failures(&counters), 1);
+    }
+
+    fn client_for(endpoint: String) -> BesClient {
+        let config = BesConfig {
+            bes_backend: Some(endpoint.replacen("http://", "grpc://", 1)),
+            grpc_timeout: Duration::from_secs(2),
+            ..BesConfig::default()
+        };
+        // SAFETY: `BesClient::new` ignores the token, which outside fbcode stands for nothing.
+        BesClient::new(unsafe { fbinit::assume_init() }, config).expect("client")
+    }
+
+    fn offer_a_command(client: &BesClient) {
+        let trace_id = TraceId::new().to_string();
+        for data in [
+            command_start_data(),
+            action_start_data(),
+            command_end_data(),
+        ] {
+            client.offer(make_message(Some(&trace_id), Some(1), data));
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_client_drain_is_bounded_by_its_timeout() {
+        let endpoint = serve_bes_that_holds_acks_past_eof(None).await;
+        let client = client_for(endpoint);
+        offer_a_command(&client);
+
+        let started = Instant::now();
+        let report = client
+            .drain(DrainScope::FinishedCommands, Duration::from_secs(1))
+            .await
+            .expect("the worker answers");
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed < Duration::from_millis(1500),
+            "a drain bounded to 1 s returned after {elapsed:?}"
+        );
+        assert!(!report.is_complete());
+        assert_eq!(report.unacked_events(), COMMAND_EVENTS_WITH_FINISH);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_client_drain_its_caller_gave_up_on_frees_the_worker() {
+        let endpoint = serve_bes_that_holds_acks_past_eof(None).await;
+        let client = client_for(endpoint);
+        offer_a_command(&client);
+
+        let abandoned = tokio::time::timeout(
+            Duration::from_millis(300),
+            client.drain(DrainScope::FinishedCommands, Duration::from_secs(60)),
+        )
+        .await;
+        assert!(abandoned.is_err());
+
+        let started = Instant::now();
+        let report = client
+            .drain(DrainScope::FinishedCommands, Duration::from_secs(1))
+            .await
+            .expect("the worker answers");
+        assert!(
+            started.elapsed() < Duration::from_millis(1500),
+            "the worker went on with a drain nobody waited for: {:?}",
+            started.elapsed()
+        );
+        assert_eq!(report.unacked_events(), COMMAND_EVENTS_WITH_FINISH);
     }
 }

@@ -35,6 +35,7 @@ pub mod span;
 use std::num::NonZeroU64;
 use std::str::FromStr;
 use std::sync::Arc;
+use std::time::Duration;
 use std::time::SystemTime;
 
 use async_trait::async_trait;
@@ -278,6 +279,79 @@ pub trait EventSinkWithStats: Send + Sync {
     /// so an interrupted build ends on the remote side instead of staying open forever.
     async fn shutdown(&self) -> buck2_error::Result<()> {
         Ok(())
+    }
+
+    /// Deliver what is queued and wait, for at most `timeout`, until the remote end has
+    /// acknowledged it, closing the streams that `scope` names. `None` for a sink with no
+    /// remote streams.
+    async fn drain(
+        &self,
+        _scope: DrainScope,
+        _timeout: Duration,
+    ) -> buck2_error::Result<Option<DrainReport>> {
+        Ok(None)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DrainScope {
+    /// The streams of commands that ended. A running command's stream is sent what it holds
+    /// and stays open.
+    FinishedCommands,
+    /// Every stream, a running command's marked interrupted, and no stream opens afterwards:
+    /// the daemon is shutting down.
+    Shutdown,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum StreamDrainOutcome {
+    Acked,
+    /// The deadline passed with `events` events not yet acknowledged, which the sink still
+    /// holds and goes on delivering.
+    Pending {
+        events: u64,
+    },
+    Failed {
+        events: u64,
+        error: String,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StreamDrain {
+    pub invocation_id: String,
+    pub outcome: StreamDrainOutcome,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct DrainReport {
+    pub streams: Vec<StreamDrain>,
+}
+
+impl DrainReport {
+    pub fn is_complete(&self) -> bool {
+        self.streams
+            .iter()
+            .all(|stream| stream.outcome == StreamDrainOutcome::Acked)
+    }
+
+    pub fn unacked_events(&self) -> u64 {
+        self.streams
+            .iter()
+            .map(|stream| match &stream.outcome {
+                StreamDrainOutcome::Acked => 0,
+                StreamDrainOutcome::Pending { events } => *events,
+                StreamDrainOutcome::Failed { events, .. } => *events,
+            })
+            .sum()
+    }
+
+    pub fn unacked_invocations(&self) -> Vec<&str> {
+        self.streams
+            .iter()
+            .filter(|stream| stream.outcome != StreamDrainOutcome::Acked)
+            .map(|stream| stream.invocation_id.as_str())
+            .collect()
     }
 }
 
