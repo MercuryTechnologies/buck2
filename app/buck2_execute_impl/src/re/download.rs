@@ -343,7 +343,9 @@ impl CasDownloader<'_> {
             );
 
             if self.missing_cas_as_cache_miss {
-                let missing_digest = match self.missing_declared_artifact_digest(&artifacts).await {
+                let missing_digest = match self
+                    .missing_declared_artifact_digest(&artifacts, output_spec)
+                    .await {
                     Ok(missing_digest) => missing_digest,
                     Err(error) => {
                         return ControlFlow::Break(DownloadResult::Result(manager.error(
@@ -570,8 +572,9 @@ impl CasDownloader<'_> {
     async fn missing_declared_artifact_digest(
         &self,
         artifacts: &ExtractedArtifacts,
+        output_spec: &dyn RemoteActionResult,
     ) -> buck2_error::Result<Option<TDigest>> {
-        let digests = extracted_artifact_file_digests(&artifacts.mapped_outputs);
+        let digests = cache_hit_cas_digests(&artifacts.mapped_outputs, output_spec);
         if digests.is_empty() {
             return Ok(None);
         }
@@ -612,8 +615,13 @@ fn first_expired_digest(expirations: Vec<(TDigest, Timestamp)>, now: Timestamp) 
         .find_map(|(digest, expires)| if expires <= now { Some(digest) } else { None })
 }
 
-fn extracted_artifact_file_digests(
+/// The CAS blobs a cache hit is served from: its output files, and the stdout and stderr it
+/// stores by digest. A test reads its result from the action's stdout and stderr, so a hit whose
+/// streams the CAS has evicted fails the test as surely as a missing output fails a build.
+/// BuildBuddy checks a hit's outputs before serving it, but not its streams.
+fn cache_hit_cas_digests(
     outputs: &BuckIndexMap<CommandExecutionOutput, ArtifactValue>,
+    output_spec: &dyn RemoteActionResult,
 ) -> Vec<TDigest> {
     let mut digests = StdBuckHashSet::default();
     for value in outputs.values() {
@@ -622,6 +630,7 @@ fn extracted_artifact_file_digests(
             collect_directory_file_digests(deps, &mut digests);
         }
     }
+    digests.extend(output_spec.std_stream_digests());
     digests.into_iter().collect()
 }
 
@@ -695,6 +704,7 @@ fn is_materialization_cancelled_error(error: &buck2_error::Error) -> bool {
 #[cfg(test)]
 mod tests {
     use buck2_execute::re::error::test_re_error;
+    use buck2_execute::re::remote_action_result::ActionCacheResult;
 
     use super::*;
 
@@ -727,6 +737,99 @@ mod tests {
             Some(missing.clone())
         );
         assert_eq!(first_expired_digest(expirations[..1].to_vec(), asked), None);
+    }
+
+    fn digest(hash_byte: char, size_in_bytes: i64) -> TDigest {
+        TDigest {
+            hash: hash_byte.to_string().repeat(40),
+            size_in_bytes,
+            ..Default::default()
+        }
+    }
+
+    /// What `get_digest_expirations` returns from a CAS holding `held`: a held blob lives for
+    /// three hours, and one the CAS lacks has a TTL of zero.
+    fn expirations_from_cas(
+        held: &[TDigest],
+        digests: Vec<TDigest>,
+        asked: Timestamp,
+    ) -> Vec<(TDigest, Timestamp)> {
+        digests
+            .into_iter()
+            .map(|digest| {
+                let ttl = if held.contains(&digest) { 3 * 60 * 60 } else { 0 };
+                let expires = buck2_execute::re::ttl::re_expiration_from_ttl(asked, ttl, &digest);
+                (digest, expires)
+            })
+            .collect()
+    }
+
+    fn cache_hit(action_result: remote_execution::TActionResult2) -> ActionCacheResult {
+        ActionCacheResult(
+            remote_execution::ActionResultResponse {
+                action_result,
+                ttl: 3 * 60 * 60,
+            },
+            buck2_data::CacheType::ActionCache,
+        )
+    }
+
+    #[test]
+    fn a_stderr_the_cas_lost_makes_the_hit_a_miss() {
+        let stdout = digest('a', 10);
+        let stderr = digest('b', 5112);
+        let hit = cache_hit(remote_execution::TActionResult2 {
+            stdout_digest: Some(stdout.clone()),
+            stderr_digest: Some(stderr.clone()),
+            ..Default::default()
+        });
+        let asked = Timestamp::now();
+
+        let expirations = expirations_from_cas(
+            &[stdout],
+            cache_hit_cas_digests(&BuckIndexMap::default(), &hit),
+            asked,
+        );
+
+        assert_eq!(first_expired_digest(expirations, asked), Some(stderr));
+    }
+
+    #[test]
+    fn a_hit_whose_stdout_and_stderr_the_cas_holds_is_served() {
+        let stdout = digest('a', 10);
+        let stderr = digest('b', 5112);
+        let hit = cache_hit(remote_execution::TActionResult2 {
+            stdout_digest: Some(stdout.clone()),
+            stderr_digest: Some(stderr.clone()),
+            ..Default::default()
+        });
+        let asked = Timestamp::now();
+
+        let expirations = expirations_from_cas(
+            &[stdout, stderr],
+            cache_hit_cas_digests(&BuckIndexMap::default(), &hit),
+            asked,
+        );
+
+        assert_eq!(first_expired_digest(expirations, asked), None);
+    }
+
+    #[test]
+    fn a_hit_asks_only_about_the_streams_it_would_download() {
+        let inline_stdout_digest = digest('a', 13);
+        let empty_stderr = digest('e', 0);
+        let hit = cache_hit(remote_execution::TActionResult2 {
+            stdout_raw: Some(b"inline stdout".to_vec()),
+            stdout_digest: Some(inline_stdout_digest),
+            stderr_raw: Some(Vec::new()),
+            stderr_digest: Some(empty_stderr),
+            ..Default::default()
+        });
+
+        assert_eq!(
+            cache_hit_cas_digests(&BuckIndexMap::default(), &hit),
+            Vec::<TDigest>::new()
+        );
     }
 
     #[test]

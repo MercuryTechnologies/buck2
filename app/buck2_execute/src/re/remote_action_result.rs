@@ -16,6 +16,7 @@ use buck2_error::BuckErrorContext;
 use buck2_miniperf_proto::MiniperfCounter;
 use remote_execution::ActionResultResponse;
 use remote_execution::ExecuteResponse;
+use remote_execution::TDigest;
 use remote_execution::TDirectory2;
 use remote_execution::TExecutedActionMetadata;
 use remote_execution::TFile;
@@ -31,6 +32,7 @@ use crate::execute::result::RemoteExecutionTiming;
 use crate::re::manager::ManagedRemoteExecutionClient;
 use crate::re::queue_stats::QueueStats;
 use crate::re::streams::RemoteCommandStdStreams;
+use crate::re::streams::stored_std_stream_digests;
 
 pub struct ActionCacheResult(pub ActionResultResponse, pub buck2_data::CacheType);
 
@@ -56,6 +58,9 @@ pub trait RemoteActionResult: Send + Sync {
         client: &ManagedRemoteExecutionClient,
         digest_config: DigestConfig,
     ) -> RemoteCommandStdStreams;
+
+    /// The digests of the stdout and stderr blobs that `std_streams` reads from the CAS.
+    fn std_stream_digests(&self) -> Vec<TDigest>;
 
     /// The TTL given by RE for the outputs for this action.
     fn ttl(&self) -> i64;
@@ -109,6 +114,10 @@ impl RemoteActionResult for ExecuteResponseWithQueueStats {
         RemoteCommandStdStreams::new(&self.execute_response.action_result, client, digest_config)
     }
 
+    fn std_stream_digests(&self) -> Vec<TDigest> {
+        stored_std_stream_digests(&self.execute_response.action_result)
+    }
+
     fn ttl(&self) -> i64 {
         self.execute_response.action_result_ttl
     }
@@ -159,6 +168,10 @@ impl RemoteActionResult for ActionCacheResult {
         digest_config: DigestConfig,
     ) -> RemoteCommandStdStreams {
         RemoteCommandStdStreams::new(&self.0.action_result, client, digest_config)
+    }
+
+    fn std_stream_digests(&self) -> Vec<TDigest> {
+        stored_std_stream_digests(&self.0.action_result)
     }
 
     fn ttl(&self) -> i64 {
