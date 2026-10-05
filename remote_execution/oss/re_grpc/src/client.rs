@@ -36,7 +36,9 @@ use async_compression::tokio::bufread::ZstdEncoder;
 use buck2_credential_helper::CredentialHelper;
 use buck2_credential_helper::CredentialHelperSettings;
 use buck2_credential_helper::Credentials;
+use buck2_events::dispatch::get_dispatcher_opt;
 use buck2_events::dispatch::span_async;
+use buck2_events::dispatch::with_dispatcher_async;
 use buck2_re_configuration::Buck2OssReConfiguration;
 use buck2_re_configuration::CASdMode;
 use buck2_re_configuration::CopyPolicy;
@@ -169,6 +171,11 @@ const DEFAULT_READ_CACHE_MAX_BLOB_BYTES: usize = 64 * 1024;
 /// The 17,844 distinct stderr blobs of that build came to 11.6 MB, so 64 MiB keeps them all
 /// with room for the output trees read beside them, at a small part of a daemon's memory.
 const DEFAULT_READ_CACHE_BYTES: usize = 64 * 1024 * 1024;
+/// Replaying the 127,058 BatchReadBlobs calls of that build through `SmallBlobReader`, each RPC
+/// taking as long as the build's call did, the read cache and in-flight join leave 97,346
+/// RPCs, a 5 ms window 37,295, and a read waits 1.6 ms longer on average. 10 ms leaves 31,709
+/// and adds 6 ms.
+const DEFAULT_BATCH_READ_BLOBS_WINDOW_MS: u64 = 5;
 /// BuildBuddy answers an Execute with an Operation as soon as it has looked the action up in the
 /// cache and dispatched or merged it, before any executor is involved (v2.310.0
 /// enterprise/server/remote_execution/execution_server/execution_server.go:1124-1197, 1297-1306),
@@ -2140,6 +2147,9 @@ pub struct RERuntimeOpts {
     read_cache_bytes: usize,
     /// The largest blob the client keeps in memory after reading it; zero keeps none.
     read_cache_max_blob_bytes: usize,
+    /// How long a read of small blobs waits for others to share its `BatchReadBlobs` RPC; zero
+    /// sends each read on its own.
+    batch_read_blobs_window: Duration,
     /// Whether to chunk large remote-cache blobs using FastCDC 2020 and SpliceBlob.
     remote_cache_chunking: bool,
     /// Minimum blob size for remote cache compression.
@@ -3604,6 +3614,10 @@ impl REClientBuilder {
                 read_cache_max_blob_bytes: opts
                     .read_cache_max_blob_bytes
                     .unwrap_or(DEFAULT_READ_CACHE_MAX_BLOB_BYTES),
+                batch_read_blobs_window: Duration::from_millis(
+                    opts.batch_read_blobs_window_ms
+                        .unwrap_or(DEFAULT_BATCH_READ_BLOBS_WINDOW_MS),
+                ),
                 remote_cache_chunking: opts.remote_cache_chunking,
                 remote_cache_compression_threshold,
                 retries,
@@ -5178,11 +5192,20 @@ struct SmallBlobReader {
     send: SendBatchRead,
     cache: Option<Arc<Mutex<SmallBlobCache>>>,
     in_flight: SharedCallRegistry<BlobReads>,
+    /// Batches the reads of different callers; None sends each read on its own.
+    batcher: Option<ReadBatcher>,
 }
 
 impl SmallBlobReader {
-    fn new(shape: BatchReadShape, send: SendBatchRead, cache: Option<SmallBlobCache>) -> Self {
+    fn new(
+        shape: BatchReadShape,
+        send: SendBatchRead,
+        cache: Option<SmallBlobCache>,
+        window: Duration,
+    ) -> Self {
         Self {
+            batcher: (!window.is_zero())
+                .then(|| ReadBatcher::new(window, shape.clone(), send.dupe())),
             shape,
             send,
             cache: cache.map(|cache| Arc::new(Mutex::new(cache))),
@@ -5259,12 +5282,20 @@ impl SmallBlobReader {
         metadata: RemoteExecutionMetadata,
         digests: Vec<TDigest>,
     ) -> BoxFuture<'static, anyhow::Result<BlobReads>> {
-        let requests = self.shape.requests(digests);
-        let send = self.send.dupe();
+        let read = match &self.batcher {
+            Some(batcher) => batcher.read(metadata, digests),
+            None => {
+                let requests = self.shape.requests(digests);
+                let send = self.send.dupe();
+                async move {
+                    read_blob_batches(requests, |request| send(metadata.clone(), request)).await
+                }
+                .boxed()
+            }
+        };
         let cache = self.cache.dupe();
         async move {
-            let blobs =
-                read_blob_batches(requests, |request| send(metadata.clone(), request)).await?;
+            let blobs = read.await?;
             if let Some(cache) = cache {
                 let mut cache = cache.lock().unwrap();
                 for (digest, blob) in &blobs {
@@ -5276,6 +5307,259 @@ impl SmallBlobReader {
             Ok(blobs)
         }
         .boxed()
+    }
+}
+
+/// Reads of small blobs that callers start within `window` of each other, sent as one
+/// BatchReadBlobs RPC of at most `max_total_batch_size` bytes. A cold build reads one output
+/// tree or one stderr blob per action, each of a few hundred bytes, so without this each read
+/// is an RPC of its own. This follows the `FindMissingBatcher` beside it: a batch is sent by a
+/// task of its own, so a caller that is dropped leaves the batch to the others, and each caller
+/// gets its own blobs or the batch's error.
+struct ReadBatcher {
+    window: Duration,
+    shape: BatchReadShape,
+    send: SendBatchRead,
+    open: Arc<Mutex<OpenReadBatches>>,
+}
+
+#[derive(Default)]
+struct OpenReadBatches {
+    next_id: u64,
+    by_key: HashMap<ReadBatchKey, OpenReadBatch>,
+}
+
+/// What the blobs of one batch share: request metadata that reads the same for the
+/// invocation, and the compressor and digest function the request names.
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct ReadBatchKey {
+    invocation: Vec<String>,
+    compressor: Option<Compressor>,
+    digest_function: Option<digest_function::Value>,
+}
+
+/// The fields of `metadata` that `with_re_metadata` puts on a request and that every read of an
+/// invocation shares. The action's own fields, `action_id`, `action_mnemonic`, `target_id` and
+/// `configuration_id`, are left out, because the reads of different actions would otherwise
+/// never share a batch.
+fn read_batch_invocation_key(metadata: &RemoteExecutionMetadata) -> Vec<String> {
+    let buck_info = metadata.buck_info.clone().unwrap_or_default();
+    let mut key = vec![
+        metadata.use_case_id.clone(),
+        metadata
+            .correlated_invocations_id
+            .clone()
+            .unwrap_or_default(),
+        buck_info.build_id,
+        buck_info.version,
+    ];
+    key.extend(
+        metadata
+            .platform
+            .iter()
+            .flat_map(|platform| &platform.properties)
+            .map(|property| format!("{}={}", property.name, property.value)),
+    );
+    key
+}
+
+type ReadAnswer = Result<Arc<BlobReads>, SharedCallFailure>;
+
+struct OpenReadBatch {
+    id: u64,
+    digests: Vec<TDigest>,
+    included: HashSet<TDigest>,
+    bytes: i64,
+    /// The request metadata the batch is sent with: its first caller's, without the action's
+    /// own fields once a caller for another action joins, so the server attributes the RPC to
+    /// no one action rather than to the wrong one.
+    metadata: RemoteExecutionMetadata,
+    /// Hands the batch to its task when the batch fills before its window ends.
+    full: tokio::sync::oneshot::Sender<ClosedReadBatch>,
+    answer: futures::future::Shared<tokio::sync::oneshot::Receiver<ReadAnswer>>,
+}
+
+struct ClosedReadBatch {
+    digests: Vec<TDigest>,
+    metadata: RemoteExecutionMetadata,
+}
+
+impl OpenReadBatch {
+    fn join(&mut self, metadata: &RemoteExecutionMetadata) {
+        let own = &mut self.metadata;
+        if own.action_id != metadata.action_id
+            || own.action_mnemonic != metadata.action_mnemonic
+            || own.target_id != metadata.target_id
+            || own.configuration_id != metadata.configuration_id
+        {
+            own.action_id = None;
+            own.action_mnemonic = None;
+            own.target_id = None;
+            own.configuration_id = None;
+        }
+    }
+
+    fn add(&mut self, digest: &TDigest) {
+        if self.included.insert(digest.clone()) {
+            self.digests.push(digest.clone());
+            self.bytes += digest.size_in_bytes;
+        }
+    }
+
+    fn close(
+        self,
+    ) -> (
+        ClosedReadBatch,
+        tokio::sync::oneshot::Sender<ClosedReadBatch>,
+    ) {
+        (
+            ClosedReadBatch {
+                digests: self.digests,
+                metadata: self.metadata,
+            },
+            self.full,
+        )
+    }
+
+    fn send_now(self) {
+        let (batch, full) = self.close();
+        drop(full.send(batch));
+    }
+}
+
+impl ReadBatcher {
+    fn new(window: Duration, shape: BatchReadShape, send: SendBatchRead) -> Self {
+        Self {
+            window,
+            shape,
+            send,
+            open: Arc::default(),
+        }
+    }
+
+    /// Adds each of `digests` to the open batch for its key and answers with their blobs once
+    /// the batches are read.
+    fn read(
+        &self,
+        metadata: RemoteExecutionMetadata,
+        digests: Vec<TDigest>,
+    ) -> BoxFuture<'static, anyhow::Result<BlobReads>> {
+        let invocation = read_batch_invocation_key(&metadata);
+        let max_bytes = self.shape.max_total_batch_size as i64;
+        let mut answers = Vec::new();
+        {
+            let mut open = self.open.lock().unwrap();
+            let open = &mut *open;
+            for digest in &digests {
+                let key = ReadBatchKey {
+                    invocation: invocation.clone(),
+                    compressor: self.shape.compressor_for(digest),
+                    digest_function: self
+                        .shape
+                        .request_digest_function_config
+                        .for_hash(&digest.hash),
+                };
+                if open
+                    .by_key
+                    .get(&key)
+                    .is_some_and(|batch| batch.bytes + digest.size_in_bytes > max_bytes)
+                {
+                    open.by_key.remove(&key).unwrap().send_now();
+                }
+                let batch = open.by_key.entry(key.clone()).or_insert_with(|| {
+                    open.next_id += 1;
+                    self.start_batch(open.next_id, key.clone(), metadata.clone())
+                });
+                batch.join(&metadata);
+                batch.add(digest);
+                if !answers.iter().any(|(id, _)| *id == batch.id) {
+                    answers.push((batch.id, batch.answer.clone()));
+                }
+                if batch.bytes >= max_bytes {
+                    open.by_key.remove(&key).unwrap().send_now();
+                }
+            }
+        }
+
+        async move {
+            let mut blobs = HashMap::new();
+            for (_, answer) in answers {
+                let read = answer.await.unwrap_or_else(|_| {
+                    Err(SharedCallFailure {
+                        message: "BatchReadBlobs batch ended without an answer".to_owned(),
+                        code: None,
+                        group: TCodeReasonGroup::UNKNOWN,
+                        final_for_every_caller: false,
+                    })
+                })?;
+                for digest in &digests {
+                    if let Some(blob) = read.get(digest) {
+                        blobs.insert(digest.clone(), blob.clone());
+                    }
+                }
+            }
+            Ok(blobs)
+        }
+        .boxed()
+    }
+
+    /// Spawns the task that sends batch `id` when its window ends or it fills, whichever comes
+    /// first. The task reports to the first caller's event dispatcher, so the RPC shows in the
+    /// build's event log as the separate reads did.
+    fn start_batch(
+        &self,
+        id: u64,
+        key: ReadBatchKey,
+        metadata: RemoteExecutionMetadata,
+    ) -> OpenReadBatch {
+        let (full, mut filled) = tokio::sync::oneshot::channel();
+        let (answer_sender, answer) = tokio::sync::oneshot::channel();
+        let open = self.open.dupe();
+        let window = self.window;
+        let shape = self.shape.clone();
+        let send = self.send.dupe();
+        let task = async move {
+            let batch = match tokio::time::timeout(window, &mut filled).await {
+                Ok(batch) => batch,
+                Err(_elapsed) => {
+                    let batch = {
+                        let mut open = open.lock().unwrap();
+                        match open.by_key.get(&key) {
+                            Some(batch) if batch.id == id => open.by_key.remove(&key),
+                            _ => None,
+                        }
+                    };
+                    match batch {
+                        Some(batch) => Ok(batch.close().0),
+                        // A caller filled it as the window ended.
+                        None => filled.await,
+                    }
+                }
+            };
+            let Ok(ClosedReadBatch { digests, metadata }) = batch else {
+                return;
+            };
+            let result = read_blob_batches(shape.requests(digests), |request| {
+                send(metadata.clone(), request)
+            })
+            .await
+            .map(Arc::new)
+            .map_err(|err| SharedCallFailure::from_error(&err));
+            drop(answer_sender.send(result));
+        };
+        match get_dispatcher_opt() {
+            Some(dispatcher) => tokio::spawn(with_dispatcher_async(dispatcher, task)),
+            None => tokio::spawn(task),
+        };
+        OpenReadBatch {
+            id,
+            digests: Vec::new(),
+            included: HashSet::new(),
+            bytes: 0,
+            metadata,
+            full,
+            answer: answer.shared(),
+        }
     }
 }
 
@@ -5499,6 +5783,7 @@ impl REClient {
                     runtime_opts.read_cache_bytes,
                     runtime_opts.read_cache_max_blob_bytes,
                 ),
+                runtime_opts.batch_read_blobs_window,
             )
         };
         REClient {
@@ -10089,6 +10374,7 @@ mod tests {
             find_missing_blobs_batch_window: Duration::ZERO,
             read_cache_bytes: 0,
             read_cache_max_blob_bytes: 0,
+            batch_read_blobs_window: Duration::ZERO,
             remote_cache_chunking: false,
             remote_cache_compression_threshold: DEFAULT_REMOTE_CACHE_COMPRESSION_THRESHOLD,
             retries: 0,
@@ -13780,6 +14066,8 @@ mod tests {
         batch_read_digests: AtomicUsize,
         /// Errors the next BatchReadBlobs calls answer with, in order.
         batch_read_failures: Mutex<VecDeque<tonic::Status>>,
+        /// The action id in the request metadata of each BatchReadBlobs call.
+        batch_read_action_ids: Mutex<Vec<String>>,
         /// How long each FindMissingBlobs, BatchUpdateBlobs and BatchReadBlobs call takes to
         /// answer.
         delay: Duration,
@@ -13903,6 +14191,11 @@ mod tests {
         ) -> Result<tonic::Response<BatchReadBlobsResponse>, tonic::Status> {
             let state = &self.0;
             state.batch_read_calls.fetch_add(1, Ordering::SeqCst);
+            state
+                .batch_read_action_ids
+                .lock()
+                .unwrap()
+                .push(decode_request_metadata(&request).action_id);
             let digests = request.into_inner().digests;
             state
                 .batch_read_digests
@@ -14698,6 +14991,234 @@ mod tests {
                 0
             );
         }
+        Ok(())
+    }
+
+    /// The request metadata of a read for action `action`.
+    fn action_metadata(action: usize) -> RemoteExecutionMetadata {
+        RemoteExecutionMetadata {
+            action_id: Some(format!("action {action}")),
+            target_id: Some(format!("root//:target{action}")),
+            ..Default::default()
+        }
+    }
+
+    /// `count` distinct blobs the CAS holds, with their contents.
+    fn held_blobs(state: &FakeCasState, count: usize) -> Vec<(TDigest, Vec<u8>)> {
+        (0..count)
+            .map(|i| {
+                let data = format!("the output tree of action {i:02} ").into_bytes();
+                (state.holds(&data), data)
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn concurrent_reads_of_different_blobs_share_one_batch_read() -> anyhow::Result<()> {
+        let state = Arc::new(FakeCasState::default());
+        let (client, _server) = fake_cas_client(state.clone(), Default::default()).await?;
+        let blobs = held_blobs(&state, 20);
+
+        let client = &client;
+        let results = futures::future::join_all(blobs.iter().enumerate().map(
+            |(action, (digest, _))| async move {
+                client
+                    .download(
+                        &action_metadata(action),
+                        inlined_read(std::slice::from_ref(digest)),
+                    )
+                    .await
+            },
+        ))
+        .await;
+
+        for (result, (_, data)) in results.into_iter().zip(&blobs) {
+            assert_eq!(read_blobs(result)?, vec![data.clone()]);
+        }
+        assert_eq!(state.batch_reads(), 1);
+        assert_eq!(state.batch_read_digests.load(Ordering::SeqCst), 20);
+        // The RPC served twenty actions, so it names none of them.
+        assert_eq!(
+            *state.batch_read_action_ids.lock().unwrap(),
+            vec![String::new()]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_batch_of_one_actions_reads_keeps_its_request_metadata() -> anyhow::Result<()> {
+        let state = Arc::new(FakeCasState::default());
+        let (client, _server) = fake_cas_client(state.clone(), Default::default()).await?;
+        let blobs = held_blobs(&state, 3);
+
+        let client = &client;
+        let results = futures::future::join_all(blobs.iter().map(|(digest, _)| async move {
+            client
+                .download(
+                    &action_metadata(7),
+                    inlined_read(std::slice::from_ref(digest)),
+                )
+                .await
+        }))
+        .await;
+
+        for result in results {
+            result?;
+        }
+        assert_eq!(state.batch_reads(), 1);
+        assert_eq!(
+            *state.batch_read_action_ids.lock().unwrap(),
+            vec!["action 7".to_owned()]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn with_no_read_window_each_read_sends_its_own_batch_read() -> anyhow::Result<()> {
+        let state = Arc::new(FakeCasState::default());
+        let (client, _server) = fake_cas_client(
+            state.clone(),
+            Buck2OssReConfiguration {
+                batch_read_blobs_window_ms: Some(0),
+                ..Default::default()
+            },
+        )
+        .await?;
+        let blobs = held_blobs(&state, 20);
+
+        let client = &client;
+        let results = futures::future::join_all(blobs.iter().enumerate().map(
+            |(action, (digest, _))| async move {
+                client
+                    .download(
+                        &action_metadata(action),
+                        inlined_read(std::slice::from_ref(digest)),
+                    )
+                    .await
+            },
+        ))
+        .await;
+
+        for (result, (_, data)) in results.into_iter().zip(&blobs) {
+            assert_eq!(read_blobs(result)?, vec![data.clone()]);
+        }
+        assert_eq!(state.batch_reads(), 20);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_full_read_batch_is_sent_before_its_window_ends() -> anyhow::Result<()> {
+        let state = Arc::new(FakeCasState::default());
+        let (client, _server) = fake_cas_client(
+            state.clone(),
+            Buck2OssReConfiguration {
+                batch_read_blobs_window_ms: Some(60_000),
+                ..Default::default()
+            },
+        )
+        .await?;
+        // Four blobs of half the default batch size, two to a batch.
+        let blobs = (0..4u8)
+            .map(|i| {
+                let data = vec![i; DEFAULT_MAX_TOTAL_BATCH_SIZE / 2];
+                (state.holds(&data), data)
+            })
+            .collect::<Vec<_>>();
+
+        let started = Instant::now();
+        let client = &client;
+        let results = futures::future::join_all(blobs.iter().enumerate().map(
+            |(action, (digest, _))| async move {
+                client
+                    .download(
+                        &action_metadata(action),
+                        inlined_read(std::slice::from_ref(digest)),
+                    )
+                    .await
+            },
+        ))
+        .await;
+
+        for (result, (_, data)) in results.into_iter().zip(&blobs) {
+            assert_eq!(read_blobs(result)?, vec![data.clone()]);
+        }
+        assert_eq!(state.batch_reads(), 2);
+        assert!(started.elapsed() < Duration::from_secs(30));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_failed_batch_read_fails_every_read_in_it() -> anyhow::Result<()> {
+        let state = Arc::new(FakeCasState {
+            batch_read_failures: Mutex::new(VecDeque::from([tonic::Status::permission_denied(
+                "not this instance",
+            )])),
+            ..Default::default()
+        });
+        let (client, _server) = fake_cas_client(
+            state.clone(),
+            Buck2OssReConfiguration {
+                retries: Some(0),
+                ..Default::default()
+            },
+        )
+        .await?;
+        let blobs = held_blobs(&state, 6);
+
+        let client = &client;
+        let results = futures::future::join_all(blobs.iter().enumerate().map(
+            |(action, (digest, _))| async move {
+                client
+                    .download(
+                        &action_metadata(action),
+                        inlined_read(std::slice::from_ref(digest)),
+                    )
+                    .await
+            },
+        ))
+        .await;
+
+        for result in results {
+            let Err(err) = result else {
+                panic!("a read that shared the failed batch succeeded");
+            };
+            assert_eq!(
+                err.downcast_ref::<REClientError>().map(|err| err.code),
+                Some(TCode::PERMISSION_DENIED),
+                "{err:#}"
+            );
+        }
+        assert_eq!(state.batch_reads(), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_read_dropped_before_its_batch_is_sent_leaves_the_batch_to_the_rest()
+    -> anyhow::Result<()> {
+        let state = Arc::new(FakeCasState::default());
+        let (client, _server) = fake_cas_client(state.clone(), Default::default()).await?;
+        let blobs = held_blobs(&state, 2);
+
+        // The first read joins a batch and is dropped before the batch is sent.
+        assert!(
+            client
+                .download(
+                    &action_metadata(0),
+                    inlined_read(std::slice::from_ref(&blobs[0].0)),
+                )
+                .now_or_never()
+                .is_none()
+        );
+        let read = client
+            .download(
+                &action_metadata(1),
+                inlined_read(std::slice::from_ref(&blobs[1].0)),
+            )
+            .await;
+
+        assert_eq!(read_blobs(read)?, vec![blobs[1].1.clone()]);
+        assert_eq!(state.batch_reads(), 1);
+        assert_eq!(state.batch_read_digests.load(Ordering::SeqCst), 2);
         Ok(())
     }
 
