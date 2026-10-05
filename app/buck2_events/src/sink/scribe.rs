@@ -585,6 +585,22 @@ impl EventSinkWithStats for RemoteEventSink {
         }
     }
 
+    async fn drain(
+        &self,
+        scope: crate::DrainScope,
+        timeout: std::time::Duration,
+    ) -> buck2_error::Result<Option<crate::DrainReport>> {
+        #[cfg(not(fbcode_build))]
+        {
+            self.client.drain(scope, timeout).await.map(Some)
+        }
+        #[cfg(fbcode_build)]
+        {
+            let _unused = (scope, timeout);
+            Ok(None)
+        }
+    }
+
     fn stats(&self) -> EventSinkStats {
         let counters = self.client.export_counters();
         EventSinkStats {

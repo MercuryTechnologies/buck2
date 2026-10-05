@@ -30,6 +30,13 @@ use buck2_client_ctx::startup_deadline::StartupDeadline;
 pub struct KillCommand {
     #[clap(flatten)]
     pub(crate) event_log_opts: CommonEventLogOptions,
+
+    /// Before shutting down, wait up to this long (e.g. `120s`) for the BES server to
+    /// acknowledge the daemon's build events, closing every stream. A server that
+    /// acknowledges a stream only once it ends, as BuildBuddy does, loses what it was not
+    /// sent before the daemon exits. The kill takes at most this long more than without it.
+    #[clap(long, value_name = "DURATION", default_value = "0s")]
+    bes_drain_timeout: humantime::Duration,
 }
 
 impl BuckSubcommand for KillCommand {
@@ -52,6 +59,7 @@ impl BuckSubcommand for KillCommand {
         buck2_client_ctx::daemon::client::kill::kill_command_impl(
             &lifecycle_lock,
             "`buck kill` was invoked",
+            self.bes_drain_timeout.into(),
         )
         .await
         .into()

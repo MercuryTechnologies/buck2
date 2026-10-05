@@ -48,7 +48,11 @@ use buck2_core::fs::project::ProjectRoot;
 use buck2_core::logging::LogConfigurationReloadHandle;
 use buck2_core::pattern::unparsed::UnparsedPatternPredicate;
 use buck2_error::BuckErrorContext;
+use buck2_events::DrainReport;
+use buck2_events::DrainScope;
 use buck2_events::Event;
+use buck2_events::EventSinkWithStats;
+use buck2_events::StreamDrainOutcome;
 use buck2_events::daemon_id::DaemonId;
 use buck2_events::dispatch::EventDispatcher;
 use buck2_events::source::ChannelEventSource;
@@ -770,6 +774,87 @@ fn convert_positive_duration(proto_duration: &prost_types::Duration) -> Result<D
         + Duration::from_nanos(proto_duration.nanos as u64))
 }
 
+/// Finishes the Build Event Service streams before a kill starts the shutdown, while the
+/// daemon is still whole. A kill during a build ends in a forced shutdown that exits the
+/// process without the graceful path's cleanup, and a stream left open shows as a build
+/// running forever. Bounded, so a dead server cannot hold the kill hostage: by the drain
+/// timeout when the client asked for one, which it waits for on top of its usual three
+/// seconds, and otherwise by five seconds, of which the client waits three.
+async fn finish_bes_for_kill(
+    sink: Option<&dyn EventSinkWithStats>,
+    bes_drain_timeout: Option<Duration>,
+) -> Option<BesDrainResult> {
+    match (bes_drain_timeout, sink) {
+        (Some(drain_timeout), sink) => {
+            Some(drain_bes(sink, DrainScope::Shutdown, drain_timeout).await)
+        }
+        (None, Some(sink)) => {
+            match timeout(Duration::from_secs(5), sink.shutdown()).await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    tracing::warn!("remote event sink streams not finished cleanly: {:#}", e)
+                }
+                Err(_) => {
+                    tracing::warn!("timed out finishing remote event sink streams before shutdown")
+                }
+            }
+            None
+        }
+        (None, None) => None,
+    }
+}
+
+async fn drain_bes(
+    sink: Option<&dyn EventSinkWithStats>,
+    scope: DrainScope,
+    drain_timeout: Duration,
+) -> BesDrainResult {
+    let Some(sink) = sink else {
+        return BesDrainResult::default();
+    };
+    match sink.drain(scope, drain_timeout).await {
+        Ok(Some(report)) => bes_drain_result(report),
+        Ok(None) => BesDrainResult::default(),
+        Err(e) => {
+            tracing::warn!("BES drain did not run: {:#}", e);
+            BesDrainResult {
+                sink_enabled: true,
+                streams: Vec::new(),
+                error: format!("{e:#}"),
+            }
+        }
+    }
+}
+
+fn bes_drain_result(report: DrainReport) -> BesDrainResult {
+    let streams = report
+        .streams
+        .into_iter()
+        .map(|stream| {
+            let (outcome, unacked_events, error) = match stream.outcome {
+                StreamDrainOutcome::Acked => (bes_stream_drain::Outcome::Acked, 0, String::new()),
+                StreamDrainOutcome::Pending { events } => {
+                    (bes_stream_drain::Outcome::Pending, events, String::new())
+                }
+                StreamDrainOutcome::Failed { events, error } => {
+                    (bes_stream_drain::Outcome::Failed, events, error)
+                }
+            };
+            BesStreamDrain {
+                invocation_id: stream.invocation_id,
+                outcome: outcome as i32,
+                unacked_events,
+                error,
+            }
+        })
+        .collect();
+    BesDrainResult {
+        sink_enabled: true,
+        streams,
+        error: String::new(),
+    }
+}
+
 fn error_to_command_result(e: buck2_error::Error) -> CommandResult {
     CommandResult {
         result: Some(command_result::Result::Error(
@@ -1013,17 +1098,15 @@ impl DaemonApi for BuckdServer {
                 .stop_accepting_requests
                 .store(true, Ordering::Relaxed);
 
-            // Finish the Build Event Service streams first, while the daemon is still whole. A
-            // kill during a build ends in a forced shutdown that exits the process without the
-            // graceful path's cleanup, and a stream left open shows as a build running forever.
-            // Bounded, so a dead server cannot hold the kill hostage.
-            if let Some(sink) = self.0.daemon_state.data().scribe_sink.dupe() {
-                match timeout(Duration::from_secs(5), sink.shutdown()).await {
-                    Ok(Ok(())) => {}
-                    Ok(Err(e)) => tracing::warn!("remote event sink streams not finished cleanly: {:#}", e),
-                    Err(_) => tracing::warn!("timed out finishing remote event sink streams before shutdown"),
-                }
-            }
+            let bes_drain_timeout = req
+                .bes_drain_timeout
+                .as_ref()
+                .map(convert_positive_duration)
+                .transpose()?
+                .filter(|drain_timeout| !drain_timeout.is_zero());
+
+            let sink = self.0.daemon_state.data().scribe_sink.dupe();
+            let bes_drain = finish_bes_for_kill(sink.as_deref(), bes_drain_timeout).await;
 
             let timeout = req
                 .timeout
@@ -1037,7 +1120,7 @@ impl DaemonApi for BuckdServer {
             };
 
             self.0.daemon_shutdown.start_shutdown(reason, timeout);
-            Ok(KillResponse {})
+            Ok(KillResponse { bes_drain })
         })
         .await
     }
@@ -1474,6 +1557,25 @@ impl DaemonApi for BuckdServer {
         Ok(Response::new(UnstableFlushPgoProfileResponse {
             pgo_active,
         }))
+    }
+
+    async fn flush_bes(
+        &self,
+        req: Request<FlushBesRequest>,
+    ) -> Result<Response<BesDrainResult>, Status> {
+        self.check_if_accepting_requests()?;
+        let drain_timeout = req
+            .into_inner()
+            .timeout
+            .as_ref()
+            .map(convert_positive_duration)
+            .transpose()?
+            .filter(|drain_timeout| !drain_timeout.is_zero())
+            .ok_or_else(|| Status::invalid_argument("a BES flush needs a timeout above zero"))?;
+        let sink = self.0.daemon_state.data().scribe_sink.dupe();
+        Ok(Response::new(
+            drain_bes(sink.as_deref(), DrainScope::FinishedCommands, drain_timeout).await,
+        ))
     }
 
     async fn unstable_allocator_stats(
@@ -2028,5 +2130,90 @@ mod tests {
         shutdown_future.await;
 
         assert_eq!(expected_deadline, shutdown_deadline.await.unwrap());
+    }
+
+    #[derive(Default)]
+    struct RecordingSink {
+        calls: std::sync::Mutex<Vec<String>>,
+        drain_takes: Duration,
+    }
+
+    #[async_trait]
+    impl EventSinkWithStats for RecordingSink {
+        fn to_event_sync(self: Arc<Self>) -> Arc<dyn buck2_events::EventSink> {
+            unreachable!("a kill sends no events")
+        }
+
+        fn stats(&self) -> buck2_events::EventSinkStats {
+            unreachable!("a kill reads no stats")
+        }
+
+        async fn shutdown(&self) -> buck2_error::Result<()> {
+            self.calls.lock().unwrap().push("shutdown".to_owned());
+            Ok(())
+        }
+
+        async fn drain(
+            &self,
+            scope: DrainScope,
+            timeout: Duration,
+        ) -> buck2_error::Result<Option<DrainReport>> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("drain {scope:?} {timeout:?}"));
+            tokio::time::sleep(self.drain_takes).await;
+            Ok(Some(DrainReport {
+                streams: vec![buck2_events::StreamDrain {
+                    invocation_id: "slow".to_owned(),
+                    outcome: StreamDrainOutcome::Pending { events: 3 },
+                }],
+            }))
+        }
+    }
+
+    #[tokio::test]
+    async fn a_kill_without_a_drain_timeout_finishes_the_streams_as_before() {
+        let sink = RecordingSink::default();
+        assert_eq!(finish_bes_for_kill(Some(&sink), None).await, None);
+        assert_eq!(*sink.calls.lock().unwrap(), vec!["shutdown".to_owned()]);
+    }
+
+    #[tokio::test]
+    async fn a_kill_with_a_drain_timeout_answers_only_once_the_drain_ends() {
+        tokio::time::pause();
+        let sink = RecordingSink {
+            drain_takes: Duration::from_secs(7),
+            ..RecordingSink::default()
+        };
+        let started = tokio::time::Instant::now();
+        let result = finish_bes_for_kill(Some(&sink), Some(Duration::from_secs(10)))
+            .await
+            .expect("a kill that asked for a drain gets its result");
+        // Past the five seconds a kill without a drain gives the streams.
+        assert!(started.elapsed() >= Duration::from_secs(7));
+        assert_eq!(
+            *sink.calls.lock().unwrap(),
+            vec!["drain Shutdown 10s".to_owned()]
+        );
+        assert_eq!(
+            result,
+            BesDrainResult {
+                sink_enabled: true,
+                streams: vec![BesStreamDrain {
+                    invocation_id: "slow".to_owned(),
+                    outcome: bes_stream_drain::Outcome::Pending as i32,
+                    unacked_events: 3,
+                    error: String::new(),
+                }],
+                error: String::new(),
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn a_kill_with_a_drain_timeout_and_no_sink_says_there_is_none() {
+        let result = finish_bes_for_kill(None, Some(Duration::from_secs(10))).await;
+        assert_eq!(result, Some(BesDrainResult::default()));
     }
 }
