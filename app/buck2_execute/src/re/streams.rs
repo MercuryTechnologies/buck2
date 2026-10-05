@@ -13,10 +13,26 @@ use derivative::Derivative;
 use dupe::Dupe;
 use futures::future;
 use remote_execution::TActionResult2;
+use remote_execution::TDigest;
 
 use crate::digest_config::DigestConfig;
 use crate::execute::output::ReStdStream;
 use crate::re::manager::ManagedRemoteExecutionClient;
+
+/// The stdout and stderr blobs that reading `action_result`'s streams fetches from the CAS. A
+/// stream sent inline is read from the result instead, by the rule in `ReStdStream::new`, and an
+/// empty blob is never fetched.
+pub fn stored_std_stream_digests(action_result: &TActionResult2) -> Vec<TDigest> {
+    [
+        (&action_result.stdout_raw, &action_result.stdout_digest),
+        (&action_result.stderr_raw, &action_result.stderr_digest),
+    ]
+    .into_iter()
+    .filter(|(raw, _)| raw.as_ref().is_none_or(|raw| raw.is_empty()))
+    .filter_map(|(_, digest)| digest.clone())
+    .filter(|digest| digest.size_in_bytes > 0)
+    .collect()
+}
 
 #[derive(Derivative, Clone)]
 #[derivative(Debug)]
