@@ -177,16 +177,7 @@ fn read_buckconfig_bes_settings(
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(str::to_owned);
-    let re_client_default_address: Option<String> = root_config.parse(BuckconfigKeyRef {
-        section: "buck2_re_client",
-        property: "address",
-    })?;
-    let re_client_cas_address = root_config
-        .parse::<String>(BuckconfigKeyRef {
-            section: "buck2_re_client",
-            property: "cas_address",
-        })?
-        .or(re_client_default_address);
+    let re_client_cas_address = buck2_re_configuration::bes_cas_address(&root_config)?;
 
     // `[bes] connection = re_client` reuses the remote execution client's endpoint, headers
     // and TLS identity. Explicit `backend` and `header` keys still win.
