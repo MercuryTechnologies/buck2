@@ -20,6 +20,7 @@ use buck2_core::fs::artifact_path_resolver::ArtifactFs;
 use buck2_core::fs::project::ProjectRoot;
 use buck2_core::fs::project_rel_path::ProjectRelativePath;
 use buck2_core::soft_error;
+use buck2_events::dispatch::console_message;
 use buck2_events::dispatch::span_async;
 use buck2_execute::digest_config::DigestConfig;
 use buck2_execute::execute::action_digest::ActionDigest;
@@ -177,6 +178,7 @@ impl ReExecutor {
         re_gang_workers: &[buck2_core::execution_types::executor_config::ReGangWorker],
         meta_internal_extra_params: &MetaInternalExtraParams,
         worker_tool_action_digest: Option<ActionDigest>,
+        skip_cache_read: bool,
     ) -> ControlFlow<CommandExecutionResult, (CommandExecutionManager, ReExecuteOutcome)> {
         info!(
             "RE command line:\n```\n$ {}\n```\n for action `{}`",
@@ -193,7 +195,7 @@ impl ReExecutor {
             re_gang_workers,
             identity,
             &mut manager,
-            self.skip_cache_read,
+            skip_cache_read,
             self.skip_cache_write,
             self.re_max_queue_time,
             self.re_resource_units,
@@ -428,8 +430,6 @@ impl PreparedCommandExecutor for ReExecutor {
 
         let worker_tool_action_digest = worker_tool_init_action.clone().map(|w| w.action);
 
-        let execution_time = TimeSpan::start_now();
-
         let re_gang_workers: Vec<_> = self
             .gang_workers
             .iter()
@@ -439,116 +439,133 @@ impl PreparedCommandExecutor for ReExecutor {
 
         // TODO(bobyf, torozco): remote execution probably needs to explicitly handle cancellations
         let mut manager = manager;
-        let mut retried_missing_cas_inputs = false;
-        let response = loop {
-            manager = self
-                .upload(
-                    manager,
-                    &identity,
-                    &action_and_blobs.blobs,
-                    request.paths(),
-                    *digest_config,
-                )
-                .await?;
+        let mut skip_cache_read = self.skip_cache_read;
+        let (response, res) = loop {
+            let execution_time = TimeSpan::start_now();
+            let mut retried_missing_cas_inputs = false;
+            let response = loop {
+                manager = self
+                    .upload(
+                        manager,
+                        &identity,
+                        &action_and_blobs.blobs,
+                        request.paths(),
+                        *digest_config,
+                    )
+                    .await?;
 
-            manager = if let (Some(worker), Some(worker_tool_init_action)) =
-                (request.remote_worker(), worker_tool_init_action)
-            {
-                self.upload(
-                    manager,
-                    &identity,
-                    &worker_tool_init_action.blobs,
-                    &worker.input_paths,
-                    *digest_config,
-                )
-                .await?
-            } else {
-                manager
+                manager = if let (Some(worker), Some(worker_tool_init_action)) =
+                    (request.remote_worker(), worker_tool_init_action)
+                {
+                    self.upload(
+                        manager,
+                        &identity,
+                        &worker_tool_init_action.blobs,
+                        &worker.input_paths,
+                        *digest_config,
+                    )
+                    .await?
+                } else {
+                    manager
+                };
+
+                let (next_manager, outcome) = self
+                    .re_execute(
+                        manager,
+                        &identity,
+                        request,
+                        &action_and_blobs.action,
+                        *digest_config,
+                        platform,
+                        self.dependencies
+                            .iter()
+                            .chain(remote_execution_dependencies.iter()),
+                        &re_gang_workers,
+                        command.request.meta_internal_extra_params(),
+                        worker_tool_action_digest.dupe(),
+                        skip_cache_read,
+                    )
+                    .await?;
+                manager = next_manager;
+
+                match outcome {
+                    ReExecuteOutcome::Executed(response) => break response,
+                    ReExecuteOutcome::MissingCasInputs(status) => {
+                        if retried_missing_cas_inputs {
+                            return ControlFlow::Break(manager.error_classified(
+                                "remote_exec_error",
+                                ReErrorWrapper {
+                                    action_digest: action_and_blobs.action.dupe(),
+                                    inner: status,
+                                },
+                                CommandExecutionErrorType::Other,
+                            ))?;
+                        }
+
+                        retried_missing_cas_inputs = true;
+                        info!(
+                            "Retrying RE action `{}` after RE reported missing CAS inputs",
+                            action_and_blobs.action,
+                        );
+                    }
+                }
             };
 
-            let (next_manager, outcome) = self
-                .re_execute(
-                    manager,
-                    &identity,
-                    request,
-                    &action_and_blobs.action,
-                    *digest_config,
-                    platform,
-                    self.dependencies
-                        .iter()
-                        .chain(remote_execution_dependencies.iter()),
-                    &re_gang_workers,
-                    command.request.meta_internal_extra_params(),
-                    worker_tool_action_digest.dupe(),
-                )
-                .await?;
-            manager = next_manager;
+            let exit_code = response.execute_response.action_result.exit_code;
+            let additional_message = if response.execute_response.status.message.is_empty() {
+                None
+            } else {
+                Some(response.execute_response.status.message.clone())
+            };
 
-            match outcome {
-                ReExecuteOutcome::Executed(response) => break response,
-                ReExecuteOutcome::MissingCasInputs(status) => {
-                    if retried_missing_cas_inputs {
-                        return ControlFlow::Break(manager.error_classified(
-                            "remote_exec_error",
-                            ReErrorWrapper {
-                                action_digest: action_and_blobs.action.dupe(),
-                                inner: status,
-                            },
-                            CommandExecutionErrorType::Other,
-                        ))?;
-                    }
+            let res = download_action_results(
+                request,
+                execution_time,
+                &*self.materializer,
+                &self.re_client,
+                *digest_config,
+                manager,
+                &identity,
+                buck2_data::ReStage {
+                    stage: Some(buck2_data::ReDownload {}.into()),
+                }
+                .into(),
+                request.paths(),
+                request.outputs(),
+                details.clone(),
+                &response,
+                self.paranoid.as_ref(),
+                cancellations,
+                exit_code,
+                &self.artifact_fs,
+                self.materialize_failed_inputs,
+                self.materialize_failed_outputs,
+                additional_message,
+                &self.output_trees_download_config,
+                served_from_action_cache(&response, skip_cache_read),
+            )
+            .boxed()
+            .await;
 
-                    retried_missing_cas_inputs = true;
-                    info!(
-                        "Retrying RE action `{}` after RE reported missing CAS inputs",
-                        action_and_blobs.action,
-                    );
+            match res {
+                DownloadResult::Result(res) => break (response, res),
+                DownloadResult::CacheMiss {
+                    manager: next_manager,
+                    error,
+                } => {
+                    // Only a result the server took from its action cache can be a CacheMiss, and the
+                    // execution sent next skips that cache, so this sends at most one more Execute.
+                    console_message(format!(
+                        "Executing `{}` again without the remote cache, because the result the \
+                    server served from it references a blob the CAS lacks: {:#}",
+                        identity.action_key, error
+                    ));
+                    manager = next_manager;
+                    skip_cache_read = true;
                 }
             }
         };
-
-        let exit_code = response.execute_response.action_result.exit_code;
-        let additional_message = if response.execute_response.status.message.is_empty() {
-            None
-        } else {
-            Some(response.execute_response.status.message.clone())
-        };
-
-        let res = download_action_results(
-            request,
-            execution_time,
-            &*self.materializer,
-            &self.re_client,
-            *digest_config,
-            manager,
-            &identity,
-            buck2_data::ReStage {
-                stage: Some(buck2_data::ReDownload {}.into()),
-            }
-            .into(),
-            request.paths(),
-            request.outputs(),
-            details,
-            &response,
-            self.paranoid.as_ref(),
-            cancellations,
-            exit_code,
-            &self.artifact_fs,
-            self.materialize_failed_inputs,
-            self.materialize_failed_outputs,
-            additional_message,
-            &self.output_trees_download_config,
-            false,
-        )
-        .boxed()
-        .await;
-
-        let mut res = match res {
-            DownloadResult::Result(res) => res,
-            DownloadResult::CacheMiss { manager, error } => {
-                manager.error("materialize_outputs", error)
-            }
-        };
+        let mut res = res;
         res.action_result = Some(response.execute_response.action_result);
 
         if let Some(run_action_key) = request.run_action_key()
@@ -585,6 +602,18 @@ impl PreparedCommandExecutor for ReExecutor {
 struct ReErrorWrapper {
     action_digest: ActionDigest,
     inner: remote_execution::TStatus,
+}
+
+/// Whether Execute answered with a result from the server's action cache rather than from running
+/// the action. BuildBuddy checks a cached result's outputs before serving it, but not its stdout
+/// and stderr, so a result served this way can reference a blob the CAS has evicted, and the
+/// download treats such a blob as a cache miss. A result from an execution that skipped the cache
+/// reports a missing blob as the error it is.
+fn served_from_action_cache(
+    response: &ExecuteResponseWithQueueStats,
+    skip_cache_read: bool,
+) -> bool {
+    response.execute_response.cached_result && !skip_cache_read
 }
 
 fn as_missing_outputs_error(err: &remote_execution::TStatus) -> Option<&str> {
@@ -655,4 +684,30 @@ fn is_re_queue_full(e: &buck2_error::Error) -> bool {
 
     e.find_typed_context::<RemoteExecutionError>()
         .is_some_and(|re_err| re_err.group == TCodeReasonGroup::USER_QUEUE_FULL)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn response(cached_result: bool) -> ExecuteResponseWithQueueStats {
+        ExecuteResponseWithQueueStats {
+            execute_response: remote_execution::ExecuteResponse {
+                cached_result,
+                ..Default::default()
+            },
+            queue_stats: Default::default(),
+        }
+    }
+
+    #[test]
+    fn a_result_execute_served_from_the_cache_may_be_stale() {
+        assert!(served_from_action_cache(&response(true), false));
+    }
+
+    #[test]
+    fn a_missing_blob_after_a_real_execution_stays_an_error() {
+        assert!(!served_from_action_cache(&response(false), false));
+        assert!(!served_from_action_cache(&response(true), true));
+    }
 }
