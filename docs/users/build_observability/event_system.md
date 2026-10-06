@@ -167,6 +167,25 @@ only at its end needs Buck2 to hold far fewer of them for a retry. In the
 default `buck` format the key drops successful `ActionExecutionEnd` events from
 the stream.
 
+A test run by the built-in test runner can write files into the directory that
+`TEST_UNDECLARED_OUTPUTS_DIR` names, and its `TestRunEnd` event lists up to 200
+of them by path, digest and size. In `bazel` mode a file named `test.lcov` at
+the top of that directory goes into the test's `TestResult` as `test.lcov`,
+which BuildBuddy's target page reads as the test's coverage. To list every file
+the test left, as Bazel does with `test.outputs/<path>`, set:
+
+```ini
+[bes]
+event_format = bazel
+upload_test_outputs = true
+```
+
+These files are not uploaded again: each carries its digest, and the sink
+points it at the CAS its artifact uploads go to, where a remote test's
+outputs already are. A test that ran locally leaves its files under
+`buck-out` and not in that CAS, so the links work only for remote tests and
+tests whose results came from the remote cache.
+
 In `bazel` mode, Buck2 translates the event stream into
 `build_event_stream.BuildEvent` messages. The converter currently maps:
 

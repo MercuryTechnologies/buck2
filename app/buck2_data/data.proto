@@ -2456,6 +2456,21 @@ message TestRunEnd {
   optional buck.host_sharing.HostSharingRequirements
       command_host_sharing_requirements = 3;
   google.protobuf.Duration timeout = 4;
+  // The files the test left in its outputs directory (TEST_UNDECLARED_OUTPUTS_DIR), by path
+  // relative to it: test.lcov first if present, then the rest by path, at most 200.
+  repeated TestOutputFile output_files = 5;
+  // How many files the directory held past the ones in `output_files`.
+  optional uint64 output_files_truncated = 6;
+}
+
+// One file a test left in its outputs directory. A remote test's files stay in
+// the CAS, so the BES sink can point at them by digest.
+message TestOutputFile {
+  // Relative to the outputs directory.
+  string path = 1;
+  // "<hash>:<size>", the form ActionOutput.digest uses.
+  string digest = 2;
+  uint64 size_bytes = 3;
 }
 
 message FileWatcherStart {
