@@ -2764,7 +2764,10 @@ mod tests {
 
         let (files, truncated) = list_test_output_files(&dir);
 
-        assert_eq!(paths(&files), vec!["test.lcov", "a.txt", "a/b.txt", "z.txt"]);
+        assert_eq!(
+            paths(&files),
+            vec!["test.lcov", "a.txt", "a/b.txt", "z.txt"]
+        );
         assert_eq!(truncated, None);
         let lcov = &files[0];
         let expected = TrackedFileDigest::from_content(

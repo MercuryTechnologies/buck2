@@ -3886,7 +3886,8 @@ mod tests {
     #[tokio::test]
     async fn upload_event_files_names_test_output_files_in_the_cas() {
         let hash = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
-        let mut uploader = BazelArtifactUploader::new(test_artifact_upload_config(), Arc::default());
+        let mut uploader =
+            BazelArtifactUploader::new(test_artifact_upload_config(), Arc::default());
         let mut event = bazel_bep_proto::build_event_stream::BuildEvent {
             id: None,
             children: Vec::new(),
