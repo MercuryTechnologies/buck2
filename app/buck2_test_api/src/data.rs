@@ -360,6 +360,10 @@ impl RemoteStorageConfig {
     }
 }
 
+/// The name of the output directory the built-in test runner gives every test,
+/// which the orchestrator reads back to report the files the test left there.
+pub const TEST_OUTPUTS_DIR_NAME: &str = "test_outputs";
+
 #[derive(Debug, Clone, PartialEq, Allocative, Hash, Eq, Display, Pagable)]
 #[display("name = {}, config = {}", "name", "remote_storage_config")]
 pub struct DeclaredOutput {
