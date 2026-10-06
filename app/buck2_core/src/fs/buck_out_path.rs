@@ -247,6 +247,10 @@ impl BuckOutTestPath {
     pub fn into_path(self) -> ForwardRelativePathBuf {
         self.path
     }
+
+    pub fn path(&self) -> &ForwardRelativePath {
+        &self.path
+    }
 }
 
 #[derive(Clone, Dupe, PartialEq, Eq, Allocative, Pagable)]

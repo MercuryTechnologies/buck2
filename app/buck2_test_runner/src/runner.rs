@@ -24,6 +24,7 @@ use buck2_test_api::data::ExternalRunnerSpecValue;
 use buck2_test_api::data::OutputName;
 use buck2_test_api::data::RemoteStorageConfig;
 use buck2_test_api::data::RequiredLocalResources;
+use buck2_test_api::data::TEST_OUTPUTS_DIR_NAME;
 use buck2_test_api::data::TestResult;
 use buck2_test_api::data::TestStage;
 use buck2_test_api::data::TestStatus;
@@ -209,8 +210,6 @@ impl Buck2TestRunner {
 /// https://bazel.build/reference/test-encyclopedia#initial-conditions
 const TEST_OUTPUT_DIR_ENV: &str = "TEST_UNDECLARED_OUTPUTS_DIR";
 
-const TEST_OUTPUT_DIR_NAME: &str = "test_outputs";
-
 /// The output directory every test gets, and the variable naming its path.
 ///
 /// It comes first in the environment, so a target's own `env` or the runner's
@@ -218,7 +217,7 @@ const TEST_OUTPUT_DIR_NAME: &str = "test_outputs";
 /// directory in the CAS, listed in its action result, rather than downloading
 /// every test's files; a local test's directory is written under buck-out.
 fn test_output_dir() -> (DeclaredOutput, (String, ArgValue)) {
-    let name = OutputName::unchecked_new(TEST_OUTPUT_DIR_NAME.to_owned());
+    let name = OutputName::unchecked_new(TEST_OUTPUTS_DIR_NAME.to_owned());
     (
         DeclaredOutput {
             name: name.clone(),
