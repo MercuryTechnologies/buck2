@@ -124,6 +124,9 @@ pub struct BesConfig {
     pub event_format: BesEventFormat,
     pub bazel_artifact_upload: bool,
     pub upload_successful_action_events: bool,
+    /// `[bes] upload_test_outputs`: a test's result lists every file in its outputs directory,
+    /// as test.outputs/<path>. Off, only test.lcov is listed.
+    pub upload_test_outputs: bool,
     pub bazel_artifact_upload_backend: Option<String>,
     pub re_client_cas_address: Option<String>,
     pub bazel_artifact_upload_instance_name: Option<String>,
@@ -203,6 +206,7 @@ impl Default for BesConfig {
             event_format: BesEventFormat::Buck,
             bazel_artifact_upload: true,
             upload_successful_action_events: true,
+            upload_test_outputs: false,
             bazel_artifact_upload_backend: None,
             re_client_cas_address: None,
             bazel_artifact_upload_instance_name: None,
@@ -587,6 +591,9 @@ impl BazelArtifactUploader {
             Some(Payload::TestResult(result)) => {
                 for file in &mut result.test_action_output {
                     self.upload_file_if_inline(file).await;
+                    // A test's output file arrives as a digest of a blob the remote test left
+                    // in the CAS; it only needs a URI that names it there.
+                    self.add_uri_for_digest_file(file);
                 }
             }
             Some(Payload::TestSummary(summary)) => {
@@ -1756,7 +1763,7 @@ impl WorkerState {
             return Ok(());
         }
         let upload_config = BazelArtifactUploadConfig::from_bes(&self.config, &self.connection)?;
-        let stream = StreamState::new(
+        let mut stream = StreamState::new(
             parsed,
             &self.config.build_metadata,
             upload_config,
@@ -1764,6 +1771,9 @@ impl WorkerState {
             self.counters.clone(),
             self.spill_target.clone(),
         );
+        stream
+            .bazel_converter
+            .set_upload_test_outputs(self.config.upload_test_outputs);
         self.streams.insert(parsed.invocation_id.clone(), stream);
         Ok(())
     }
@@ -3867,6 +3877,71 @@ mod tests {
             uri,
             &format!("bytestream://localhost:1985/remote/instance/blobs/{hash}/3")
         );
+    }
+
+    /// BuildBuddy's coverage card reads test.lcov from a TestResult only through a
+    /// `bytestream://` URI (app/target/target_test_coverage_card.tsx at v2.310.0). A test's
+    /// output file is a digest of a blob already in the CAS, so it is named there, not uploaded,
+    /// while test.log is still uploaded from its inline contents.
+    #[tokio::test]
+    async fn upload_event_files_names_test_output_files_in_the_cas() {
+        let hash = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let mut uploader = BazelArtifactUploader::new(test_artifact_upload_config(), Arc::default());
+        let mut event = bazel_bep_proto::build_event_stream::BuildEvent {
+            id: None,
+            children: Vec::new(),
+            payload: Some(
+                bazel_bep_proto::build_event_stream::build_event::Payload::TestResult(
+                    bazel_bep_proto::build_event_stream::TestResult {
+                        test_action_output: vec![
+                            bazel_bep_proto::build_event_stream::File {
+                                name: "test.log".to_owned(),
+                                path_prefix: Vec::new(),
+                                file: Some(
+                                    bazel_bep_proto::build_event_stream::file::File::Contents(
+                                        b"log".to_vec(),
+                                    ),
+                                ),
+                                digest: String::new(),
+                                length: 0,
+                            },
+                            bazel_bep_proto::build_event_stream::File {
+                                name: "test.lcov".to_owned(),
+                                path_prefix: Vec::new(),
+                                file: None,
+                                digest: format!("{hash}:42"),
+                                length: 42,
+                            },
+                        ],
+                        ..Default::default()
+                    },
+                ),
+            ),
+            last_message: false,
+        };
+
+        uploader.upload_event_files(&mut event).await;
+
+        let Some(bazel_bep_proto::build_event_stream::build_event::Payload::TestResult(result)) =
+            event.payload
+        else {
+            panic!("expected test result");
+        };
+        let uri = |name: &str| match result
+            .test_action_output
+            .iter()
+            .find(|file| file.name == name)
+            .and_then(|file| file.file.as_ref())
+        {
+            Some(bazel_bep_proto::build_event_stream::file::File::Uri(uri)) => uri.clone(),
+            other => panic!("expected a URI for {name}, got {other:?}"),
+        };
+        assert_eq!(
+            uri("test.lcov"),
+            format!("bytestream://localhost:1985/remote/instance/blobs/{hash}/42")
+        );
+        assert!(uri("test.log").starts_with("bytestream://localhost:1985/remote/instance/blobs/"));
+        assert_eq!(uploader.test_writes.len(), 1, "only test.log is uploaded");
     }
 
     /// BuildBuddy's Timing tab reads the profile only from a `command.profile.gz` tool log with a
