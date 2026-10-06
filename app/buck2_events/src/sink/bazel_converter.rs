@@ -1223,6 +1223,9 @@ fn render_progress_phase_with_running(
 pub(crate) struct BazelEventConverter {
     build_metadata: BTreeMap<String, String>,
     skip_successful_action_events: bool,
+    /// `[bes] upload_test_outputs`: list every file a test left in its outputs directory with
+    /// its result, not only test.lcov.
+    upload_test_outputs: bool,
     saw_started: bool,
     saw_finished: bool,
     progress_count: i32,
@@ -1287,6 +1290,10 @@ impl BazelEventConverter {
             skip_successful_action_events: !upload_successful_action_events,
             ..Self::default()
         }
+    }
+
+    pub(crate) fn set_upload_test_outputs(&mut self, upload_test_outputs: bool) {
+        self.upload_test_outputs = upload_test_outputs;
     }
 
     pub(crate) fn convert(
@@ -2677,7 +2684,11 @@ impl BazelEventConverter {
         let end_time = event.timestamp;
         let start_time = start_time_from_span_end(span_end, end_time.as_ref());
         let duration = test_duration(test_end.command_report.as_ref()).or(span_end.duration);
-        let outputs = test_action_outputs(&cases, test_end.command_report.as_ref(), status);
+        let mut outputs = test_action_outputs(&cases, test_end.command_report.as_ref(), status);
+        outputs.extend(test_output_files(
+            &test_end.output_files,
+            self.upload_test_outputs,
+        ));
         self.remember_test_children(&key);
         self.remember_test_tags(Some(target), &suite.labels);
         if let Some(timeout) = test_end.timeout.as_ref() {
@@ -7646,6 +7657,40 @@ fn test_action_outputs(
         outputs.push(file_with_contents("test.xml", xml));
     }
     outputs
+}
+
+/// The files a test left in its outputs directory, as TestResult outputs: the coverage report as
+/// test.lcov, which BuildBuddy's target page reads (app/target/target_test_coverage_card.tsx at
+/// v2.310.0), and with `upload_test_outputs` every other file as test.outputs/<path>, under the
+/// name Bazel gives the outputs directory. Each carries its digest and no URI; the BES sink
+/// points it at the CAS that holds it, where a remote test's outputs already are.
+/// https://bazel.build/reference/test-encyclopedia#initial-conditions
+fn test_output_files(
+    files: &[buck2_data::TestOutputFile],
+    upload_test_outputs: bool,
+) -> Vec<bep::File> {
+    files
+        .iter()
+        .filter_map(|file| {
+            let name = if file.path == "test.lcov" {
+                file.path.clone()
+            } else if upload_test_outputs {
+                format!("test.outputs/{}", file.path)
+            } else {
+                return None;
+            };
+            if file.digest.is_empty() {
+                return None;
+            }
+            Some(bep::File {
+                name,
+                path_prefix: Vec::new(),
+                file: None,
+                digest: file.digest.clone(),
+                length: i64::try_from(file.size_bytes).unwrap_or(i64::MAX),
+            })
+        })
+        .collect()
 }
 
 fn test_summary_files(
@@ -13443,6 +13488,162 @@ mod tests {
             )),
         ));
         events
+    }
+
+    const LCOV_DIGEST: &str =
+        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef:42";
+
+    fn test_output_file(path: &str, digest: &str, size_bytes: u64) -> buck2_data::TestOutputFile {
+        buck2_data::TestOutputFile {
+            path: path.to_owned(),
+            digest: digest.to_owned(),
+            size_bytes,
+        }
+    }
+
+    /// The test_action_output of the TestResult for one test run whose outputs directory held
+    /// `output_files`.
+    fn test_result_outputs(
+        converter: &mut BazelEventConverter,
+        output_files: Vec<buck2_data::TestOutputFile>,
+    ) -> Vec<bep::File> {
+        let events = convert_through_end_of_results(
+            converter,
+            1,
+            &trace_event(buck2_data::buck_event::Data::SpanEnd(
+                buck2_data::SpanEndEvent {
+                    data: Some(buck2_data::span_end_event::Data::TestRun(
+                        buck2_data::TestRunEnd {
+                            suite: Some(buck2_data::TestSuite {
+                                suite_name: "suite".to_owned(),
+                                test_names: Vec::new(),
+                                target_label: Some(configured_target()),
+                                labels: Vec::new(),
+                            }),
+                            command_report: Some(buck2_data::CommandExecution {
+                                details: Some(buck2_data::CommandExecutionDetails {
+                                    signed_exit_code: Some(0),
+                                    cmd_stdout: "test stdout".to_owned(),
+                                    ..Default::default()
+                                }),
+                                status: Some(buck2_data::command_execution::Status::Success(
+                                    buck2_data::command_execution::Success {},
+                                )),
+                                ..Default::default()
+                            }),
+                            output_files,
+                            ..Default::default()
+                        },
+                    )),
+                    ..Default::default()
+                },
+            )),
+        );
+        events
+            .into_iter()
+            .find_map(|event| match event.payload {
+                Some(build_event::Payload::TestResult(result)) => Some(result.test_action_output),
+                _ => None,
+            })
+            .expect("TestResult event")
+    }
+
+    fn output_names(outputs: &[bep::File]) -> Vec<&str> {
+        outputs.iter().map(|file| file.name.as_str()).collect()
+    }
+
+    #[test]
+    fn test_result_lists_the_coverage_report_by_digest() {
+        let mut converter = BazelEventConverter::default();
+
+        let outputs = test_result_outputs(
+            &mut converter,
+            vec![
+                test_output_file("test.lcov", LCOV_DIGEST, 42),
+                test_output_file("screenshot.png", "abc:3", 3),
+            ],
+        );
+
+        assert_eq!(output_names(&outputs), vec!["test.log", "test.lcov"]);
+        let lcov = outputs
+            .iter()
+            .find(|file| file.name == "test.lcov")
+            .expect("test.lcov");
+        assert_eq!(lcov.digest, LCOV_DIGEST);
+        assert_eq!(lcov.length, 42);
+        assert!(lcov.path_prefix.is_empty());
+        // The BES sink names the blob in the CAS; the converter does not know where that is.
+        assert_eq!(lcov.file, None);
+    }
+
+    #[test]
+    fn test_result_without_a_coverage_report_lists_none() {
+        let mut converter = BazelEventConverter::default();
+
+        let outputs = test_result_outputs(
+            &mut converter,
+            vec![
+                test_output_file("coverage/test.lcov", "abc:3", 3),
+                test_output_file("log.txt", "def:3", 3),
+            ],
+        );
+
+        assert_eq!(output_names(&outputs), vec!["test.log"]);
+    }
+
+    #[test]
+    fn test_result_lists_every_output_with_upload_test_outputs() {
+        let mut converter = BazelEventConverter::default();
+        converter.set_upload_test_outputs(true);
+
+        let outputs = test_result_outputs(
+            &mut converter,
+            vec![
+                test_output_file("test.lcov", LCOV_DIGEST, 42),
+                test_output_file("a/screenshot.png", "abc:3", 3),
+                test_output_file("log.txt", "def:5", 5),
+            ],
+        );
+
+        assert_eq!(
+            output_names(&outputs),
+            vec![
+                "test.log",
+                "test.lcov",
+                "test.outputs/a/screenshot.png",
+                "test.outputs/log.txt"
+            ]
+        );
+        let screenshot = outputs
+            .iter()
+            .find(|file| file.name == "test.outputs/a/screenshot.png")
+            .expect("screenshot");
+        assert_eq!(screenshot.digest, "abc:3");
+        assert_eq!(screenshot.length, 3);
+    }
+
+    #[test]
+    fn test_result_lists_only_the_coverage_report_without_upload_test_outputs() {
+        let mut converter = BazelEventConverter::new_with_options(
+            std::iter::empty::<(String, String)>(),
+            true,
+        );
+        converter.set_upload_test_outputs(false);
+
+        let outputs = test_result_outputs(
+            &mut converter,
+            vec![
+                test_output_file("test.lcov", LCOV_DIGEST, 42),
+                test_output_file("log.txt", "def:5", 5),
+            ],
+        );
+
+        assert!(
+            !outputs
+                .iter()
+                .any(|file| file.name.starts_with("test.outputs/"))
+        );
+        assert_eq!(output_names(&outputs), vec!["test.log", "test.lcov"]);
     }
 
     #[test]
