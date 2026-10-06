@@ -58,6 +58,13 @@ use opentelemetry_semantic_conventions::attribute::PROCESS_EXIT_CODE;
 use opentelemetry_semantic_conventions::attribute::VCS_REF_BASE_REVISION;
 use opentelemetry_semantic_conventions::attribute::VCS_REF_HEAD_REVISION;
 
+/// What `remote_execution/oss/re_grpc`'s `REClient::get_session_id` returns for every invocation:
+/// the OSS gRPC client has no RE session, so the value identifies nothing and is not exported.
+const OSS_RE_SESSION_ID_PLACEHOLDER: &str = "GRPC-SESSION-ID";
+
+/// `daemon_was_started` for a command served by a daemon that an earlier command started.
+const DAEMON_REUSED: &str = "REUSED";
+
 /// Accumulates OTLP attributes while keeping each field mapping to a single readable line. The
 /// helpers centralise the `Option`/unit/empty-skipping conventions so the mapping below reads as a
 /// flat list of "field -> key" decisions.
@@ -225,7 +232,11 @@ pub(crate) fn invocation_record_attributes(record: &buck2_data::InvocationRecord
     a.string("event_type", "invocation_record");
 
     // -- Identity / command ------------------------------------------------------------------
-    a.string("re_session_id", record.re_session_id.clone());
+    a.opt_string(
+        "re_session_id",
+        Some(record.re_session_id.as_str())
+            .filter(|id| !id.is_empty() && *id != OSS_RE_SESSION_ID_PLACEHOLDER),
+    );
     // `cli_args` is the full argv as received by the process -- OTel `process.command_args`.
     a.strings_std(PROCESS_COMMAND_ARGS, record.cli_args.iter().cloned());
     a.string("filesystem", record.filesystem.clone());
@@ -585,11 +596,19 @@ pub(crate) fn invocation_record_attributes(record: &buck2_data::InvocationRecord
     {
         a.string("outcome", outcome.as_str_name());
     }
-    if let Some(reason) = record
+    // The record leaves `daemon_was_started` unset both when the command connected to a running
+    // daemon and when it never reached one. Only a daemon sends `CommandStart`, so a set
+    // `time_to_command_start_ms` without a start reason means the daemon was reused. The one
+    // exception is `--no-buckd`, whose in-process daemon is started without reporting a reason.
+    match record
         .daemon_was_started
         .and_then(|v| buck2_data::DaemonWasStartedReason::try_from(v).ok())
     {
-        a.string("daemon_was_started", reason.as_str_name());
+        Some(reason) => a.string("daemon_was_started", reason.as_str_name()),
+        None if record.time_to_command_start_ms.is_some() => {
+            a.string("daemon_was_started", DAEMON_REUSED)
+        }
+        None => {}
     }
     a.strings(
         "active_networks_kinds",
@@ -1598,6 +1617,83 @@ mod tests {
                 .filter(|kv| kv.key.as_str() == "buck2.install_device_metadata.os")
                 .count(),
             1
+        );
+    }
+
+    /// The OSS gRPC RE client has no session concept and reports the same placeholder for every
+    /// invocation, so exporting it would offer a join key that matches every span. Both the
+    /// placeholder and the empty string (no RE session at all) must leave the attribute absent,
+    /// while a real session id still goes through.
+    #[test]
+    fn skips_placeholder_and_empty_re_session_id() {
+        for placeholder in ["GRPC-SESSION-ID", ""] {
+            let record = buck2_data::InvocationRecord {
+                re_session_id: placeholder.to_owned(),
+                ..Default::default()
+            };
+            let attrs = invocation_record_attributes(&record);
+            assert!(
+                find(&attrs, "buck2.re_session_id").is_none(),
+                "re_session_id {placeholder:?} must not be exported"
+            );
+        }
+
+        let record = buck2_data::InvocationRecord {
+            re_session_id: "reSessionID-123".to_owned(),
+            ..Default::default()
+        };
+        let attrs = invocation_record_attributes(&record);
+        assert_eq!(
+            string(&attrs, "buck2.re_session_id").as_deref(),
+            Some("reSessionID-123")
+        );
+    }
+
+    /// `daemon_was_started` is unset on the record both when the command reused a running daemon
+    /// and when it never reached one, so the span has to tell those apart: a command the daemon
+    /// served (it sent `CommandStart`, so `time_to_command_start_ms` is set) without starting one
+    /// reads `REUSED`, a command that started a daemon carries the start reason, and a command that
+    /// never reached a daemon has no attribute.
+    #[test]
+    fn daemon_was_started_distinguishes_started_reused_and_unreached() {
+        let started = buck2_data::InvocationRecord {
+            daemon_was_started: Some(buck2_data::DaemonWasStartedReason::NoBuckdInfo as i32),
+            time_to_command_start_ms: Some(1200),
+            ..Default::default()
+        };
+        assert_eq!(
+            string(
+                &invocation_record_attributes(&started),
+                "buck2.daemon_was_started"
+            )
+            .as_deref(),
+            Some("NO_BUCKD_INFO")
+        );
+
+        let reused = buck2_data::InvocationRecord {
+            daemon_was_started: None,
+            time_to_command_start_ms: Some(15),
+            ..Default::default()
+        };
+        assert_eq!(
+            string(
+                &invocation_record_attributes(&reused),
+                "buck2.daemon_was_started"
+            )
+            .as_deref(),
+            Some("REUSED")
+        );
+
+        let unreached = buck2_data::InvocationRecord {
+            daemon_connection_failure: Some(true),
+            ..Default::default()
+        };
+        assert!(
+            find(
+                &invocation_record_attributes(&unreached),
+                "buck2.daemon_was_started"
+            )
+            .is_none()
         );
     }
 }
