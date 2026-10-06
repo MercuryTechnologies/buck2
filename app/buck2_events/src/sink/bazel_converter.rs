@@ -13500,8 +13500,7 @@ mod tests {
         events
     }
 
-    const LCOV_DIGEST: &str =
-        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef:42";
+    const LCOV_DIGEST: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef:42";
 
     fn test_output_file(path: &str, digest: &str, size_bytes: u64) -> buck2_data::TestOutputFile {
         buck2_data::TestOutputFile {
@@ -13523,7 +13522,7 @@ mod tests {
             &trace_event(buck2_data::buck_event::Data::SpanEnd(
                 buck2_data::SpanEndEvent {
                     data: Some(buck2_data::span_end_event::Data::TestRun(
-                        buck2_data::TestRunEnd {
+                        Box::new(buck2_data::TestRunEnd {
                             suite: Some(buck2_data::TestSuite {
                                 suite_name: "suite".to_owned(),
                                 test_names: Vec::new(),
@@ -13543,7 +13542,7 @@ mod tests {
                             }),
                             output_files,
                             ..Default::default()
-                        },
+                        }),
                     )),
                     ..Default::default()
                 },
@@ -13634,10 +13633,8 @@ mod tests {
 
     #[test]
     fn test_result_lists_only_the_coverage_report_without_upload_test_outputs() {
-        let mut converter = BazelEventConverter::new_with_options(
-            std::iter::empty::<(String, String)>(),
-            true,
-        );
+        let mut converter =
+            BazelEventConverter::new_with_options(std::iter::empty::<(String, String)>(), true);
         converter.set_upload_test_outputs(false);
 
         let outputs = test_result_outputs(
