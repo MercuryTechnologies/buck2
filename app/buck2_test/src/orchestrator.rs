@@ -54,6 +54,7 @@ use buck2_build_signals::env::NodeDuration;
 use buck2_build_signals::env::WaitingData;
 use buck2_common::dice::cells::HasCellResolver;
 use buck2_common::events::HasEvents;
+use buck2_common::file_ops::metadata::TrackedFileDigest;
 use buck2_common::legacy_configs::dice::HasLegacyConfigs;
 use buck2_common::legacy_configs::key::BuckconfigKeyRef;
 use buck2_common::liveliness_observer::LivelinessObserver;
@@ -82,6 +83,9 @@ use buck2_data::TestRunStart;
 use buck2_data::TestSessionInfo;
 use buck2_data::TestSuite;
 use buck2_data::ToProtoMessage;
+use buck2_directory::directory::directory::Directory;
+use buck2_directory::directory::directory_iterator::DirectoryIterator;
+use buck2_directory::directory::entry::DirectoryEntry;
 use buck2_error::BuckErrorContext;
 use buck2_error::ErrorTag;
 use buck2_error::conversion::from_any_with_tag;
@@ -91,6 +95,7 @@ use buck2_execute::artifact::fs::ExecutorFs;
 use buck2_execute::artifact_value::ArtifactValue;
 use buck2_execute::digest_config::DigestConfig;
 use buck2_execute::digest_config::HasDigestConfig;
+use buck2_execute::directory::ActionDirectoryMember;
 use buck2_execute::execute::blocking::HasBlockingExecutor;
 use buck2_execute::execute::cache_uploader::CacheUploadInfo;
 use buck2_execute::execute::cache_uploader::NoOpCacheUploader;
@@ -151,6 +156,7 @@ use buck2_test_api::data::LocalExecutionCommand;
 use buck2_test_api::data::Output;
 use buck2_test_api::data::PrepareForLocalExecutionResult;
 use buck2_test_api::data::RequiredLocalResources;
+use buck2_test_api::data::TEST_OUTPUTS_DIR_NAME;
 use buck2_test_api::data::TestResult;
 use buck2_test_api::data::TestStage;
 use buck2_test_api::data::convert::host_sharing_requirements_to_grpc;
@@ -828,6 +834,64 @@ fn test_timeout_proto(timeout: Option<Duration>) -> Option<prost_types::Duration
     timeout.and_then(|timeout| timeout.try_into().ok())
 }
 
+/// The most files a TestRunEnd lists from a test's outputs directory. The event goes to every
+/// event sink, and a test that writes thousands of files should not make it megabytes long.
+const MAX_TEST_OUTPUT_FILES: usize = 200;
+
+/// The coverage report BuildBuddy's target page reads, by this name, from a test result's
+/// outputs (app/target/target_test_coverage_card.tsx at v2.310.0). It is listed first, so a
+/// directory past the cap still reports it.
+const TEST_COVERAGE_FILE: &str = "test.lcov";
+
+/// The files of the outputs directory the built-in runner declares for every test, read from
+/// the directory tree buck2 already holds for the result: a remote test's files stay in the CAS
+/// and none is downloaded or read here.
+fn test_output_files(
+    outputs: &BuckIndexMap<CommandExecutionOutput, ArtifactValue>,
+) -> (Vec<buck2_data::TestOutputFile>, Option<u64>) {
+    let dir = outputs
+        .iter()
+        .find_map(|(output, value)| match (output, value.entry()) {
+            (CommandExecutionOutput::TestPath { path, .. }, DirectoryEntry::Dir(dir))
+                if path.path().as_str() == TEST_OUTPUTS_DIR_NAME =>
+            {
+                Some(dir)
+            }
+            _ => None,
+        });
+    match dir {
+        Some(dir) => list_test_output_files(dir),
+        None => (Vec::new(), None),
+    }
+}
+
+/// Every file under `dir` by its path relative to `dir`: test.lcov first, then the rest by path,
+/// at most `MAX_TEST_OUTPUT_FILES` of them, with the count of the rest. Symlinks have no digest
+/// of their own and are left out.
+fn list_test_output_files<D>(dir: &D) -> (Vec<buck2_data::TestOutputFile>, Option<u64>)
+where
+    D: Directory<ActionDirectoryMember, TrackedFileDigest>,
+{
+    let mut files: Vec<buck2_data::TestOutputFile> = dir
+        .unordered_walk_leaves()
+        .with_paths()
+        .filter_map(|(path, leaf)| match leaf {
+            ActionDirectoryMember::File(meta) => Some(buck2_data::TestOutputFile {
+                path: path.to_string(),
+                digest: meta.digest.to_string(),
+                size_bytes: meta.digest.size(),
+            }),
+            ActionDirectoryMember::Symlink(_) | ActionDirectoryMember::ExternalSymlink(_) => None,
+        })
+        .collect();
+    files.sort_by(|a, b| {
+        (a.path != TEST_COVERAGE_FILE, &a.path).cmp(&(b.path != TEST_COVERAGE_FILE, &b.path))
+    });
+    let truncated = files.len().saturating_sub(MAX_TEST_OUTPUT_FILES);
+    files.truncate(MAX_TEST_OUTPUT_FILES);
+    (files, (truncated > 0).then_some(truncated as u64))
+}
+
 impl Display for TestExecutionKey {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "test_target = {}, ", self.test_target)?;
@@ -1338,6 +1402,8 @@ impl BuckTestOrchestrator<'_> {
                                 .exec_cmd(manager, &prepared_command, cancellation)
                                 .await
                         };
+                        let (output_files, output_files_truncated) =
+                            test_output_files(&result.outputs);
                         let end = TestRunEnd {
                             suite: test_suite,
                             command_report: Some(test_run_command_report(&result.report).await),
@@ -1346,6 +1412,8 @@ impl BuckTestOrchestrator<'_> {
                             )
                             .ok(),
                             timeout: test_timeout_proto(prepared_command.request.timeout()),
+                            output_files,
+                            output_files_truncated,
                         };
                         (result, end)
                     })
@@ -2594,11 +2662,15 @@ mod tests {
     use buck2_build_api::context::SetBuildContextData;
     use buck2_common::dice::cells::SetCellResolver;
     use buck2_common::dice::data::testing::SetTestingIoProvider;
+    use buck2_common::file_ops::metadata::FileMetadata;
+    use buck2_common::file_ops::metadata::Symlink;
     use buck2_common::liveliness_observer::NoopLivelinessObserver;
     use buck2_core::cells::CellResolver;
     use buck2_core::cells::name::CellName;
     use buck2_core::configuration::data::ConfigurationData;
     use buck2_core::fs::project::ProjectRootTemp;
+    use buck2_execute::directory::ActionDirectoryBuilder;
+    use buck2_execute::directory::INTERNER;
     use buck2_execute::execute::action_digest::ActionDigest;
     use buck2_execute::execute::output::CommandStdStreams;
     use buck2_execute::re::manager::UnconfiguredRemoteExecutionClient;
@@ -2652,6 +2724,137 @@ mod tests {
 
         assert_eq!(timeout.seconds, 42);
         assert_eq!(timeout.nanos, 0);
+    }
+
+    fn file_member(contents: &str) -> ActionDirectoryMember {
+        ActionDirectoryMember::File(FileMetadata {
+            digest: TrackedFileDigest::from_content(
+                contents.as_bytes(),
+                DigestConfig::testing_default().cas_digest_config(),
+            ),
+            is_executable: false,
+        })
+    }
+
+    fn output_dir(files: &[(&str, &str)]) -> ActionDirectoryBuilder {
+        let mut builder = ActionDirectoryBuilder::empty();
+        for (path, contents) in files {
+            builder
+                .insert(
+                    ForwardRelativePath::new(path).unwrap(),
+                    DirectoryEntry::Leaf(file_member(contents)),
+                )
+                .unwrap();
+        }
+        builder
+    }
+
+    fn paths(files: &[buck2_data::TestOutputFile]) -> Vec<&str> {
+        files.iter().map(|file| file.path.as_str()).collect()
+    }
+
+    #[test]
+    fn test_output_files_list_the_coverage_report_first_then_by_path() {
+        let dir = output_dir(&[
+            ("z.txt", "z"),
+            ("a/b.txt", "ab"),
+            ("test.lcov", "SF:src/lib.rs\nend_of_record\n"),
+            ("a.txt", "a"),
+        ]);
+
+        let (files, truncated) = list_test_output_files(&dir);
+
+        assert_eq!(paths(&files), vec!["test.lcov", "a.txt", "a/b.txt", "z.txt"]);
+        assert_eq!(truncated, None);
+        let lcov = &files[0];
+        let expected = TrackedFileDigest::from_content(
+            b"SF:src/lib.rs\nend_of_record\n",
+            DigestConfig::testing_default().cas_digest_config(),
+        );
+        assert_eq!(lcov.digest, expected.to_string());
+        assert_eq!(lcov.digest, format!("{}:28", expected.raw_digest()));
+        assert_eq!(lcov.size_bytes, 28);
+    }
+
+    #[test]
+    fn test_output_files_past_the_cap_keep_the_coverage_report_and_count_the_rest() {
+        let names: Vec<String> = (0..250).map(|i| format!("f{i:03}.txt")).collect();
+        let mut files: Vec<(&str, &str)> = names.iter().map(|name| (name.as_str(), "x")).collect();
+        files.push(("test.lcov", "lcov"));
+        let dir = output_dir(&files);
+
+        let (listed, truncated) = list_test_output_files(&dir);
+
+        assert_eq!(listed.len(), MAX_TEST_OUTPUT_FILES);
+        assert_eq!(listed[0].path, "test.lcov");
+        assert_eq!(listed[1].path, "f000.txt");
+        assert_eq!(listed[MAX_TEST_OUTPUT_FILES - 1].path, "f198.txt");
+        assert_eq!(truncated, Some(51));
+    }
+
+    #[test]
+    fn test_output_files_at_the_cap_are_not_truncated() {
+        let names: Vec<String> = (0..MAX_TEST_OUTPUT_FILES)
+            .map(|i| format!("f{i:03}.txt"))
+            .collect();
+        let files: Vec<(&str, &str)> = names.iter().map(|name| (name.as_str(), "x")).collect();
+
+        let (listed, truncated) = list_test_output_files(&output_dir(&files));
+
+        assert_eq!(listed.len(), MAX_TEST_OUTPUT_FILES);
+        assert_eq!(truncated, None);
+    }
+
+    #[test]
+    fn test_output_files_leave_out_symlinks() {
+        let mut dir = output_dir(&[("report.txt", "r")]);
+        dir.insert(
+            ForwardRelativePath::new("link").unwrap(),
+            DirectoryEntry::Leaf(ActionDirectoryMember::Symlink(Arc::new(Symlink::new(
+                "report.txt".into(),
+            )))),
+        )
+        .unwrap();
+
+        let (files, _) = list_test_output_files(&dir);
+
+        assert_eq!(paths(&files), vec!["report.txt"]);
+    }
+
+    #[test]
+    fn test_output_files_come_from_the_outputs_directory_only() {
+        let digest_config = DigestConfig::testing_default();
+        let shared = |files: &[(&str, &str)]| {
+            ArtifactValue::dir(
+                output_dir(files)
+                    .fingerprint(digest_config.as_directory_serializer())
+                    .shared(&*INTERNER),
+            )
+        };
+        let base = ForwardRelativePathBuf::unchecked_new("test/run".to_owned());
+        let test_path = |name: &str| CommandExecutionOutput::TestPath {
+            path: BuckOutTestPath::new(
+                base.clone(),
+                ForwardRelativePathBuf::unchecked_new(name.to_owned()),
+            ),
+            create: OutputCreationBehavior::Create,
+        };
+        let mut outputs = BuckIndexMap::default();
+        outputs.insert(test_path("other"), shared(&[("test.lcov", "other")]));
+        outputs.insert(
+            test_path(TEST_OUTPUTS_DIR_NAME),
+            shared(&[("test.lcov", "lcov"), ("log.txt", "log")]),
+        );
+
+        let (files, truncated) = test_output_files(&outputs);
+
+        assert_eq!(paths(&files), vec!["test.lcov", "log.txt"]);
+        assert_eq!(files[0].size_bytes, 4);
+        assert_eq!(truncated, None);
+
+        let (files, truncated) = test_output_files(&BuckIndexMap::default());
+        assert!(files.is_empty());
+        assert_eq!(truncated, None);
     }
 
     async fn make() -> buck2_error::Result<(

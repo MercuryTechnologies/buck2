@@ -505,6 +505,13 @@ impl DaemonState {
                 })?
                 .unwrap_or(true);
             #[cfg(not(fbcode_build))]
+            let upload_test_outputs = root_config
+                .parse::<bool>(BuckconfigKeyRef {
+                    section: "bes",
+                    property: "upload_test_outputs",
+                })?
+                .unwrap_or(false);
+            #[cfg(not(fbcode_build))]
             let bazel_artifact_upload_backend = root_config
                 .get(BuckconfigKeyRef {
                     section: "bes",
@@ -609,6 +616,8 @@ impl DaemonState {
                     bazel_artifact_upload,
                     #[cfg(not(fbcode_build))]
                     upload_successful_action_events,
+                    #[cfg(not(fbcode_build))]
+                    upload_test_outputs,
                     #[cfg(not(fbcode_build))]
                     bazel_artifact_upload_backend,
                     #[cfg(not(fbcode_build))]
