@@ -40,6 +40,7 @@ use buck2_events::dispatch::get_dispatcher_opt;
 use buck2_events::dispatch::span_async;
 use buck2_events::dispatch::with_dispatcher_async;
 use buck2_re_configuration::Buck2OssReConfiguration;
+use buck2_re_configuration::ExecutionPriorityByCategory;
 use buck2_re_configuration::CASdMode;
 use buck2_re_configuration::CopyPolicy;
 use buck2_re_configuration::HttpHeader;
@@ -2810,6 +2811,28 @@ fn validate_priority_in_range(
     ))
 }
 
+/// Checks the configured category priorities when the client connects, so a number the server
+/// would refuse fails the daemon's start with the category's name instead of failing every action
+/// of that category.
+fn validate_execution_priority_by_category(
+    by_category: &ExecutionPriorityByCategory,
+    ranges: &[PriorityRange],
+) -> anyhow::Result<()> {
+    for entry in by_category.entries() {
+        if validate_priority_in_range(entry.priority, "execution_priority_by_category", ranges)
+            .is_err()
+        {
+            return Err(anyhow::anyhow!(
+                "`execution_priority_by_category` gives category `{}` priority {}, which is outside of server supported range {}",
+                entry.category,
+                entry.priority,
+                priority_range_names(ranges)
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn supports_hash_validation(digest_function: digest_function::Value) -> bool {
     matches!(
         digest_function,
@@ -3479,6 +3502,10 @@ impl REClientBuilder {
 
         validate_digest_function_capabilities(&opts.digest_algorithms, &capabilities)?;
         validate_remote_cache_chunking_enabled(opts.remote_cache_chunking, &capabilities)?;
+        validate_execution_priority_by_category(
+            &opts.execution_priority_by_category,
+            &capabilities.execution_priority_ranges,
+        )?;
 
         let download_hash_digest_function = select_download_hash_digest_function(
             &opts.digest_algorithms,
@@ -12224,6 +12251,136 @@ mod tests {
         Err(anyhow::anyhow!(
             "the stream ended without an ExecuteResponse"
         ))
+    }
+
+    /// A raw server that advertises BuildBuddy's execution priority range, -1000 to 1000
+    /// (enterprise/server/remote_execution/capabilities_server), records the
+    /// `ExecutionPolicy.priority` of each Execute it gets, and finishes each action.
+    async fn serve_execution_priorities()
+    -> anyhow::Result<(String, Arc<Mutex<Vec<i32>>>, tokio::task::JoinHandle<()>)> {
+        use re_grpc_proto::build::bazel::remote::execution::v2::ServerCapabilities;
+        use re_grpc_proto::build::bazel::remote::execution::v2::priority_capabilities;
+
+        let capabilities = ServerCapabilities {
+            low_api_version: Some(semver(2, 0, 0)),
+            high_api_version: Some(semver(2, 3, 0)),
+            execution_capabilities: Some(ExecutionCapabilities {
+                exec_enabled: true,
+                execution_priority_capabilities: Some(PriorityCapabilities {
+                    priorities: vec![priority_capabilities::PriorityRange {
+                        min_priority: -1000,
+                        max_priority: 1000,
+                    }],
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+        .encode_to_vec();
+        let priorities = Arc::new(Mutex::new(Vec::new()));
+        let (address, _log, server) = serve_raw_h2({
+            let priorities = priorities.clone();
+            move |body| match GExecuteRequest::decode(body) {
+                Ok(GExecuteRequest {
+                    action_digest: Some(_),
+                    execution_policy,
+                    ..
+                }) => {
+                    priorities
+                        .lock()
+                        .unwrap()
+                        .push(execution_policy.unwrap_or_default().priority);
+                    RawReply::Operation(done_operation(), RawTrailers::After(Duration::ZERO))
+                }
+                // GetCapabilities, whose request carries no action digest.
+                _ => RawReply::Unary(capabilities.clone()),
+            }
+        })
+        .await?;
+        Ok((address, priorities, server))
+    }
+
+    /// A client of `address` that queries its capabilities, as a client of BuildBuddy does.
+    async fn priority_client(
+        address: String,
+        by_category: &str,
+    ) -> anyhow::Result<REClient> {
+        REClientBuilder::build_and_connect(&Buck2OssReConfiguration {
+            cas_address: Some(address.clone()),
+            engine_address: Some(address.clone()),
+            action_cache_address: Some(address),
+            tls: Some(false),
+            capabilities: Some(true),
+            engine_connection_count: Some(1),
+            retries: Some(0),
+            retry_max_delay_ms: Some(10),
+            execution_priority_by_category: by_category
+                .parse()
+                .map_err(|err| anyhow::anyhow!("{err}"))?,
+            ..Default::default()
+        })
+        .await
+    }
+
+    #[tokio::test]
+    async fn execute_sends_the_priority_of_the_action_category() -> anyhow::Result<()> {
+        let (address, priorities, server) = serve_execution_priorities().await?;
+        let by_category = "haskell_compile_shared:-100,haskell_link:100";
+        let client = priority_client(address, by_category).await?;
+        let by_category: ExecutionPriorityByCategory = by_category
+            .parse()
+            .map_err(|err| anyhow::anyhow!("{err}"))?;
+
+        for category in ["haskell_compile_shared", "haskell_link", "write"] {
+            let metadata = RemoteExecutionMetadata {
+                action_mnemonic: Some(category.to_owned()),
+                ..Default::default()
+            };
+            // As buck2_execute src/re/client.rs builds the policy of an action that sets no
+            // priority of its own, on an executor that sets none either.
+            let execution_policy = TExecutionPolicy {
+                priority: by_category.resolve(None, metadata.action_mnemonic.as_deref(), None),
+                ..Default::default()
+            };
+            let mut stream = client
+                .execute_with_progress(
+                    &metadata,
+                    ExecuteRequest {
+                        action_digest: TDigest {
+                            hash: "ab".repeat(32),
+                            size_in_bytes: 1,
+                            _dot_dot: (),
+                        },
+                        execution_policy: Some(execution_policy),
+                        ..Default::default()
+                    },
+                )
+                .await?;
+            while stream.try_next().await?.is_some() {}
+        }
+
+        assert_eq!(*priorities.lock().unwrap(), vec![-100, 100, 0]);
+        server.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_category_priority_outside_the_server_range_fails_the_connect()
+    -> anyhow::Result<()> {
+        let (address, priorities, server) = serve_execution_priorities().await?;
+
+        let err = match priority_client(address, "haskell_compile_shared:-100,haskell_link:5000")
+            .await
+        {
+            Ok(_) => panic!("a client with an out-of-range category priority connected"),
+            Err(err) => format!("{err:#}"),
+        };
+
+        assert!(err.contains("category `haskell_link` priority 5000"), "{err}");
+        assert!(err.contains("-1000-1000"), "{err}");
+        assert!(priorities.lock().unwrap().is_empty());
+        server.abort();
+        Ok(())
     }
 
     /// A cache that never answers: tonic ends each attempt at the request timeout with CANCELLED
