@@ -13490,8 +13490,7 @@ mod tests {
         events
     }
 
-    const LCOV_DIGEST: &str =
-        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef:42";
+    const LCOV_DIGEST: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef:42";
 
     fn test_output_file(path: &str, digest: &str, size_bytes: u64) -> buck2_data::TestOutputFile {
         buck2_data::TestOutputFile {
@@ -13624,10 +13623,8 @@ mod tests {
 
     #[test]
     fn test_result_lists_only_the_coverage_report_without_upload_test_outputs() {
-        let mut converter = BazelEventConverter::new_with_options(
-            std::iter::empty::<(String, String)>(),
-            true,
-        );
+        let mut converter =
+            BazelEventConverter::new_with_options(std::iter::empty::<(String, String)>(), true);
         converter.set_upload_test_outputs(false);
 
         let outputs = test_result_outputs(
