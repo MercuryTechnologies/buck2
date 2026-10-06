@@ -474,6 +474,8 @@ impl InvocationRecorder {
                 #[cfg(not(fbcode_build))]
                 upload_successful_action_events: true,
                 #[cfg(not(fbcode_build))]
+                upload_test_outputs: false,
+                #[cfg(not(fbcode_build))]
                 bazel_artifact_upload_backend: None,
                 #[cfg(not(fbcode_build))]
                 re_client_cas_address: None,
@@ -715,6 +717,8 @@ impl InvocationRecorder {
                 bazel_artifact_upload: true,
                 #[cfg(not(fbcode_build))]
                 upload_successful_action_events: true,
+                #[cfg(not(fbcode_build))]
+                upload_test_outputs: false,
                 #[cfg(not(fbcode_build))]
                 bazel_artifact_upload_backend: None,
                 #[cfg(not(fbcode_build))]
