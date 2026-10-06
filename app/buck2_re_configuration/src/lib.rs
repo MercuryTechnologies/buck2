@@ -1170,22 +1170,23 @@ mod tests {
             "haskell_link:100,",
             "haskell_link:99999999999",
         ] {
-            let err = priority_by_category(value)
-                .expect_err(value)
-                .to_string();
+            // The config layer wraps the parse error; `{:#}` prints the whole chain.
+            let err = format!("{:#}", priority_by_category(value).expect_err(value));
             assert!(err.contains("execution_priority_by_category"), "{value}: {err}");
         }
-        let err = priority_by_category("haskell_link:100, haskell_link 5")
-            .unwrap_err()
-            .to_string();
+        let err = format!(
+            "{:#}",
+            priority_by_category("haskell_link:100, haskell_link 5").unwrap_err()
+        );
         assert!(err.contains("`haskell_link 5`"), "{err}");
     }
 
     #[test]
     fn execution_priority_by_category_rejects_a_category_named_twice() {
-        let err = priority_by_category("haskell_link:100,haskell_link:-5")
-            .unwrap_err()
-            .to_string();
+        let err = format!(
+            "{:#}",
+            priority_by_category("haskell_link:100,haskell_link:-5").unwrap_err()
+        );
         assert!(err.contains("`haskell_link` more than once"), "{err}");
     }
 
