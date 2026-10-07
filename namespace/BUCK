@@ -1,4 +1,4 @@
-load("@root//buildbuddy:defs.bzl", "buildbuddy_remote_execution_platform")
+load("@root//buildbuddy:defs.bzl", "buildbuddy_remote_execution_platform", "local_execution_platform")
 
 oncall("build_infra")
 
@@ -11,6 +11,16 @@ buildbuddy_remote_execution_platform(
     cpu_configuration = "prelude//cpu:x86_64",
     os_configuration = "prelude//os:linux",
     os_family = "Linux",
+    visibility = ["PUBLIC"],
+)
+
+# The same toolchains on the machine running buck2, for `.buckconfig.local-musl`:
+# an x86_64 Linux host with glibc builds both release targets below, the
+# aarch64 one as a cross-compile, with no remote execution at all.
+local_execution_platform(
+    name = "local",
+    cpu_configuration = "prelude//cpu:x86_64",
+    os_configuration = "prelude//os:linux",
     visibility = ["PUBLIC"],
 )
 

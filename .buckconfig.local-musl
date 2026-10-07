@@ -1,0 +1,18 @@
+# Build buck2 with buck2 on this machine, with the pinned hermetic toolchains:
+#
+#   ./bootstrap/buck2 build //app/buck2:buck2-bin --config-file .buckconfig.local-musl \
+#       --target-platforms namespace//:linux-x86_64-musl
+#
+# `--target-platforms namespace//:linux-aarch64-musl` cross-compiles the aarch64
+# binary on an x86_64 host. The host needs glibc, because the pinned rustc is
+# x86_64-unknown-linux-gnu; the LLVM toolchain is a static musl build. The
+# release binaries come out static either way (namespace/BUCK).
+
+[cell_aliases]
+toolchains = buildbuddy_toolchains
+
+[build]
+execution_platforms = namespace//:local
+
+[buck2]
+digest_algorithms = BLAKE3
