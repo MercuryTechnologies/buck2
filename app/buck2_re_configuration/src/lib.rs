@@ -512,6 +512,10 @@ pub struct Buck2OssReConfiguration {
     pub use_fbcode_metadata: bool,
     /// Optional override for RequestMetadata.tool_details.tool_name.
     pub request_metadata_tool_name: Option<String>,
+    /// The name of an environment variable that every remotely executed action gets set to this
+    /// invocation's build id, through BuildBuddy's `x-buildbuddy-platform.env-overrides` header
+    /// on Execute, which leaves the Action and its digest as they are. Unset sends nothing.
+    pub invocation_env_override: Option<String>,
     /// The max size for a GRPC message to be decoded.
     pub max_decoding_message_size: Option<usize>,
     /// The max cumulative blob size for batch CAS methods.
@@ -732,6 +736,10 @@ impl Buck2OssReConfiguration {
             request_metadata_tool_name: legacy_config.parse(BuckconfigKeyRef {
                 section: BUCK2_RE_CLIENT_CFG_SECTION,
                 property: "request_metadata_tool_name",
+            })?,
+            invocation_env_override: legacy_config.parse(BuckconfigKeyRef {
+                section: BUCK2_RE_CLIENT_CFG_SECTION,
+                property: "invocation_env_override",
             })?,
             max_decoding_message_size: legacy_config.parse(BuckconfigKeyRef {
                 section: BUCK2_RE_CLIENT_CFG_SECTION,
@@ -1155,6 +1163,33 @@ mod tests {
         let config = Buck2OssReConfiguration::from_legacy_config(&legacy_config, Vec::new())?;
 
         assert_eq!(config.request_metadata_tool_name.as_deref(), Some("bazel"));
+        Ok(())
+    }
+
+    #[test]
+    fn oss_config_parses_invocation_env_override() -> buck2_error::Result<()> {
+        let legacy_config = parse(
+            &[(
+                "config",
+                "[buck2_re_client]\ninvocation_env_override = GHC_WORKER_BUILD_KEY\n",
+            )],
+            "config",
+        )?;
+        let config = Buck2OssReConfiguration::from_legacy_config(&legacy_config, Vec::new())?;
+
+        assert_eq!(
+            config.invocation_env_override.as_deref(),
+            Some("GHC_WORKER_BUILD_KEY")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn oss_config_leaves_invocation_env_override_unset_by_default() -> buck2_error::Result<()> {
+        let legacy_config = parse(&[("config", "")], "config")?;
+        let config = Buck2OssReConfiguration::from_legacy_config(&legacy_config, Vec::new())?;
+
+        assert_eq!(config.invocation_env_override, None);
         Ok(())
     }
 
