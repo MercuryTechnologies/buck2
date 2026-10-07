@@ -1149,12 +1149,16 @@ async fn execute_stream(
                     // tonic returns the stream once the response headers are in, which the
                     // server sends with its first Operation. Only that wait is bounded: a
                     // grpc-timeout would end the whole stream, which lasts as long as the action.
-                    let execute = client.execute(with_re_metadata(
-                        request,
+                    let execute = client.execute(with_invocation_env_override(
+                        with_re_metadata(
+                            request,
+                            &metadata,
+                            use_fbcode_metadata,
+                            request_metadata_tool_name,
+                        ),
+                        grpc_clients.invocation_env_override.as_deref(),
                         &metadata,
-                        use_fbcode_metadata,
-                        request_metadata_tool_name,
-                    ));
+                    )?);
                     let response = if response_timeout.is_zero() {
                         execute.await?
                     } else {
@@ -3234,6 +3238,7 @@ pub struct REClientBuilder;
 impl REClientBuilder {
     pub async fn build_and_connect(opts: &Buck2OssReConfiguration) -> anyhow::Result<REClient> {
         let request_metadata_tool_name = request_metadata_tool_name_from_options(opts)?;
+        let invocation_env_override = invocation_env_override_from_options(opts)?;
         let tls_config = Arc::new(tokio::sync::OnceCell::new());
         let channel_settings = GrpcChannelSettings::from_options(opts);
         let credential_helper = CredentialHelperSettings::from_options(
@@ -3592,6 +3597,7 @@ impl REClientBuilder {
             ),
             credential_helper,
             cas_daemon,
+            invocation_env_override,
         };
 
         Ok(REClient::new(
@@ -4256,6 +4262,8 @@ pub struct GRPCClients {
     credential_helper: Option<Arc<CredentialHelper>>,
     /// Set when CAS and ByteStream go to an auto-started buck2-casd.
     cas_daemon: Option<Arc<CasDaemonLauncher>>,
+    /// See `with_invocation_env_override`; read where Execute is sent.
+    invocation_env_override: Option<String>,
 }
 
 impl GRPCClients {
@@ -9641,6 +9649,55 @@ fn with_re_metadata_timeout<T>(
     request
 }
 
+/// The BuildBuddy header that overrides a platform property for one Execute. The server puts
+/// header overrides in the execution task's platform overrides, outside the cached Action
+/// (server/util/platform/platform.go, `RemoteHeaderOverrides` and `WithRemoteHeaderOverride`,
+/// v2.310.0), and the executor sets each `NAME=VALUE` of `env-overrides` in the action's
+/// environment, so the action digest and its action cache entry stay what they were.
+const ENV_OVERRIDES_HEADER: &str = "x-buildbuddy-platform.env-overrides";
+
+/// `request` with `variable` set to the invocation's build id in its action's environment, for
+/// a backend that routes on the invocation from inside the action, as lab's GHC worker servers
+/// serve one build each. The build id is the one `with_re_metadata` reports as
+/// `tool_invocation_id`. Only Execute carries it: WaitExecution starts nothing.
+fn with_invocation_env_override<T>(
+    mut request: tonic::Request<T>,
+    variable: Option<&str>,
+    metadata: &RemoteExecutionMetadata,
+) -> anyhow::Result<tonic::Request<T>> {
+    let build_id = metadata
+        .buck_info
+        .as_ref()
+        .map_or("", |buck_info| buck_info.build_id.as_str());
+    if let Some(variable) = variable
+        && !build_id.is_empty()
+    {
+        request.metadata_mut().insert(
+            ENV_OVERRIDES_HEADER,
+            MetadataValue::try_from(format!("{variable}={build_id}"))
+                .with_context(|| format!("build id `{build_id}` is not a header value"))?,
+        );
+    }
+    Ok(request)
+}
+
+/// `invocation_env_override` checked as the name of one variable: `env-overrides` is a list of
+/// `NAME=VALUE` separated by commas, so a name with `=` or `,` in it would set something else.
+fn invocation_env_override_from_options(
+    opts: &Buck2OssReConfiguration,
+) -> anyhow::Result<Option<String>> {
+    match opts.invocation_env_override.as_deref() {
+        None => Ok(None),
+        Some(name) => {
+            anyhow::ensure!(
+                !name.is_empty() && !name.contains(['=', ',']) && !name.contains(char::is_whitespace),
+                "`invocation_env_override` must name one environment variable, got `{name}`"
+            );
+            Ok(Some(name.to_owned()))
+        }
+    }
+}
+
 /// Replace occurrences of $FOO in a string with the value of the env var $FOO.
 pub(crate) fn substitute_env_vars(s: &str) -> anyhow::Result<String> {
     substitute_env_vars_impl(s, |v| std::env::var(v))
@@ -9681,6 +9738,8 @@ mod tests {
     use re_grpc_proto::build::bazel::remote::execution::v2::FastCdc2020Params;
     use re_grpc_proto::build::bazel::remote::execution::v2::action_cache_server::ActionCache;
     use re_grpc_proto::build::bazel::remote::execution::v2::action_cache_server::ActionCacheServer;
+    use re_grpc_proto::build::bazel::remote::execution::v2::execution_server::Execution;
+    use re_grpc_proto::build::bazel::remote::execution::v2::execution_server::ExecutionServer;
     use re_grpc_proto::build::bazel::remote::execution::v2::batch_read_blobs_response;
     use re_grpc_proto::build::bazel::remote::execution::v2::batch_update_blobs_response;
     use tokio_stream::wrappers::TcpListenerStream;
@@ -10029,6 +10088,75 @@ mod tests {
             .expect("tool details should be set");
         assert_eq!(tool_details.tool_name, "bazel");
         assert_eq!(tool_details.tool_version, "version");
+    }
+
+    fn metadata_with_build_id(build_id: &str) -> RemoteExecutionMetadata {
+        RemoteExecutionMetadata {
+            buck_info: Some(BuckInfo {
+                build_id: build_id.to_owned(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn with_invocation_env_override_sets_the_build_id_in_the_action_env() -> anyhow::Result<()> {
+        let request = with_invocation_env_override(
+            tonic::Request::new(()),
+            Some("GHC_WORKER_BUILD_KEY"),
+            &metadata_with_build_id("8f3c2a5e-1b4d-4c7e-9a6f-0d2e3b4c5a6f"),
+        )?;
+
+        assert_eq!(
+            request
+                .metadata()
+                .get(ENV_OVERRIDES_HEADER)
+                .map(|value| value.to_str().unwrap().to_owned()),
+            Some("GHC_WORKER_BUILD_KEY=8f3c2a5e-1b4d-4c7e-9a6f-0d2e3b4c5a6f".to_owned())
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn with_invocation_env_override_sends_nothing_unset_or_without_a_build_id()
+    -> anyhow::Result<()> {
+        let unset = with_invocation_env_override(
+            tonic::Request::new(()),
+            None,
+            &metadata_with_build_id("build-id"),
+        )?;
+        let no_build_id = with_invocation_env_override(
+            tonic::Request::new(()),
+            Some("GHC_WORKER_BUILD_KEY"),
+            &metadata_with_build_id(""),
+        )?;
+
+        assert!(unset.metadata().get(ENV_OVERRIDES_HEADER).is_none());
+        assert!(no_build_id.metadata().get(ENV_OVERRIDES_HEADER).is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn invocation_env_override_from_options_rejects_more_than_one_name() {
+        for name in ["", "A=B", "A,B", "A B"] {
+            let opts = Buck2OssReConfiguration {
+                invocation_env_override: Some(name.to_owned()),
+                ..Default::default()
+            };
+            assert!(
+                invocation_env_override_from_options(&opts).is_err(),
+                "`{name}` was accepted"
+            );
+        }
+        let opts = Buck2OssReConfiguration {
+            invocation_env_override: Some("GHC_WORKER_BUILD_KEY".to_owned()),
+            ..Default::default()
+        };
+        assert_eq!(
+            invocation_env_override_from_options(&opts).unwrap().as_deref(),
+            Some("GHC_WORKER_BUILD_KEY")
+        );
     }
 
     fn status_for_code(code: TCode) -> Status {
@@ -12180,6 +12308,105 @@ mod tests {
             },
         )
         .await
+    }
+
+    /// An Execution service that records the `env-overrides` header of each Execute it is
+    /// sent and answers it with a finished operation.
+    #[derive(Default)]
+    struct EnvOverridesExecution {
+        seen: Arc<Mutex<Vec<Option<String>>>>,
+    }
+
+    #[tonic::async_trait]
+    impl Execution for EnvOverridesExecution {
+        type ExecuteStream = futures::stream::Iter<std::vec::IntoIter<Result<Operation, tonic::Status>>>;
+        type WaitExecutionStream =
+            futures::stream::Iter<std::vec::IntoIter<Result<Operation, tonic::Status>>>;
+
+        async fn execute(
+            &self,
+            request: tonic::Request<GExecuteRequest>,
+        ) -> Result<tonic::Response<Self::ExecuteStream>, tonic::Status> {
+            self.seen.lock().unwrap().push(
+                request
+                    .metadata()
+                    .get(ENV_OVERRIDES_HEADER)
+                    .map(|value| value.to_str().unwrap().to_owned()),
+            );
+            Ok(tonic::Response::new(futures::stream::iter(vec![Ok(
+                done_operation(),
+            )])))
+        }
+
+        async fn wait_execution(
+            &self,
+            _request: tonic::Request<WaitExecutionRequest>,
+        ) -> Result<tonic::Response<Self::WaitExecutionStream>, tonic::Status> {
+            Err(tonic::Status::unimplemented("the operation was done on Execute"))
+        }
+    }
+
+    /// The `env-overrides` header each of two Executes reached the server with: one from a
+    /// client given `invocation_env_override`, one from a client without it, both for a build
+    /// with id `build-1`.
+    async fn env_overrides_on_the_wire() -> anyhow::Result<Vec<Option<String>>> {
+        let execution = EnvOverridesExecution::default();
+        let seen = execution.seen.clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let address = format!("grpc://{}", listener.local_addr()?);
+        let server = tokio::spawn(
+            tonic::transport::Server::builder()
+                .add_service(ExecutionServer::new(execution))
+                .serve_with_incoming(TcpListenerStream::new(listener)),
+        );
+        let metadata = RemoteExecutionMetadata {
+            buck_info: Some(BuckInfo {
+                build_id: "build-1".to_owned(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        for invocation_env_override in [Some("GHC_WORKER_BUILD_KEY".to_owned()), None] {
+            let client = raw_h2_client_with(
+                address.clone(),
+                Buck2OssReConfiguration {
+                    retries: Some(0),
+                    invocation_env_override,
+                    ..Default::default()
+                },
+            )
+            .await?;
+            let mut stream = client
+                .execute_with_progress(
+                    &metadata,
+                    ExecuteRequest {
+                        action_digest: TDigest {
+                            hash: "ab".repeat(32),
+                            size_in_bytes: 1,
+                            _dot_dot: (),
+                        },
+                        ..Default::default()
+                    },
+                )
+                .await?;
+            while let Some(response) = stream.try_next().await? {
+                if response.execute_response.is_some() {
+                    break;
+                }
+            }
+        }
+        server.abort();
+        Ok(seen.lock().unwrap().clone())
+    }
+
+    #[tokio::test]
+    async fn execute_carries_the_build_id_env_override_only_when_configured()
+    -> anyhow::Result<()> {
+        assert_eq!(
+            env_overrides_on_the_wire().await?,
+            [Some("GHC_WORKER_BUILD_KEY=build-1".to_owned()), None]
+        );
+        Ok(())
     }
 
     /// `raw_h2_client`, with the rest of its configuration from `opts`.
