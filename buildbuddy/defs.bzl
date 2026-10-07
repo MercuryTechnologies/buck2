@@ -102,3 +102,33 @@ def buildbuddy_linux_x86_64_rbe(name, visibility = None, container_image = BUILD
         os_family = "Linux",
         **kwargs
     )
+
+def _local_execution_platform_impl(ctx):
+    configuration = _configuration(ctx)
+    label = ctx.label.raw_target()
+    platform = ExecutionPlatformInfo(
+        label = label,
+        configuration = configuration,
+        executor_config = CommandExecutorConfig(
+            local_enabled = True,
+            remote_enabled = False,
+            use_windows_path_separators = False,
+        ),
+    )
+    return [
+        DefaultInfo(),
+        platform,
+        PlatformInfo(label = str(label), configuration = configuration),
+        ExecutionPlatformRegistrationInfo(platforms = [platform]),
+    ]
+
+# Every action on this machine, with the same hermetic toolchains the remote
+# platforms use: a CI runner can build the release binaries without a remote
+# execution backend whose workers lack glibc for the pinned rustc.
+local_execution_platform = rule(
+    attrs = {
+        "cpu_configuration": attrs.dep(default = "prelude//cpu:x86_64", providers = [ConfigurationInfo]),
+        "os_configuration": attrs.dep(default = "prelude//os:linux", providers = [ConfigurationInfo]),
+    },
+    impl = _local_execution_platform_impl,
+)
