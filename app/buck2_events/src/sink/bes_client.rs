@@ -6658,4 +6658,101 @@ mod tests {
         );
         assert_eq!(report.unacked_events(), COMMAND_EVENTS_WITH_FINISH);
     }
+
+    // Scratch benchmark, not for merge: replays a client event log through the worker into an
+    // in-process server that acknowledges only at EOF, as BuildBuddy does, and reports the rate.
+    // Run: SINKBENCH_LOG=/path/build.pb cargo test --release --lib -p buck2_events sink_e2e -- --nocapture --ignored
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore]
+    async fn sink_e2e_bench() {
+        use buck2_cli_proto::command_progress;
+        let path = std::env::var("SINKBENCH_LOG").expect("SINKBENCH_LOG");
+        let limit: usize = std::env::var("SINKBENCH_LIMIT")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(usize::MAX);
+        let buf = std::fs::read(&path).unwrap();
+        let schedule = crate::schedule_type::SandcastleScheduleType::new().unwrap();
+        let (endpoint, _streams, _events) =
+            serve_bes_that_acks_at_eof_keeping_bazel_events(None).await;
+        let config = BesConfig {
+            buffer_size: 100_000,
+            event_format: BesEventFormat::Bazel,
+            upload_successful_action_events: true,
+            grpc_timeout: Duration::from_secs(30),
+            ..BesConfig::default()
+        };
+        let connection = ConnectionConfig {
+            endpoint,
+            headers: Vec::new(),
+            tls: BesTls::default(),
+            credential_helper: None,
+        };
+        let counters = Arc::new(CounterState::default());
+        let mut worker = WorkerState::new(config, connection, counters.clone());
+        let read_varint = |buf: &[u8], pos: &mut usize| -> Option<u64> {
+            let mut v = 0u64;
+            let mut shift = 0;
+            loop {
+                let b = *buf.get(*pos)?;
+                *pos += 1;
+                v |= ((b & 0x7f) as u64) << shift;
+                if b & 0x80 == 0 {
+                    return Some(v);
+                }
+                shift += 7;
+            }
+        };
+        let mut pos = 0usize;
+        let mut frames = 0u64;
+        let mut sent = 0usize;
+        let started = Instant::now();
+        let mut slowest = Duration::ZERO;
+        let mut over_1ms = 0u64;
+        while pos < buf.len() && sent < limit {
+            let Some(len) = read_varint(&buf, &mut pos) else { break };
+            let end = pos + len as usize;
+            let frame = &buf[pos..end];
+            pos = end;
+            frames += 1;
+            if frames == 1 {
+                continue;
+            }
+            let cp = buck2_cli_proto::CommandProgress::decode(frame).unwrap();
+            let Some(command_progress::Progress::Event(e)) = cp.progress else { continue };
+            let Some(data) = e.data.as_ref() else { continue };
+            if !crate::sink::scribe::should_send_event_data(data, &schedule, true, true) {
+                continue;
+            }
+            let message = Message {
+                category: String::new(),
+                message: e.encode_to_vec(),
+                message_key: Some(1),
+            };
+            let t = Instant::now();
+            drop(worker.send_message_with_retry(&message, false).await);
+            let took = t.elapsed();
+            slowest = slowest.max(took);
+            if took > Duration::from_millis(1) {
+                over_1ms += 1;
+            }
+            sent += 1;
+            if sent % 100_000 == 0 {
+                eprintln!(
+                    "sink_e2e progress sent={sent} elapsed_s={:.1} rate={:.0}/s",
+                    started.elapsed().as_secs_f64(),
+                    sent as f64 / started.elapsed().as_secs_f64()
+                );
+            }
+        }
+        let elapsed = started.elapsed().as_secs_f64();
+        let c = counters.snapshot();
+        eprintln!(
+            "sink_e2e sent={sent} elapsed_s={elapsed:.1} rate={:.0}/s slowest_ms={:.1} over_1ms={over_1ms} successes={} dropped={}",
+            sent as f64 / elapsed,
+            slowest.as_secs_f64() * 1e3,
+            c.successes,
+            c.dropped
+        );
+    }
 }

@@ -289,7 +289,7 @@ impl RemoteEventSink {
     }
 }
 
-fn should_send_event_data(
+pub(crate) fn should_send_event_data(
     data: &buck2_data::buck_event::Data,
     schedule_type: &SandcastleScheduleType,
     upload_successful_action_events: bool,
@@ -954,5 +954,136 @@ mod tests {
             false,
             false
         ));
+    }
+}
+
+// Scratch benchmark, not for merge: times each step a queued event takes through the sink.
+// Run: SINKBENCH_LOG=/path/build.pb cargo test --release --lib -p buck2_events sinkbench -- --nocapture --ignored
+#[cfg(test)]
+mod sinkbench {
+    use std::collections::BTreeMap;
+    use std::time::Duration;
+    use std::time::Instant;
+
+    use buck2_cli_proto::command_progress;
+    use prost::Message as _;
+
+    use super::*;
+    use crate::sink::bazel_converter::BazelEventConverter;
+    use crate::sink::bazel_converter::encode_bep_event;
+
+    fn read_varint(buf: &[u8], pos: &mut usize) -> Option<u64> {
+        let mut v = 0u64;
+        let mut shift = 0;
+        loop {
+            let b = *buf.get(*pos)?;
+            *pos += 1;
+            v |= ((b & 0x7f) as u64) << shift;
+            if b & 0x80 == 0 {
+                return Some(v);
+            }
+            shift += 7;
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn sinkbench() {
+        let path = std::env::var("SINKBENCH_LOG").expect("SINKBENCH_LOG");
+        let schedule = SandcastleScheduleType::new().unwrap();
+        let buf = std::fs::read(&path).unwrap();
+        let mut converter =
+            BazelEventConverter::new_with_options(Vec::<(String, String)>::new(), true);
+        let mut pos = 0usize;
+        let mut frames = 0u64;
+        let (mut offered, mut bazel_out, mut no_output) = (0u64, 0u64, 0u64);
+        let (mut t_encode, mut t_decode, mut t_convert, mut t_bep) =
+            (Duration::ZERO, Duration::ZERO, Duration::ZERO, Duration::ZERO);
+        let mut no_output_by_kind: BTreeMap<String, u64> = BTreeMap::new();
+        let mut seq = 0i64;
+        while pos < buf.len() {
+            let Some(len) = read_varint(&buf, &mut pos) else { break };
+            let end = pos + len as usize;
+            if end > buf.len() {
+                break;
+            }
+            let frame = &buf[pos..end];
+            pos = end;
+            frames += 1;
+            if frames == 1 {
+                continue;
+            }
+            let cp = buck2_cli_proto::CommandProgress::decode(frame).unwrap();
+            let Some(command_progress::Progress::Event(e)) = cp.progress else { continue };
+            let Some(data) = e.data.as_ref() else { continue };
+            if !should_send_event_data(data, &schedule, true, true) {
+                continue;
+            }
+            offered += 1;
+            // Producer: what RemoteEventSink::encode_message does.
+            let t = Instant::now();
+            let mut ev = e.clone();
+            if let Some(d) = ev.data.as_mut() {
+                smart_truncate_event_preserving_logs(d);
+            }
+            RemoteEventSink::prepare_event(&mut ev);
+            let bytes = ev.encode_to_vec();
+            t_encode += t.elapsed();
+            // Worker: ParsedMessage::from_message's decode, then the converter, then BEP encode.
+            let t = Instant::now();
+            let decoded = buck2_data::BuckEvent::decode(bytes.as_slice()).unwrap();
+            let _payload = bytes.clone();
+            t_decode += t.elapsed();
+            let t = Instant::now();
+            let out = converter.convert(seq, &decoded);
+            t_convert += t.elapsed();
+            let t = Instant::now();
+            for b in &out {
+                seq += 1;
+                std::hint::black_box(encode_bep_event(b));
+            }
+            t_bep += t.elapsed();
+            if out.is_empty() {
+                no_output += 1;
+                let name = |d: String| {
+                    d.strip_prefix("Some(")
+                        .unwrap_or(&d)
+                        .split(['(', ' ', '{'])
+                        .next()
+                        .unwrap_or("")
+                        .to_owned()
+                };
+                let kind = match decoded.data.as_ref() {
+                    Some(buck2_data::buck_event::Data::SpanStart(s)) => {
+                        format!("SpanStart/{}", name(format!("{:?}", s.data)))
+                    }
+                    Some(buck2_data::buck_event::Data::SpanEnd(s)) => {
+                        format!("SpanEnd/{}", name(format!("{:?}", s.data)))
+                    }
+                    Some(buck2_data::buck_event::Data::Instant(s)) => {
+                        format!("Instant/{}", name(format!("{:?}", s.data)))
+                    }
+                    _ => "other".to_owned(),
+                };
+                *no_output_by_kind.entry(kind).or_default() += 1;
+            } else {
+                bazel_out += out.len() as u64;
+            }
+        }
+        let us = |d: Duration| d.as_secs_f64() * 1e6 / offered.max(1) as f64;
+        eprintln!("sinkbench offered={offered} bazel_events={bazel_out} offered_without_output={no_output}");
+        eprintln!(
+            "sinkbench per_offered_us encode={:.2} decode={:.2} convert={:.2} bep_encode={:.2} total_s={:.1}",
+            us(t_encode),
+            us(t_decode),
+            us(t_convert),
+            us(t_bep),
+            (t_encode + t_decode + t_convert + t_bep).as_secs_f64()
+        );
+        let mut top: Vec<_> = no_output_by_kind.into_iter().collect();
+        top.sort_by(|a, b| b.1.cmp(&a.1));
+        for (k, n) in top.iter().take(8) {
+            eprintln!("sinkbench no_output {n} {k}");
+        }
     }
 }
