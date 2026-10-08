@@ -1149,7 +1149,8 @@ async fn execute_stream(
                     // tonic returns the stream once the response headers are in, which the
                     // server sends with its first Operation. Only that wait is bounded: a
                     // grpc-timeout would end the whole stream, which lasts as long as the action.
-                    let execute = client.execute(with_invocation_env_override(
+                    let execute = client.execute(with_persistent_worker_key_per_build(
+                        with_invocation_env_override(
                         with_re_metadata(
                             request,
                             &metadata,
@@ -1157,6 +1158,9 @@ async fn execute_stream(
                             request_metadata_tool_name,
                         ),
                         grpc_clients.invocation_env_override.as_deref(),
+                        &metadata,
+                    )?,
+                        grpc_clients.persistent_worker_key_per_build,
                         &metadata,
                     )?);
                     let response = if response_timeout.is_zero() {
@@ -3239,6 +3243,7 @@ impl REClientBuilder {
     pub async fn build_and_connect(opts: &Buck2OssReConfiguration) -> anyhow::Result<REClient> {
         let request_metadata_tool_name = request_metadata_tool_name_from_options(opts)?;
         let invocation_env_override = invocation_env_override_from_options(opts)?;
+        let persistent_worker_key_per_build = opts.persistent_worker_key_per_build;
         let tls_config = Arc::new(tokio::sync::OnceCell::new());
         let channel_settings = GrpcChannelSettings::from_options(opts);
         let credential_helper = CredentialHelperSettings::from_options(
@@ -3598,6 +3603,7 @@ impl REClientBuilder {
             credential_helper,
             cas_daemon,
             invocation_env_override,
+            persistent_worker_key_per_build,
         };
 
         Ok(REClient::new(
@@ -4264,6 +4270,8 @@ pub struct GRPCClients {
     cas_daemon: Option<Arc<CasDaemonLauncher>>,
     /// See `with_invocation_env_override`; read where Execute is sent.
     invocation_env_override: Option<String>,
+    /// See `with_persistent_worker_key_per_build`; read where Execute is sent.
+    persistent_worker_key_per_build: bool,
 }
 
 impl GRPCClients {
@@ -9681,6 +9689,54 @@ fn with_invocation_env_override<T>(
     Ok(request)
 }
 
+/// The platform property buck2 sets on an action that runs on a Bazel-protocol persistent worker
+/// (`command_executor.rs`, `use_bazel_protocol_remote_persistent_workers`): a digest of the
+/// worker's own files, the same for every build.
+const PERSISTENT_WORKER_KEY_PROPERTY: &str = "persistentWorkerKey";
+
+/// The BuildBuddy header that overrides `persistentWorkerKey` for one Execute. The executor's
+/// runner pool matches a paused runner on the overridden key (runner.go, `pool.Get`, v2.310.0),
+/// while the Action, its digest and its action cache entry keep the property's own value.
+/// gRPC metadata keys are lowercase; BuildBuddy lowercases property names when it parses them.
+const PERSISTENT_WORKER_KEY_HEADER: &str = "x-buildbuddy-platform.persistentworkerkey";
+
+/// `request` with its action's `persistentWorkerKey` replaced, for this Execute only, by that key
+/// followed by `/` and the invocation's build id, so that each build is served by persistent
+/// workers of its own: a worker keeps state across the requests it serves, and a worker shared
+/// between builds can serve one build what it kept from another. The key comes from the
+/// action's own platform, which `metadata` carries, so two kinds of worker in one build keep
+/// apart. An action without the property, or a client without the option, sends nothing.
+fn with_persistent_worker_key_per_build<T>(
+    mut request: tonic::Request<T>,
+    enabled: bool,
+    metadata: &RemoteExecutionMetadata,
+) -> anyhow::Result<tonic::Request<T>> {
+    if !enabled {
+        return Ok(request);
+    }
+    let build_id = metadata
+        .buck_info
+        .as_ref()
+        .map_or("", |buck_info| buck_info.build_id.as_str());
+    let key = metadata.platform.as_ref().and_then(|platform| {
+        platform
+            .properties
+            .iter()
+            .find(|property| property.name == PERSISTENT_WORKER_KEY_PROPERTY)
+            .map(|property| property.value.as_str())
+    });
+    if let Some(key) = key
+        && !build_id.is_empty()
+    {
+        request.metadata_mut().insert(
+            PERSISTENT_WORKER_KEY_HEADER,
+            MetadataValue::try_from(format!("{key}/{build_id}"))
+                .with_context(|| format!("worker key `{key}` with build id `{build_id}` is not a header value"))?,
+        );
+    }
+    Ok(request)
+}
+
 /// `invocation_env_override` checked as the name of one variable: `env-overrides` is a list of
 /// `NAME=VALUE` separated by commas, so a name with `=` or `,` in it would set something else.
 fn invocation_env_override_from_options(
@@ -10100,6 +10156,70 @@ mod tests {
             }),
             ..Default::default()
         }
+    }
+
+    fn metadata_with_worker_key(build_id: &str, key: Option<&str>) -> RemoteExecutionMetadata {
+        RemoteExecutionMetadata {
+            platform: Some(crate::grpc::Platform {
+                properties: [("OSFamily", "Linux")]
+                    .into_iter()
+                    .chain(key.map(|key| (PERSISTENT_WORKER_KEY_PROPERTY, key)))
+                    .map(|(name, value)| crate::grpc::Property {
+                        name: name.to_owned(),
+                        value: value.to_owned(),
+                    })
+                    .collect(),
+            }),
+            ..metadata_with_build_id(build_id)
+        }
+    }
+
+    fn persistent_worker_key_header<T>(request: &tonic::Request<T>) -> Option<String> {
+        request
+            .metadata()
+            .get(PERSISTENT_WORKER_KEY_HEADER)
+            .map(|value| value.to_str().unwrap().to_owned())
+    }
+
+    #[test]
+    fn with_persistent_worker_key_per_build_appends_the_build_id_to_the_actions_key()
+    -> anyhow::Result<()> {
+        let request = with_persistent_worker_key_per_build(
+            tonic::Request::new(()),
+            true,
+            &metadata_with_worker_key("build-1", Some("4f1c:213")),
+        )?;
+
+        assert_eq!(
+            persistent_worker_key_header(&request),
+            Some("4f1c:213/build-1".to_owned())
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn with_persistent_worker_key_per_build_sends_nothing_off_keyless_or_without_a_build_id()
+    -> anyhow::Result<()> {
+        let off = with_persistent_worker_key_per_build(
+            tonic::Request::new(()),
+            false,
+            &metadata_with_worker_key("build-1", Some("4f1c:213")),
+        )?;
+        let keyless = with_persistent_worker_key_per_build(
+            tonic::Request::new(()),
+            true,
+            &metadata_with_worker_key("build-1", None),
+        )?;
+        let no_build_id = with_persistent_worker_key_per_build(
+            tonic::Request::new(()),
+            true,
+            &metadata_with_worker_key("", Some("4f1c:213")),
+        )?;
+
+        assert_eq!(persistent_worker_key_header(&off), None);
+        assert_eq!(persistent_worker_key_header(&keyless), None);
+        assert_eq!(persistent_worker_key_header(&no_build_id), None);
+        Ok(())
     }
 
     #[test]
@@ -12314,15 +12434,15 @@ mod tests {
         .await
     }
 
-    /// An Execution service that records the `env-overrides` header of each Execute it is
-    /// sent and answers it with a finished operation.
+    /// An Execution service that records the `x-buildbuddy-platform.*` headers of each Execute
+    /// it is sent, sorted, and answers it with a finished operation.
     #[derive(Default)]
-    struct EnvOverridesExecution {
-        seen: Arc<Mutex<Vec<Option<String>>>>,
+    struct PlatformHeadersExecution {
+        seen: Arc<Mutex<Vec<Vec<(String, String)>>>>,
     }
 
     #[tonic::async_trait]
-    impl Execution for EnvOverridesExecution {
+    impl Execution for PlatformHeadersExecution {
         type ExecuteStream =
             futures::stream::Iter<std::vec::IntoIter<Result<Operation, tonic::Status>>>;
         type WaitExecutionStream =
@@ -12332,12 +12452,20 @@ mod tests {
             &self,
             request: tonic::Request<GExecuteRequest>,
         ) -> Result<tonic::Response<Self::ExecuteStream>, tonic::Status> {
-            self.seen.lock().unwrap().push(
-                request
-                    .metadata()
-                    .get(ENV_OVERRIDES_HEADER)
-                    .map(|value| value.to_str().unwrap().to_owned()),
-            );
+            let mut headers: Vec<(String, String)> = request
+                .metadata()
+                .iter()
+                .filter_map(|entry| match entry {
+                    tonic::metadata::KeyAndValueRef::Ascii(key, value)
+                        if key.as_str().starts_with("x-buildbuddy-platform.") =>
+                    {
+                        Some((key.as_str().to_owned(), value.to_str().unwrap().to_owned()))
+                    }
+                    _ => None,
+                })
+                .collect();
+            headers.sort();
+            self.seen.lock().unwrap().push(headers);
             Ok(tonic::Response::new(futures::stream::iter(vec![Ok(
                 done_operation(),
             )])))
@@ -12353,11 +12481,13 @@ mod tests {
         }
     }
 
-    /// The `env-overrides` header each of two Executes reached the server with: one from a
-    /// client given `invocation_env_override`, one from a client without it, both for a build
-    /// with id `build-1`.
-    async fn env_overrides_on_the_wire() -> anyhow::Result<Vec<Option<String>>> {
-        let execution = EnvOverridesExecution::default();
+    /// The `x-buildbuddy-platform.*` headers one Execute reached the server with, for each client
+    /// configuration in `configs`, all for a build with id `build-1` and an action whose platform
+    /// carries `persistentWorkerKey = 4f1c:213`.
+    async fn platform_headers_on_the_wire(
+        configs: Vec<Buck2OssReConfiguration>,
+    ) -> anyhow::Result<Vec<Vec<(String, String)>>> {
+        let execution = PlatformHeadersExecution::default();
         let seen = execution.seen.clone();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
         let address = format!("grpc://{}", listener.local_addr()?);
@@ -12366,20 +12496,13 @@ mod tests {
                 .add_service(ExecutionServer::new(execution))
                 .serve_with_incoming(TcpListenerStream::new(listener)),
         );
-        let metadata = RemoteExecutionMetadata {
-            buck_info: Some(BuckInfo {
-                build_id: "build-1".to_owned(),
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
-        for invocation_env_override in [Some("GHC_WORKER_BUILD_KEY".to_owned()), None] {
+        let metadata = metadata_with_worker_key("build-1", Some("4f1c:213"));
+        for config in configs {
             let client = raw_h2_client_with(
                 address.clone(),
                 Buck2OssReConfiguration {
                     retries: Some(0),
-                    invocation_env_override,
-                    ..Default::default()
+                    ..config
                 },
             )
             .await?;
@@ -12404,6 +12527,53 @@ mod tests {
         }
         server.abort();
         Ok(seen.lock().unwrap().clone())
+    }
+
+    /// The `env-overrides` header of each of two Executes: one from a client given
+    /// `invocation_env_override`, one from a client without it.
+    async fn env_overrides_on_the_wire() -> anyhow::Result<Vec<Option<String>>> {
+        let seen = platform_headers_on_the_wire(vec![
+            Buck2OssReConfiguration {
+                invocation_env_override: Some("GHC_WORKER_BUILD_KEY".to_owned()),
+                ..Default::default()
+            },
+            Buck2OssReConfiguration::default(),
+        ])
+        .await?;
+        Ok(seen
+            .into_iter()
+            .map(|headers| {
+                headers
+                    .into_iter()
+                    .find(|(key, _)| key == ENV_OVERRIDES_HEADER)
+                    .map(|(_, value)| value)
+            })
+            .collect())
+    }
+
+    #[tokio::test]
+    async fn execute_carries_the_per_build_worker_key_only_when_configured()
+    -> anyhow::Result<()> {
+        let seen = platform_headers_on_the_wire(vec![
+            Buck2OssReConfiguration {
+                persistent_worker_key_per_build: true,
+                ..Default::default()
+            },
+            Buck2OssReConfiguration::default(),
+        ])
+        .await?;
+
+        assert_eq!(
+            seen,
+            [
+                vec![(
+                    PERSISTENT_WORKER_KEY_HEADER.to_owned(),
+                    "4f1c:213/build-1".to_owned()
+                )],
+                vec![],
+            ]
+        );
+        Ok(())
     }
 
     #[tokio::test]

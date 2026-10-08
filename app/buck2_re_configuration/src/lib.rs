@@ -516,6 +516,11 @@ pub struct Buck2OssReConfiguration {
     /// invocation's build id, through BuildBuddy's `x-buildbuddy-platform.env-overrides` header
     /// on Execute, which leaves the Action and its digest as they are. Unset sends nothing.
     pub invocation_env_override: Option<String>,
+    /// Send each remotely executed action that has a `persistentWorkerKey` that key with this
+    /// invocation's build id appended, as BuildBuddy's `x-buildbuddy-platform.persistentWorkerKey`
+    /// header on Execute, so a build gets persistent workers of its own while the Action and its
+    /// digest keep the build-independent key. Off by default.
+    pub persistent_worker_key_per_build: bool,
     /// The max size for a GRPC message to be decoded.
     pub max_decoding_message_size: Option<usize>,
     /// The max cumulative blob size for batch CAS methods.
@@ -741,6 +746,12 @@ impl Buck2OssReConfiguration {
                 section: BUCK2_RE_CLIENT_CFG_SECTION,
                 property: "invocation_env_override",
             })?,
+            persistent_worker_key_per_build: legacy_config
+                .parse(BuckconfigKeyRef {
+                    section: BUCK2_RE_CLIENT_CFG_SECTION,
+                    property: "persistent_worker_key_per_build",
+                })?
+                .unwrap_or(false),
             max_decoding_message_size: legacy_config.parse(BuckconfigKeyRef {
                 section: BUCK2_RE_CLIENT_CFG_SECTION,
                 property: "max_decoding_message_size",
@@ -1190,6 +1201,22 @@ mod tests {
         let config = Buck2OssReConfiguration::from_legacy_config(&legacy_config, Vec::new())?;
 
         assert_eq!(config.invocation_env_override, None);
+        Ok(())
+    }
+
+    #[test]
+    fn oss_config_parses_persistent_worker_key_per_build() -> buck2_error::Result<()> {
+        let on = parse(
+            &[(
+                "config",
+                "[buck2_re_client]\npersistent_worker_key_per_build = true\n",
+            )],
+            "config",
+        )?;
+        let off = parse(&[("config", "")], "config")?;
+
+        assert!(Buck2OssReConfiguration::from_legacy_config(&on, Vec::new())?.persistent_worker_key_per_build);
+        assert!(!Buck2OssReConfiguration::from_legacy_config(&off, Vec::new())?.persistent_worker_key_per_build);
         Ok(())
     }
 
