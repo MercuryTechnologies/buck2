@@ -121,6 +121,7 @@ impl EventSinkWithStats for OtelEventSink {
             buffered: 0,
             dropped: 0,
             bytes_written: 0,
+            ..EventSinkStats::default()
         }
     }
 }
