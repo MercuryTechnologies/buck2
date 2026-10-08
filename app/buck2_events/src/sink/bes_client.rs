@@ -6896,7 +6896,7 @@ mod tests {
             worker.streams.contains_key(&invocation_id),
             failures(&counters)
         );
-        let _ = c;
+        eprintln!("sink_e2e counters={c:?}");
         let c = counters.snapshot();
         eprintln!(
             "sink_e2e sent={sent} elapsed_s={elapsed:.1} rate={:.0}/s slowest_ms={:.1} over_1ms={over_1ms} successes={} dropped={}",
