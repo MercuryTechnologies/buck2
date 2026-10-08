@@ -6671,6 +6671,58 @@ mod tests {
         assert_eq!(report.unacked_events(), COMMAND_EVENTS_WITH_FINISH);
     }
 
+
+    /// A TCP relay to `endpoint` (`http://host:port`) that holds every chunk `delay` before
+    /// passing it on, in both directions, buffering without bound so that only latency is added.
+    async fn delaying_relay(endpoint: &str, delay: Duration) -> String {
+        use tokio::io::AsyncReadExt;
+        use tokio::io::AsyncWriteExt;
+        let upstream = endpoint.trim_start_matches("http://").to_owned();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let address = listener.local_addr().expect("local addr");
+        tokio::spawn(async move {
+            loop {
+                let Ok((client, _)) = listener.accept().await else { return };
+                let Ok(server) = tokio::net::TcpStream::connect(&upstream).await else { return };
+                drop(client.set_nodelay(true));
+                drop(server.set_nodelay(true));
+                let (client_read, client_write) = client.into_split();
+                let (server_read, server_write) = server.into_split();
+                for (mut from, mut to) in [(
+                    Box::new(client_read) as Box<dyn tokio::io::AsyncRead + Unpin + Send>,
+                    Box::new(server_write) as Box<dyn tokio::io::AsyncWrite + Unpin + Send>,
+                ), (
+                    Box::new(server_read) as Box<dyn tokio::io::AsyncRead + Unpin + Send>,
+                    Box::new(client_write) as Box<dyn tokio::io::AsyncWrite + Unpin + Send>,
+                )] {
+                    let (tx, mut rx) = mpsc::unbounded_channel::<(Instant, Vec<u8>)>();
+                    tokio::spawn(async move {
+                        let mut buf = vec![0u8; 64 * 1024];
+                        loop {
+                            match from.read(&mut buf).await {
+                                Ok(0) | Err(_) => return,
+                                Ok(n) => {
+                                    if tx.send((Instant::now() + delay, buf[..n].to_vec())).is_err() {
+                                        return;
+                                    }
+                                }
+                            }
+                        }
+                    });
+                    tokio::spawn(async move {
+                        while let Some((due, chunk)) = rx.recv().await {
+                            tokio::time::sleep_until(due.into()).await;
+                            if to.write_all(&chunk).await.is_err() {
+                                return;
+                            }
+                        }
+                    });
+                }
+            }
+        });
+        format!("http://{address}")
+    }
+
     // Scratch benchmark, not for merge: replays a client event log through the worker into an
     // in-process server that acknowledges only at EOF, as BuildBuddy does, and reports the rate.
     // Run: SINKBENCH_LOG=/path/build.pb cargo test --release --lib -p buck2_events sink_e2e -- --nocapture --ignored
@@ -6703,6 +6755,15 @@ mod tests {
             None => {
                 let (endpoint, _streams, _events) =
                     serve_bes_that_acks_at_eof_keeping_bazel_events(None).await;
+                // SINKBENCH_DELAY_MS puts a relay in front that delays every byte by that much
+                // each way, so a round trip costs twice it, as a cross-region path does.
+                let endpoint = match std::env::var("SINKBENCH_DELAY_MS")
+                    .ok()
+                    .and_then(|v| v.parse::<u64>().ok())
+                {
+                    Some(delay_ms) => delaying_relay(&endpoint, Duration::from_millis(delay_ms)).await,
+                    None => endpoint,
+                };
                 (endpoint, Vec::new(), BesTls::default())
             }
         };
