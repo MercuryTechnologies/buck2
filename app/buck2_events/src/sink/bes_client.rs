@@ -6797,6 +6797,16 @@ mod tests {
         }
         let sending_s = started.elapsed().as_secs_f64();
         let invocation_id = worker.streams.keys().next().cloned().unwrap_or_default();
+        if let Some(stream) = worker.streams.values().next() {
+            let bytes: usize = stream.pending_unacked.iter().map(|r| r.encoded_len()).sum();
+            eprintln!(
+                "sink_e2e bazel_events={} pending_unacked={} pending_bytes={} last_sent={}",
+                stream.next_sequence_number - 1,
+                stream.pending_unacked.len(),
+                bytes,
+                stream.last_sent_sequence_number
+            );
+        }
         // As at a command's end: wait for the server to acknowledge everything sent.
         let deadline = Instant::now() + Duration::from_secs(1800);
         let report = worker
