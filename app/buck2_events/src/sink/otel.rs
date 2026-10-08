@@ -121,6 +121,8 @@ impl EventSinkWithStats for OtelEventSink {
             buffered: 0,
             dropped: 0,
             bytes_written: 0,
+            // No worker, so none of the BES sink worker timings.
+            ..EventSinkStats::default()
         }
     }
 }
