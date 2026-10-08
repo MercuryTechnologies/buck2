@@ -1645,6 +1645,22 @@ impl WorkerState {
                 .get_mut(&parsed.invocation_id)
                 .expect("stream was inserted");
             abandoned = stream.abandoned;
+            if parsed.is_command_end {
+                // The queue in front of this worker drops what it cannot hold (`offer`), and the
+                // count is the daemon's, so commands that overlap share their drops.
+                let dropped = self
+                    .counters
+                    .dropped
+                    .load(Ordering::Relaxed)
+                    .saturating_sub(stream.dropped_at_open);
+                if dropped > 0 {
+                    tracing::warn!(
+                        "BES sink: {dropped} events were dropped while invocation {} ran, so its BuildBuddy record is incomplete; [bes] buffer_size bounds the queue",
+                        parsed.invocation_id
+                    );
+                }
+                stream.bazel_converter.set_events_dropped(dropped);
+            }
             sequence_number = if abandoned {
                 self.counters.inc_dropped();
                 None
@@ -2542,6 +2558,8 @@ struct StreamState {
     saw_command_end: bool,
     pending_close: Option<PendingClose>,
     stream_finished_enqueued: bool,
+    /// The daemon-wide count of events dropped before the worker, when this stream opened.
+    dropped_at_open: u64,
     /// Set while the transport is down. A successful flush clears it.
     failing: Option<StreamFailure>,
     /// The sink gave up on this invocation: events are dropped and nothing reconnects.
@@ -2886,6 +2904,7 @@ impl StreamState {
                 build_metadata.iter().cloned(),
                 upload_successful_action_events,
             ),
+            dropped_at_open: counters.dropped.load(Ordering::Relaxed),
             bazel_artifact_uploader: bazel_artifact_upload_config
                 .map(|config| BazelArtifactUploader::new(config, counters)),
             last_sent_sequence_number: 0,

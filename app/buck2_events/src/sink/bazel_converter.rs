@@ -1243,6 +1243,9 @@ pub(crate) struct BazelEventConverter {
     emitted_completed_targets: BTreeSet<TargetKey>,
     test_cases: BTreeMap<TargetKey, Vec<TestCaseState>>,
     held_test_ends: BTreeMap<TargetKey, HeldTestEnd>,
+    /// Events the sink's queue dropped while this command ran, reported once as a tag.
+    events_dropped: u64,
+    events_dropped_reported: bool,
     test_progress_counts: BTreeMap<TargetKey, i32>,
     test_timeouts: BTreeMap<TargetKey, prost_types::Duration>,
     announced_event_ids: BTreeMap<Vec<u8>, bep::BuildEventId>,
@@ -1294,6 +1297,24 @@ impl BazelEventConverter {
 
     pub(crate) fn set_upload_test_outputs(&mut self, upload_test_outputs: bool) {
         self.upload_test_outputs = upload_test_outputs;
+    }
+
+    pub(crate) fn set_events_dropped(&mut self, events_dropped: u64) {
+        self.events_dropped = events_dropped;
+    }
+
+    /// BuildBuddy stores a `TAG_<name>` BuildMetadata key as the invocation tag `<name>=<value>`
+    /// (event_parser.go, fillInvocationFromBuildMetadata, v2.310.0), which makes a stream that
+    /// lost events findable in its Invocations table.
+    fn push_events_dropped(&mut self, events: &mut Vec<bep::BuildEvent>) {
+        if self.events_dropped == 0 || self.events_dropped_reported {
+            return;
+        }
+        self.events_dropped_reported = true;
+        events.push(self.build_metadata_event(&BTreeMap::from([(
+            "TAG_bes_dropped".to_owned(),
+            self.events_dropped.to_string(),
+        )])));
     }
 
     pub(crate) fn convert(
@@ -1452,6 +1473,7 @@ impl BazelEventConverter {
         match span_end.data.as_ref() {
             Some(buck2_data::span_end_event::Data::Command(command)) => {
                 self.push_all_held_test_events(events);
+                self.push_events_dropped(events);
                 self.emit_pending_pattern_expanded(&[], events, true);
                 self.emit_completed_updates_for_actions(events);
                 self.push_convenience_symlinks_identified(&[], events);
@@ -13467,6 +13489,47 @@ mod tests {
             announced < configured,
             "announced after its TargetConfigured"
         );
+    }
+
+    /// A command whose events the sink's queue dropped tells BuildBuddy so, once, as the tag
+    /// `bes_dropped=<n>`; a command that lost nothing carries no such tag.
+    #[test]
+    fn command_end_tags_the_events_the_sink_dropped() {
+        let command_end = || {
+            trace_event(buck2_data::buck_event::Data::SpanEnd(
+                buck2_data::SpanEndEvent {
+                    data: Some(buck2_data::span_end_event::Data::Command(
+                        buck2_data::CommandEnd {
+                            data: Some(buck2_data::command_end::Data::Build(
+                                buck2_data::BuildCommandEnd::default(),
+                            )),
+                            is_success: true,
+                            ..Default::default()
+                        },
+                    )),
+                    ..Default::default()
+                },
+            ))
+        };
+        let dropped_tags = |events: &[bep::BuildEvent]| {
+            events
+                .iter()
+                .filter_map(|event| match event.payload.as_ref() {
+                    Some(build_event::Payload::BuildMetadata(metadata)) => {
+                        metadata.metadata.get("TAG_bes_dropped").cloned()
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+
+        let mut lossless = BazelEventConverter::default();
+        assert!(dropped_tags(&lossless.convert(1, &command_end())).is_empty());
+
+        let mut lossy = BazelEventConverter::default();
+        lossy.set_events_dropped(105_873);
+        assert_eq!(dropped_tags(&lossy.convert(1, &command_end())), ["105873"]);
+        assert!(dropped_tags(&lossy.convert(2, &command_end())).is_empty());
     }
 
     /// Converts a test run's span end and then the stream's EndOfTestResults, the order a test
