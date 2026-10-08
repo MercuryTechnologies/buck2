@@ -621,6 +621,8 @@ impl EventSinkWithStats for RemoteEventSink {
             worker_upload_us: counters.worker_upload_us,
             worker_send_wait_us: counters.worker_send_wait_us,
             worker_transport_opens: counters.worker_transport_opens,
+            worker_upload_connect_us: counters.worker_upload_connect_us,
+            worker_upload_slot_wait_us: counters.worker_upload_slot_wait_us,
         }
     }
 }

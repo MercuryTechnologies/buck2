@@ -228,6 +228,8 @@ pub struct EventSinkStats {
     pub worker_upload_us: u64,
     pub worker_send_wait_us: u64,
     pub worker_transport_opens: u64,
+    pub worker_upload_connect_us: u64,
+    pub worker_upload_slot_wait_us: u64,
 }
 
 impl EventSinkStats {
@@ -250,6 +252,8 @@ impl EventSinkStats {
             worker_upload_us: _,
             worker_send_wait_us: _,
             worker_transport_opens: _,
+            worker_upload_connect_us: _,
+            worker_upload_slot_wait_us: _,
         } = self;
         *failures_invalid_request
             + *failures_unauthorized
