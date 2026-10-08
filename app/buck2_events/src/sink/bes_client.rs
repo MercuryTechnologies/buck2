@@ -150,6 +150,15 @@ pub struct BesChannelSettings {
     /// answering. The key's documentation speaks of downloads, the only use the remote
     /// execution client makes of it; an upload is the same wait in the other direction.
     pub bytestream_progress_timeout_secs: Option<u64>,
+    /// `[bes] http2_adaptive_window`: let the connection grow its HTTP/2 flow-control windows
+    /// to the measured bandwidth-delay product, as gRPC's servers do. A build streams its events
+    /// on one HTTP/2 stream, so a fixed window bounds them to a window per round trip.
+    pub http2_adaptive_window: Option<bool>,
+    /// `[bes] http2_initial_stream_window_bytes`: the stream's flow-control window, 64 KiB
+    /// (HTTP/2's default) when unset. Ignored with the adaptive window.
+    pub http2_initial_stream_window_bytes: Option<u32>,
+    /// `[bes] http2_initial_connection_window_bytes`: the connection's window, as above.
+    pub http2_initial_connection_window_bytes: Option<u32>,
 }
 
 impl BesChannelSettings {
@@ -170,6 +179,9 @@ impl BesChannelSettings {
                     .unwrap_or(DEFAULT_GRPC_KEEPALIVE_WHILE_IDLE),
             )
             .tcp_keepalive(self.tcp_keepalive_secs.map(Duration::from_secs))
+            .http2_adaptive_window(self.http2_adaptive_window.unwrap_or(false))
+            .initial_stream_window_size(self.http2_initial_stream_window_bytes)
+            .initial_connection_window_size(self.http2_initial_connection_window_bytes)
     }
 
     fn bytestream_progress_timeout(&self) -> Duration {
