@@ -1713,7 +1713,27 @@ impl WorkerState {
             }
             match self.flush_stream(&parsed.invocation_id).await {
                 Ok(()) => {
-                    if close_immediately {
+                    if close_immediately && !fail_fast {
+                        // BuildBuddy acknowledges a stream only once it has taken the whole of
+                        // it, so waiting here held every later command's events in the queue,
+                        // where they were dropped: on 2026-10-08 a test's first 95 s sent
+                        // nothing while the build before it was finalized. The stream finishes
+                        // among `closing`, which `close_due_streams` reaps and a drain awaits.
+                        match self
+                            .half_close_stream(&parsed.invocation_id, parsed.event_time)
+                            .await
+                        {
+                            Ok(closing) => {
+                                self.closing.extend(closing);
+                                self.counters.inc_success(parsed.payload_size as u64);
+                                return Ok(None);
+                            }
+                            Err(status) => {
+                                self.stream_failed(&parsed.invocation_id, &status);
+                                last_error = Some(status);
+                            }
+                        }
+                    } else if close_immediately {
                         match self
                             .close_stream(&parsed.invocation_id, parsed.event_time)
                             .await
@@ -4797,6 +4817,7 @@ mod tests {
         );
         send_queued_ok(&mut worker, &trace_id, command_end_data()).await;
         send_queued_ok(&mut worker, &trace_id, invocation_record_data()).await;
+        finish_closing(&mut worker).await;
 
         assert!(
             !worker.streams.contains_key(&invocation_id),
@@ -4911,6 +4932,7 @@ mod tests {
                 "fail_fast={fail_fast}"
             );
             send_queued_ok(&mut worker, &trace_id, invocation_record_data()).await;
+            finish_closing(&mut worker).await;
 
             // The command's start, its record and the stream's finish event, on one stream.
             assert_eq!(
@@ -5261,6 +5283,7 @@ mod tests {
         }
         send_queued_ok(&mut worker, &trace_id, command_end_data()).await;
         send_queued_ok(&mut worker, &trace_id, invocation_record_data()).await;
+        finish_closing(&mut worker).await;
 
         assert!(
             !worker.streams.contains_key(&invocation_id),
@@ -5809,6 +5832,7 @@ mod tests {
         assert_eq!(worker.streams[&invocation_id].replay_copies_dropped, 0);
         send_queued_ok(&mut worker, &trace_id, command_end_data()).await;
         send_queued_ok(&mut worker, &trace_id, invocation_record_data()).await;
+        finish_closing(&mut worker).await;
 
         assert!(!worker.streams.contains_key(&invocation_id));
         assert!(spill_files(spill_dir.path()).is_empty());
@@ -5902,6 +5926,7 @@ mod tests {
         );
         send_queued_ok(&mut worker, &trace_id, command_end_data()).await;
         send_queued_ok(&mut worker, &trace_id, invocation_record_data()).await;
+        finish_closing(&mut worker).await;
 
         assert!(!worker.streams.contains_key(&invocation_id));
         let events = (1 + actions + 2 + 1) as i64;
@@ -6392,6 +6417,18 @@ mod tests {
 
     const COMMAND_EVENTS_WITH_FINISH: u64 = 4;
 
+    /// Waits for the streams that records closed to be acknowledged, as a drain does: a record
+    /// half-closes its stream and leaves it among `closing`.
+    async fn finish_closing(worker: &mut WorkerState) {
+        worker
+            .drain(
+                DrainScope::FinishedCommands,
+                Instant::now() + Duration::from_secs(10),
+                std::future::pending(),
+            )
+            .await;
+    }
+
     async fn run_a_command(worker: &mut WorkerState) -> String {
         let trace_id = TraceId::new().to_string();
         send_queued_ok(worker, &trace_id, command_start_data()).await;
@@ -6432,6 +6469,45 @@ mod tests {
             vec![(1..=COMMAND_EVENTS_WITH_FINISH as i64).collect::<Vec<_>>()]
         );
         assert_eq!(failures(&counters), 0);
+    }
+
+    /// The record that ends a command closes its stream without waiting for the server to
+    /// acknowledge it, so the next command's events are taken while BuildBuddy finalizes the
+    /// last one, and a drain still waits for that acknowledgement.
+    #[tokio::test]
+    async fn the_next_command_is_taken_while_the_last_one_waits_for_its_acknowledgement() {
+        let endpoint = serve_bes_that_holds_acks_past_eof(Some(Duration::from_secs(1))).await;
+        let (mut worker, counters) = worker_for(endpoint);
+        let first = run_a_command(&mut worker).await;
+
+        let started = Instant::now();
+        send_queued_ok(&mut worker, &first, invocation_record_data()).await;
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "the record waited {:?} for the server",
+            started.elapsed()
+        );
+        assert!(!worker.streams.contains_key(&first));
+        assert_eq!(worker.closing.len(), 1);
+
+        let second = run_a_command(&mut worker).await;
+        assert!(worker.streams.contains_key(&second));
+        assert_eq!(counters.snapshot().dropped, 0);
+
+        let report = worker
+            .drain(
+                DrainScope::FinishedCommands,
+                Instant::now() + Duration::from_secs(10),
+                std::future::pending(),
+            )
+            .await;
+        assert!(
+            report
+                .streams
+                .contains(&drained(&first, StreamDrainOutcome::Acked)),
+            "{:?}",
+            report.streams
+        );
     }
 
     #[tokio::test]
