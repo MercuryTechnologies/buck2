@@ -486,9 +486,16 @@ struct BazelArtifactUploader {
     reported_failure: bool,
     repo_path: Option<PathBuf>,
     directory_outputs: HashSet<BepFileIdentity>,
+    /// Writes of inline contents still running. An event names its blob's URI, a function of the
+    /// blob's digest, before the blob is written, so the worker does not wait one round trip
+    /// per file: on 2026-10-08 those waits, 43,075 of them in one build, took 99% of its time.
+    in_flight: tokio::task::JoinSet<Result<(), Status>>,
     #[cfg(test)]
     test_writes: Vec<WriteRequest>,
 }
+
+/// Writes of inline contents in flight per stream; one more waits for one to finish.
+const MAX_UPLOADS_IN_FLIGHT: usize = 64;
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct BepFileIdentity {
@@ -519,6 +526,7 @@ impl BazelArtifactUploader {
             reported_failure: false,
             repo_path: None,
             directory_outputs: HashSet::new(),
+            in_flight: tokio::task::JoinSet::new(),
             #[cfg(test)]
             test_writes: Vec::new(),
         }
@@ -738,8 +746,7 @@ impl BazelArtifactUploader {
             finish_write: true,
             data: contents.to_vec(),
         };
-        let response = self.write_request(request).await.ok()?;
-        if response.committed_size != size && response.committed_size != -1 {
+        if !self.write_in_background(request, size).await {
             return None;
         }
         let uri = bytestream_uri(
@@ -749,6 +756,126 @@ impl BazelArtifactUploader {
             size,
         );
         Some((uri, format!("{hash}:{size}"), size))
+    }
+
+    /// Starts `request`'s write and returns whether it started, after waiting for a slot when
+    /// `MAX_UPLOADS_IN_FLIGHT` are running. A write that fails later is counted and warned about
+    /// like a failed write was; its event names a blob the server does not have.
+    async fn write_in_background(&mut self, request: WriteRequest, size: i64) -> bool {
+        #[cfg(test)]
+        if self.config.endpoint == "test://bytestream" {
+            return self.write_request(request).await.is_ok_and(|response| {
+                response.committed_size == size || response.committed_size == -1
+            });
+        }
+        if self.timed_out {
+            return false;
+        }
+        self.reap_finished_uploads();
+        while self.in_flight.len() >= MAX_UPLOADS_IN_FLIGHT {
+            if let Some(joined) = self.in_flight.join_next().await {
+                self.record_upload(joined);
+            }
+        }
+        let client = match self.client().await {
+            Ok(client) => client,
+            Err(status) => {
+                self.record_upload(Ok(Err(status)));
+                return false;
+            }
+        };
+        let config = self.config.clone();
+        self.in_flight.spawn(async move {
+            let response =
+                write_with_progress_timeout(client, &config, tokio_stream::iter(vec![request]))
+                    .await?;
+            if response.committed_size != size && response.committed_size != -1 {
+                return Err(Status::data_loss(format!(
+                    "ByteStream Write committed {} of {size} bytes",
+                    response.committed_size
+                )));
+            }
+            Ok(())
+        });
+        true
+    }
+
+    fn reap_finished_uploads(&mut self) {
+        while let Some(joined) = self.in_flight.try_join_next() {
+            self.record_upload(joined);
+        }
+    }
+
+    /// Waits for this stream's writes until `deadline`, and gives up on the rest, so that the
+    /// stream ends only once the blobs its events name are written, as when each write was
+    /// awaited in turn.
+    async fn finish_uploads(&mut self, deadline: Instant) {
+        loop {
+            match tokio::time::timeout_at(
+                tokio::time::Instant::from_std(deadline),
+                self.in_flight.join_next(),
+            )
+            .await
+            {
+                Ok(Some(joined)) => self.record_upload(joined),
+                Ok(None) => return,
+                Err(_) => {
+                    let abandoned = self.in_flight.len();
+                    self.in_flight.abort_all();
+                    self.record_upload(Ok(Err(Status::deadline_exceeded(format!(
+                        "{abandoned} artifact uploads were still running when the stream ended"
+                    )))));
+                    return;
+                }
+            }
+        }
+    }
+
+    fn record_upload(&mut self, joined: Result<Result<(), Status>, tokio::task::JoinError>) {
+        let status = match joined {
+            Ok(Ok(())) => return,
+            Ok(Err(status)) => status,
+            Err(e) if e.is_cancelled() => return,
+            Err(e) => Status::internal(e.to_string()),
+        };
+        if status.code() == tonic::Code::DeadlineExceeded {
+            if !self.timed_out {
+                self.timed_out = true;
+                self.client = None;
+                tracing::warn!(
+                    "BES sink: artifact upload to {} gave up, and this stream uploads no more: {}",
+                    self.config.endpoint,
+                    status.message()
+                );
+            }
+            self.counters.inc_failures_timed_out();
+        } else {
+            self.counters.inc_failures_internal_error();
+            if !self.reported_failure {
+                self.reported_failure = true;
+                tracing::warn!(
+                    "BES sink: artifact upload to {} failed, and the event names a blob the server lacks: {}",
+                    self.config.endpoint,
+                    status
+                );
+            }
+        }
+    }
+
+    async fn client(&mut self) -> Result<ByteStreamClient<Channel>, Status> {
+        if let Some(client) = &self.client {
+            return Ok(client.clone());
+        }
+        let endpoint = endpoint_for(
+            &self.config.endpoint,
+            self.config.grpc_timeout,
+            &self.config.tls,
+            &self.config.channel,
+        )?;
+        let client =
+            ByteStreamClient::new(connect_within(&endpoint, self.config.grpc_timeout).await?);
+        self.client = Some(client.clone());
+        Ok(client)
     }
 
     async fn upload_local_file(&mut self, path: &Path, size: i64) -> Option<(String, String, i64)> {
@@ -770,6 +897,7 @@ impl BazelArtifactUploader {
         Some((uri, format!("{hash}:{size}"), size))
     }
 
+    #[cfg(test)]
     async fn write_request(
         &mut self,
         request: WriteRequest,
@@ -777,6 +905,7 @@ impl BazelArtifactUploader {
         self.write_requests(vec![request]).await
     }
 
+    #[cfg(test)]
     async fn write_requests(
         &mut self,
         requests: Vec<WriteRequest>,
@@ -856,59 +985,54 @@ impl BazelArtifactUploader {
         &mut self,
         outbound: impl futures::Stream<Item = WriteRequest> + Send + 'static,
     ) -> Result<google_grpc_proto::google::bytestream::WriteResponse, Status> {
-        let progress_timeout = self.config.channel.bytestream_progress_timeout();
-        let mut client = match &self.client {
-            Some(client) => client.clone(),
-            None => {
-                let endpoint = endpoint_for(
-                    &self.config.endpoint,
-                    self.config.grpc_timeout,
-                    &self.config.tls,
-                    &self.config.channel,
-                )?;
-                let client = ByteStreamClient::new(
-                    connect_within(&endpoint, self.config.grpc_timeout).await?,
-                );
-                self.client = Some(client.clone());
-                client
-            }
-        };
-        let started = tokio::time::Instant::now();
-        let last_progress_millis = Arc::new(AtomicU64::new(0));
-        let outbound = {
-            let last_progress_millis = last_progress_millis.clone();
-            futures::StreamExt::inspect(outbound, move |_| {
-                last_progress_millis.store(
-                    u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
-                    Ordering::Relaxed,
-                );
-            })
-        };
-        let mut request = tonic::Request::new(outbound);
-        attach_headers(
-            &mut request,
-            &self.config.headers,
-            self.config.credential_helper.as_deref(),
-            &self.config.endpoint,
-        )
-        .await?;
-        let write = client.write(request);
-        tokio::pin!(write);
-        loop {
-            let deadline = started
-                + Duration::from_millis(last_progress_millis.load(Ordering::Relaxed))
-                + progress_timeout;
-            tokio::select! {
-                response = &mut write => return Ok(response?.into_inner()),
-                () = tokio::time::sleep_until(deadline) => {
-                    let deadline = started
-                        + Duration::from_millis(last_progress_millis.load(Ordering::Relaxed))
-                        + progress_timeout;
-                    if tokio::time::Instant::now() >= deadline {
-                        return Err(Status::deadline_exceeded(format!(
-                            "ByteStream Write made no progress for {progress_timeout:?}"
-                        )));
-                    }
+        let client = self.client().await?;
+        write_with_progress_timeout(client, &self.config, outbound).await
+    }
+}
+
+/// One ByteStream Write, given up when its stream goes `bytestream_progress_timeout` without the
+/// transport taking a chunk or the server answering.
+async fn write_with_progress_timeout(
+    mut client: ByteStreamClient<Channel>,
+    config: &BazelArtifactUploadConfig,
+    outbound: impl futures::Stream<Item = WriteRequest> + Send + 'static,
+) -> Result<google_grpc_proto::google::bytestream::WriteResponse, Status> {
+    let progress_timeout = config.channel.bytestream_progress_timeout();
+    let started = tokio::time::Instant::now();
+    let last_progress_millis = Arc::new(AtomicU64::new(0));
+    let outbound = {
+        let last_progress_millis = last_progress_millis.clone();
+        futures::StreamExt::inspect(outbound, move |_| {
+            last_progress_millis.store(
+                u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                Ordering::Relaxed,
+            );
+        })
+    };
+    let mut request = tonic::Request::new(outbound);
+    attach_headers(
+        &mut request,
+        &config.headers,
+        config.credential_helper.as_deref(),
+        &config.endpoint,
+    )
+    .await?;
+    let write = client.write(request);
+    tokio::pin!(write);
+    loop {
+        let deadline = started
+            + Duration::from_millis(last_progress_millis.load(Ordering::Relaxed))
+            + progress_timeout;
+        tokio::select! {
+            response = &mut write => return Ok(response?.into_inner()),
+            () = tokio::time::sleep_until(deadline) => {
+                let deadline = started
+                    + Duration::from_millis(last_progress_millis.load(Ordering::Relaxed))
+                    + progress_timeout;
+                if tokio::time::Instant::now() >= deadline {
+                    return Err(Status::deadline_exceeded(format!(
+                        "ByteStream Write made no progress for {progress_timeout:?}"
+                    )));
                 }
             }
         }
@@ -2602,6 +2726,9 @@ impl ClosingStream {
     /// Waits for the server to end the stream, until the deadline. An error carries the
     /// number of events the server did not acknowledge.
     async fn finish(mut self) -> Result<(), (Status, u64)> {
+        if let Some(uploader) = self.stream.bazel_artifact_uploader.as_mut() {
+            uploader.finish_uploads(self.deadline).await;
+        }
         let Some(ack_task) = self.stream.ack_task.as_mut() else {
             return Err((
                 Status::unavailable("BES stream was closed before finish acknowledgement"),
@@ -6045,6 +6172,97 @@ mod tests {
         endpoint
     }
 
+    /// Answers each Write `delay` after its last chunk, committing every byte, and counts
+    /// the Writes it answered.
+    struct SlowByteStream {
+        delay: Duration,
+        writes: Arc<AtomicU64>,
+    }
+
+    #[tonic::async_trait]
+    impl ByteStream for SlowByteStream {
+        type ReadStream = ReceiverStream<Result<ReadResponse, Status>>;
+
+        async fn read(
+            &self,
+            _request: tonic::Request<ReadRequest>,
+        ) -> Result<tonic::Response<Self::ReadStream>, Status> {
+            Err(Status::unimplemented("read"))
+        }
+
+        async fn write(
+            &self,
+            request: tonic::Request<tonic::Streaming<WriteRequest>>,
+        ) -> Result<tonic::Response<WriteResponse>, Status> {
+            let mut inbound = request.into_inner();
+            let mut committed_size = 0i64;
+            while let Ok(Some(chunk)) = inbound.message().await {
+                committed_size += i64::try_from(chunk.data.len()).unwrap_or(0);
+            }
+            tokio::time::sleep(self.delay).await;
+            self.writes.fetch_add(1, Ordering::SeqCst);
+            Ok(tonic::Response::new(WriteResponse { committed_size }))
+        }
+
+        async fn query_write_status(
+            &self,
+            _request: tonic::Request<QueryWriteStatusRequest>,
+        ) -> Result<tonic::Response<QueryWriteStatusResponse>, Status> {
+            Err(Status::unimplemented("query_write_status"))
+        }
+    }
+
+    /// A stream's inline files get their URIs without a round trip each, and its end waits
+    /// for them: 64 files against a server that takes 200 ms a Write were 12.8 s one by one.
+    #[tokio::test]
+    async fn inline_files_are_uploaded_off_the_event_path_and_finished_at_the_end() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let endpoint = format!("http://{}", listener.local_addr().expect("local addr"));
+        let writes = Arc::new(AtomicU64::new(0));
+        tokio::spawn(
+            tonic::transport::Server::builder()
+                .add_service(ByteStreamServer::new(SlowByteStream {
+                    delay: Duration::from_millis(200),
+                    writes: writes.clone(),
+                }))
+                .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener)),
+        );
+        let counters = Arc::new(CounterState::default());
+        let mut uploader = BazelArtifactUploader::new(
+            BazelArtifactUploadConfig {
+                endpoint,
+                ..test_artifact_upload_config()
+            },
+            counters.clone(),
+        );
+
+        let started = Instant::now();
+        for i in 0..64 {
+            let (uri, _digest, _size) = uploader
+                .upload_bytes(format!("stderr {i}").as_bytes())
+                .await
+                .expect("a URI for the file");
+            assert!(uri.starts_with("bytestream://"), "{uri}");
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "64 files took {:?} to get their URIs",
+            started.elapsed()
+        );
+        uploader
+            .finish_uploads(Instant::now() + Duration::from_secs(30))
+            .await;
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "64 Writes took {:?} in all",
+            started.elapsed()
+        );
+        assert_eq!(writes.load(Ordering::SeqCst), 64);
+        assert_eq!(counters.snapshot().failures_internal_error, 0);
+    }
+
     fn serve_silence() -> std::net::SocketAddr {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
         let address = listener.local_addr().expect("local addr");
@@ -6074,12 +6292,19 @@ mod tests {
             counters.clone(),
         );
 
-        let uploaded =
-            tokio::time::timeout(Duration::from_secs(10), uploader.upload_bytes(b"stdout")).await;
-        let Ok(uploaded) = uploaded else {
-            panic!("a Write the server never answered held the uploader past 10 s");
-        };
-        assert_eq!(uploaded, None);
+        // The event gets its URI without waiting for the Write.
+        let started = Instant::now();
+        assert!(uploader.upload_bytes(b"stdout").await.is_some());
+        assert!(started.elapsed() < Duration::from_millis(500));
+        let finished = tokio::time::timeout(
+            Duration::from_secs(10),
+            uploader.finish_uploads(Instant::now() + Duration::from_secs(30)),
+        )
+        .await;
+        assert!(
+            finished.is_ok(),
+            "a Write the server never answered held the stream's end past 10 s"
+        );
         assert_eq!(counters.snapshot().failures_timed_out, 1);
 
         // The stream's later files are not tried against the same server.
@@ -6091,6 +6316,7 @@ mod tests {
     #[tokio::test]
     async fn keepalive_ends_a_write_to_a_peer_that_stopped_answering() {
         let address = serve_silence();
+        let counters = Arc::new(CounterState::default());
         let mut uploader = BazelArtifactUploader::new(
             BazelArtifactUploadConfig {
                 endpoint: format!("http://{address}"),
@@ -6104,15 +6330,22 @@ mod tests {
                 },
                 ..test_artifact_upload_config()
             },
-            Arc::default(),
+            counters.clone(),
         );
 
-        let uploaded =
-            tokio::time::timeout(Duration::from_secs(15), uploader.upload_bytes(b"stdout")).await;
-        let Ok(uploaded) = uploaded else {
-            panic!("no keepalive ended a Write to a peer that never answered within 15 s");
-        };
-        assert_eq!(uploaded, None);
+        let ended = tokio::time::timeout(Duration::from_secs(15), async {
+            uploader.upload_bytes(b"stdout").await;
+            uploader
+                .finish_uploads(Instant::now() + Duration::from_secs(3600))
+                .await;
+        })
+        .await;
+        assert!(
+            ended.is_ok(),
+            "no keepalive ended a Write to a peer that never answered within 15 s"
+        );
+        let c = counters.snapshot();
+        assert_eq!(c.failures_timed_out + c.failures_internal_error, 1);
     }
 
     #[tokio::test]
