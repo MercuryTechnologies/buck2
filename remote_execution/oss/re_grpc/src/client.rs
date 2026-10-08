@@ -9683,16 +9683,16 @@ fn with_invocation_env_override<T>(
 
 /// `invocation_env_override` checked as the name of one variable: `env-overrides` is a list of
 /// `NAME=VALUE` separated by commas, so a name with `=` or `,` in it would set something else.
+/// Empty is unset, as for `tls_client_cert` (#53): the key is read from buckconfig files alone,
+/// so `.buckconfig.local` turns off a value the project sets only by giving it empty.
 fn invocation_env_override_from_options(
     opts: &Buck2OssReConfiguration,
 ) -> anyhow::Result<Option<String>> {
     match opts.invocation_env_override.as_deref() {
-        None => Ok(None),
+        None | Some("") => Ok(None),
         Some(name) => {
             anyhow::ensure!(
-                !name.is_empty()
-                    && !name.contains(['=', ','])
-                    && !name.contains(char::is_whitespace),
+                !name.contains(['=', ',']) && !name.contains(char::is_whitespace),
                 "`invocation_env_override` must name one environment variable, got `{name}`"
             );
             Ok(Some(name.to_owned()))
@@ -10141,7 +10141,7 @@ mod tests {
 
     #[test]
     fn invocation_env_override_from_options_rejects_more_than_one_name() {
-        for name in ["", "A=B", "A,B", "A B"] {
+        for name in ["A=B", "A,B", "A B"] {
             let opts = Buck2OssReConfiguration {
                 invocation_env_override: Some(name.to_owned()),
                 ..Default::default()
@@ -10161,6 +10161,15 @@ mod tests {
                 .as_deref(),
             Some("GHC_WORKER_BUILD_KEY")
         );
+    }
+
+    #[test]
+    fn invocation_env_override_from_options_reads_empty_as_unset() {
+        let opts = Buck2OssReConfiguration {
+            invocation_env_override: Some(String::new()),
+            ..Default::default()
+        };
+        assert_eq!(invocation_env_override_from_options(&opts).unwrap(), None);
     }
 
     fn status_for_code(code: TCode) -> Status {
