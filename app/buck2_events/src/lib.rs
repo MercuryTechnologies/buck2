@@ -201,7 +201,7 @@ pub enum Event {
 }
 
 /// Statistics from this event sink on how messages were processed.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct EventSinkStats {
     /// Count of number of successful messages (e.g. those that have been processed by their downstream destination).
     pub successes: u64,
@@ -220,6 +220,14 @@ pub struct EventSinkStats {
     pub dropped: u64,
     /// How many bytes were written into this sink.
     pub bytes_written: u64,
+    /// Microseconds the sink's worker spent on queued messages, converting them, uploading
+    /// their files and waiting for the transport to take them; and how often it opened a
+    /// transport. Zero for sinks without a worker.
+    pub worker_busy_us: u64,
+    pub worker_convert_us: u64,
+    pub worker_upload_us: u64,
+    pub worker_send_wait_us: u64,
+    pub worker_transport_opens: u64,
 }
 
 impl EventSinkStats {
@@ -237,6 +245,11 @@ impl EventSinkStats {
             buffered: _,
             dropped: _,
             bytes_written: _,
+            worker_busy_us: _,
+            worker_convert_us: _,
+            worker_upload_us: _,
+            worker_send_wait_us: _,
+            worker_transport_opens: _,
         } = self;
         *failures_invalid_request
             + *failures_unauthorized
