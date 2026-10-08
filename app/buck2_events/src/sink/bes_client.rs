@@ -304,6 +304,11 @@ pub struct Counters {
     pub queue_depth: u64,
     pub dropped: u64,
     pub bytes_written: u64,
+    pub worker_busy_us: u64,
+    pub worker_convert_us: u64,
+    pub worker_upload_us: u64,
+    pub worker_send_wait_us: u64,
+    pub worker_transport_opens: u64,
 }
 
 #[derive(Default)]
@@ -320,6 +325,13 @@ struct CounterState {
     queue_depth: AtomicU64,
     dropped: AtomicU64,
     bytes_written: AtomicU64,
+    /// Where the worker thread's time goes, so a snapshot can tell a starved worker from one
+    /// waiting on the server. Microseconds, cumulative.
+    worker_busy_us: AtomicU64,
+    worker_convert_us: AtomicU64,
+    worker_upload_us: AtomicU64,
+    worker_send_wait_us: AtomicU64,
+    worker_transport_opens: AtomicU64,
 }
 
 impl CounterState {
@@ -391,7 +403,19 @@ impl CounterState {
             queue_depth: self.queue_depth.load(Ordering::Relaxed),
             dropped: self.dropped.load(Ordering::Relaxed),
             bytes_written: self.bytes_written.load(Ordering::Relaxed),
+            worker_busy_us: self.worker_busy_us.load(Ordering::Relaxed),
+            worker_convert_us: self.worker_convert_us.load(Ordering::Relaxed),
+            worker_upload_us: self.worker_upload_us.load(Ordering::Relaxed),
+            worker_send_wait_us: self.worker_send_wait_us.load(Ordering::Relaxed),
+            worker_transport_opens: self.worker_transport_opens.load(Ordering::Relaxed),
         }
+    }
+
+    fn add_elapsed(counter: &AtomicU64, since: Instant) {
+        counter.fetch_add(
+            u64::try_from(since.elapsed().as_micros()).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
     }
 }
 
@@ -1426,7 +1450,9 @@ fn process_queued_message(
     message: Message,
 ) {
     worker.counters.dec_queue_depth();
+    let started = Instant::now();
     drop(runtime.block_on(worker.send_message_with_retry(&message, false)));
+    CounterState::add_elapsed(&worker.counters.worker_busy_us, started);
 }
 
 fn process_request(
@@ -2526,6 +2552,7 @@ struct StreamState {
     pending_unacked: VecDeque<PublishBuildToolEventStreamRequest>,
     bazel_converter: BazelEventConverter,
     bazel_artifact_uploader: Option<BazelArtifactUploader>,
+    counters: Arc<CounterState>,
     last_sent_sequence_number: i64,
     saw_command_end: bool,
     pending_close: Option<PendingClose>,
@@ -2875,7 +2902,8 @@ impl StreamState {
                 upload_successful_action_events,
             ),
             bazel_artifact_uploader: bazel_artifact_upload_config
-                .map(|config| BazelArtifactUploader::new(config, counters)),
+                .map(|config| BazelArtifactUploader::new(config, counters.clone())),
+            counters,
             last_sent_sequence_number: 0,
             saw_command_end: false,
             pending_close: None,
@@ -2915,16 +2943,20 @@ impl StreamState {
                 if let Some(uploader) = self.bazel_artifact_uploader.as_mut() {
                     uploader.observe_buck_event(&parsed.buck_event);
                 }
+                let started = Instant::now();
                 let events = self
                     .bazel_converter
                     .convert(self.next_sequence_number, &parsed.buck_event);
+                CounterState::add_elapsed(&self.counters.worker_convert_us, started);
                 if let Some(uploader) = self.bazel_artifact_uploader.as_mut() {
                     uploader.observe_bazel_events(&events);
                 }
                 let mut last_sequence_number = None;
                 for mut event in events {
                     if let Some(uploader) = self.bazel_artifact_uploader.as_mut() {
+                        let started = Instant::now();
                         uploader.upload_event_files(&mut event).await;
+                        CounterState::add_elapsed(&self.counters.worker_upload_us, started);
                     }
                     last_sequence_number = Some(self.enqueue_raw_event(BuildEvent {
                         event_time: parsed.event_time,
@@ -2967,6 +2999,9 @@ impl StreamState {
     }
 
     fn attach_transport(&mut self, transport: StreamTransport) {
+        self.counters
+            .worker_transport_opens
+            .fetch_add(1, Ordering::Relaxed);
         self.sender = Some(transport.sender);
         self.ack_task = Some(transport.ack_task);
         self.progress = Some(transport.progress);
@@ -3048,7 +3083,10 @@ impl StreamState {
         }
         // A server that stays connected but stops reading fills the channel; without a
         // bound the worker thread would wait here for the rest of the daemon's life.
-        match tokio::time::timeout(send_timeout, sender.send(request)).await {
+        let started = Instant::now();
+        let sent = tokio::time::timeout(send_timeout, sender.send(request)).await;
+        CounterState::add_elapsed(&self.counters.worker_send_wait_us, started);
+        match sent {
             Ok(Ok(())) => {}
             Ok(Err(_)) => {
                 if let Some(status) = self.finished_ack_task_status().await {
@@ -4768,6 +4806,22 @@ mod tests {
             + c.failures_internal_error
             + c.failures_timed_out
             + c.failures_unknown
+    }
+
+    /// A stream's transport is counted once when it opens, for the snapshot's account of the
+    /// worker's time.
+    #[tokio::test]
+    async fn worker_counts_the_transports_it_opens() {
+        let (endpoint, _streams) = serve_bes_that_acks_at_eof(None).await;
+        let (mut worker, counters) = worker_for(endpoint);
+        let trace_id = TraceId::new().to_string();
+
+        send_queued_ok(&mut worker, &trace_id, command_start_data()).await;
+        send_queued_ok(&mut worker, &trace_id, action_start_data()).await;
+        send_queued_ok(&mut worker, &trace_id, command_end_data()).await;
+        send_queued_ok(&mut worker, &trace_id, invocation_record_data()).await;
+
+        assert_eq!(counters.snapshot().worker_transport_opens, 1);
     }
 
     #[tokio::test]

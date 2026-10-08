@@ -616,6 +616,11 @@ impl EventSinkWithStats for RemoteEventSink {
             buffered: counters.queue_depth,
             dropped: counters.dropped,
             bytes_written: counters.bytes_written,
+            worker_busy_us: counters.worker_busy_us,
+            worker_convert_us: counters.worker_convert_us,
+            worker_upload_us: counters.worker_upload_us,
+            worker_send_wait_us: counters.worker_send_wait_us,
+            worker_transport_opens: counters.worker_transport_opens,
         }
     }
 }
