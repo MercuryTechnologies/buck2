@@ -6685,19 +6685,52 @@ mod tests {
             .unwrap_or(usize::MAX);
         let buf = std::fs::read(&path).unwrap();
         let schedule = crate::schedule_type::SandcastleScheduleType::new().unwrap();
-        let (endpoint, _streams, _events) =
-            serve_bes_that_acks_at_eof_keeping_bazel_events(None).await;
+        // SINKBENCH_ENDPOINT targets a real BES (e.g. grpcs://host:443) with SINKBENCH_CA and the
+        // key in BUILDBUDDY_API_KEY; unset, an in-process server that acks at EOF.
+        let real = std::env::var("SINKBENCH_ENDPOINT").ok();
+        let (endpoint, headers, tls) = match real {
+            Some(endpoint) => (
+                endpoint,
+                vec![(
+                    "x-buildbuddy-api-key".to_owned(),
+                    std::env::var("BUILDBUDDY_API_KEY").expect("BUILDBUDDY_API_KEY"),
+                )],
+                BesTls {
+                    client_cert: None,
+                    ca_certs: std::env::var("SINKBENCH_CA").ok(),
+                },
+            ),
+            None => {
+                let (endpoint, _streams, _events) =
+                    serve_bes_that_acks_at_eof_keeping_bazel_events(None).await;
+                (endpoint, Vec::new(), BesTls::default())
+            }
+        };
+        let env_u32 = |k: &str| std::env::var(k).ok().and_then(|v| v.parse::<u32>().ok());
         let config = BesConfig {
             buffer_size: 100_000,
             event_format: BesEventFormat::Bazel,
             upload_successful_action_events: true,
-            grpc_timeout: Duration::from_secs(30),
+            grpc_timeout: Duration::from_secs(60),
+            build_metadata: vec![
+                ("ROLE".to_owned(), "BES-BENCH".to_owned()),
+                (
+                    "TAG_bes_bench_arm".to_owned(),
+                    std::env::var("SINKBENCH_ARM").unwrap_or_else(|_| "default".to_owned()),
+                ),
+            ],
+            channel: BesChannelSettings {
+                http2_adaptive_window: std::env::var("SINKBENCH_ADAPTIVE").ok().map(|v| v == "1"),
+                http2_initial_stream_window_bytes: env_u32("SINKBENCH_STREAM_WINDOW"),
+                http2_initial_connection_window_bytes: env_u32("SINKBENCH_CONNECTION_WINDOW"),
+                ..BesChannelSettings::default()
+            },
             ..BesConfig::default()
         };
         let connection = ConnectionConfig {
             endpoint,
-            headers: Vec::new(),
-            tls: BesTls::default(),
+            headers,
+            tls,
             credential_helper: None,
         };
         let counters = Arc::new(CounterState::default());
@@ -6715,6 +6748,8 @@ mod tests {
                 shift += 7;
             }
         };
+        let trace_id = uuid::Uuid::new_v4().to_string();
+        eprintln!("sink_e2e trace_id={trace_id}");
         let mut pos = 0usize;
         let mut frames = 0u64;
         let mut sent = 0usize;
@@ -6731,11 +6766,14 @@ mod tests {
                 continue;
             }
             let cp = buck2_cli_proto::CommandProgress::decode(frame).unwrap();
-            let Some(command_progress::Progress::Event(e)) = cp.progress else { continue };
+            let Some(command_progress::Progress::Event(mut e)) = cp.progress else { continue };
             let Some(data) = e.data.as_ref() else { continue };
             if !crate::sink::scribe::should_send_event_data(data, &schedule, true, true) {
                 continue;
             }
+            // A fresh invocation per run: the log's own trace ID would make BuildBuddy record
+            // this replay as another attempt of the build it was taken from.
+            e.trace_id = trace_id.clone();
             let message = Message {
                 category: String::new(),
                 message: e.encode_to_vec(),
@@ -6757,7 +6795,19 @@ mod tests {
                 );
             }
         }
+        let sending_s = started.elapsed().as_secs_f64();
+        let invocation_id = worker.streams.keys().next().cloned().unwrap_or_default();
+        // As at a command's end: wait for the server to acknowledge everything sent.
+        let deadline = Instant::now() + Duration::from_secs(1800);
+        let report = worker
+            .drain(DrainScope::Shutdown, deadline, std::future::pending())
+            .await;
         let elapsed = started.elapsed().as_secs_f64();
+        eprintln!(
+            "sink_e2e invocation={invocation_id} sending_s={sending_s:.1} drain_s={:.1} unacked_after_drain={}",
+            elapsed - sending_s,
+            report.unacked_events()
+        );
         let c = counters.snapshot();
         eprintln!(
             "sink_e2e sent={sent} elapsed_s={elapsed:.1} rate={:.0}/s slowest_ms={:.1} over_1ms={over_1ms} successes={} dropped={}",
