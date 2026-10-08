@@ -666,7 +666,11 @@ impl BazelArtifactUploader {
                     if self.is_directory_output(file) {
                         continue;
                     }
-                    if !self.upload_file_if_local(file).await {
+                    // An output whose digest is the CAS's own is already stored under it, and
+                    // writing it again from the local copy costs a read and a round trip per
+                    // file on the worker: on 2026-10-08 a build's 15,552 outputs that dynamic
+                    // analysis had materialized locally, 183 MB, held it about 126 s.
+                    if has_cas_digest(file) || !self.upload_file_if_local(file).await {
                         self.add_uri_for_digest_file(file);
                     }
                 }
@@ -1293,6 +1297,18 @@ fn bytestream_uri(authority: &str, instance_name: &str, hash: &str, size: i64) -
         format!("{}/", instance_name.trim_matches('/'))
     };
     format!("bytestream://{authority}/{prefix}blobs/{hash}/{size}")
+}
+
+/// Whether a file's digest has the form of a CAS digest: 64 lowercase hex characters, as SHA-256
+/// and BLAKE3 give, and a size. buck2 gives an action's outputs the remote execution digest, under
+/// which the CAS stores them; a digest of another form names nothing in the CAS.
+fn has_cas_digest(file: &bazel_bep_proto::build_event_stream::File) -> bool {
+    file_digest_and_size(file).is_some_and(|(hash, _)| {
+        hash.len() == 64
+            && hash
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    })
 }
 
 fn file_digest_and_size(file: &bazel_bep_proto::build_event_stream::File) -> Option<(&str, i64)> {
@@ -4363,6 +4379,78 @@ mod tests {
         assert_eq!(
             uri,
             &format!("bytestream://localhost:1985/remote/instance/blobs/{hash}/3")
+        );
+        std::fs::remove_dir_all(repo_path).ok();
+    }
+
+    /// A local output whose digest is a CAS digest is named by it and not written again.
+    #[tokio::test]
+    async fn upload_event_files_names_local_outputs_by_their_cas_digest_without_writing() {
+        let contents = b"abc";
+        let mut hasher = Sha256::new();
+        hasher.update(contents);
+        let hash = format!("{:x}", hasher.finalize());
+        let repo_path =
+            std::env::temp_dir().join(format!("buck2-bes-client-test-{}", uuid::Uuid::new_v4()));
+        let output_path = repo_path.join("buck-out/gen/root/main");
+        std::fs::create_dir_all(output_path.parent().unwrap()).unwrap();
+        std::fs::write(&output_path, contents).unwrap();
+        let mut uploader = BazelArtifactUploader::new(test_artifact_upload_config(), Arc::default());
+        let mut metadata = HashMap::new();
+        metadata.insert(
+            "REPO_ROOT".to_owned(),
+            repo_path.to_string_lossy().into_owned(),
+        );
+        uploader.observe_buck_event(&buck2_data::BuckEvent {
+            timestamp: None,
+            trace_id: String::new(),
+            span_id: 0,
+            parent_id: 0,
+            data: Some(buck2_data::buck_event::Data::SpanStart(
+                buck2_data::SpanStartEvent {
+                    data: Some(
+                        buck2_data::CommandStart {
+                            metadata,
+                            ..Default::default()
+                        }
+                        .into(),
+                    ),
+                },
+            )),
+        });
+        let mut event = bazel_bep_proto::build_event_stream::BuildEvent {
+            id: None,
+            children: Vec::new(),
+            payload: Some(
+                bazel_bep_proto::build_event_stream::build_event::Payload::NamedSetOfFiles(
+                    bazel_bep_proto::build_event_stream::NamedSetOfFiles {
+                        files: vec![bazel_bep_proto::build_event_stream::File {
+                            name: "buck-out/gen/root/main".to_owned(),
+                            path_prefix: Vec::new(),
+                            file: None,
+                            digest: format!("{hash}:3"),
+                            length: 3,
+                        }],
+                        file_sets: Vec::new(),
+                    },
+                ),
+            ),
+            last_message: false,
+        };
+
+        uploader.upload_event_files(&mut event).await;
+
+        assert!(uploader.test_writes.is_empty(), "the local copy was written again");
+        let Some(bazel_bep_proto::build_event_stream::build_event::Payload::NamedSetOfFiles(files)) =
+            event.payload
+        else {
+            panic!("expected named set");
+        };
+        assert_eq!(
+            files.files[0].file,
+            Some(bazel_bep_proto::build_event_stream::file::File::Uri(format!(
+                "bytestream://localhost:1985/remote/instance/blobs/{hash}/3"
+            )))
         );
         std::fs::remove_dir_all(repo_path).ok();
     }
