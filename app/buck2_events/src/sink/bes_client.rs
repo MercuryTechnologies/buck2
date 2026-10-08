@@ -6503,32 +6503,39 @@ mod tests {
     /// SINKBENCH_BUILD / SINKBENCH_TEST: decompressed event logs; SINKBENCH_BUILD_LIMIT: events
     /// of the build to replay; SINKBENCH_CAS_DELAY_MS: each Write's server delay;
     /// SINKBENCH_RELAY_MS: one-way delay in front of both servers.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[test]
     #[ignore]
-    async fn sink_two_phase_bench() {
+    fn sink_two_phase_bench() {
         use buck2_cli_proto::command_progress;
         let env_u64 = |k: &str, d: u64| std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d);
         let relay_ms = env_u64("SINKBENCH_RELAY_MS", 0);
-        let (bes, _streams, _events) = serve_bes_that_acks_at_eof_keeping_bazel_events(None).await;
-        let cas_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
-        let cas = format!("http://{}", cas_listener.local_addr().expect("addr"));
+        // Servers and relays on their own runtime; the worker on the sink's, driven by block_on
+        // from this thread as the sink's worker thread does.
+        let server_rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
         let writes = Arc::new(AtomicU64::new(0));
-        tokio::spawn(
-            tonic::transport::Server::builder()
-                .add_service(ByteStreamServer::new(SlowByteStream {
-                    delay: Duration::from_millis(env_u64("SINKBENCH_CAS_DELAY_MS", 15)),
-                    writes: writes.clone(),
-                }))
-                .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(cas_listener)),
-        );
-        let (bes, cas) = if relay_ms > 0 {
-            (
-                delaying_relay(&bes, Duration::from_millis(relay_ms)).await,
-                delaying_relay(&cas, Duration::from_millis(relay_ms)).await,
-            )
-        } else {
+        let (bes, cas) = server_rt.block_on(async {
+            let (bes, _streams, _events) = serve_bes_that_acks_at_eof_keeping_bazel_events(None).await;
+            let cas_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+            let cas = format!("http://{}", cas_listener.local_addr().expect("addr"));
+            tokio::spawn(
+                tonic::transport::Server::builder()
+                    .add_service(ByteStreamServer::new(SlowByteStream {
+                        delay: Duration::from_millis(env_u64("SINKBENCH_CAS_DELAY_MS", 15)),
+                        writes: writes.clone(),
+                    }))
+                    .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(cas_listener)),
+            );
+            let (bes, cas) = if relay_ms > 0 {
+                (
+                    delaying_relay(&bes, Duration::from_millis(relay_ms)).await,
+                    delaying_relay(&cas, Duration::from_millis(relay_ms)).await,
+                )
+            } else {
+                (bes, cas)
+            };
             (bes, cas)
-        };
+        });
+        let _keep = &server_rt;
         let config = BesConfig {
             buffer_size: 100_000,
             event_format: BesEventFormat::Bazel,
@@ -6545,6 +6552,8 @@ mod tests {
             tls: BesTls::default(),
             credential_helper: None,
         };
+        let rt = bes_worker_runtime().unwrap();
+        let _enter = rt.enter();
         let counters = Arc::new(CounterState::default());
         let mut worker = WorkerState::new(config, connection, counters.clone());
         let schedule = crate::schedule_type::SandcastleScheduleType::new().unwrap();
@@ -6593,19 +6602,19 @@ mod tests {
                     message_key: Some(1),
                 };
                 let t = Instant::now();
-                drop(worker.send_message_with_retry(&message, false).await);
+                drop(rt.block_on(worker.send_message_with_retry(&message, false)));
                 let took = t.elapsed();
                 if took > slowest.0 {
                     let kind = format!("{:?}", e.data).chars().take(60).collect::<String>();
                     slowest = (took, sent, kind);
                 }
                 sent += 1;
-                worker.close_due_streams().await;
+                rt.block_on(worker.close_due_streams());
             }
             if phase == "build" && limit != usize::MAX {
                 for data in [command_end_data(), invocation_record_data()] {
                     let message = make_message(Some(&trace_id), Some(1), data);
-                    drop(worker.send_message_with_retry(&message, false).await);
+                    drop(rt.block_on(worker.send_message_with_retry(&message, false)));
                 }
             }
             let c = counters.snapshot();
