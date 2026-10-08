@@ -309,6 +309,8 @@ pub struct Counters {
     pub worker_upload_us: u64,
     pub worker_send_wait_us: u64,
     pub worker_transport_opens: u64,
+    pub worker_upload_connect_us: u64,
+    pub worker_upload_slot_wait_us: u64,
 }
 
 #[derive(Default)]
@@ -332,6 +334,10 @@ struct CounterState {
     worker_upload_us: AtomicU64,
     worker_send_wait_us: AtomicU64,
     worker_transport_opens: AtomicU64,
+    /// Within `worker_upload_us`: opening an uploader's ByteStream connection, and waiting for
+    /// one of its `MAX_UPLOADS_IN_FLIGHT` writes to finish.
+    worker_upload_connect_us: AtomicU64,
+    worker_upload_slot_wait_us: AtomicU64,
 }
 
 impl CounterState {
@@ -408,6 +414,8 @@ impl CounterState {
             worker_upload_us: self.worker_upload_us.load(Ordering::Relaxed),
             worker_send_wait_us: self.worker_send_wait_us.load(Ordering::Relaxed),
             worker_transport_opens: self.worker_transport_opens.load(Ordering::Relaxed),
+            worker_upload_connect_us: self.worker_upload_connect_us.load(Ordering::Relaxed),
+            worker_upload_slot_wait_us: self.worker_upload_slot_wait_us.load(Ordering::Relaxed),
         }
     }
 
@@ -796,12 +804,17 @@ impl BazelArtifactUploader {
             return false;
         }
         self.reap_finished_uploads();
+        let waiting = Instant::now();
         while self.in_flight.len() >= MAX_UPLOADS_IN_FLIGHT {
             if let Some(joined) = self.in_flight.join_next().await {
                 self.record_upload(joined);
             }
         }
-        let client = match self.client().await {
+        CounterState::add_elapsed(&self.counters.worker_upload_slot_wait_us, waiting);
+        let connecting = Instant::now();
+        let client = self.client().await;
+        CounterState::add_elapsed(&self.counters.worker_upload_connect_us, connecting);
+        let client = match client {
             Ok(client) => client,
             Err(status) => {
                 self.record_upload(Ok(Err(status)));
@@ -6340,6 +6353,183 @@ mod tests {
         );
         assert_eq!(writes.load(Ordering::SeqCst), 64);
         assert_eq!(counters.snapshot().failures_internal_error, 0);
+    }
+
+    /// A TCP relay to `endpoint` (`http://host:port`) that holds every chunk `delay` before
+    /// passing it on, in both directions, buffering without bound so that only latency is added.
+    async fn delaying_relay(endpoint: &str, delay: Duration) -> String {
+        use tokio::io::AsyncReadExt;
+        use tokio::io::AsyncWriteExt;
+        let upstream = endpoint.trim_start_matches("http://").to_owned();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let address = listener.local_addr().expect("local addr");
+        tokio::spawn(async move {
+            loop {
+                let Ok((client, _)) = listener.accept().await else { return };
+                let Ok(server) = tokio::net::TcpStream::connect(&upstream).await else { return };
+                drop(client.set_nodelay(true));
+                drop(server.set_nodelay(true));
+                let (client_read, client_write) = client.into_split();
+                let (server_read, server_write) = server.into_split();
+                for (mut from, mut to) in [(
+                    Box::new(client_read) as Box<dyn tokio::io::AsyncRead + Unpin + Send>,
+                    Box::new(server_write) as Box<dyn tokio::io::AsyncWrite + Unpin + Send>,
+                ), (
+                    Box::new(server_read) as Box<dyn tokio::io::AsyncRead + Unpin + Send>,
+                    Box::new(client_write) as Box<dyn tokio::io::AsyncWrite + Unpin + Send>,
+                )] {
+                    let (tx, mut rx) = mpsc::unbounded_channel::<(Instant, Vec<u8>)>();
+                    tokio::spawn(async move {
+                        let mut buf = vec![0u8; 64 * 1024];
+                        loop {
+                            match from.read(&mut buf).await {
+                                Ok(0) | Err(_) => return,
+                                Ok(n) => {
+                                    if tx.send((Instant::now() + delay, buf[..n].to_vec())).is_err() {
+                                        return;
+                                    }
+                                }
+                            }
+                        }
+                    });
+                    tokio::spawn(async move {
+                        while let Some((due, chunk)) = rx.recv().await {
+                            tokio::time::sleep_until(due.into()).await;
+                            if to.write_all(&chunk).await.is_err() {
+                                return;
+                            }
+                        }
+                    });
+                }
+            }
+        });
+        format!("http://{address}")
+    }
+
+
+    /// Scratch benchmark, not for merge: a build's events then a test's, as two invocations
+    /// through one worker, with Bazel artifact uploads on against an in-process ByteStream server.
+    /// SINKBENCH_BUILD / SINKBENCH_TEST: decompressed event logs; SINKBENCH_BUILD_LIMIT: events
+    /// of the build to replay; SINKBENCH_CAS_DELAY_MS: each Write's server delay;
+    /// SINKBENCH_RELAY_MS: one-way delay in front of both servers.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore]
+    async fn sink_two_phase_bench() {
+        use buck2_cli_proto::command_progress;
+        let env_u64 = |k: &str, d: u64| std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d);
+        let relay_ms = env_u64("SINKBENCH_RELAY_MS", 0);
+        let (bes, _streams, _events) = serve_bes_that_acks_at_eof_keeping_bazel_events(None).await;
+        let cas_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let cas = format!("http://{}", cas_listener.local_addr().expect("addr"));
+        let writes = Arc::new(AtomicU64::new(0));
+        tokio::spawn(
+            tonic::transport::Server::builder()
+                .add_service(ByteStreamServer::new(SlowByteStream {
+                    delay: Duration::from_millis(env_u64("SINKBENCH_CAS_DELAY_MS", 15)),
+                    writes: writes.clone(),
+                }))
+                .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(cas_listener)),
+        );
+        let (bes, cas) = if relay_ms > 0 {
+            (
+                delaying_relay(&bes, Duration::from_millis(relay_ms)).await,
+                delaying_relay(&cas, Duration::from_millis(relay_ms)).await,
+            )
+        } else {
+            (bes, cas)
+        };
+        let config = BesConfig {
+            buffer_size: 100_000,
+            event_format: BesEventFormat::Bazel,
+            upload_successful_action_events: true,
+            bazel_artifact_upload: true,
+            bazel_artifact_upload_backend: Some(cas.replace("http://", "grpc://")),
+            bazel_artifact_upload_max_bytes: 10 * 1024 * 1024,
+            grpc_timeout: Duration::from_secs(60),
+            ..BesConfig::default()
+        };
+        let connection = ConnectionConfig {
+            endpoint: bes,
+            headers: Vec::new(),
+            tls: BesTls::default(),
+            credential_helper: None,
+        };
+        let counters = Arc::new(CounterState::default());
+        let mut worker = WorkerState::new(config, connection, counters.clone());
+        let schedule = crate::schedule_type::SandcastleScheduleType::new().unwrap();
+        let read_varint = |buf: &[u8], pos: &mut usize| -> Option<u64> {
+            let mut v = 0u64;
+            let mut shift = 0;
+            loop {
+                let b = *buf.get(*pos)?;
+                *pos += 1;
+                v |= ((b & 0x7f) as u64) << shift;
+                if b & 0x80 == 0 {
+                    return Some(v);
+                }
+                shift += 7;
+            }
+        };
+        for (phase, var, limit) in [
+            ("build", "SINKBENCH_BUILD", env_u64("SINKBENCH_BUILD_LIMIT", u64::MAX) as usize),
+            ("test", "SINKBENCH_TEST", usize::MAX),
+        ] {
+            let buf = std::fs::read(std::env::var(var).expect(var)).unwrap();
+            let trace_id = uuid::Uuid::new_v4().to_string();
+            let before = counters.snapshot();
+            let started = Instant::now();
+            let (mut pos, mut frames, mut sent) = (0usize, 0u64, 0usize);
+            let mut slowest = (Duration::ZERO, 0usize, String::new());
+            while pos < buf.len() && sent < limit {
+                let Some(len) = read_varint(&buf, &mut pos) else { break };
+                let end = pos + len as usize;
+                let frame = &buf[pos..end];
+                pos = end;
+                frames += 1;
+                if frames == 1 {
+                    continue;
+                }
+                let cp = buck2_cli_proto::CommandProgress::decode(frame).unwrap();
+                let Some(command_progress::Progress::Event(mut e)) = cp.progress else { continue };
+                let Some(data) = e.data.as_ref() else { continue };
+                if !crate::sink::scribe::should_send_event_data(data, &schedule, true, true) {
+                    continue;
+                }
+                e.trace_id = trace_id.clone();
+                let message = Message {
+                    category: String::new(),
+                    message: e.encode_to_vec(),
+                    message_key: Some(1),
+                };
+                let t = Instant::now();
+                drop(worker.send_message_with_retry(&message, false).await);
+                let took = t.elapsed();
+                if took > slowest.0 {
+                    let kind = format!("{:?}", e.data).chars().take(60).collect::<String>();
+                    slowest = (took, sent, kind);
+                }
+                sent += 1;
+                worker.close_due_streams().await;
+            }
+            if phase == "build" && limit != usize::MAX {
+                for data in [command_end_data(), invocation_record_data()] {
+                    let message = make_message(Some(&trace_id), Some(1), data);
+                    drop(worker.send_message_with_retry(&message, false).await);
+                }
+            }
+            let c = counters.snapshot();
+            eprintln!(
+                "two_phase {phase} sent={sent} wall_s={:.1} slowest_ms={:.0} at={} kind={} upload_s={:.1} connect_s={:.1} slot_wait_s={:.1} writes_total={}",
+                started.elapsed().as_secs_f64(),
+                slowest.0.as_secs_f64() * 1e3,
+                slowest.1,
+                slowest.2,
+                (c.worker_upload_us - before.worker_upload_us) as f64 / 1e6,
+                (c.worker_upload_connect_us - before.worker_upload_connect_us) as f64 / 1e6,
+                (c.worker_upload_slot_wait_us - before.worker_upload_slot_wait_us) as f64 / 1e6,
+                writes.load(Ordering::SeqCst),
+            );
+        }
     }
 
     fn serve_silence() -> std::net::SocketAddr {

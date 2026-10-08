@@ -1158,6 +1158,9 @@ message Snapshot {
   optional uint64 sink_worker_upload_us = 1211;
   optional uint64 sink_worker_send_wait_us = 1212;
   optional uint64 sink_worker_transport_opens = 1213;
+  // Within sink_worker_upload_us: opening an uploader's connection, and waiting for a write slot.
+  optional uint64 sink_worker_upload_connect_us = 1214;
+  optional uint64 sink_worker_upload_slot_wait_us = 1215;
   // Current number of messages queued up to be submitted.
   optional uint64 sink_buffer_depth = 107;
   // Cumulative count of messages that were dropped (i.e. not even processed).
