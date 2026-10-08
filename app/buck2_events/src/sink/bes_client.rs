@@ -521,13 +521,23 @@ struct BazelArtifactUploader {
     /// Writes of inline contents still running. An event names its blob's URI, a function of the
     /// blob's digest, before the blob is written, so the worker does not wait one round trip
     /// per file: on 2026-10-08 those waits, 43,075 of them in one build, took 99% of its time.
-    in_flight: tokio::task::JoinSet<Result<(), Status>>,
+    in_flight: tokio::task::JoinSet<(u64, Result<(), Status>)>,
+    /// At most `MAX_UPLOADS_IN_FLIGHT` writes talk to the server at once. A write waits for its
+    /// permit inside its task, not on the worker, which would hold every event behind it: on
+    /// 2026-10-08 a test's 15,561 logs held the worker 156 s when it waited here.
+    permits: Arc<tokio::sync::Semaphore>,
+    /// Bytes of contents whose writes have not finished. Past `MAX_UPLOAD_BYTES_QUEUED` the
+    /// worker waits for writes to finish, which bounds what the queued contents hold in memory.
+    queued_bytes: u64,
     #[cfg(test)]
     test_writes: Vec<WriteRequest>,
 }
 
-/// Writes of inline contents in flight per stream; one more waits for one to finish.
+/// Writes of inline contents in flight per stream.
 const MAX_UPLOADS_IN_FLIGHT: usize = 64;
+
+/// Contents queued for writing per stream before the worker waits for writes to finish.
+const MAX_UPLOAD_BYTES_QUEUED: u64 = 256 * 1024 * 1024;
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct BepFileIdentity {
@@ -559,6 +569,8 @@ impl BazelArtifactUploader {
             repo_path: None,
             directory_outputs: HashSet::new(),
             in_flight: tokio::task::JoinSet::new(),
+            permits: Arc::new(tokio::sync::Semaphore::new(MAX_UPLOADS_IN_FLIGHT)),
+            queued_bytes: 0,
             #[cfg(test)]
             test_writes: Vec::new(),
         }
@@ -805,9 +817,10 @@ impl BazelArtifactUploader {
         }
         self.reap_finished_uploads();
         let waiting = Instant::now();
-        while self.in_flight.len() >= MAX_UPLOADS_IN_FLIGHT {
-            if let Some(joined) = self.in_flight.join_next().await {
-                self.record_upload(joined);
+        while self.queued_bytes > MAX_UPLOAD_BYTES_QUEUED {
+            match self.in_flight.join_next().await {
+                Some(joined) => self.record_upload(joined),
+                None => break,
             }
         }
         CounterState::add_elapsed(&self.counters.worker_upload_slot_wait_us, waiting);
@@ -817,22 +830,32 @@ impl BazelArtifactUploader {
         let client = match client {
             Ok(client) => client,
             Err(status) => {
-                self.record_upload(Ok(Err(status)));
+                self.record_failure(status);
                 return false;
             }
         };
         let config = self.config.clone();
+        let permits = Arc::clone(&self.permits);
+        let bytes = u64::try_from(size).unwrap_or(0);
+        self.queued_bytes += bytes;
         self.in_flight.spawn(async move {
-            let response =
-                write_with_progress_timeout(client, &config, tokio_stream::iter(vec![request]))
-                    .await?;
-            if response.committed_size != size && response.committed_size != -1 {
-                return Err(Status::data_loss(format!(
-                    "ByteStream Write committed {} of {size} bytes",
-                    response.committed_size
-                )));
-            }
-            Ok(())
+            let written = async {
+                let _permit = permits
+                    .acquire_owned()
+                    .await
+                    .map_err(|e| Status::internal(e.to_string()))?;
+                let response =
+                    write_with_progress_timeout(client, &config, tokio_stream::iter(vec![request]))
+                        .await?;
+                if response.committed_size != size && response.committed_size != -1 {
+                    return Err(Status::data_loss(format!(
+                        "ByteStream Write committed {} of {size} bytes",
+                        response.committed_size
+                    )));
+                }
+                Ok(())
+            };
+            (bytes, written.await)
         });
         true
     }
@@ -859,22 +882,40 @@ impl BazelArtifactUploader {
                 Err(_) => {
                     let abandoned = self.in_flight.len();
                     self.in_flight.abort_all();
-                    self.record_upload(Ok(Err(Status::deadline_exceeded(format!(
+                    self.queued_bytes = 0;
+                    self.record_failure(Status::deadline_exceeded(format!(
                         "{abandoned} artifact uploads were still running when the stream ended"
-                    )))));
+                    )));
                     return;
                 }
             }
         }
     }
 
-    fn record_upload(&mut self, joined: Result<Result<(), Status>, tokio::task::JoinError>) {
+    fn record_upload(&mut self, joined: Result<(u64, Result<(), Status>), tokio::task::JoinError>) {
         let status = match joined {
-            Ok(Ok(())) => return,
-            Ok(Err(status)) => status,
-            Err(e) if e.is_cancelled() => return,
-            Err(e) => Status::internal(e.to_string()),
+            Ok((bytes, result)) => {
+                self.queued_bytes = self.queued_bytes.saturating_sub(bytes);
+                match result {
+                    Ok(()) => return,
+                    Err(status) => status,
+                }
+            }
+            Err(e) => {
+                // A task that ended without saying its size: none is queued once none runs.
+                if self.in_flight.is_empty() {
+                    self.queued_bytes = 0;
+                }
+                if e.is_cancelled() {
+                    return;
+                }
+                Status::internal(e.to_string())
+            }
         };
+        self.record_failure(status);
+    }
+
+    fn record_failure(&mut self, status: Status) {
         if status.code() == tonic::Code::DeadlineExceeded {
             if !self.timed_out {
                 self.timed_out = true;
@@ -6406,6 +6447,56 @@ mod tests {
         format!("http://{address}")
     }
 
+
+    /// More files than writes in flight still get their URIs without the worker waiting for a
+    /// write: on 2026-10-08 a test's 15,561 logs held the worker 156 s when it waited for one of
+    /// 64 slots. 256 files against a server that takes 250 ms a Write waited 1 s that way.
+    #[tokio::test]
+    async fn more_files_than_writes_in_flight_do_not_hold_the_worker() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let endpoint = format!("http://{}", listener.local_addr().expect("local addr"));
+        let writes = Arc::new(AtomicU64::new(0));
+        tokio::spawn(
+            tonic::transport::Server::builder()
+                .add_service(ByteStreamServer::new(SlowByteStream {
+                    delay: Duration::from_millis(250),
+                    writes: writes.clone(),
+                }))
+                .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener)),
+        );
+        let counters = Arc::new(CounterState::default());
+        let mut uploader = BazelArtifactUploader::new(
+            BazelArtifactUploadConfig {
+                endpoint,
+                ..test_artifact_upload_config()
+            },
+            counters.clone(),
+        );
+        // Connect before timing, so only the files are measured.
+        uploader.upload_bytes(b"warm").await.expect("a URI");
+
+        let started = Instant::now();
+        for i in 0..4 * MAX_UPLOADS_IN_FLIGHT {
+            uploader
+                .upload_bytes(format!("test log {i}").as_bytes())
+                .await
+                .expect("a URI for the file");
+        }
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "{} files held the worker {:?}",
+            4 * MAX_UPLOADS_IN_FLIGHT,
+            started.elapsed()
+        );
+        uploader
+            .finish_uploads(Instant::now() + Duration::from_secs(30))
+            .await;
+        assert_eq!(writes.load(Ordering::SeqCst), 4 * MAX_UPLOADS_IN_FLIGHT as u64 + 1);
+        assert_eq!(uploader.queued_bytes, 0);
+        assert_eq!(counters.snapshot().failures_internal_error, 0);
+    }
 
     /// Scratch benchmark, not for merge: a build's events then a test's, as two invocations
     /// through one worker, with Bazel artifact uploads on against an in-process ByteStream server.
