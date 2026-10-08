@@ -333,6 +333,18 @@ fn read_buckconfig_bes_settings(
                 section: "buck2_re_client",
                 property: "bytestream_progress_timeout_secs",
             })?,
+            http2_adaptive_window: root_config.parse(BuckconfigKeyRef {
+                section: "bes",
+                property: "http2_adaptive_window",
+            })?,
+            http2_initial_stream_window_bytes: root_config.parse(BuckconfigKeyRef {
+                section: "bes",
+                property: "http2_initial_stream_window_bytes",
+            })?,
+            http2_initial_connection_window_bytes: root_config.parse(BuckconfigKeyRef {
+                section: "bes",
+                property: "http2_initial_connection_window_bytes",
+            })?,
         },
         replay: buck2_re_configuration::BesReplaySettings::from_legacy_config(&root_config)?,
     })

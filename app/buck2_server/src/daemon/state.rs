@@ -567,6 +567,18 @@ impl DaemonState {
                     section: "buck2_re_client",
                     property: "bytestream_progress_timeout_secs",
                 })?,
+                http2_adaptive_window: root_config.parse(BuckconfigKeyRef {
+                    section: "bes",
+                    property: "http2_adaptive_window",
+                })?,
+                http2_initial_stream_window_bytes: root_config.parse(BuckconfigKeyRef {
+                    section: "bes",
+                    property: "http2_initial_stream_window_bytes",
+                })?,
+                http2_initial_connection_window_bytes: root_config.parse(BuckconfigKeyRef {
+                    section: "bes",
+                    property: "http2_initial_connection_window_bytes",
+                })?,
             };
             #[cfg(not(fbcode_build))]
             let bes_replay =
