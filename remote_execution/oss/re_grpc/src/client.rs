@@ -9690,7 +9690,9 @@ fn invocation_env_override_from_options(
         None => Ok(None),
         Some(name) => {
             anyhow::ensure!(
-                !name.is_empty() && !name.contains(['=', ',']) && !name.contains(char::is_whitespace),
+                !name.is_empty()
+                    && !name.contains(['=', ','])
+                    && !name.contains(char::is_whitespace),
                 "`invocation_env_override` must name one environment variable, got `{name}`"
             );
             Ok(Some(name.to_owned()))
@@ -9738,10 +9740,10 @@ mod tests {
     use re_grpc_proto::build::bazel::remote::execution::v2::FastCdc2020Params;
     use re_grpc_proto::build::bazel::remote::execution::v2::action_cache_server::ActionCache;
     use re_grpc_proto::build::bazel::remote::execution::v2::action_cache_server::ActionCacheServer;
-    use re_grpc_proto::build::bazel::remote::execution::v2::execution_server::Execution;
-    use re_grpc_proto::build::bazel::remote::execution::v2::execution_server::ExecutionServer;
     use re_grpc_proto::build::bazel::remote::execution::v2::batch_read_blobs_response;
     use re_grpc_proto::build::bazel::remote::execution::v2::batch_update_blobs_response;
+    use re_grpc_proto::build::bazel::remote::execution::v2::execution_server::Execution;
+    use re_grpc_proto::build::bazel::remote::execution::v2::execution_server::ExecutionServer;
     use tokio_stream::wrappers::TcpListenerStream;
 
     use super::*;
@@ -10119,8 +10121,8 @@ mod tests {
     }
 
     #[test]
-    fn with_invocation_env_override_sends_nothing_unset_or_without_a_build_id()
-    -> anyhow::Result<()> {
+    fn with_invocation_env_override_sends_nothing_unset_or_without_a_build_id() -> anyhow::Result<()>
+    {
         let unset = with_invocation_env_override(
             tonic::Request::new(()),
             None,
@@ -10154,7 +10156,9 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            invocation_env_override_from_options(&opts).unwrap().as_deref(),
+            invocation_env_override_from_options(&opts)
+                .unwrap()
+                .as_deref(),
             Some("GHC_WORKER_BUILD_KEY")
         );
     }
@@ -12319,7 +12323,8 @@ mod tests {
 
     #[tonic::async_trait]
     impl Execution for EnvOverridesExecution {
-        type ExecuteStream = futures::stream::Iter<std::vec::IntoIter<Result<Operation, tonic::Status>>>;
+        type ExecuteStream =
+            futures::stream::Iter<std::vec::IntoIter<Result<Operation, tonic::Status>>>;
         type WaitExecutionStream =
             futures::stream::Iter<std::vec::IntoIter<Result<Operation, tonic::Status>>>;
 
@@ -12342,7 +12347,9 @@ mod tests {
             &self,
             _request: tonic::Request<WaitExecutionRequest>,
         ) -> Result<tonic::Response<Self::WaitExecutionStream>, tonic::Status> {
-            Err(tonic::Status::unimplemented("the operation was done on Execute"))
+            Err(tonic::Status::unimplemented(
+                "the operation was done on Execute",
+            ))
         }
     }
 
@@ -12400,8 +12407,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn execute_carries_the_build_id_env_override_only_when_configured()
-    -> anyhow::Result<()> {
+    async fn execute_carries_the_build_id_env_override_only_when_configured() -> anyhow::Result<()>
+    {
         assert_eq!(
             env_overrides_on_the_wire().await?,
             [Some("GHC_WORKER_BUILD_KEY=build-1".to_owned()), None]
@@ -12512,8 +12519,8 @@ mod tests {
     /// `connect_with_connector`: a lookup on a connection whose peer stopped answering fails as
     /// a broken connection after the PING goes unanswered, well before the request timeout.
     #[tokio::test]
-    async fn keepalive_ends_a_lookup_on_a_connection_that_stopped_answering()
-    -> anyhow::Result<()> {
+    async fn keepalive_ends_a_lookup_on_a_connection_that_stopped_answering() -> anyhow::Result<()>
+    {
         let requests = Arc::new(AtomicUsize::new(0));
         let (address, log, server) = serve_raw_h2({
             let requests = requests.clone();
@@ -13245,7 +13252,10 @@ mod tests {
                         (Duration::ZERO, queued_operation("operations/running")),
                         (
                             Duration::from_millis(100),
-                            staged_operation("operations/running", execution_stage::Value::Executing),
+                            staged_operation(
+                                "operations/running",
+                                execution_stage::Value::Executing,
+                            ),
                         ),
                     ],
                     RawTrailers::After(Duration::from_millis(200)),
