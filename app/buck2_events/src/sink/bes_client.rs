@@ -6768,10 +6768,12 @@ mod tests {
             }
         };
         let env_u32 = |k: &str| std::env::var(k).ok().and_then(|v| v.parse::<u32>().ok());
+        // SINKBENCH_FAILED_ONLY=1 is `[bes] upload_successful_action_events = false`.
+        let failed_only = std::env::var("SINKBENCH_FAILED_ONLY").is_ok_and(|v| v == "1");
         let config = BesConfig {
             buffer_size: 100_000,
             event_format: BesEventFormat::Bazel,
-            upload_successful_action_events: true,
+            upload_successful_action_events: !failed_only,
             grpc_timeout: Duration::from_secs(60),
             build_metadata: vec![
                 ("ROLE".to_owned(), "BES-BENCH".to_owned()),
@@ -6829,7 +6831,7 @@ mod tests {
             let cp = buck2_cli_proto::CommandProgress::decode(frame).unwrap();
             let Some(command_progress::Progress::Event(mut e)) = cp.progress else { continue };
             let Some(data) = e.data.as_ref() else { continue };
-            if !crate::sink::scribe::should_send_event_data(data, &schedule, true, true) {
+            if !crate::sink::scribe::should_send_event_data(data, &schedule, !failed_only, true) {
                 continue;
             }
             // A fresh invocation per run: the log's own trace ID would make BuildBuddy record
