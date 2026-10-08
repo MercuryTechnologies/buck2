@@ -309,6 +309,8 @@ pub struct Counters {
     pub worker_upload_us: u64,
     pub worker_send_wait_us: u64,
     pub worker_transport_opens: u64,
+    pub worker_upload_connect_us: u64,
+    pub worker_upload_slot_wait_us: u64,
 }
 
 #[derive(Default)]
@@ -332,6 +334,10 @@ struct CounterState {
     worker_upload_us: AtomicU64,
     worker_send_wait_us: AtomicU64,
     worker_transport_opens: AtomicU64,
+    /// Within `worker_upload_us`: opening an uploader's ByteStream connection, and waiting for
+    /// one of its `MAX_UPLOADS_IN_FLIGHT` writes to finish.
+    worker_upload_connect_us: AtomicU64,
+    worker_upload_slot_wait_us: AtomicU64,
 }
 
 impl CounterState {
@@ -408,6 +414,8 @@ impl CounterState {
             worker_upload_us: self.worker_upload_us.load(Ordering::Relaxed),
             worker_send_wait_us: self.worker_send_wait_us.load(Ordering::Relaxed),
             worker_transport_opens: self.worker_transport_opens.load(Ordering::Relaxed),
+            worker_upload_connect_us: self.worker_upload_connect_us.load(Ordering::Relaxed),
+            worker_upload_slot_wait_us: self.worker_upload_slot_wait_us.load(Ordering::Relaxed),
         }
     }
 
@@ -812,13 +820,18 @@ impl BazelArtifactUploader {
             return false;
         }
         self.reap_finished_uploads();
+        let waiting = Instant::now();
         while self.queued_bytes > MAX_UPLOAD_BYTES_QUEUED {
             match self.in_flight.join_next().await {
                 Some(joined) => self.record_upload(joined),
                 None => break,
             }
         }
-        let client = match self.client().await {
+        CounterState::add_elapsed(&self.counters.worker_upload_slot_wait_us, waiting);
+        let connecting = Instant::now();
+        let client = self.client().await;
+        CounterState::add_elapsed(&self.counters.worker_upload_connect_us, connecting);
+        let client = match client {
             Ok(client) => client,
             Err(status) => {
                 self.record_failure(status);
