@@ -6672,6 +6672,14 @@ mod tests {
     }
 
 
+
+    /// Gives the worker a turn to close due streams and read acknowledgements, as its thread's
+    /// poll interval does.
+    async fn runtime_poll(worker: &mut WorkerState) {
+        worker.close_due_streams().await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
     /// A TCP relay to `endpoint` (`http://host:port`) that holds every chunk `delay` before
     /// passing it on, in both directions, buffering without bound so that only latency is added.
     async fn delaying_relay(endpoint: &str, delay: Duration) -> String {
@@ -6870,17 +6878,25 @@ mod tests {
                 stream.last_sent_sequence_number
             );
         }
-        // As at a command's end: wait for the server to acknowledge everything sent.
+        // End the command as buck2 does: CommandEnd, then the InvocationRecord, which closes the
+        // stream once the server has acknowledged every event (BuildBuddy acks only at EOF).
+        for data in [command_end_data(), invocation_record_data()] {
+            let message = make_message(Some(&trace_id), Some(1), data);
+            drop(worker.send_message_with_retry(&message, false).await);
+        }
         let deadline = Instant::now() + Duration::from_secs(1800);
-        let report = worker
-            .drain(DrainScope::Shutdown, deadline, std::future::pending())
-            .await;
+        while worker.streams.contains_key(&invocation_id) && Instant::now() < deadline {
+            runtime_poll(&mut worker).await;
+        }
         let elapsed = started.elapsed().as_secs_f64();
+        let c = counters.snapshot();
         eprintln!(
-            "sink_e2e invocation={invocation_id} sending_s={sending_s:.1} drain_s={:.1} unacked_after_drain={}",
+            "sink_e2e invocation={invocation_id} sending_s={sending_s:.1} close_s={:.1} stream_still_open={} failures={}",
             elapsed - sending_s,
-            report.unacked_events()
+            worker.streams.contains_key(&invocation_id),
+            failures(&counters)
         );
+        let _ = c;
         let c = counters.snapshot();
         eprintln!(
             "sink_e2e sent={sent} elapsed_s={elapsed:.1} rate={:.0}/s slowest_ms={:.1} over_1ms={over_1ms} successes={} dropped={}",
