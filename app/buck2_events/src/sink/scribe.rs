@@ -1000,6 +1000,7 @@ mod sinkbench {
         let (mut t_encode, mut t_decode, mut t_convert, mut t_bep) =
             (Duration::ZERO, Duration::ZERO, Duration::ZERO, Duration::ZERO);
         let mut no_output_by_kind: BTreeMap<String, u64> = BTreeMap::new();
+        let mut upload_kinds: BTreeMap<String, (u64, u64)> = BTreeMap::new();
         let mut seq = 0i64;
         while pos < buf.len() {
             let Some(len) = read_varint(&buf, &mut pos) else { break };
@@ -1043,6 +1044,35 @@ mod sinkbench {
                 std::hint::black_box(encode_bep_event(b));
             }
             t_bep += t.elapsed();
+            for b in &out {
+                use bazel_bep_proto::build_event_stream::build_event::Payload;
+                use bazel_bep_proto::build_event_stream::file::File as F;
+                let mut note = |kind: &str, f: &bazel_bep_proto::build_event_stream::File| {
+                    let what = match f.file.as_ref() {
+                        Some(F::Contents(c)) if !c.is_empty() => format!("{kind}/inline"),
+                        Some(F::Contents(_)) => format!("{kind}/empty"),
+                        Some(F::Uri(u)) if u.starts_with("bytestream") => format!("{kind}/bytestream"),
+                        Some(F::Uri(_)) => format!("{kind}/uri"),
+                        _ => format!("{kind}/none"),
+                    };
+                    let e = upload_kinds.entry(what).or_insert((0u64, 0u64));
+                    e.0 += 1;
+                    if let Some(F::Contents(c)) = f.file.as_ref() {
+                        e.1 += c.len() as u64;
+                    }
+                };
+                match b.payload.as_ref() {
+                    Some(Payload::Action(a)) => {
+                        if let Some(f) = a.stdout.as_ref() { note("action.stdout", f); }
+                        if let Some(f) = a.stderr.as_ref() { note("action.stderr", f); }
+                    }
+                    Some(Payload::TestResult(r)) => for f in &r.test_action_output { note("test_result", f); },
+                    Some(Payload::TestSummary(r)) => for f in r.passed.iter().chain(r.failed.iter()) { note("test_summary", f); },
+                    Some(Payload::BuildToolLogs(r)) => for f in &r.log { note("tool_logs", f); },
+                    Some(Payload::NamedSetOfFiles(r)) => for f in &r.files { note("named_set", f); },
+                    _ => {}
+                }
+            }
             if out.is_empty() {
                 no_output += 1;
                 let name = |d: String| {
@@ -1080,6 +1110,9 @@ mod sinkbench {
             us(t_bep),
             (t_encode + t_decode + t_convert + t_bep).as_secs_f64()
         );
+        for (k, (n, bytes)) in &upload_kinds {
+            eprintln!("sinkbench files {k} n={n} inline_bytes={bytes}");
+        }
         let mut top: Vec<_> = no_output_by_kind.into_iter().collect();
         top.sort_by(|a, b| b.1.cmp(&a.1));
         for (k, n) in top.iter().take(8) {
