@@ -516,6 +516,9 @@ pub struct Buck2OssReConfiguration {
     /// invocation's build id, through BuildBuddy's `x-buildbuddy-platform.env-overrides` header
     /// on Execute, which leaves the Action and its digest as they are. Unset sends nothing.
     pub invocation_env_override: Option<String>,
+    /// Seconds one attempt to connect to remote execution may take before it counts as failed
+    /// and is retried. Unset is 60; 0 waits forever, as before this key existed.
+    pub connect_timeout_s: Option<u64>,
     /// The max size for a GRPC message to be decoded.
     pub max_decoding_message_size: Option<usize>,
     /// The max cumulative blob size for batch CAS methods.
@@ -741,6 +744,10 @@ impl Buck2OssReConfiguration {
                 section: BUCK2_RE_CLIENT_CFG_SECTION,
                 property: "invocation_env_override",
             })?,
+            connect_timeout_s: legacy_config.parse(BuckconfigKeyRef {
+                section: BUCK2_RE_CLIENT_CFG_SECTION,
+                property: "connect_timeout_s",
+            })?,
             max_decoding_message_size: legacy_config.parse(BuckconfigKeyRef {
                 section: BUCK2_RE_CLIENT_CFG_SECTION,
                 property: "max_decoding_message_size",
@@ -873,7 +880,19 @@ impl Buck2OssReConfiguration {
             })?,
         })
     }
+
+    /// How long one connection attempt may take, or `None` to wait as long as it takes. A
+    /// connect that never returns would otherwise hold every action's first cache lookup behind
+    /// it without an error to retry on.
+    pub fn connect_timeout(&self) -> Option<std::time::Duration> {
+        match self.connect_timeout_s.unwrap_or(DEFAULT_CONNECT_TIMEOUT_S) {
+            0 => None,
+            secs => Some(std::time::Duration::from_secs(secs)),
+        }
+    }
 }
+
+const DEFAULT_CONNECT_TIMEOUT_S: u64 = 60;
 
 #[cfg(fbcode_build)]
 pub use fbcode::RemoteExecutionStaticMetadata;
@@ -1190,6 +1209,26 @@ mod tests {
         let config = Buck2OssReConfiguration::from_legacy_config(&legacy_config, Vec::new())?;
 
         assert_eq!(config.invocation_env_override, None);
+        Ok(())
+    }
+
+    #[test]
+    fn oss_config_bounds_a_connect_attempt_at_60s_unless_told_otherwise() -> buck2_error::Result<()>
+    {
+        let timeout = |text: &str| -> buck2_error::Result<Option<std::time::Duration>> {
+            let legacy_config = parse(&[("config", text)], "config")?;
+            Ok(
+                Buck2OssReConfiguration::from_legacy_config(&legacy_config, Vec::new())?
+                    .connect_timeout(),
+            )
+        };
+
+        assert_eq!(timeout("")?, Some(std::time::Duration::from_secs(60)));
+        assert_eq!(
+            timeout("[buck2_re_client]\nconnect_timeout_s = 15\n")?,
+            Some(std::time::Duration::from_secs(15))
+        );
+        assert_eq!(timeout("[buck2_re_client]\nconnect_timeout_s = 0\n")?, None);
         Ok(())
     }
 

@@ -469,6 +469,10 @@ const CONFIGS_INVISIBLE_TO_DICE: &[BuckconfigKeyRef<'static>] = &[
         property: "invocation_env_override",
     },
     BuckconfigKeyRef {
+        section: "buck2_re_client",
+        property: "connect_timeout_s",
+    },
+    BuckconfigKeyRef {
         section: "scuba",
         property: "defaults",
     },

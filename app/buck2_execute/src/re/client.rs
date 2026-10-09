@@ -695,6 +695,27 @@ static TEST_FAIL_RE_EXECUTE_MISSING_INPUTS_ONCE: AtomicBool = AtomicBool::new(fa
 static TEST_FAIL_RE_DOWNLOAD_DIGESTS_ONCE: LazyLock<Mutex<StdBuckHashSet<String>>> =
     LazyLock::new(|| Mutex::new(StdBuckHashSet::default()));
 
+/// `connect`, or an error once `timeout` passes. The error reaches `with_error_handler` like a
+/// refused connection, so `new_retry` warns and tries again rather than waiting on an attempt
+/// that never returns.
+#[cfg_attr(fbcode_build, allow(dead_code))]
+async fn connect_within<T>(
+    timeout: Option<Duration>,
+    connect: impl std::future::Future<Output = anyhow::Result<T>>,
+) -> anyhow::Result<T> {
+    let Some(timeout) = timeout else {
+        return connect.await;
+    };
+    tokio::time::timeout(timeout, connect)
+        .await
+        .unwrap_or_else(|_| {
+            Err(anyhow::anyhow!(
+                "connecting to remote execution took longer than {}s (`[buck2_re_client] connect_timeout_s`)",
+                timeout.as_secs_f64()
+            ))
+        })
+}
+
 impl RemoteExecutionClientImpl {
     async fn new(re_config: &RemoteExecutionConfig) -> buck2_error::Result<Self> {
         let op_name = "REClientBuilder";
@@ -1057,7 +1078,11 @@ impl RemoteExecutionClientImpl {
                 with_error_handler(
                     op_name,
                     "<none>",
-                    REClientBuilder::build_and_connect(&static_metadata.0).await,
+                    connect_within(
+                        static_metadata.0.connect_timeout(),
+                        REClientBuilder::build_and_connect(&static_metadata.0),
+                    )
+                    .await,
                 )?
             };
 
@@ -2388,6 +2413,30 @@ fn validate_digest_expirations(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn a_connect_that_never_returns_fails_once_its_timeout_passes() {
+        let started = Instant::now();
+        let result =
+            connect_within::<()>(Some(Duration::from_millis(50)), std::future::pending()).await;
+
+        let error = result.expect_err("a pending connect was waited on forever");
+        assert!(
+            format!("{error:#}").contains("connect_timeout_s"),
+            "the error should name the key that bounds it: {error:#}"
+        );
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[tokio::test]
+    async fn a_connect_is_waited_on_without_a_timeout() -> anyhow::Result<()> {
+        let connect = async {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            anyhow::Ok(7)
+        };
+        assert_eq!(connect_within(None, connect).await?, 7);
+        Ok(())
+    }
 
     fn test_digest(size: i64) -> TDigest {
         TDigest {
