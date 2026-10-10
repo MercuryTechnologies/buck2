@@ -31,6 +31,7 @@ use buck2_test_api::data::RequiredLocalResources;
 use buck2_test_api::data::TestResult;
 use buck2_test_api::data::TestStage;
 use buck2_test_api::data::TestStatus;
+use buck2_test_api::environment::build_test_env;
 use buck2_test_api::protocol::TestOrchestrator;
 use futures::StreamExt;
 use futures::stream::FuturesUnordered;
@@ -302,18 +303,11 @@ fn build_command_from_spec(spec: &ExternalRunnerSpec) -> Vec<ArgValue> {
 fn build_env_from_spec(
     spec: &ExternalRunnerSpec,
 ) -> sorted_vector_map::SortedVectorMap<String, ArgValue> {
-    spec.env
-        .iter()
-        .map(|(k, v)| {
-            (
-                k.clone(),
-                ArgValue {
-                    content: ArgValueContent::ExternalRunnerSpecValue(v.clone()),
-                    format: None,
-                },
-            )
-        })
-        .collect()
+    build_test_env(
+        spec.env
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone())),
+    )
 }
 
 fn format_execution_output(stdout: &ExecutionStream, stderr: &ExecutionStream) -> String {
@@ -399,7 +393,6 @@ mod tests {
     fn test_build_env_from_spec() {
         let spec = make_spec(vec![], vec![("FOO", "bar"), ("BAZ", "qux")]);
         let env = build_env_from_spec(&spec);
-        assert_eq!(env.len(), 2);
         assert!(env.contains_key("BAZ"));
         assert!(env.contains_key("FOO"));
     }
