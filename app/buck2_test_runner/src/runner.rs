@@ -12,6 +12,7 @@ use std::time::Duration;
 
 use buck2_error::BuckErrorContext;
 use buck2_error::internal_error;
+use buck2_test_api::environment::build_test_env;
 use buck2_test_api::data::ArgValue;
 use buck2_test_api::data::ArgValueContent;
 use buck2_test_api::data::ConfiguredTargetHandle;
@@ -235,7 +236,8 @@ fn test_output_dir() -> (DeclaredOutput, (String, ArgValue)) {
 }
 
 /// A test's environment: its output directory's variable when the directory is
-/// asked for, then the target's `env`, then the runner's `--env`, each later one
+/// asked for, then the target's `env` with `LC_CTYPE` defaulted as mercury-head's
+/// runner does it (`build_test_env`), then the runner's `--env`, each later one
 /// winning over an earlier one of the same name.
 ///
 /// The directory is an extra output and the variable an extra environment entry,
@@ -254,15 +256,7 @@ fn test_env(
     };
     let env = test_output_env
         .into_iter()
-        .chain(spec_env.into_iter().map(|(key, value)| {
-            (
-                key,
-                ArgValue {
-                    content: ArgValueContent::ExternalRunnerSpecValue(value),
-                    format: None,
-                },
-            )
-        }))
+        .chain(build_test_env(spec_env))
         .chain(config_env)
         .collect();
     (test_output_dir, env)
@@ -352,6 +346,8 @@ mod tests {
         let (declared, env) = test_env(vec![("A".to_owned(), verbatim("1"))], Vec::new(), false);
         assert!(declared.is_none());
         assert!(!env.contains_key("TEST_UNDECLARED_OUTPUTS_DIR"));
-        assert_eq!(env.len(), 1);
+        // The target's own variable, and the LC_CTYPE default mercury-head's runner adds.
+        assert_eq!(env.len(), 2);
+        assert!(env.contains_key("LC_CTYPE"));
     }
 }
