@@ -112,25 +112,30 @@ def _tar_strip_prefix_flags(strip_prefix: [str, None]) -> list[str]:
 def _shell_quote(value: str) -> str:
     return "'" + value.replace("'", "'\"'\"'") + "'"
 
+# Upstream's parameters come first, in upstream's order, so a rule written
+# against upstream's prelude (mercury-web-backend's toolchains/downloader)
+# still analyses. The remote-download and patch parameters this fork adds
+# default to what upstream's unarchive does: a local archive, no download,
+# no patches.
 def unarchive(
         ctx: AnalysisContext,
         archive: Artifact | None,
-        download_urls: list[str],
         output_name: str,
         ext_type,
         excludes,
-        remote_download: bool,
-        sha1: str | None,
-        sha256: str | None,
-        size_bytes: int | None,
         strip_prefix,
-        patch_args: list[str],
-        patches: list[Artifact],
         exec_deps: HttpArchiveExecDeps,
         prefer_local: bool,
-        resolve_static_crates: bool,
         sub_targets: list[str] | dict[str, list[str]],
-        has_content_based_path: bool = False):
+        has_content_based_path: bool = False,
+        download_urls: list[str] = [],
+        remote_download: bool = False,
+        sha1: str | None = None,
+        sha256: str | None = None,
+        size_bytes: int | None = None,
+        patch_args: list[str] = [],
+        patches: list[Artifact] = [],
+        resolve_static_crates: bool = False):
     exec_is_windows = exec_deps.exec_os_type[OsLookup].os == Os("windows")
     if remote_download and exec_is_windows:
         fail("remote_download is not supported for Windows http_archive actions")
