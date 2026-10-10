@@ -10,6 +10,7 @@
 
 use std::ffi::OsString;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
@@ -395,6 +396,17 @@ impl WorkerPool {
         dispatcher: EventDispatcher,
     ) -> (bool, WorkerFuture) {
         let mut workers = self.workers.lock();
+        let retired = workers
+            .get(&worker_spec.id)
+            .and_then(|worker_fut| worker_fut.peek().cloned())
+            .is_some_and(|worker| worker.is_ok_and(|worker| worker.is_retired()));
+        if retired {
+            tracing::warn!(
+                "Worker {:?} exited or stopped answering; starting a new one",
+                worker_spec.id
+            );
+            workers.remove(&worker_spec.id);
+        }
         if let Some(worker_fut) = workers.get(&worker_spec.id) {
             (false, worker_fut.clone())
         } else {
@@ -565,11 +577,22 @@ impl WorkerClient {
     }
 }
 
+/// How long past an action's `timeout_s` buck2 waits for its worker to answer. The worker is
+/// asked to enforce the timeout itself and report `timed_out_after_s`; this is for a worker that
+/// stopped answering altogether.
+#[cfg(not(test))]
+const WORKER_REPLY_GRACE: Duration = Duration::from_secs(30);
+#[cfg(test)]
+const WORKER_REPLY_GRACE: Duration = Duration::from_millis(100);
+
 pub struct WorkerHandle {
     client: WorkerClient,
     child_exited_observer: Arc<dyn LivelinessObserver>,
     std_redirects: StdRedirectPaths,
     _liveliness_guard: LivelinessGuard,
+    /// Set when the worker exited or let a request pass its deadline. The pool then starts a
+    /// new worker for the next action, and this one is killed when its last request lets go.
+    retired: AtomicBool,
 }
 
 impl WorkerHandle {
@@ -584,7 +607,12 @@ impl WorkerHandle {
             child_exited_observer,
             std_redirects,
             _liveliness_guard: liveliness_guard,
+            retired: AtomicBool::new(false),
         }
+    }
+
+    fn is_retired(&self) -> bool {
+        self.retired.load(Ordering::Relaxed)
     }
 }
 
@@ -626,6 +654,15 @@ impl WorkerHandle {
         };
 
         let mut client = self.client.clone();
+        // Nothing bounded a request but the worker's own exit: a worker that stopped answering
+        // held its action, and every action queued behind it, for the rest of the build. On
+        // 2026-10-08 a mwb CI job froze for 40 minutes that way with 749 actions waiting.
+        let deadline = async {
+            match timeout {
+                Some(timeout) => tokio::time::sleep(timeout + WORKER_REPLY_GRACE).await,
+                None => futures::future::pending().await,
+            }
+        };
         let (status, stdout, stderr) = tokio::select! {
             response = client.execute(request) => {
                 match response {
@@ -661,6 +698,7 @@ impl WorkerHandle {
                 }
             }
             _ = self.child_exited_observer.while_alive() => {
+                self.retired.store(true, Ordering::Relaxed);
                 (
                     GatherOutputStatus::SpawnFailed(format!(
                         "Worker exited while running command, see worker logs:\n{}\n{}",
@@ -668,6 +706,22 @@ impl WorkerHandle {
                     )),
                     vec![],
                     vec![],
+                )
+            }
+            () = deadline => {
+                self.retired.store(true, Ordering::Relaxed);
+                let timeout = timeout.unwrap_or_default();
+                (
+                    GatherOutputStatus::TimedOut(timeout),
+                    vec![],
+                    format!(
+                        "Worker did not answer within the action's timeout of {}s and {}s more; it is replaced for later actions. See worker logs:\n{}\n{}",
+                        timeout.as_secs(),
+                        WORKER_REPLY_GRACE.as_secs(),
+                        self.std_redirects.stdout,
+                        self.std_redirects.stderr,
+                    )
+                    .into_bytes(),
                 )
             }
         };
@@ -753,6 +807,84 @@ mod tests {
             .await
             .unwrap();
         (client, handle)
+    }
+
+    /// Accepts a request and never answers it, as a worker wedged behind a dead compiler does.
+    struct SilentWorker;
+
+    #[tonic::async_trait]
+    impl Worker for SilentWorker {
+        async fn execute(
+            &self,
+            _req: Request<ExecuteCommand>,
+        ) -> Result<Response<ExecuteResponse>, Status> {
+            futures::future::pending().await
+        }
+
+        async fn exec(
+            &self,
+            _req: Request<tonic::Streaming<ExecuteEvent>>,
+        ) -> Result<Response<ExecuteResponse>, Status> {
+            unimplemented!()
+        }
+    }
+
+    /// A request to a worker that never answers ends at the action's timeout, plus the grace,
+    /// as a timeout, and the worker is retired so the pool starts another for later actions.
+    #[tokio::test]
+    async fn a_worker_that_never_answers_times_out_and_is_retired() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            Server::builder()
+                .add_service(WorkerServer::new(SilentWorker))
+                .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
+                .await
+                .unwrap();
+        });
+        let channel = Channel::from_shared(format!("http://{addr}"))
+            .unwrap()
+            .connect()
+            .await
+            .unwrap();
+        // The worker process stays alive throughout: only the reply is missing.
+        let (child_alive, _child) = buck2_common::liveliness_observer::LivelinessGuard::create();
+        let (_observer, guard) = buck2_common::liveliness_observer::LivelinessGuard::create();
+        let handle = super::WorkerHandle::new(
+            WorkerClient::single(channel),
+            child_alive,
+            buck2_execute_local::StdRedirectPaths {
+                stdout: buck2_fs::paths::abs_norm_path::AbsNormPathBuf::new(
+                    "/tmp/worker.out".into(),
+                )
+                .unwrap(),
+                stderr: buck2_fs::paths::abs_norm_path::AbsNormPathBuf::new(
+                    "/tmp/worker.err".into(),
+                )
+                .unwrap(),
+            },
+            guard,
+        );
+
+        let started = std::time::Instant::now();
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            handle.exec_cmd(&[], Vec::new(), Some(std::time::Duration::from_secs(1))),
+        )
+        .await
+        .expect("the request outlived its deadline");
+
+        assert!(
+            matches!(
+                result.status,
+                buck2_execute_local::GatherOutputStatus::TimedOut(timeout)
+                    if timeout == std::time::Duration::from_secs(1)
+            ),
+            "{:?}",
+            result.status
+        );
+        assert!(started.elapsed() >= std::time::Duration::from_secs(1));
+        assert!(handle.is_retired());
     }
 
     fn empty_request() -> ExecuteCommand {
