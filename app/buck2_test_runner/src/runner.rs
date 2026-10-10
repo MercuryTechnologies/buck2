@@ -28,6 +28,8 @@ use buck2_test_api::data::TEST_OUTPUTS_DIR_NAME;
 use buck2_test_api::data::TestResult;
 use buck2_test_api::data::TestStage;
 use buck2_test_api::data::TestStatus;
+use buck2_test_api::environment::build_test_env;
+use buck2_test_api::environment::TestEnvironment;
 use buck2_test_api::grpc::TestOrchestratorClient;
 use clap::Parser;
 use futures::StreamExt;
@@ -35,7 +37,6 @@ use futures::TryStreamExt;
 use futures::channel::mpsc::UnboundedReceiver;
 use host_sharing::HostSharingRequirements;
 use parking_lot::Mutex;
-use sorted_vector_map::SortedVectorMap;
 
 use crate::config::Config;
 use crate::config::EnvValue;
@@ -235,7 +236,8 @@ fn test_output_dir() -> (DeclaredOutput, (String, ArgValue)) {
 }
 
 /// A test's environment: its output directory's variable when the directory is
-/// asked for, then the target's `env`, then the runner's `--env`, each later one
+/// asked for, then the target's `env` with `LC_CTYPE` defaulted as mercury-head's
+/// runner does it (`build_test_env`), then the runner's `--env`, each later one
 /// winning over an earlier one of the same name.
 ///
 /// The directory is an extra output and the variable an extra environment entry,
@@ -245,7 +247,7 @@ fn test_env(
     spec_env: impl IntoIterator<Item = (String, ExternalRunnerSpecValue)>,
     config_env: impl IntoIterator<Item = (String, ArgValue)>,
     undeclared_outputs_dir: bool,
-) -> (Option<DeclaredOutput>, SortedVectorMap<String, ArgValue>) {
+) -> (Option<DeclaredOutput>, TestEnvironment) {
     let (test_output_dir, test_output_env) = if undeclared_outputs_dir {
         let (dir, env) = test_output_dir();
         (Some(dir), Some(env))
@@ -254,15 +256,7 @@ fn test_env(
     };
     let env = test_output_env
         .into_iter()
-        .chain(spec_env.into_iter().map(|(key, value)| {
-            (
-                key,
-                ArgValue {
-                    content: ArgValueContent::ExternalRunnerSpecValue(value),
-                    format: None,
-                },
-            )
-        }))
+        .chain(build_test_env(spec_env))
         .chain(config_env)
         .collect();
     (test_output_dir, env)
@@ -323,7 +317,7 @@ mod tests {
         let declared = declared.expect("asked for an output dir");
         assert_eq!(declared.name.as_str(), "test_outputs");
         assert!(declared.remote_storage_config.supports_remote);
-        match &env["TEST_UNDECLARED_OUTPUTS_DIR"].content {
+        match &env.get("TEST_UNDECLARED_OUTPUTS_DIR").expect("the variable is set").content {
             ArgValueContent::DeclaredOutput(output) => assert_eq!(output, &declared.name),
             other => panic!("the variable should name the declared output, got {other}"),
         }
@@ -339,7 +333,7 @@ mod tests {
             Vec::new(),
             true,
         );
-        match &env["TEST_UNDECLARED_OUTPUTS_DIR"].content {
+        match &env.get("TEST_UNDECLARED_OUTPUTS_DIR").expect("the variable is set").content {
             ArgValueContent::ExternalRunnerSpecValue(ExternalRunnerSpecValue::Verbatim(v)) => {
                 assert_eq!(v, "/elsewhere")
             }
@@ -352,6 +346,8 @@ mod tests {
         let (declared, env) = test_env(vec![("A".to_owned(), verbatim("1"))], Vec::new(), false);
         assert!(declared.is_none());
         assert!(!env.contains_key("TEST_UNDECLARED_OUTPUTS_DIR"));
-        assert_eq!(env.len(), 1);
+        // The target's own variable, and the LC_CTYPE default mercury-head's runner adds.
+        assert_eq!(env.len(), 2);
+        assert!(env.contains_key("LC_CTYPE"));
     }
 }
