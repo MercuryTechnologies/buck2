@@ -385,6 +385,9 @@ async fn test(
         .await?
         .filter(|s| !s.is_empty());
 
+    // Set only for the internal test runner, whose own arguments come after
+    // the executor's file descriptors, with the ones from `buck2 test -- ...`.
+    let mut internal_runner_undeclared_outputs_dir = false;
     let (test_executor, test_executor_args) = match test_executor_config {
         Some(config) => {
             let test_executor = post_process_test_executor(config.as_ref())
@@ -416,8 +419,8 @@ async fn test(
         None => {
             // If no v2_test_executor config was set, fall back to the internal test runner.
             let test_executor = std::env::current_exe()?;
-            let mut test_executor_args = vec!["internal-test-runner".to_owned()];
-            let undeclared_outputs_dir = ctx
+            let test_executor_args = vec!["internal-test-runner".to_owned()];
+            internal_runner_undeclared_outputs_dir = ctx
                 .ctx()
                 .get_legacy_config_property(
                     cell_resolver.root_cell(),
@@ -428,9 +431,6 @@ async fn test(
                 )
                 .await?
                 .is_some_and(|v| v.trim() == "true");
-            if undeclared_outputs_dir {
-                test_executor_args.push("--undeclared-outputs-dir".to_owned());
-            }
             (test_executor, test_executor_args)
         }
     };
@@ -493,6 +493,11 @@ async fn test(
 
     let mut test_executor_args = request.test_executor_args.clone();
     test_executor_args.extend(extra_tpx_args);
+    // First, so that a trailing `--test-arg`, which takes every value after
+    // it, cannot swallow the flag.
+    if internal_runner_undeclared_outputs_dir {
+        test_executor_args.insert(0, "--undeclared-outputs-dir".to_owned());
+    }
 
     let test_outcome = test_targets(
         ctx.dupe(),
