@@ -289,7 +289,7 @@ impl RemoteEventSink {
     }
 }
 
-fn should_send_event_data(
+pub(crate) fn should_send_event_data(
     data: &buck2_data::buck_event::Data,
     schedule_type: &SandcastleScheduleType,
     upload_successful_action_events: bool,

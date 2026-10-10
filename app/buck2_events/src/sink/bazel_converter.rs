@@ -1558,8 +1558,11 @@ impl BazelEventConverter {
                 );
             }
             Some(buck2_data::span_end_event::Data::TestRun(test_end)) => {
-                if self.should_defer_target_setup()
-                    && let Some(suite) = test_end.suite.as_ref()
+                // The sink drops a test run's SpanStart, so its end is the first event that can
+                // configure a test target analysis didn't, and announce it to BuildBuddy's tracker.
+                if let Some(suite) = test_end.suite.as_ref()
+                    && (self.should_defer_target_setup()
+                        || !self.target_configured(suite.target_label.as_ref()))
                 {
                     self.push_configured_event(configured_event_from_test_suite(suite), events);
                 }
@@ -2134,6 +2137,12 @@ impl BazelEventConverter {
         }
         self.announce_late_test_target(&event, events);
         events.push(event);
+    }
+
+    fn target_configured(&self, label: Option<&buck2_data::ConfiguredTargetLabel>) -> bool {
+        label
+            .and_then(label_for_configured_target)
+            .is_some_and(|label| self.emitted_configured_targets.contains_key(&label))
     }
 
     /// BuildBuddy's target tracker follows only the targets a PatternExpanded event names
@@ -13467,6 +13476,114 @@ mod tests {
             announced < configured,
             "announced after its TargetConfigured"
         );
+    }
+
+    /// The sink drops a test run's SpanStart (scribe.rs, `should_send_event_data`), so a test
+    /// target that starts after the first PatternExpanded is configured and announced from its
+    /// span end, or BuildBuddy's target tracker never records it: on 2026-10-07 a test of 5,187
+    /// specs recorded its first 6, and none of its 134 failures.
+    #[test]
+    fn test_target_after_the_pattern_expansion_is_tracked_through_the_sink_filter() {
+        let schedule = crate::schedule_type::SandcastleScheduleType::new().unwrap();
+        let mut converter = BazelEventConverter::default();
+        let mut sequence = 0;
+        let mut feed = |converter: &mut BazelEventConverter, event: buck2_data::BuckEvent| {
+            sequence += 1;
+            let data = event.data.as_ref().expect("event data");
+            if crate::sink::scribe::should_send_event_data(data, &schedule, true, true) {
+                converter.convert(sequence, &event)
+            } else {
+                Vec::new()
+            }
+        };
+        let test_run_start = |target: &buck2_data::ConfiguredTargetLabel| {
+            trace_event(buck2_data::buck_event::Data::SpanStart(
+                buck2_data::SpanStartEvent {
+                    data: Some(buck2_data::span_start_event::Data::TestRun(
+                        buck2_data::TestRunStart {
+                            suite: Some(buck2_data::TestSuite {
+                                suite_name: "suite".to_owned(),
+                                test_names: Vec::new(),
+                                target_label: Some(target.clone()),
+                                labels: Vec::new(),
+                            }),
+                        },
+                    )),
+                },
+            ))
+        };
+        let first = configured_target();
+        let second = configured_target_with_package("pkg", "second", "cfg");
+        let second_id = target_configured_id("//pkg:second".to_owned());
+
+        feed(
+            &mut converter,
+            trace_event(buck2_data::buck_event::Data::SpanStart(
+                buck2_data::SpanStartEvent {
+                    data: Some(buck2_data::span_start_event::Data::Command(
+                        buck2_data::CommandStart {
+                            cli_args: vec![
+                                "buck2".to_owned(),
+                                "test".to_owned(),
+                                "//pkg/...".to_owned(),
+                            ],
+                            data: Some(buck2_data::command_start::Data::Test(
+                                buck2_data::TestCommandStart {},
+                            )),
+                            ..Default::default()
+                        },
+                    )),
+                },
+            )),
+        );
+        let mut first_events = feed(&mut converter, test_run_start(&first));
+        first_events.extend(feed(&mut converter, test_run_end_event(&first, 0)));
+        first_events.extend(feed(
+            &mut converter,
+            test_case_event(&first, buck2_data::TestStatus::Pass, ""),
+        ));
+        let first_expansion = first_events
+            .iter()
+            .find(|event| matches!(event.payload, Some(build_event::Payload::Expanded(_))))
+            .expect("the first PatternExpanded");
+        assert!(!first_expansion.children.contains(&second_id));
+
+        let mut later = feed(&mut converter, test_run_start(&second));
+        later.extend(feed(&mut converter, test_run_end_event(&second, 1)));
+        later.extend(feed(
+            &mut converter,
+            test_case_event(&second, buck2_data::TestStatus::Fail, "expected true"),
+        ));
+        later.extend(feed(&mut converter, end_of_test_results_event()));
+        let announced = later
+            .iter()
+            .position(|event| {
+                matches!(event.payload, Some(build_event::Payload::Expanded(_)))
+                    && event.children.contains(&second_id)
+            })
+            .expect("a PatternExpanded naming the late test target");
+        let configured = later
+            .iter()
+            .position(|event| {
+                event.id.as_ref() == Some(&second_id)
+                    && matches!(
+                        event.payload.as_ref(),
+                        Some(build_event::Payload::Configured(configured))
+                            if configured.test_size != bep::TestSize::Unknown as i32
+                    )
+            })
+            .expect("the late target's TargetConfigured as a test");
+        let summary = later
+            .iter()
+            .position(|event| {
+                matches!(
+                    event.payload.as_ref(),
+                    Some(build_event::Payload::TestSummary(summary))
+                        if summary.overall_status == bep::TestStatus::Failed as i32
+                )
+            })
+            .expect("the late target's failed TestSummary");
+        assert!(announced < configured && configured < summary);
     }
 
     /// Converts a test run's span end and then the stream's EndOfTestResults, the order a test
