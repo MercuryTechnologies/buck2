@@ -416,7 +416,21 @@ async fn test(
         None => {
             // If no v2_test_executor config was set, fall back to the internal test runner.
             let test_executor = std::env::current_exe()?;
-            let test_executor_args = vec!["internal-test-runner".to_owned()];
+            let mut test_executor_args = vec!["internal-test-runner".to_owned()];
+            let undeclared_outputs_dir = ctx
+                .ctx()
+                .get_legacy_config_property(
+                    cell_resolver.root_cell(),
+                    BuckconfigKeyRef {
+                        section: "test",
+                        property: "undeclared_outputs_dir",
+                    },
+                )
+                .await?
+                .is_some_and(|v| v.trim() == "true");
+            if undeclared_outputs_dir {
+                test_executor_args.push("--undeclared-outputs-dir".to_owned());
+            }
             (test_executor, test_executor_args)
         }
     };

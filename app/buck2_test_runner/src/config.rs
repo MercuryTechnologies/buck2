@@ -18,6 +18,13 @@ pub struct Config {
     #[clap(long)]
     pub env: Vec<String>,
 
+    /// Give every test a directory for its outputs, named by TEST_UNDECLARED_OUTPUTS_DIR.
+    /// The extra output and variable change every test's action digest, so test results
+    /// are then not shared with a buck2 that doesn't add them. Set from
+    /// `[test] undeclared_outputs_dir`.
+    #[clap(long)]
+    pub undeclared_outputs_dir: bool,
+
     /// Max number of seconds allowed to run a test.
     #[clap(long, default_value = "600")]
     pub timeout: u64,
