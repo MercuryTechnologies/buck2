@@ -583,6 +583,10 @@ pub struct Buck2OssReConfiguration {
     pub grpc_keepalive_while_idle: Option<bool>,
     /// Maximum number of concurrent execution requests.
     pub execution_concurrency_limit: Option<usize>,
+    /// The `ExecutionPolicy.priority` sent with the actions of each category, from a
+    /// comma-separated list of `category:priority`. A server that queues by priority, such as
+    /// BuildBuddy, then hands executors the categories on the critical path first.
+    pub execution_priority_by_category: ExecutionPriorityByCategory,
     /// Interval in seconds for TCP keepalive probes on the socket.
     pub tcp_keepalive_secs: Option<u64>,
     /// Effective digest algorithms used by the daemon.
@@ -644,6 +648,97 @@ impl FromStr for HttpHeader {
                 s
             )),
         }
+    }
+}
+
+/// One `category:priority` entry of `execution_priority_by_category`.
+#[derive(Clone, Debug, PartialEq, Eq, Allocative)]
+pub struct CategoryPriority {
+    pub category: String,
+    pub priority: i32,
+}
+
+impl FromStr for CategoryPriority {
+    type Err = buck2_error::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let invalid = || {
+            buck2_error::buck2_error!(
+                buck2_error::ErrorTag::Input,
+                "Invalid `execution_priority_by_category` entry (expect `category:priority`): `{}`",
+                s.trim()
+            )
+        };
+        let (category, priority) = s.split_once(':').ok_or_else(invalid)?;
+        let category = category.trim();
+        if category.is_empty() {
+            return Err(invalid());
+        }
+        Ok(Self {
+            category: category.to_owned(),
+            priority: priority.trim().parse().map_err(|_| invalid())?,
+        })
+    }
+}
+
+/// The remote execution priority of each listed action category. A category that is not listed
+/// keeps the priority it would have had without the list.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Allocative)]
+pub struct ExecutionPriorityByCategory(Vec<CategoryPriority>);
+
+impl ExecutionPriorityByCategory {
+    pub fn entries(&self) -> &[CategoryPriority] {
+        &self.0
+    }
+
+    pub fn get(&self, category: &str) -> Option<i32> {
+        self.0
+            .iter()
+            .find(|entry| entry.category == category)
+            .map(|entry| entry.priority)
+    }
+
+    /// The priority to send with an action. The action's own priority, which a rule sets with
+    /// `meta_internal_extra_params`, is the most specific, so it wins; the executor's is the
+    /// least specific, so it only fills in for an unlisted category. Unset everywhere is 0,
+    /// which the REAPI defines as the server's default.
+    pub fn resolve(
+        &self,
+        action_priority: Option<i32>,
+        category: Option<&str>,
+        executor_priority: Option<i32>,
+    ) -> i32 {
+        action_priority
+            .or_else(|| category.and_then(|category| self.get(category)))
+            .or(executor_priority)
+            .unwrap_or_default()
+    }
+}
+
+impl FromStr for ExecutionPriorityByCategory {
+    type Err = buck2_error::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        // An empty value is an empty list, so a `.buckconfig.local` can drop a list that a file
+        // it includes has set.
+        if s.trim().is_empty() {
+            return Ok(Self::default());
+        }
+        let mut entries: Vec<CategoryPriority> = Vec::new();
+        for entry in s.split(',') {
+            let entry: CategoryPriority = entry.parse()?;
+            // A later file replaces the whole value, so a category named twice in one value is a
+            // typo, and either reading of it would hide one of the two numbers.
+            if entries.iter().any(|seen| seen.category == entry.category) {
+                return Err(buck2_error::buck2_error!(
+                    buck2_error::ErrorTag::Input,
+                    "`execution_priority_by_category` names category `{}` more than once",
+                    entry.category
+                ));
+            }
+            entries.push(entry);
+        }
+        Ok(Self(entries))
     }
 }
 
@@ -842,6 +937,12 @@ impl Buck2OssReConfiguration {
                 section: BUCK2_RE_CLIENT_CFG_SECTION,
                 property: "execution_concurrency_limit",
             })?,
+            execution_priority_by_category: legacy_config
+                .parse(BuckconfigKeyRef {
+                    section: BUCK2_RE_CLIENT_CFG_SECTION,
+                    property: "execution_priority_by_category",
+                })?
+                .unwrap_or_default(),
             tcp_keepalive_secs: legacy_config.parse(BuckconfigKeyRef {
                 section: BUCK2_RE_CLIENT_CFG_SECTION,
                 property: "tcp_keepalive_secs",
@@ -1044,6 +1145,90 @@ mod tests {
         );
         let invalid = parse(&[("config", "[bes]\nretry_window_secs = soon\n")], "config")?;
         assert!(BesReplaySettings::from_legacy_config(&invalid).is_err());
+        Ok(())
+    }
+
+    fn priority_by_category(value: &str) -> buck2_error::Result<ExecutionPriorityByCategory> {
+        let legacy_config = parse(
+            &[(
+                "config",
+                format!("[buck2_re_client]\nexecution_priority_by_category = {value}\n").as_str(),
+            )],
+            "config",
+        )?;
+        Ok(Buck2OssReConfiguration::from_legacy_config(&legacy_config, Vec::new())?
+            .execution_priority_by_category)
+    }
+
+    #[test]
+    fn execution_priority_by_category_reads_each_entry() -> buck2_error::Result<()> {
+        let unset = parse(&[("config", "")], "config")?;
+        assert_eq!(
+            Buck2OssReConfiguration::from_legacy_config(&unset, Vec::new())?
+                .execution_priority_by_category,
+            ExecutionPriorityByCategory::default()
+        );
+
+        let map = priority_by_category(" haskell_compile_shared : -100 ,haskell_link:100")?;
+        assert_eq!(
+            map.entries(),
+            &[
+                CategoryPriority {
+                    category: "haskell_compile_shared".to_owned(),
+                    priority: -100,
+                },
+                CategoryPriority {
+                    category: "haskell_link".to_owned(),
+                    priority: 100,
+                },
+            ]
+        );
+        assert_eq!(map.get("haskell_link"), Some(100));
+        assert_eq!(map.get("cxx_link"), None);
+        Ok(())
+    }
+
+    #[test]
+    fn execution_priority_by_category_rejects_a_malformed_entry() {
+        for value in [
+            "haskell_link",
+            "haskell_link:soon",
+            ":100",
+            "haskell_link:100,",
+            "haskell_link:99999999999",
+        ] {
+            // The config layer wraps the parse error; `{:#}` prints the whole chain.
+            let err = format!("{:#}", priority_by_category(value).expect_err(value));
+            assert!(err.contains("execution_priority_by_category"), "{value}: {err}");
+        }
+        let err = format!(
+            "{:#}",
+            priority_by_category("haskell_link:100, haskell_link 5").unwrap_err()
+        );
+        assert!(err.contains("`haskell_link 5`"), "{err}");
+    }
+
+    #[test]
+    fn execution_priority_by_category_rejects_a_category_named_twice() {
+        let err = format!(
+            "{:#}",
+            priority_by_category("haskell_link:100,haskell_link:-5").unwrap_err()
+        );
+        assert!(err.contains("`haskell_link` more than once"), "{err}");
+    }
+
+    #[test]
+    fn execution_priority_resolves_action_then_category_then_executor() -> buck2_error::Result<()>
+    {
+        let map = priority_by_category("haskell_compile_shared:-100,haskell_link:100")?;
+
+        assert_eq!(map.resolve(Some(7), Some("haskell_link"), Some(3)), 7);
+        assert_eq!(map.resolve(None, Some("haskell_link"), Some(3)), 100);
+        assert_eq!(map.resolve(None, Some("haskell_compile_shared"), None), -100);
+        assert_eq!(map.resolve(None, Some("cxx_link"), Some(3)), 3);
+        assert_eq!(map.resolve(Some(7), None, Some(3)), 7);
+        assert_eq!(map.resolve(None, None, None), 0);
+        assert_eq!(map.resolve(None, Some("cxx_link"), None), 0);
         Ok(())
     }
 

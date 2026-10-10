@@ -43,6 +43,7 @@ use buck2_hash::StdBuckHashMap;
 use buck2_hash::StdBuckHashSet;
 #[cfg(fbcode_build)]
 use buck2_re_configuration::CASdMode;
+use buck2_re_configuration::ExecutionPriorityByCategory;
 use buck2_re_configuration::RemoteExecutionStaticMetadataImpl;
 use dupe::Dupe;
 use either::Either;
@@ -545,6 +546,7 @@ struct RemoteExecutionClientImpl {
     persistent_cache_mode: Option<String>,
     #[allocative(skip)]
     missing_remote_cas_digests: MissingCasDigests,
+    execution_priority_by_category: ExecutionPriorityByCategory,
 }
 
 /// CAS digests that a stale action cache hit was found to lack. A later hit naming one of them is
@@ -1097,6 +1099,17 @@ impl RemoteExecutionClientImpl {
                 }
             };
 
+            let execution_priority_by_category = {
+                #[cfg(fbcode_build)]
+                {
+                    ExecutionPriorityByCategory::default()
+                }
+                #[cfg(not(fbcode_build))]
+                {
+                    static_metadata.0.execution_priority_by_category.clone()
+                }
+            };
+
             Self {
                 client: Some(client),
                 skip_remote_cache: re_config.skip_remote_cache,
@@ -1110,6 +1123,7 @@ impl RemoteExecutionClientImpl {
                 respect_file_symlinks,
                 persistent_cache_mode,
                 missing_remote_cas_digests: MissingCasDigests::default(),
+                execution_priority_by_category,
             }
         };
 
@@ -1651,10 +1665,11 @@ impl RemoteExecutionClientImpl {
                 || induced_cache_miss.is_some(),
             execution_policy: Some(TExecutionPolicy {
                 affinity_keys: vec![identity.affinity_key.clone()],
-                // TODO: figure out what to do with priority from `meta_internal_extra_params`
-                priority: priority
-                    .or(meta_internal_extra_params.remote_execution_policy.priority)
-                    .unwrap_or_default(),
+                priority: self.execution_priority_by_category.resolve(
+                    meta_internal_extra_params.remote_execution_policy.priority,
+                    identity.action_mnemonic.as_deref(),
+                    priority,
+                ),
                 region_preference: meta_internal_extra_params
                     .remote_execution_policy
                     .region_preference
