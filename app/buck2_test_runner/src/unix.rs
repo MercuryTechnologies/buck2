@@ -62,3 +62,53 @@ impl Buck2TestRunnerUnix {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::Config;
+
+    /// The command line `buck2 test` gives the internal runner when
+    /// `[test] undeclared_outputs_dir` is set: the runner's own flags come
+    /// after the executor's file descriptors and `--`, first among them.
+    #[test]
+    fn the_outputs_dir_flag_reaches_the_runner_s_config() {
+        let runner = Buck2TestRunnerUnix::try_parse_from([
+            "internal-test-runner",
+            "--executor-fd",
+            "3",
+            "--orchestrator-fd",
+            "4",
+            "--",
+            "ignored",
+            "--buck-test-info",
+            "ignored",
+            "--undeclared-outputs-dir",
+            "--timeout",
+            "3600",
+            "--test-arg",
+            "--match",
+            "x",
+        ])
+        .expect("the runner command accepts its arguments");
+        let config = Config::try_parse_from(&runner.args).expect("the config parses");
+        assert!(config.undeclared_outputs_dir);
+        assert_eq!(config.timeout, 3600);
+        assert_eq!(config.test_arg, vec!["--match", "x"]);
+    }
+
+    #[test]
+    fn the_flag_before_the_file_descriptors_is_refused() {
+        assert!(
+            Buck2TestRunnerUnix::try_parse_from([
+                "internal-test-runner",
+                "--undeclared-outputs-dir",
+                "--executor-fd",
+                "3",
+                "--orchestrator-fd",
+                "4",
+            ])
+            .is_err()
+        );
+    }
+}
