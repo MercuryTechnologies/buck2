@@ -172,11 +172,12 @@ impl Buck2TestRunner {
             )
         });
 
-        let (test_output_dir, env) = test_env(spec.env, config_env);
+        let (test_output_dir, env) =
+            test_env(spec.env, config_env, self.config.undeclared_outputs_dir);
 
         let target_handle = spec.target.handle;
         let host_sharing_requirements = HostSharingRequirements::default();
-        let pre_create_dirs = vec![test_output_dir];
+        let pre_create_dirs = test_output_dir.into_iter().collect();
         let executor_override = None;
 
         self.orchestrator_client
@@ -233,15 +234,26 @@ fn test_output_dir() -> (DeclaredOutput, (String, ArgValue)) {
     )
 }
 
-/// A test's environment: its output directory's variable, then the target's
-/// `env`, then the runner's `--env`, each later one winning over an earlier
-/// one of the same name.
+/// A test's environment: its output directory's variable when the directory is
+/// asked for, then the target's `env`, then the runner's `--env`, each later one
+/// winning over an earlier one of the same name.
+///
+/// The directory is an extra output and the variable an extra environment entry,
+/// so either changes every test's action digest. Without them a test's action is
+/// the one upstream buck2 runs, and can share cached results with it.
 fn test_env(
     spec_env: impl IntoIterator<Item = (String, ExternalRunnerSpecValue)>,
     config_env: impl IntoIterator<Item = (String, ArgValue)>,
-) -> (DeclaredOutput, SortedVectorMap<String, ArgValue>) {
-    let (test_output_dir, test_output_env) = test_output_dir();
-    let env = std::iter::once(test_output_env)
+    undeclared_outputs_dir: bool,
+) -> (Option<DeclaredOutput>, SortedVectorMap<String, ArgValue>) {
+    let (test_output_dir, test_output_env) = if undeclared_outputs_dir {
+        let (dir, env) = test_output_dir();
+        (Some(dir), Some(env))
+    } else {
+        (None, None)
+    };
+    let env = test_output_env
+        .into_iter()
         .chain(spec_env.into_iter().map(|(key, value)| {
             (
                 key,
@@ -307,7 +319,8 @@ mod tests {
 
     #[test]
     fn every_test_gets_one_output_dir_named_by_the_variable() {
-        let (declared, env) = test_env(Vec::new(), Vec::new());
+        let (declared, env) = test_env(Vec::new(), Vec::new(), true);
+        let declared = declared.expect("asked for an output dir");
         assert_eq!(declared.name.as_str(), "test_outputs");
         assert!(declared.remote_storage_config.supports_remote);
         match &env["TEST_UNDECLARED_OUTPUTS_DIR"].content {
@@ -324,6 +337,7 @@ mod tests {
                 verbatim("/elsewhere"),
             )],
             Vec::new(),
+            true,
         );
         match &env["TEST_UNDECLARED_OUTPUTS_DIR"].content {
             ArgValueContent::ExternalRunnerSpecValue(ExternalRunnerSpecValue::Verbatim(v)) => {
@@ -331,5 +345,13 @@ mod tests {
             }
             other => panic!("the target's value should win, got {other}"),
         }
+    }
+
+    #[test]
+    fn unless_asked_a_test_gets_no_output_dir_and_no_variable() {
+        let (declared, env) = test_env(vec![("A".to_owned(), verbatim("1"))], Vec::new(), false);
+        assert!(declared.is_none());
+        assert!(!env.contains_key("TEST_UNDECLARED_OUTPUTS_DIR"));
+        assert_eq!(env.len(), 1);
     }
 }
