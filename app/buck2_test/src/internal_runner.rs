@@ -367,6 +367,7 @@ mod tests {
             contacts: vec![],
             oncall: None,
             working_dir_cell: CellName::testing_new("root"),
+            timeout_ms: None,
         }
     }
 
