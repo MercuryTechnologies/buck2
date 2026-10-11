@@ -55,6 +55,7 @@ pub fn build_external_runner_spec<'a>(
     target: ConfiguredTarget,
     working_dir_cell: CellName,
     tenting_status: &TentingStatus,
+    timeout_ms: Option<u64>,
 ) -> ExternalRunnerSpec {
     let mut handle_index = 0;
 
@@ -113,6 +114,7 @@ pub fn build_external_runner_spec<'a>(
         contacts,
         oncall,
         working_dir_cell,
+        timeout_ms,
     }
 }
 
@@ -144,6 +146,7 @@ impl TestProvider for FrozenExternalRunnerTestInfo {
             target,
             working_dir_cell,
             &tenting_acl_names,
+            self.timeout_ms(),
         );
         async move { executor.external_runner_spec(spec).await }.boxed()
     }
@@ -182,6 +185,7 @@ impl TestProvider for FrozenInternalRunnerTestInfo {
             target,
             working_dir_cell,
             &tenting_acl_names,
+            None,
         );
         async move { executor.external_runner_spec(spec).await }.boxed()
     }
