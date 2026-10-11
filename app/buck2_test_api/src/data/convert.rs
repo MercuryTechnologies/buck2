@@ -458,6 +458,7 @@ impl TryFrom<buck2_test_proto::ExternalRunnerSpec> for ExternalRunnerSpec {
             contacts,
             oncall,
             working_dir_cell,
+            timeout_ms,
         } = s;
 
         Ok(Self {
@@ -479,6 +480,7 @@ impl TryFrom<buck2_test_proto::ExternalRunnerSpec> for ExternalRunnerSpec {
             contacts,
             oncall,
             working_dir_cell: CellName::unchecked_new(&working_dir_cell)?,
+            timeout_ms,
         })
     }
 }
@@ -496,6 +498,7 @@ impl TryInto<buck2_test_proto::ExternalRunnerSpec> for ExternalRunnerSpec {
             contacts,
             oncall,
             working_dir_cell,
+            timeout_ms,
         } = self;
         Ok(buck2_test_proto::ExternalRunnerSpec {
             target: Some(target.try_into().buck_error_context("Invalid `target`")?),
@@ -513,6 +516,7 @@ impl TryInto<buck2_test_proto::ExternalRunnerSpec> for ExternalRunnerSpec {
             contacts,
             oncall,
             working_dir_cell: working_dir_cell.as_str().to_owned(),
+            timeout_ms,
         })
     }
 }
@@ -1326,6 +1330,7 @@ mod tests {
             contacts: vec!["contact1".to_owned(), "contact2".to_owned()],
             oncall: Some("contact1".to_owned()),
             working_dir_cell: CellName::testing_new("qux"),
+            timeout_ms: Some(3_600_000),
         };
         assert_roundtrips::<buck2_test_proto::ExternalRunnerSpec, ExternalRunnerSpec>(&test_spec);
     }
