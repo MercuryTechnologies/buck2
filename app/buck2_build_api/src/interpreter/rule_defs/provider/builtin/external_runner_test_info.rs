@@ -133,6 +133,10 @@ pub struct ExternalRunnerTestInfo<'v> {
 
     /// Whether test execution results can be read from the remote action cache.
     supports_test_execution_caching: ValueOfUnchecked<'v, bool>,
+
+    /// How long the test may run, in milliseconds. When set, a test runner uses it in place of its
+    /// own default, so one long test can carry its own limit.
+    timeout_ms: ValueOfUnchecked<'v, i32>,
 }
 
 /// An `ExternalRunnerTestInfo` kept alive by its owning frozen heap; usable across threads and
@@ -227,6 +231,14 @@ impl<'v> ExternalRunnerTestInfo<'v> {
 
     pub fn worker(&self) -> Option<&'v WorkerInfo<'v>> {
         self.worker.map(|v| v.as_ref())
+    }
+
+    pub fn timeout_ms(&self) -> Option<u64> {
+        NoneOr::<i32>::unpack_value(self.timeout_ms.get())
+            .unwrap()
+            .unwrap()
+            .into_option()
+            .map(|ms| ms as u64)
     }
 
     pub fn supports_test_execution_caching(&self) -> bool {
@@ -564,6 +576,14 @@ fn validate_external_runner_test_info<'v>(
     NoneOr::<bool>::unpack_value(info.supports_test_execution_caching.get())?.ok_or_else(|| {
         internal_error!("`supports_test_execution_caching` must be a bool if provided")
     })?;
+    match NoneOr::<i32>::unpack_value(info.timeout_ms.get())?
+        .internal_error("`timeout_ms` must be an int if provided")?
+    {
+        NoneOr::Other(ms) if ms <= 0 => {
+            return Err(internal_error!("`timeout_ms` must be positive, got {ms}"));
+        }
+        _ => {}
+    }
     info.test_type
         .get()
         .unpack_str()
@@ -596,6 +616,7 @@ fn external_runner_test_info_creator(globals: &mut GlobalsBuilder) {
             ValueTyped<'v, WorkerInfo<'v>>,
         >,
         #[starlark(require = named, default = NoneType)] supports_test_execution_caching: Value<'v>,
+        #[starlark(require = named, default = NoneType)] timeout_ms: Value<'v>,
         eval: &mut Evaluator<'v, '_, '_>,
     ) -> starlark::Result<ExternalRunnerTestInfo<'v>> {
         let exec_group = exec_group.into_option();
@@ -619,6 +640,7 @@ fn external_runner_test_info_creator(globals: &mut GlobalsBuilder) {
             required_local_resources: ValueOfUnchecked::new(required_local_resources),
             worker: worker.into_option(),
             supports_test_execution_caching: ValueOfUnchecked::new(supports_test_execution_caching),
+            timeout_ms: ValueOfUnchecked::new(timeout_ms),
         };
         validate_external_runner_test_info(&res)?;
         Ok(res)
