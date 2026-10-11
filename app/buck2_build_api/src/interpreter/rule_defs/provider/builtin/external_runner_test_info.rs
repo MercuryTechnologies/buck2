@@ -119,6 +119,10 @@ pub struct ExternalRunnerTestInfoGen<V: ValueLifetimeless> {
 
     /// Whether test execution results can be read from the remote action cache.
     supports_test_execution_caching: ValueOfUncheckedGeneric<V, bool>,
+
+    /// How long the test may run, in milliseconds. When set, a test runner uses it in place of its
+    /// own default, so one long test can carry its own limit.
+    timeout_ms: ValueOfUncheckedGeneric<V, i32>,
 }
 
 // NOTE: All the methods here unwrap because we validate at freeze time.
@@ -202,6 +206,14 @@ impl FrozenExternalRunnerTestInfo {
 
     pub fn worker(&self) -> Option<&WorkerInfo<'_>> {
         unpack_opt_worker(self.worker.get().to_value()).unwrap()
+    }
+
+    pub fn timeout_ms(&self) -> Option<u64> {
+        NoneOr::<i32>::unpack_value(self.timeout_ms.get().to_value())
+            .unwrap()
+            .unwrap()
+            .into_option()
+            .map(|ms| ms as u64)
     }
 
     pub fn supports_test_execution_caching(&self) -> bool {
@@ -523,6 +535,14 @@ where
         .ok_or_else(|| {
             internal_error!("`supports_test_execution_caching` must be a bool if provided")
         })?;
+    match NoneOr::<i32>::unpack_value(info.timeout_ms.get().to_value())?
+        .ok_or_else(|| internal_error!("`timeout_ms` must be an int if provided"))?
+    {
+        NoneOr::Other(ms) if ms <= 0 => {
+            return Err(internal_error!("`timeout_ms` must be positive, got {ms}"));
+        }
+        _ => {}
+    }
     info.test_type
         .get()
         .to_value()
@@ -549,6 +569,7 @@ fn external_runner_test_info_creator(globals: &mut GlobalsBuilder) {
         #[starlark(require = named, default = NoneType)] required_local_resources: Value<'v>,
         #[starlark(require = named, default = NoneType)] worker: Value<'v>,
         #[starlark(require = named, default = NoneType)] supports_test_execution_caching: Value<'v>,
+        #[starlark(require = named, default = NoneType)] timeout_ms: Value<'v>,
     ) -> starlark::Result<ExternalRunnerTestInfo<'v>> {
         let res = ExternalRunnerTestInfo {
             test_type: ValueOfUnchecked::new(r#type),
@@ -564,6 +585,7 @@ fn external_runner_test_info_creator(globals: &mut GlobalsBuilder) {
             required_local_resources: ValueOfUnchecked::new(required_local_resources),
             worker: ValueOfUnchecked::new(worker),
             supports_test_execution_caching: ValueOfUnchecked::new(supports_test_execution_caching),
+            timeout_ms: ValueOfUnchecked::new(timeout_ms),
         };
         validate_external_runner_test_info(&res)?;
         Ok(res)

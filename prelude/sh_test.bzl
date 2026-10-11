@@ -69,6 +69,7 @@ def sh_test_impl(ctx: AnalysisContext) -> list[Provider]:
             run_from_project_root = run_from_project_root,
             use_project_relative_paths = use_project_relative_paths,
             supports_test_execution_caching = ctx.attrs.supports_test_execution_caching,
+            timeout_ms = ctx.attrs.test_rule_timeout_ms,
         ),
     ) + [
         DefaultInfo(),
