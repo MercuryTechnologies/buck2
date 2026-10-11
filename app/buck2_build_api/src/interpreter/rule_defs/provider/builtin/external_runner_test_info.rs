@@ -122,6 +122,10 @@ pub struct ExternalRunnerTestInfo<'v> {
 
     /// Whether test execution results can be read from the remote action cache.
     supports_test_execution_caching: Option<ValueOf<'v, bool>>,
+
+    /// How long the test may run, in milliseconds. When set, a test runner uses it in place of its
+    /// own default, so one long test can carry its own limit.
+    timeout_ms: Option<ValueOf<'v, i32>>,
 }
 
 /// An `ExternalRunnerTestInfo` kept alive by its owning frozen heap; usable across threads and
@@ -200,6 +204,10 @@ impl<'v> ExternalRunnerTestInfo<'v> {
 
     pub fn worker(&self) -> Option<&'v WorkerInfo<'v>> {
         self.worker.map(|v| v.as_ref())
+    }
+
+    pub fn timeout_ms(&self) -> Option<u64> {
+        self.timeout_ms.map(|v| v.get() as u64)
     }
 
     pub fn supports_test_execution_caching(&self) -> bool {
@@ -425,6 +433,11 @@ pub(super) fn visit_env_artifacts<'v>(
 fn validate_external_runner_test_info<'v>(
     info: &ExternalRunnerTestInfo<'v>,
 ) -> buck2_error::Result<()> {
+    if let Some(ms) = info.timeout_ms.map(|v| v.get()) {
+        if ms <= 0 {
+            return Err(internal_error!("`timeout_ms` must be positive, got {ms}"));
+        }
+    }
     check_required_local_resources(info.local_resources, info.required_local_resources)
 }
 
@@ -463,6 +476,8 @@ fn external_runner_test_info_creator(globals: &mut GlobalsBuilder) {
         >,
         #[starlark(require = named, default = NoneOr::None)]
         supports_test_execution_caching: NoneOr<ValueOf<'v, bool>>,
+        #[starlark(require = named, default = NoneOr::None)]
+        timeout_ms: NoneOr<ValueOf<'v, i32>>,
         eval: &mut Evaluator<'v, '_, '_>,
     ) -> starlark::Result<ValueOf<'v, ExternalRunnerTestInfo<'v>>> {
         let exec_group = exec_group.into_option();
@@ -487,6 +502,7 @@ fn external_runner_test_info_creator(globals: &mut GlobalsBuilder) {
             required_local_resources: required_local_resources.into_option(),
             worker: worker.into_option(),
             supports_test_execution_caching: supports_test_execution_caching.into_option(),
+            timeout_ms: timeout_ms.into_option(),
         };
         validate_external_runner_test_info(&res)?;
         Ok(eval.heap().alloc(res))

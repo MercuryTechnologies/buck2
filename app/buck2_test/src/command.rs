@@ -1779,6 +1779,7 @@ async fn test_target<'a, 'e>(
                     handle.clone(),
                     working_dir_cell,
                     &tenting_acl_names,
+                    None,
                 )?;
                 let spec = build_external_runner_spec(
                     provider.command(),
@@ -1789,6 +1790,7 @@ async fn test_target<'a, 'e>(
                     handle,
                     working_dir_cell,
                     &tenting_acl_names,
+                    None,
                 )?;
                 (spec, listing_spec)
             };
