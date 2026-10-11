@@ -150,6 +150,9 @@ message ExternalRunnerSpec {
 
   // Current working directory cell.
   string working_dir_cell = 8;
+
+  // How long the test may run, in milliseconds, when its rule sets a limit.
+  optional uint64 timeout_ms = 9;
 }
 
 message ExternalRunnerSpecValue {
