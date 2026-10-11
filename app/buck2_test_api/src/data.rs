@@ -218,6 +218,9 @@ pub struct ExternalRunnerSpec {
     pub oncall: Option<String>,
     /// Cell of current working directory for test command.
     pub working_dir_cell: CellName,
+    /// How long the test may run, in milliseconds, when its rule sets a limit. A runner uses it in
+    /// place of its own default.
+    pub timeout_ms: Option<u64>,
 }
 
 /// Command line argument or environment variable value
