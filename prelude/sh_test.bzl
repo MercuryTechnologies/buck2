@@ -74,7 +74,9 @@ def sh_test_impl(ctx: AnalysisContext) -> list[Provider]:
             run_from_project_root = run_from_project_root,
             use_project_relative_paths = use_project_relative_paths,
             supports_test_execution_caching = ctx.attrs.supports_test_execution_caching,
-            timeout_ms = ctx.attrs.test_rule_timeout_ms,
+            # Passed only when set, so a buck2 from before `timeout_ms` existed still loads this
+            # prelude, as the release build of a newer pin does with the current client.
+            **({"timeout_ms": ctx.attrs.test_rule_timeout_ms} if ctx.attrs.test_rule_timeout_ms != None else {})
         ),
     ) + [
         DefaultInfo(),
