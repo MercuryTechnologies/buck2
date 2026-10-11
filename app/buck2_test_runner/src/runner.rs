@@ -187,7 +187,7 @@ impl Buck2TestRunner {
                 target_handle,
                 command,
                 env,
-                Duration::from_secs(self.config.timeout),
+                spec_timeout(spec.timeout_ms, self.config.timeout),
                 host_sharing_requirements,
                 pre_create_dirs,
                 executor_override,
@@ -202,6 +202,14 @@ impl Buck2TestRunner {
             .report_test_result(test_result)
             .await
     }
+}
+
+/// How long a test may run: its rule's own limit when it sets one, which lets one long test carry
+/// its limit instead of every command that runs it, else the runner's `--timeout`.
+fn spec_timeout(spec_timeout_ms: Option<u64>, default_secs: u64) -> Duration {
+    spec_timeout_ms
+        .map(Duration::from_millis)
+        .unwrap_or(Duration::from_secs(default_secs))
 }
 
 /// The variable that names a directory a test may write files into, collected
@@ -339,6 +347,15 @@ mod tests {
             }
             other => panic!("the target's value should win, got {other}"),
         }
+    }
+
+    #[test]
+    fn a_rule_s_timeout_wins_over_the_runner_s_default() {
+        assert_eq!(
+            spec_timeout(Some(3_600_000), 600),
+            Duration::from_secs(3600)
+        );
+        assert_eq!(spec_timeout(None, 600), Duration::from_secs(600));
     }
 
     #[test]
