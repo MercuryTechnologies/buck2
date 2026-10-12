@@ -563,7 +563,8 @@ pub struct Buck2OssReConfiguration {
     /// Maximum time in seconds a ByteStream download may make no read progress.
     pub bytestream_progress_timeout_secs: Option<u64>,
     /// Time in seconds an operation may stay QUEUED after its Execute before the action is
-    /// executed again, within `retries`. 0 turns it off. Must exceed the time the server merges
+    /// executed again, up to `retries` times, counted apart from the re-Executes of failed
+    /// requests. 0 turns it off. Must exceed the time the server merges
     /// a new Execute onto a queued operation of the same action, or the new Execute joins the
     /// operation that is stuck.
     pub queued_operation_timeout_secs: Option<u64>,

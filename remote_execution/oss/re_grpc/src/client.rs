@@ -1320,7 +1320,10 @@ struct OperationStream {
 struct QueuedDeadline {
     timeout: Duration,
     /// Times the action was executed again because an operation stayed QUEUED, each of which
-    /// doubles the next period, so a long legitimate queue gets few duplicates.
+    /// doubles the next period, so a long legitimate queue gets few duplicates. They are counted
+    /// apart from the re-Executes of failed requests: a saturated pool keeps operations QUEUED
+    /// for longer than the timeout without anything having failed, and spending `retries` on
+    /// that would leave an action fewer attempts for a server error later.
     reexecutes: u32,
     /// None once an executor has claimed the operation (`operation_claimed`): a claimed
     /// operation is the executor's lease to keep, and an action may run for as long as it needs.
@@ -1373,6 +1376,10 @@ impl QueuedDeadline {
 
     fn period(&self) -> Duration {
         self.timeout.saturating_mul(1 << self.reexecutes.min(16))
+    }
+
+    fn can_reexecute(&self, retries: usize) -> bool {
+        can_retry_execute(self.reexecutes as usize, retries)
     }
 }
 
@@ -1889,16 +1896,15 @@ async fn resume_or_retry_execute(
                 format!("RE operation `{operation_name}` was lost and Execute retry failed")
             }
             Some(Err(wait_err)) => return Err(wait_err.context(wait_failure_context)),
-            None if can_retry_execute(execute_retry_attempts, retries) => {
-                execute_retry_attempts += 1;
+            None if queued.can_reexecute(retries) => {
+                queued.reexecutes += 1;
                 warn_stayed_queued(
                     &execute_request,
                     Some(&operation_name),
                     queued.wait,
-                    Some(execute_retry_attempts),
+                    Some(queued.reexecutes as usize),
                     retries,
                 );
-                queued.reexecutes += 1;
                 match execute_stream(
                     grpc_clients.clone(),
                     metadata.clone(),
@@ -6205,7 +6211,7 @@ impl REClient {
                                 }
                                 OperationStreamEvent::Deadline => {
                                     let waited = queued.wait;
-                                    if !can_retry_execute(execute_retry_attempts, retries) {
+                                    if !queued.can_reexecute(retries) {
                                         warn_stayed_queued(
                                             &grpc_request,
                                             operation_name.as_deref(),
@@ -6216,15 +6222,14 @@ impl REClient {
                                         queued.at = None;
                                         continue;
                                     }
-                                    execute_retry_attempts += 1;
+                                    queued.reexecutes += 1;
                                     warn_stayed_queued(
                                         &grpc_request,
                                         operation_name.as_deref(),
                                         waited,
-                                        Some(execute_retry_attempts),
+                                        Some(queued.reexecutes as usize),
                                         retries,
                                     );
-                                    queued.reexecutes += 1;
                                     match execute_stream(
                                         grpc_clients.clone(),
                                         metadata.clone(),
@@ -13144,6 +13149,51 @@ mod tests {
                 "RE operation `operations/backlog` of action {}/1 stayed QUEUED for 1s and its re-Executes are spent (0/0); still waiting for it",
                 "ab".repeat(32)
             )]
+        );
+        server.abort();
+        Ok(())
+    }
+
+    /// G1-w's arm64 cold build on usw2-b, 2026-10-12: a saturated pool kept 368 operations QUEUED
+    /// past the timeout without anything failing. Executing them again does not spend the retries
+    /// a server error later needs.
+    #[tokio::test]
+    async fn executing_an_operation_that_stayed_queued_again_leaves_the_retries_for_server_errors()
+    -> anyhow::Result<()> {
+        let (client, calls, _log, server) = serve_queued(1, |earlier, _| match earlier {
+            0 => RawReply::Operation(queued_operation("operations/backlog"), RawTrailers::Never),
+            1 => RawReply::Operation(
+                finished_operation(
+                    0,
+                    Status {
+                        code: TCode::UNAVAILABLE.0,
+                        message: "executor went away".to_owned(),
+                        ..Default::default()
+                    },
+                ),
+                RawTrailers::After(Duration::ZERO),
+            ),
+            _ => RawReply::Operation(done_operation(), RawTrailers::After(Duration::ZERO)),
+        })
+        .await?;
+
+        let (completed, warnings) = execute_raw_h2_action_with_warnings(&client).await?;
+
+        assert_eq!(completed.status.code, TCode::OK);
+        assert_eq!((calls.executes(), calls.waits()), (3, 0));
+        assert_eq!(
+            warnings,
+            vec![
+                format!(
+                    "Executing RE action {}/1 again (re-Execute 1/1): operation `operations/backlog` stayed QUEUED for 1s",
+                    "ab".repeat(32)
+                ),
+                format!(
+                    "Executing RE action {}/1 again (re-Execute 1/1): operation `operations/finished` returned code {}: executor went away",
+                    "ab".repeat(32),
+                    TCode::UNAVAILABLE.0
+                ),
+            ]
         );
         server.abort();
         Ok(())
