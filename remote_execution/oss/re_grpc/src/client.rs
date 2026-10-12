@@ -452,19 +452,39 @@ fn capped_retry_delay_from_rpc_status(
     retry_delay_from_rpc_status(status).map(|delay| std::cmp::min(delay, retry_max_delay))
 }
 
+/// The shortest wait before the `attempt`th re-Execute (1-based) after the server answered with a
+/// retryable status: 1 s, doubling, at most 16 s, so the default 5 re-Executes span about 31 s. An
+/// executor that cannot pull its container image answers UNAVAILABLE without RetryInfo; without a
+/// floor every re-Execute followed at once and a registry outage of a few seconds failed the action.
+fn execute_retry_floor(attempt: usize) -> Duration {
+    const FIRST: Duration = Duration::from_secs(1);
+    const MAX: Duration = Duration::from_secs(16);
+    let doublings = attempt.saturating_sub(1).min(4) as u32;
+    std::cmp::min(FIRST * 2u32.pow(doublings), MAX)
+}
+
+/// How long to wait before the `attempt`th re-Execute: the server's RetryInfo delay (capped at
+/// `retry_max_delay`) when it is longer than the floor, else the floor.
+fn execute_retry_delay(status: &Status, retry_max_delay: Duration, attempt: usize) -> Duration {
+    let floor = execute_retry_floor(attempt);
+    match capped_retry_delay_from_rpc_status(status, retry_max_delay) {
+        Some(delay) => std::cmp::max(delay, floor),
+        None => floor,
+    }
+}
+
 async fn sleep_for_execute_retry_info(
     status: &Status,
     retry_max_delay: Duration,
     operation_name: Option<&str>,
+    attempt: usize,
 ) {
-    let Some(delay) = capped_retry_delay_from_rpc_status(status, retry_max_delay) else {
-        return;
-    };
+    let delay = execute_retry_delay(status, retry_max_delay, attempt);
 
     tracing::debug!(
         operation_name = operation_name.unwrap_or(""),
         delay_ms = delay.as_millis(),
-        "Delaying Execute retry per RetryInfo"
+        "Delaying Execute retry"
     );
     tokio::time::sleep(delay).await;
 }
@@ -6491,6 +6511,7 @@ impl REClient {
                                             &rpc_status,
                                             retry_max_delay,
                                             operation_name.as_deref(),
+                                            execute_retry_attempts,
                                         )
                                         .await;
                                         stream = execute_stream(
@@ -6538,6 +6559,7 @@ impl REClient {
                                             &execute_response_status,
                                             retry_max_delay,
                                             operation_name.as_deref(),
+                                            execute_retry_attempts,
                                         )
                                         .await;
                                         stream = execute_stream(
@@ -9732,6 +9754,35 @@ fn substitute_env_vars_impl(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn re_execute_waits_at_least_the_floor_and_longer_for_retry_info() {
+        let plain = Status {
+            code: Code::Unavailable as i32,
+            ..Default::default()
+        };
+        let floors: Vec<u64> = (1..=6)
+            .map(|attempt| {
+                super::execute_retry_delay(&plain, Duration::from_secs(5), attempt).as_secs()
+            })
+            .collect();
+        assert_eq!(floors, vec![1, 2, 4, 8, 16, 16]);
+        let total: u64 = floors[..5].iter().sum();
+        assert_eq!(total, 31);
+
+        // A longer RetryInfo delay wins, still capped at retry_max_delay; a shorter one gives way
+        // to the floor.
+        let long = retry_info_rpc_status(TCode::UNAVAILABLE, Duration::from_secs(30));
+        assert_eq!(
+            super::execute_retry_delay(&long, Duration::from_secs(5), 1),
+            Duration::from_secs(5)
+        );
+        let short = retry_info_rpc_status(TCode::UNAVAILABLE, Duration::from_millis(200));
+        assert_eq!(
+            super::execute_retry_delay(&short, Duration::from_secs(5), 3),
+            Duration::from_secs(4)
+        );
+    }
+
     use core::sync::atomic::Ordering;
     use std::collections::VecDeque;
     use std::sync::atomic::AtomicU16;
