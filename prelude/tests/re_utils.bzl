@@ -176,6 +176,7 @@ def _get_re_executors(
     use_case = re_props_copy.pop("use_case")
     listing_capabilities = re_props_copy.pop("listing_capabilities", None)
     remote_cache_enabled = re_props_copy.pop("remote_cache_enabled", None)
+    remote_enabled = re_props_copy.pop("remote_enabled", True)
     allow_cache_uploads = re_props_copy.pop("allow_cache_uploads", False)
     re_dependencies = re_props_copy.pop("dependencies", [])
     re_gang_workers = re_props_copy.pop("gang_workers", [])
@@ -200,7 +201,7 @@ def _get_re_executors(
 
     default_executor = CommandExecutorConfig(
         local_enabled = local_enabled,
-        remote_enabled = True,
+        remote_enabled = remote_enabled,
         remote_execution_properties = capabilities,
         remote_execution_use_case = use_case or "tpx-default",
         remote_cache_enabled = remote_cache_enabled,
@@ -217,7 +218,7 @@ def _get_re_executors(
     if listing_capabilities != None or local_listing_enabled != None:
         listing_executor = CommandExecutorConfig(
             local_enabled = local_listing_enabled if local_listing_enabled != None else local_enabled,
-            remote_enabled = True,
+            remote_enabled = remote_enabled,
             remote_execution_properties = listing_capabilities if listing_capabilities != None else capabilities,
             remote_execution_use_case = use_case or "tpx-default",
             remote_cache_enabled = remote_cache_enabled,
