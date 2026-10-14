@@ -515,7 +515,6 @@ fn tonic_status_indicates_broken_connection(status: &tonic::Status) -> bool {
         || message.contains("connection closed")
         || message.contains("connection error")
         || message.contains("broken pipe")
-        || message.contains("goaway")
         || message.contains("http2")
         || message.contains("io error")
 }
@@ -624,6 +623,10 @@ fn is_transient_transport_error(err: &anyhow::Error) -> bool {
 }
 
 fn is_broken_connection_error(err: &anyhow::Error) -> bool {
+    // The transport replaces a connection that a GOAWAY closed by itself.
+    if is_refused_by_server(err) {
+        return false;
+    }
     if is_transient_transport_error(err) {
         return true;
     }

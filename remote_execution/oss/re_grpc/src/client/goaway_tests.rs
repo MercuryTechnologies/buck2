@@ -21,6 +21,7 @@ use futures::stream;
 use prost::bytes::Bytes;
 use re_grpc_proto::build::bazel::remote::execution::v2::ServerCapabilities;
 use re_grpc_proto::build::bazel::remote::execution::v2::batch_read_blobs_response;
+use re_grpc_proto::build::bazel::remote::execution::v2::batch_update_blobs_request;
 use re_grpc_proto::build::bazel::remote::execution::v2::batch_update_blobs_response;
 use re_grpc_proto::build::bazel::semver::SemVer;
 use tokio::net::TcpListener;
@@ -896,5 +897,42 @@ async fn test_upload_bytestream_after_goaway() -> anyhow::Result<()> {
 
     assert!(server.goaway_sent.load(Ordering::SeqCst));
     assert_eq!(server.served(), [(WRITE.to_owned(), blob_size)]);
+    Ok(())
+}
+
+/// The transport can't send this upload again, so it fails with UNAVAILABLE.
+/// That is retried, but without rebuilding the client's channel: the
+/// transport replaces the connection the GOAWAY closes by itself.
+#[tokio::test]
+async fn test_refused_upload_does_not_reconnect() -> anyhow::Result<()> {
+    let server = GoawayServer::start().await;
+    let blob = vec![1; 2 * REPLAY_BUFFER_SIZE];
+    let request = BatchUpdateBlobsRequest {
+        requests: vec![batch_update_blobs_request::Request {
+            digest: Some(Digest {
+                hash: hex::encode(Sha256::digest(&blob)),
+                size_bytes: blob.len() as i64,
+            }),
+            data: blob,
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let status = ContentAddressableStorageClient::new(server.channel.clone())
+        .batch_update_blobs(request)
+        .await
+        .unwrap_err();
+    assert!(server.goaway_sent.load(Ordering::SeqCst));
+    assert!(
+        matches!(
+            status.code(),
+            tonic::Code::Unavailable | tonic::Code::Internal
+        ),
+        "{status:?}"
+    );
+
+    let err = anyhow::Error::from(status);
+    assert!(is_retryable_grpc_error(&err));
+    assert!(!is_broken_connection_error(&err));
     Ok(())
 }
