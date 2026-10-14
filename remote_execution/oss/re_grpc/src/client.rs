@@ -2562,6 +2562,9 @@ fn substitute_env_vars_impl(
 }
 
 #[cfg(test)]
+mod goaway_tests;
+
+#[cfg(test)]
 mod tests {
     use core::sync::atomic::Ordering;
     use std::collections::VecDeque;
