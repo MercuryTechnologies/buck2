@@ -362,7 +362,13 @@ pub fn upstream_credentials_fingerprint(
         hasher.update(line.as_bytes());
         hasher.update(b"\n");
     }
-    Ok(Some(format!("{:x}", hasher.finalize())))
+    // The digest crate's output arrays no longer implement `LowerHex`.
+    let hex = hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    Ok(Some(hex))
 }
 
 /// What a running daemon says about its upstream.
