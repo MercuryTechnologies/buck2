@@ -1459,7 +1459,7 @@ impl DaemonState {
                     ),
                     #[cfg(not(fbcode_build))]
                     replay_spill_dir: Some(
-                        paths
+                        invocation_paths
                             .tmp_dir()
                             .join(ForwardRelativePath::unchecked_new("bes-replay-spill"))
                             .into_path_buf(),
