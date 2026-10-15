@@ -123,7 +123,7 @@ impl Hasher {
         match self {
             Self::Sha256(h) => hex::encode(h.finalize()),
             Self::Sha1(h) => hex::encode(h.finalize()),
-            Self::Blake3(h) => h.finalize().to_hex().to_string(),
+            Self::Blake3(h) => blake3::Hasher::finalize(&h).to_hex().to_string(),
         }
     }
 }
