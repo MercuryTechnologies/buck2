@@ -29,6 +29,7 @@ use buck2_directory::directory::entry::DirectoryEntry;
 use buck2_directory::directory::fingerprinted_directory::FingerprintedDirectory;
 use buck2_error::BuckErrorContext;
 use buck2_error::conversion::from_any_with_tag;
+use buck2_error::internal_error;
 use buck2_hash::BuckMutSet;
 use buck2_hash::IntentionallyStdHashMap;
 use dupe::Dupe;
@@ -174,7 +175,7 @@ impl Uploader {
         dir_path: &ProjectRelativePath,
         input_dir: &'a ActionImmutableDirectory,
         mut upload_blobs: Vec<InlinedBlobWithDigest>,
-        mut missing_digests: StdBuckHashSet<&'a TrackedFileDigest>,
+        mut missing_digests: BuckMutSet<&'a TrackedFileDigest>,
         use_case: RemoteExecutorUseCase,
     ) -> buck2_error::Result<UploadContents> {
         // Find the file paths and directory blobs that need to be uploaded
