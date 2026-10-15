@@ -527,7 +527,7 @@ fn validate_action_outputs(
 
     // Ignore ordering as outputs in the original action might be ordered differently from output
     // paths in the action result (they are sorted there).
-    let actual_output_paths: HashSet<&BuildArtifactPath> =
+    let actual_output_paths: BuckMutSet<&BuildArtifactPath> =
         actual_outputs.iter().map(|(path, _)| path).collect();
     let all_declared_outputs_returned = declared_outputs
         .iter()
@@ -899,7 +899,7 @@ impl ActionExecutionCtx for BuckActionExecutionContext<'_, '_> {
                 })
                 .collect(),
         );
-        validate_action_outputs(self.fs(), self.outputs, &actual_outputs)
+        validate_action_outputs(self.fs(), &self.action.outputs(), &actual_outputs)
     }
 
     fn io_provider(&self) -> &dyn IoProvider {
