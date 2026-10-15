@@ -2933,7 +2933,7 @@ mod tests {
     }
 
     fn output_dir(files: &[(&str, &str)]) -> ActionDirectoryBuilder {
-        let mut builder = ActionDirectoryBuilder::empty();
+        let mut builder = ActionDirectoryBuilder::empty_non_exhaustive();
         for (path, contents) in files {
             builder
                 .insert(
