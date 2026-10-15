@@ -625,6 +625,7 @@ mod tests {
             &None,
             true,
             false,
+            None,
         )
         .unwrap()
     }
