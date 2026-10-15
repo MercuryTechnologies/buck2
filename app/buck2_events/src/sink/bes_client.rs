@@ -2063,8 +2063,15 @@ impl WorkerState {
 
     fn stream_failed(&mut self, invocation_id: &str, status: &Status) {
         self.record_status_failure(status);
-        if status_rejects_credentials(status) {
+        if status_rejects_credentials(status) || status.code() == tonic::Code::PermissionDenied {
             self.refuse_credentials(status);
+            return;
+        }
+        if status.code() == tonic::Code::InvalidArgument {
+            self.abandon_stream(
+                invocation_id,
+                "the server rejected the stream's requests as INVALID_ARGUMENT, which sending them again cannot change",
+            );
             return;
         }
         let max_unacked = self.max_unacked();
@@ -2195,11 +2202,11 @@ impl WorkerState {
                 .await
                 .unwrap_or_else(|| Status::unavailable("BES stream closed")));
         }
-        // A refused stream ends its ack task with UNAUTHENTICATED or PERMISSION_DENIED. Reopening
-        // at once, as for a stream the server merely closed, would redial on every event; the
-        // caller's `stream_failed` decides instead.
+        // A refused stream ends its ack task with UNAUTHENTICATED or PERMISSION_DENIED, and a
+        // rejected one with INVALID_ARGUMENT. Reopening at once, as for a stream the server merely
+        // closed, would redial on every event; the caller's `stream_failed` decides instead.
         if let Some(status) = stream.finished_ack_task_status().await
-            && status_rejects_credentials(&status)
+            && status_ends_stream_for_good(&status)
         {
             return Err(status);
         }
@@ -3605,6 +3612,18 @@ fn status_rejects_credentials(status: &Status) -> bool {
             .contains("while receiving response with status: 401"),
         _ => false,
     }
+}
+
+/// True when no new attempt of a stream can succeed: the server refused this client
+/// (UNAUTHENTICATED, a proxy's HTTP 401, or PERMISSION_DENIED), or rejected the stream's own
+/// requests (INVALID_ARGUMENT). Bazel retries neither PERMISSION_DENIED nor INVALID_ARGUMENT
+/// (NON_RETRYABLE_STATUS_CODES in its BuildEventServiceGrpcClient.java).
+fn status_ends_stream_for_good(status: &Status) -> bool {
+    status_rejects_credentials(status)
+        || matches!(
+            status.code(),
+            tonic::Code::PermissionDenied | tonic::Code::InvalidArgument
+        )
 }
 
 fn map_transport_error(err: tonic::transport::Error) -> Status {
