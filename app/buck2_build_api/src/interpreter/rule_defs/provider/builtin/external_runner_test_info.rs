@@ -118,7 +118,7 @@ pub struct ExternalRunnerTestInfo<'v> {
 
     /// How long the test may run, in milliseconds. When set, a test runner uses it in place of its
     /// own default, so one long test can carry its own limit.
-    timeout_ms: ValueOfUncheckedGeneric<V, i32>,
+    timeout_ms: ValueOfUnchecked<'v, i32>,
 }
 
 /// An `ExternalRunnerTestInfo` kept alive by its owning frozen heap; usable across threads and
@@ -206,7 +206,7 @@ impl<'v> ExternalRunnerTestInfo<'v> {
     }
 
     pub fn timeout_ms(&self) -> Option<u64> {
-        NoneOr::<i32>::unpack_value(self.timeout_ms.get().to_value())
+        NoneOr::<i32>::unpack_value(self.timeout_ms.get())
             .unwrap()
             .unwrap()
             .into_option()
