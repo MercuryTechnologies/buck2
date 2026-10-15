@@ -1567,7 +1567,7 @@ impl BazelEventConverter {
                             HeldTestEnd {
                                 event: event.clone(),
                                 span_end: span_end.clone(),
-                                test_end: test_end.clone(),
+                                test_end: (**test_end).clone(),
                                 expected_cases,
                             },
                         );
