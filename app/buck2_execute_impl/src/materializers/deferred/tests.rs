@@ -2843,7 +2843,6 @@ pub(crate) mod state_machine {
                         copy_value.entry().dupe().map_dir(|d| d.as_immutable()),
                         None,
                     )],
-                    None,
                 )
                 .await?;
 
