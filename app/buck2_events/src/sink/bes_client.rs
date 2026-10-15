@@ -5105,6 +5105,125 @@ mod tests {
         assert_eq!(sent.expect("not an error"), None);
     }
 
+    /// Fails every stream with `code`, and counts the streams opened.
+    struct BesThatFailsEveryStream {
+        opens: Arc<std::sync::atomic::AtomicUsize>,
+        code: tonic::Code,
+    }
+
+    #[tonic::async_trait]
+    impl PublishBuildEvent for BesThatFailsEveryStream {
+        async fn publish_lifecycle_event(
+            &self,
+            _request: tonic::Request<PublishLifecycleEventRequest>,
+        ) -> Result<tonic::Response<()>, Status> {
+            Err(Status::new(self.code, "refused by the test server"))
+        }
+
+        type PublishBuildToolEventStreamStream =
+            ReceiverStream<Result<PublishBuildToolEventStreamResponse, Status>>;
+
+        async fn publish_build_tool_event_stream(
+            &self,
+            _request: tonic::Request<tonic::Streaming<PublishBuildToolEventStreamRequest>>,
+        ) -> Result<tonic::Response<Self::PublishBuildToolEventStreamStream>, Status> {
+            self.opens.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err(Status::new(self.code, "refused by the test server"))
+        }
+    }
+
+    /// Serves `BesThatFailsEveryStream` and returns a worker for it, the opens counter and the
+    /// counters, after sending one invocation's start and ten more of its events, each after the
+    /// last refusal had time to reach the stream's acknowledgement task.
+    async fn worker_after_refused_events(
+        code: tonic::Code,
+        invocation: &str,
+    ) -> (
+        WorkerState,
+        Arc<std::sync::atomic::AtomicUsize>,
+        Arc<CounterState>,
+    ) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let endpoint = format!("http://{}", listener.local_addr().expect("local addr"));
+        let opens = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        tokio::spawn(
+            tonic::transport::Server::builder()
+                .add_service(PublishBuildEventServer::new(BesThatFailsEveryStream {
+                    opens: opens.clone(),
+                    code,
+                }))
+                .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener)),
+        );
+        let (mut worker, counters) = worker_for(endpoint);
+        send_queued_ok(&mut worker, invocation, command_start_data()).await;
+        for _ in 0..10 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            send_queued_ok(&mut worker, invocation, action_start_data()).await;
+        }
+        (worker, opens, counters)
+    }
+
+    /// PERMISSION_DENIED is a refusal of this client's credentials, as UNAUTHENTICATED is: Bazel
+    /// does not retry it (NON_RETRYABLE_STATUS_CODES in bazelbuild/bazel
+    /// src/main/java/com/google/devtools/build/lib/buildeventservice/client/
+    /// BuildEventServiceGrpcClient.java), and its test
+    /// `testAfterCommand_waitForUploadComplete_permissionDeniedErrorEarlyInStream` expects one
+    /// request.
+    #[tokio::test]
+    async fn a_stream_refused_with_permission_denied_is_not_redialled_and_no_later_stream_opens() {
+        let first = TraceId::new().to_string();
+        let (mut worker, opens, counters) =
+            worker_after_refused_events(tonic::Code::PermissionDenied, &first).await;
+        let second = TraceId::new().to_string();
+        send_queued_ok(&mut worker, &second, command_start_data()).await;
+        send_queued_ok(&mut worker, &second, action_start_data()).await;
+
+        assert_eq!(
+            opens.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "a PERMISSION_DENIED refusal must not be answered by redialling, nor a later invocation open a stream"
+        );
+        let snapshot = counters.snapshot();
+        assert!(snapshot.failures_unauthorized >= 1, "{snapshot:?}");
+        assert!(
+            snapshot.dropped >= 2,
+            "later events are dropped: {snapshot:?}"
+        );
+    }
+
+    /// INVALID_ARGUMENT says this stream's requests are wrong, so sending them again cannot
+    /// succeed: Bazel does not retry it (NON_RETRYABLE_STATUS_CODES, as above) and its test
+    /// `testAfterCommand_waitForUploadComplete_invalidArgumentErrorEarlyInStream` expects one
+    /// request. It says nothing about the daemon's credentials, so the next invocation still
+    /// opens its own stream.
+    #[tokio::test]
+    async fn a_stream_rejected_as_invalid_argument_is_not_retried_and_a_later_stream_opens() {
+        let first = TraceId::new().to_string();
+        let (mut worker, opens, counters) =
+            worker_after_refused_events(tonic::Code::InvalidArgument, &first).await;
+        assert_eq!(
+            opens.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "an INVALID_ARGUMENT stream must not be reopened"
+        );
+        let second = TraceId::new().to_string();
+        send_queued_ok(&mut worker, &second, command_start_data()).await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert_eq!(
+            opens.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "a later invocation opens its own stream"
+        );
+        let snapshot = counters.snapshot();
+        assert!(snapshot.failures_invalid_request >= 1, "{snapshot:?}");
+        assert!(
+            snapshot.dropped >= 1,
+            "the rejected stream's events are dropped: {snapshot:?}"
+        );
+    }
+
     #[tokio::test]
     async fn daemon_scoped_events_open_no_stream() {
         let nil_trace_id = TraceId::null().to_string();
