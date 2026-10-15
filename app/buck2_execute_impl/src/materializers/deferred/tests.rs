@@ -2672,7 +2672,7 @@ pub(crate) mod state_machine {
                 path: make_path(path),
                 content: content.clone(),
                 is_executable: *is_executable,
-                configuration_path: None,
+                path_kind: BuckOutPathKind::Configuration,
             })
             .collect();
         let values = dm.declare_write(Box::new(move || Ok(requests))).await?;
@@ -2697,7 +2697,7 @@ pub(crate) mod state_machine {
         dm: &DeferredMaterializerAccessor<StubIoHandler>,
         inputs: Vec<(ProjectRelativePathBuf, FileMetadata)>,
     ) -> buck2_error::Result<UploadContents> {
-        let mut builder = ActionDirectoryBuilder::empty();
+        let mut builder = ActionDirectoryBuilder::empty_non_exhaustive();
         for (path, meta) in inputs {
             insert_file(&mut builder, path, meta)?;
         }
@@ -2734,7 +2734,7 @@ pub(crate) mod state_machine {
     async fn test_upload_sends_write_from_memory() -> buck2_error::Result<()> {
         ignore_stack_overflow_checks_for_future(async {
             let io = Arc::new(StubIoHandler::new(temp_root()));
-            let (dm, _handle, _events) = make_materializer(io.dupe(), None).await;
+            let (dm, _events) = make_materializer(io.dupe(), None).await;
 
             let writes = declare_writes(
                 &dm,
@@ -2825,7 +2825,7 @@ pub(crate) mod state_machine {
     async fn test_upload_sends_copy_of_write_from_memory() -> buck2_error::Result<()> {
         ignore_stack_overflow_checks_for_future(async {
             let io = Arc::new(StubIoHandler::new(temp_root()));
-            let (dm, _handle, _events) = make_materializer(io.dupe(), None).await;
+            let (dm, _events) = make_materializer(io.dupe(), None).await;
 
             let writes =
                 declare_writes(&dm, vec![("out/link.argsfile", b"-lfoo\n".to_vec(), false)])
@@ -2872,7 +2872,7 @@ pub(crate) mod state_machine {
     async fn test_upload_writes_large_write_to_disk() -> buck2_error::Result<()> {
         ignore_stack_overflow_checks_for_future(async {
             let io = Arc::new(StubIoHandler::new(temp_root()));
-            let (dm, _handle, _events) = make_materializer(io.dupe(), None).await;
+            let (dm, _events) = make_materializer(io.dupe(), None).await;
 
             let writes = declare_writes(
                 &dm,
