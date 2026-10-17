@@ -37,10 +37,24 @@ use buck2_error::ExitCode;
 /// environment and root buckconfig resumes from what this writes; `buck2 resume` says whether it
 /// did. If the suspend fails, the daemon keeps running: `buck2 suspend || buck2 kill` leaves no
 /// daemon behind either way.
+///
+/// Give it, and `buck2 resume`, the same `-c` and `--config-file` flags as the builds: each
+/// command injects its own buckconfig into the graph, so a suspend without the builds' flags
+/// records other settings, and the first build after the resume recomputes what reads them.
 #[derive(Debug, clap::Parser)]
 pub struct SuspendCommand {
     #[clap(flatten)]
     event_log_opts: CommonEventLogOptions,
+
+    // Pass the same `-c`, `--config-file` and host flags as the builds this daemon ran: the
+    // suspend runs in a DICE transaction of its own, and buckconfig it injects that differs
+    // from theirs is what the image records, so the first build after the resume would
+    // invalidate what depends on it.
+    #[clap(flatten)]
+    config_opts: CommonBuildConfigurationOptions,
+
+    #[clap(flatten)]
+    starlark_opts: CommonStarlarkOptions,
 
     /// Before the daemon exits, wait up to this long for the BES server to acknowledge its
     /// build events, as `buck2 kill --bes-drain-timeout` does.
@@ -59,12 +73,12 @@ impl StreamingCommand for SuspendCommand {
     async fn exec_impl(
         self,
         buckd: &mut BuckdClientConnector,
-        _matches: BuckArgMatches<'_>,
+        matches: BuckArgMatches<'_>,
         ctx: &mut ClientCommandContext<'_>,
         events_ctx: &mut EventsCtx,
     ) -> ExitResult {
         let start = Instant::now();
-        let context = ctx.empty_client_context("suspend")?;
+        let context = ctx.client_context(matches, &self)?;
         let response = buckd
             .with_flushing()
             .hydration(
@@ -111,11 +125,11 @@ impl StreamingCommand for SuspendCommand {
     }
 
     fn build_config_opts(&self) -> &CommonBuildConfigurationOptions {
-        CommonBuildConfigurationOptions::default_ref()
+        &self.config_opts
     }
 
     fn starlark_opts(&self) -> &CommonStarlarkOptions {
-        CommonStarlarkOptions::default_ref()
+        &self.starlark_opts
     }
 }
 
@@ -127,6 +141,14 @@ impl StreamingCommand for SuspendCommand {
 pub struct ResumeCommand {
     #[clap(flatten)]
     event_log_opts: CommonEventLogOptions,
+
+    // Pass the same `-c`, `--config-file` and host flags as the build that follows: this
+    // command injects its buckconfig into the resumed graph like any other.
+    #[clap(flatten)]
+    config_opts: CommonBuildConfigurationOptions,
+
+    #[clap(flatten)]
+    starlark_opts: CommonStarlarkOptions,
 
     /// Exit with code 3 if the daemon did not resume, so a job never mistakes a cold start for
     /// a warm one.
@@ -141,11 +163,11 @@ impl StreamingCommand for ResumeCommand {
     async fn exec_impl(
         self,
         buckd: &mut BuckdClientConnector,
-        _matches: BuckArgMatches<'_>,
+        matches: BuckArgMatches<'_>,
         ctx: &mut ClientCommandContext<'_>,
         events_ctx: &mut EventsCtx,
     ) -> ExitResult {
-        let context = ctx.empty_client_context("resume")?;
+        let context = ctx.client_context(matches, &self)?;
         let response = buckd
             .with_flushing()
             .hydration(
@@ -177,10 +199,10 @@ impl StreamingCommand for ResumeCommand {
     }
 
     fn build_config_opts(&self) -> &CommonBuildConfigurationOptions {
-        CommonBuildConfigurationOptions::default_ref()
+        &self.config_opts
     }
 
     fn starlark_opts(&self) -> &CommonStarlarkOptions {
-        CommonStarlarkOptions::default_ref()
+        &self.starlark_opts
     }
 }
