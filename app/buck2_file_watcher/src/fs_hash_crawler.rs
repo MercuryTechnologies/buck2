@@ -1278,4 +1278,450 @@ mod tests {
         assert_eq!(events, expected);
         Ok(())
     }
+
+    /// T0 test 3 of the suspend-b test plan: the resume comparison with every stat the image
+    /// holds made foreign (another device, inode and change time, as on another machine), so
+    /// only the rules that hold across machines can call a file unchanged.
+    mod resume {
+        use std::collections::BTreeSet;
+        use std::collections::HashMap;
+        use std::collections::HashSet;
+        use std::os::unix::fs::PermissionsExt;
+        use std::time::Duration;
+        use std::time::SystemTime;
+
+        use buck2_common::file_ops::baseline::FileSystemBaseline;
+        use buck2_core::cells::CellResolver;
+        use buck2_core::fs::project::ProjectRoot;
+        use buck2_core::fs::project_rel_path::ProjectRelativePath;
+        use buck2_core::fs::project_rel_path::ProjectRelativePathBuf;
+        use buck2_data::FileWatcherEventType;
+        use buck2_data::FileWatcherKind;
+        use buck2_fs::fs_util::uncategorized as fs_util;
+        use buck2_fs::paths::abs_path::AbsPathBuf;
+        use buck2_hash::StdBuckHashMap;
+
+        use super::project;
+        use super::write_aged;
+        use crate::file_watcher::FileWatcherImage;
+        use crate::file_watcher::FileWatcherImageKind;
+        use crate::file_watcher::ResumeInput;
+        use crate::file_watcher::VcsDelta;
+        use crate::file_watcher::VcsImage;
+        use crate::file_watcher::VcsTree;
+        use crate::fs_hash_crawler::EntryImage;
+        use crate::fs_hash_crawler::FsSnapshot;
+        use crate::fs_hash_crawler::ResumeScan;
+        use crate::fs_hash_crawler::resume_scan;
+
+        const M: FileWatcherEventType = FileWatcherEventType::Modify;
+        const C: FileWatcherEventType = FileWatcherEventType::Create;
+        const D: FileWatcherEventType = FileWatcherEventType::Delete;
+        const F: FileWatcherKind = FileWatcherKind::File;
+        const DIR: FileWatcherKind = FileWatcherKind::Directory;
+        const L: FileWatcherKind = FileWatcherKind::Symlink;
+
+        type Events = BTreeSet<(String, FileWatcherEventType, FileWatcherKind)>;
+
+        struct Fixture {
+            _tempdir: tempfile::TempDir,
+            root: ProjectRoot,
+            cells: CellResolver,
+            ignores: StdBuckHashMap<
+                buck2_core::cells::name::CellName,
+                buck2_common::ignores::ignore_set::IgnoreSet,
+            >,
+        }
+
+        impl Fixture {
+            fn new() -> buck2_error::Result<Self> {
+                let (tempdir, root, cells) = project(&[("root", "")])?;
+                Ok(Self {
+                    _tempdir: tempdir,
+                    root,
+                    cells,
+                    ignores: StdBuckHashMap::default(),
+                })
+            }
+
+            fn path(&self, path: &str) -> AbsPathBuf {
+                self.root
+                    .resolve(ProjectRelativePath::new(path).unwrap())
+                    .into_abs_path_buf()
+            }
+
+            /// Writes a file whose modification time is an hour old, so a snapshot taken now
+            /// does not find it racily clean.
+            fn aged(&self, path: &str, contents: &str) -> buck2_error::Result<()> {
+                let path = self.path(path);
+                fs_util::create_dir_all(path.parent().unwrap())?;
+                write_aged(&path, contents)
+            }
+
+            /// A suspend image of the files now, its contents read, with git's tree `vcs`.
+            fn suspend(&self, vcs: Option<VcsTree>) -> buck2_error::Result<FileWatcherImage> {
+                let snapshot = FsSnapshot::build(&self.root, &self.cells, &self.ignores)?;
+                let (snapshot, vcs) =
+                    snapshot.suspend_image(&self.root, &self.cells, Box::new(move || vcs))?;
+                Ok(FileWatcherImage {
+                    kind: FileWatcherImageKind::FsHashCrawler,
+                    baseline: FileSystemBaseline::unique().to_image(),
+                    snapshot,
+                    vcs,
+                })
+            }
+
+            fn scan(
+                &self,
+                image: &FileWatcherImage,
+                cross_host: bool,
+                vcs: impl FnOnce() -> Option<VcsDelta>,
+            ) -> buck2_error::Result<ResumeScan> {
+                resume_scan(
+                    &self.root,
+                    &self.cells,
+                    &self.ignores,
+                    ResumeInput {
+                        image,
+                        cross_host,
+                        vcs: Box::new(vcs),
+                    },
+                )
+            }
+
+            /// The foreign image, compared without git.
+            fn scan_foreign(&self, image: &FileWatcherImage) -> buck2_error::Result<ResumeScan> {
+                self.scan(&foreign(image), true, || None)
+            }
+        }
+
+        /// `image` as another machine would have taken it: every file on another device, at
+        /// another inode, with another change time.
+        fn foreign(image: &FileWatcherImage) -> FileWatcherImage {
+            let mut image = image.clone();
+            for (_, _, entry) in &mut image.snapshot.entries {
+                if let EntryImage::File {
+                    changed, ino, dev, ..
+                } = entry
+                {
+                    *changed = (changed.0 - 7, 3);
+                    *ino += 1_000_003;
+                    *dev += 17;
+                }
+            }
+            image
+        }
+
+        fn events(scan: &ResumeScan) -> Events {
+            scan.events
+                .iter()
+                .map(|e| (e.cell_path.path().to_string(), e.event, e.kind))
+                .collect()
+        }
+
+        fn set(items: &[(&str, FileWatcherEventType, FileWatcherKind)]) -> Events {
+            items
+                .iter()
+                .map(|(p, e, k)| ((*p).to_owned(), *e, *k))
+                .collect()
+        }
+
+        fn strings(items: &[&str]) -> Vec<String> {
+            items.iter().map(|s| (*s).to_owned()).collect()
+        }
+
+        fn git_blob(contents: &str) -> [u8; 20] {
+            use sha1::Digest;
+            let mut h = sha1::Sha1::new();
+            h.update(format!("blob {}\0", contents.len()).as_bytes());
+            h.update(contents.as_bytes());
+            h.finalize().into()
+        }
+
+        fn rel(path: &str) -> ProjectRelativePathBuf {
+            ProjectRelativePath::new(path).unwrap().to_buf()
+        }
+
+        fn set_modified(path: &AbsPathBuf, time: SystemTime) -> buck2_error::Result<()> {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(path)?
+                .set_modified(time)?;
+            Ok(())
+        }
+
+        /// On the machine that took it, a file whose full stat is unchanged is not read.
+        #[test]
+        fn same_host_equal_stat_reads_nothing() -> buck2_error::Result<()> {
+            let fx = Fixture::new()?;
+            fx.aged("a", "aaaa")?;
+            let image = fx.suspend(None)?;
+            let scan = fx.scan(&image, false, || None)?;
+            assert_eq!(events(&scan), Events::new());
+            assert_eq!((scan.stat_equal, scan.hashed), (1, 0));
+            Ok(())
+        }
+
+        /// A file replaced by a copy (new inode) and one only touched are unchanged by content.
+        #[test]
+        fn new_inode_or_touched_mtime_is_no_change() -> buck2_error::Result<()> {
+            let fx = Fixture::new()?;
+            fx.aged("copied", "same bytes")?;
+            fx.aged("touched", "other bytes")?;
+            let image = fx.suspend(None)?;
+
+            fs_util::write(&fx.path("copied.tmp"), "same bytes")?;
+            std::fs::rename(fx.path("copied.tmp"), fx.path("copied"))?;
+            set_modified(&fx.path("touched"), SystemTime::now())?;
+
+            let scan = fx.scan_foreign(&image)?;
+            assert_eq!(events(&scan), Events::new());
+            assert_eq!((scan.stat_equal, scan.vouched, scan.hashed), (0, 0, 2));
+            Ok(())
+        }
+
+        /// A file the suspend found racily clean has no digest, so a same-size edit to it is
+        /// reported even across machines.
+        #[test]
+        fn same_size_edit_inside_racy_window() -> buck2_error::Result<()> {
+            let fx = Fixture::new()?;
+            fs_util::write(&fx.path("fresh"), "aaaa")?;
+            let image = fx.suspend(None)?;
+            fs_util::write(&fx.path("fresh"), "bbbb")?;
+            assert_eq!(events(&fx.scan_foreign(&image)?), set(&[("fresh", M, F)]));
+            Ok(())
+        }
+
+        /// A same-size edit that puts the modification time back is found by its digest.
+        #[test]
+        fn same_size_edit_with_forced_equal_mtime() -> buck2_error::Result<()> {
+            let fx = Fixture::new()?;
+            fx.aged("file", "aaaa")?;
+            let modified = std::fs::metadata(fx.path("file"))?.modified()?;
+            let image = fx.suspend(None)?;
+            fs_util::write(&fx.path("file"), "bbbb")?;
+            set_modified(&fx.path("file"), modified)?;
+            assert_eq!(events(&fx.scan_foreign(&image)?), set(&[("file", M, F)]));
+            Ok(())
+        }
+
+        /// An executable bit set on unchanged bytes is a change; a group write bit, which no
+        /// build reads and another umask sets, is not.
+        #[test]
+        fn exec_bit_is_a_change_and_group_write_is_not() -> buck2_error::Result<()> {
+            let fx = Fixture::new()?;
+            fx.aged("tool", "#!/bin/sh\n")?;
+            fx.aged("data", "x")?;
+            std::fs::set_permissions(fx.path("tool"), std::fs::Permissions::from_mode(0o644))?;
+            std::fs::set_permissions(fx.path("data"), std::fs::Permissions::from_mode(0o644))?;
+            let image = fx.suspend(None)?;
+            std::fs::set_permissions(fx.path("tool"), std::fs::Permissions::from_mode(0o755))?;
+            std::fs::set_permissions(fx.path("data"), std::fs::Permissions::from_mode(0o664))?;
+            assert_eq!(events(&fx.scan_foreign(&image)?), set(&[("tool", M, F)]));
+            Ok(())
+        }
+
+        /// A retargeted link is a change; across machines so is a link that leaves the project,
+        /// while one that stays inside it is not.
+        #[test]
+        fn symlinks() -> buck2_error::Result<()> {
+            let fx = Fixture::new()?;
+            fx.aged("d/a", "a")?;
+            fx.aged("d/b", "b")?;
+            let inside = fx.path("d/a");
+            let link = |target: &str, name: &str| {
+                std::os::unix::fs::symlink(target, fx.path(name).as_path())
+            };
+            link("a", "d/retargeted")?;
+            link("/etc/hostname", "d/external")?;
+            link(inside.as_path().to_str().unwrap(), "d/internal")?;
+            link("../../outside", "d/escaping")?;
+            link("../d/b", "d/relative")?;
+            let image = fx.suspend(None)?;
+            std::fs::remove_file(fx.path("d/retargeted"))?;
+            link("b", "d/retargeted")?;
+
+            assert_eq!(
+                events(&fx.scan_foreign(&image)?),
+                set(&[
+                    ("d/escaping", M, L),
+                    ("d/external", M, L),
+                    ("d/retargeted", M, L),
+                ])
+            );
+            // On the same machine, a link out of the project reads what it read at suspend.
+            assert_eq!(
+                events(&fx.scan(&image, false, || None)?),
+                set(&[("d/retargeted", M, L)])
+            );
+            Ok(())
+        }
+
+        /// Adds, deletes and a rename are exactly those paths, and they dirty their parent's
+        /// listing.
+        #[test]
+        fn add_delete_rename() -> buck2_error::Result<()> {
+            let fx = Fixture::new()?;
+            fx.aged("d/old", "o")?;
+            fx.aged("d/deleted", "x")?;
+            fx.aged("d/kept", "k")?;
+            let image = fx.suspend(None)?;
+            std::fs::rename(fx.path("d/old"), fx.path("d/new"))?;
+            std::fs::remove_file(fx.path("d/deleted"))?;
+            fs_util::write(&fx.path("d/added"), "a")?;
+
+            let scan = fx.scan_foreign(&image)?;
+            assert_eq!(
+                events(&scan),
+                set(&[
+                    ("d/added", C, F),
+                    ("d/deleted", D, F),
+                    ("d/new", C, F),
+                    ("d/old", D, F),
+                ])
+            );
+            assert_eq!(
+                scan.testing_dirtied(&fx.ignores),
+                (
+                    strings(&[
+                        "root//d/added",
+                        "root//d/deleted",
+                        "root//d/new",
+                        "root//d/old"
+                    ]),
+                    strings(&["root//d"])
+                )
+            );
+            Ok(())
+        }
+
+        /// A file in a new directory dirties both listings.
+        #[test]
+        fn file_in_new_directory() -> buck2_error::Result<()> {
+            let fx = Fixture::new()?;
+            fx.aged("d/kept", "k")?;
+            let image = fx.suspend(None)?;
+            fx.aged("d/n/f", "f")?;
+
+            let scan = fx.scan_foreign(&image)?;
+            assert_eq!(events(&scan), set(&[("d/n", C, DIR), ("d/n/f", C, F)]));
+            assert_eq!(
+                scan.testing_dirtied(&fx.ignores),
+                (
+                    strings(&["root//d/n/f"]),
+                    strings(&["root//d", "root//d/n"])
+                )
+            );
+            Ok(())
+        }
+
+        /// A file replaced by a directory is both kinds, and its parent's listing.
+        #[test]
+        fn file_replaced_by_directory() -> buck2_error::Result<()> {
+            let fx = Fixture::new()?;
+            fx.aged("d/x", "x")?;
+            let image = fx.suspend(None)?;
+            std::fs::remove_file(fx.path("d/x"))?;
+            fs_util::create_dir_all(fx.path("d/x"))?;
+
+            let scan = fx.scan_foreign(&image)?;
+            assert_eq!(events(&scan), set(&[("d/x", C, DIR), ("d/x", D, F)]));
+            assert_eq!(
+                scan.testing_dirtied(&fx.ignores),
+                (strings(&["root//d/x"]), strings(&["root//d"]))
+            );
+            Ok(())
+        }
+
+        /// A write after the scan statted a file and before it reads it is a change: the read
+        /// sees new bytes, or a stat that moved since.
+        #[test]
+        fn write_between_stat_and_hash() -> buck2_error::Result<()> {
+            let fx = Fixture::new()?;
+            fx.aged("file", "aaaa")?;
+            let image = fx.suspend(None)?;
+            let path = fx.path("file");
+            let scan = fx.scan(&foreign(&image), true, || {
+                // The scan calls git after it has statted the files and before it reads any.
+                fs_util::write(&path, "bbbb").unwrap();
+                None
+            })?;
+            assert_eq!(events(&scan), set(&[("file", M, F)]));
+            Ok(())
+        }
+
+        /// Git vouches for a file only when the suspend read exactly its commit's blob, git
+        /// tracks it now and calls it clean, and git is usable.
+        #[test]
+        fn git_vouches_only_for_its_blob() -> buck2_error::Result<()> {
+            let fx = Fixture::new()?;
+            for name in ["clean", "dirty", "untracked", "other_blob"] {
+                fx.aged(name, name)?;
+            }
+            let tree = || VcsTree {
+                image: VcsImage {
+                    head: "0".repeat(40),
+                    toplevel_to_project: String::new(),
+                },
+                blobs: HashMap::from([
+                    (rel("clean"), git_blob("clean")),
+                    (rel("dirty"), git_blob("dirty")),
+                    (rel("untracked"), git_blob("untracked")),
+                    (rel("other_blob"), git_blob("not these bytes")),
+                ]),
+            };
+            let image = foreign(&fx.suspend(Some(tree()))?);
+            let delta = |usable| VcsDelta {
+                tracked: HashSet::from([rel("clean"), rel("dirty"), rel("other_blob")]),
+                changed: HashSet::from([rel("dirty")]),
+                usable,
+            };
+
+            let scan = fx.scan(&image, true, || Some(delta(true)))?;
+            assert_eq!(events(&scan), Events::new());
+            assert_eq!((scan.vouched, scan.hashed), (1, 3));
+
+            let scan = fx.scan(&image, true, || Some(delta(false)))?;
+            assert_eq!((scan.vouched, scan.hashed), (0, 4));
+            Ok(())
+        }
+
+        /// An edit after git called a file clean is not the scan's to report, since git spoke
+        /// the truth when asked; it differs from the stat the scan hands the watcher, so the
+        /// crawler's next sync reports it (and notify, watching already, sends an event).
+        #[test]
+        fn edit_after_git_is_reported_by_the_next_sync() -> buck2_error::Result<()> {
+            let fx = Fixture::new()?;
+            fx.aged("file", "aaaa")?;
+            let tree = VcsTree {
+                image: VcsImage {
+                    head: "0".repeat(40),
+                    toplevel_to_project: String::new(),
+                },
+                blobs: HashMap::from([(rel("file"), git_blob("aaaa"))]),
+            };
+            let image = foreign(&fx.suspend(Some(tree))?);
+            let path = fx.path("file");
+            let scan = fx.scan(&image, true, || {
+                let delta = VcsDelta {
+                    tracked: HashSet::from([rel("file")]),
+                    changed: HashSet::new(),
+                    usable: true,
+                };
+                // Step past a coarse change-time tick, then edit after git answered.
+                std::thread::sleep(Duration::from_millis(20));
+                fs_util::write(&path, "bbbb").unwrap();
+                Some(delta)
+            })?;
+            assert_eq!(events(&scan), Events::new());
+            assert_eq!(scan.vouched, 1);
+            let later: Events = scan
+                .testing_changed_since(&fx.root, &fx.cells, &fx.ignores)?
+                .into_iter()
+                .map(|e| (e.cell_path.path().to_string(), e.event, e.kind))
+                .collect();
+            assert_eq!(later, set(&[("file", M, F)]));
+            Ok(())
+        }
+    }
 }
