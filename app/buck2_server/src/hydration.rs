@@ -33,7 +33,9 @@ use dupe::Dupe;
 use starlark::pagable::starlark_deserialization_state_retained_bytes;
 use starlark::pagable::starlark_serialization_state_retained_bytes;
 
+use crate::active_commands::is_only_active_command;
 use crate::ctx::ServerCommandContext;
+use crate::daemon::state::TenantState;
 use crate::paging::cancel_active_page_out;
 use crate::paging::evict_backed_measured;
 use crate::paging::page_out_in_progress;
@@ -50,6 +52,7 @@ pub(crate) async fn hydration_command(
     run_server_command(
         HydrationServerCommand {
             dice,
+            tenant: ctx.base_context.tenant.dupe(),
             subcommand,
             wait: req.wait,
         },
@@ -61,6 +64,7 @@ pub(crate) async fn hydration_command(
 
 struct HydrationServerCommand {
     dice: Arc<Dice>,
+    tenant: Arc<TenantState>,
     subcommand: HydrationSubcommand,
     /// `status --wait`: block until any in-progress idle page-out finishes.
     wait: bool,
@@ -75,10 +79,12 @@ impl ServerCommandTemplate for HydrationServerCommand {
 
     fn exclusive_command_name(&self) -> Option<String> {
         match self.subcommand {
-            HydrationSubcommand::PageOut | HydrationSubcommand::PageIn => {
-                Some("hydration".to_owned())
-            }
-            HydrationSubcommand::Status | HydrationSubcommand::Evict => None,
+            HydrationSubcommand::PageOut
+            | HydrationSubcommand::PageIn
+            | HydrationSubcommand::Suspend => Some("hydration".to_owned()),
+            HydrationSubcommand::Status
+            | HydrationSubcommand::Evict
+            | HydrationSubcommand::ResumeStatus => None,
         }
     }
 
@@ -86,9 +92,51 @@ impl ServerCommandTemplate for HydrationServerCommand {
         &self,
         server_ctx: &dyn ServerCommandContextTrait,
         _partial_result_dispatcher: PartialResultDispatcher<Self::PartialResult>,
-        _ctx: DiceTransaction,
+        ctx: DiceTransaction,
     ) -> buck2_error::Result<Self::Response> {
         match self.subcommand {
+            HydrationSubcommand::Suspend => {
+                let repo = &self.tenant.repo;
+                let identity = repo.suspend.as_ref().ok_or_else(|| {
+                    buck2_error::buck2_error!(
+                        ErrorTag::Input,
+                        "`buck2 suspend` needs `hydration.suspend = true` (or \
+                         `buck2_hydration.suspend = true`)"
+                    )
+                })?;
+                if !is_only_active_command(server_ctx.events().trace_id()) {
+                    return Err(buck2_error::buck2_error!(
+                        ErrorTag::Input,
+                        "`buck2 suspend` cannot run beside another command"
+                    ));
+                }
+                // An idle page-out would race the suspend's own.
+                cancel_active_page_out();
+                wait_for_idle_page_out().await;
+                let summary = crate::suspend::suspend(crate::suspend::SuspendInputs {
+                    identity,
+                    dice: &self.dice,
+                    transaction: &ctx,
+                    file_watcher: &*repo.file_watcher,
+                    materializer: &*repo.materializer,
+                    project_root: server_ctx.project_root(),
+                    cache_dir: repo.paths.cache_dir_path().into_path_buf(),
+                    buck_out: repo.paths.buck_out_path().into_path_buf(),
+                })
+                .await?;
+                Ok(buck2_cli_proto::HydrationResponse {
+                    summary: Some(summary),
+                    ..Default::default()
+                })
+            }
+            HydrationSubcommand::ResumeStatus => {
+                let outcome = &self.tenant.repo.resume_outcome;
+                Ok(buck2_cli_proto::HydrationResponse {
+                    summary: Some(outcome.describe()),
+                    resumed: Some(outcome.is_resumed()),
+                    ..Default::default()
+                })
+            }
             HydrationSubcommand::PageOut => {
                 // A manual page-out supersedes any idle one; stop it first so they
                 // don't page the same graph out concurrently.

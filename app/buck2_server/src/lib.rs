@@ -31,5 +31,6 @@ pub(crate) mod profile_patterns;
 pub mod profiling_manager;
 mod snapshot;
 mod subscription;
+mod suspend;
 mod trace_io;
 mod version_control_revision;
