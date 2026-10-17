@@ -44,6 +44,7 @@ use buck2_execute::materialize::materializer::ResumedArtifacts;
 use buck2_execute::materialize::materializer::SuspendedArtifact;
 use buck2_file_watcher::file_watcher::FileWatcher;
 use buck2_file_watcher::file_watcher::FileWatcherImage;
+use buck2_file_watcher::file_watcher::ResumeInput;
 use dice::Dice;
 use dice::DiceTransaction;
 use dice::ResumeStats;
@@ -454,6 +455,8 @@ impl ResumeOutcome {
 /// An image that passed every check, ready to replay.
 pub(crate) struct LoadedImage {
     image: ImageFile,
+    /// The image was written on another machine, so no file stat it holds is comparable.
+    cross_host: bool,
     image_dir: PathBuf,
     loaded_in: Duration,
 }
@@ -481,8 +484,9 @@ pub(crate) fn prepare_resume(cache_dir: &Path, identity: &SuspendIdentity) -> Re
         return ResumePrep::Refused("the MANIFEST could not be claimed".to_owned());
     }
     match check(&manifest_bytes, &image_dir, cache_dir, identity) {
-        Ok(image) => ResumePrep::Ready(LoadedImage {
+        Ok((image, cross_host)) => ResumePrep::Ready(LoadedImage {
             image,
+            cross_host,
             image_dir,
             loaded_in: start.elapsed(),
         }),
@@ -564,7 +568,7 @@ fn check(
     image_dir: &Path,
     cache_dir: &Path,
     identity: &SuspendIdentity,
-) -> Result<ImageFile, Refusal> {
+) -> Result<(ImageFile, bool), Refusal> {
     let m = parse_manifest(manifest_bytes)?;
     let observed = Observed {
         identity,
@@ -575,7 +579,11 @@ fn check(
         now_ms: now_ms(),
     };
     compare(&m, &observed)?;
-    check_files(&m, image_dir, cache_dir)
+    let image = check_files(&m, image_dir, cache_dir)?;
+    // The hostname is not checked, since the identity stands for it, but a stat taken on another
+    // machine is never comparable with this one's.
+    let cross_host = m.hostname != buck2_events::metadata::hostname().unwrap_or_default();
+    Ok((image, cross_host))
 }
 
 /// The checks that read the image's files.
@@ -600,8 +608,14 @@ fn check_files(m: &Manifest, image_dir: &Path, cache_dir: &Path) -> Result<Image
 }
 
 impl LoadedImage {
-    pub(crate) fn watcher(&self) -> &FileWatcherImage {
-        &self.image.watcher
+    /// What the resumed file watcher compares the files with.
+    pub(crate) fn resume_input<'a>(&'a self, project_root: &'a ProjectRoot) -> ResumeInput<'a> {
+        let _unused = project_root;
+        ResumeInput {
+            image: &self.image.watcher,
+            cross_host: self.cross_host,
+            vcs: Box::new(|| None),
+        }
     }
 
     /// Replays the image: the materializer's artifacts first, so that every output the graph
@@ -741,7 +755,7 @@ async fn suspend_inner(
     // resume, and one made before is in the graph or fails the suspend.
     let watcher = inputs
         .file_watcher
-        .suspend_image(inputs.project_root)
+        .suspend_image(inputs.project_root, Box::new(|| None))
         .await?;
     lap("files", &mut timings);
 
