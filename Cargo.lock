@@ -1577,6 +1577,7 @@ dependencies = [
  "assert_matches",
  "async-recursion",
  "async-trait",
+ "blake3",
  "buck2_agent_interactive",
  "buck2_cli_proto",
  "buck2_client_ctx",
@@ -1604,6 +1605,7 @@ dependencies = [
  "serde_json",
  "shlex",
  "superconsole",
+ "tar",
  "tempfile",
  "threadpool",
  "tokio",
@@ -1613,6 +1615,7 @@ dependencies = [
  "tracing",
  "uuid",
  "walkdir",
+ "zstd",
 ]
 
 [[package]]
