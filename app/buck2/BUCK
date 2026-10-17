@@ -151,7 +151,7 @@ buck_rust_binary(
     # allocator in bin/buck2.rs is selected on the same configuration.
     + select({  # @oss-enable
         "DEFAULT": [],  # @oss-enable
-        "ovr_config//abi:musl": [  # @oss-enable
+        "prelude//abi:musl": [  # @oss-enable
             "fbsource//third-party/rust:jemallocator",  # @oss-enable
         ],  # @oss-enable
     })  # @oss-enable

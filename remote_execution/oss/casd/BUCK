@@ -56,7 +56,7 @@ rust_binary(
         ":buck2_casd",
     ] + select({
         "DEFAULT": [],
-        "ovr_config//abi:musl": [
+        "prelude//abi:musl": [
             "fbsource//third-party/rust:jemallocator",
         ],
     }),
