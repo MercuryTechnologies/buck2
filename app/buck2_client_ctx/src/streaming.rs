@@ -37,6 +37,7 @@ use crate::daemon::client::connect::DesiredTraceIoState;
 use crate::daemon::client::connect::connect_buckd;
 use crate::events_ctx::EventsCtx;
 use crate::exit_result::ExitResult;
+use crate::expected_binary_digest::check_expected_binary_digest;
 use crate::path_arg::PathArg;
 use crate::remote_sink_config;
 use crate::signal_handler::with_simple_sigint_handler;
@@ -240,6 +241,9 @@ impl<T: StreamingCommand> BuckSubcommand for T {
             let mut connect_options = if T::existing_only() {
                 BuckdConnectOptions::ExistingOnly
             } else {
+                // Before anything that may connect to, kill or start a daemon: a binary the
+                // project did not pin must not replace the daemon of the one it did.
+                check_expected_binary_digest(ctx.immediate_config)?;
                 let mut req =
                     DaemonConstraintsRequest::new(ctx.immediate_config, T::trace_io(&self))?;
                 ctx.restarter.apply_to_constraints(&mut req);
