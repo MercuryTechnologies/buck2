@@ -168,3 +168,98 @@ impl ProcessGroupImpl {
         Ok(())
     }
 }
+
+impl Drop for ProcessGroupImpl {
+    /// A command whose handle goes before it has been waited for has nobody
+    /// left to wait for it or kill it: the stream that owned it was dropped,
+    /// for instance because the forkserver's connection to the daemon ended
+    /// and the forkserver is exiting. Kill its group rather than orphan it.
+    /// `id()` is `None` once the leader has been reaped, so this never
+    /// signals a group whose pgid could have been reused.
+    fn drop(&mut self) {
+        if let Some(pid) = self.inner.id().and_then(|id| i32::try_from(id).ok()) {
+            tracing::info!("Killing process group {pid}, whose handle was dropped");
+            // ESRCH: the group has already gone.
+            signal::killpg(Pid::from_raw(pid), Signal::SIGKILL).ok();
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::process::Stdio;
+    use std::time::Duration;
+
+    use buck2_util::process::background_command;
+    use tokio::io::AsyncBufReadExt;
+    use tokio::io::BufReader;
+
+    use crate::process_group::ProcessCommand;
+    use crate::process_group::ProcessGroup;
+
+    /// Spawns a wrapper that forks a long-lived child and waits for it, as a
+    /// worker started through `sh wrap.sh` without `exec` does, and returns
+    /// the group and the child's pid.
+    async fn spawn_forking_wrapper() -> buck2_error::Result<(ProcessGroup, i32)> {
+        let mut cmd = background_command("sh");
+        // Longer than any wait below, so a child that was not killed is
+        // still there when the test looks.
+        cmd.args(["-c", "sleep 1000 & echo $!; wait"]);
+        cmd.stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        let mut group = ProcessCommand::new(cmd, None)
+            .await?
+            .spawn()
+            .map_err(|x| x.0)
+            .unwrap();
+        let mut lines = BufReader::new(group.take_stdout().unwrap()).lines();
+        let child = tokio::time::timeout(Duration::from_secs(60), lines.next_line())
+            .await
+            .expect("the wrapper should print its child's pid within a minute")?
+            .unwrap()
+            .parse()
+            .unwrap();
+        Ok((group, child))
+    }
+
+    /// Whether `pid` is gone (or a zombie nobody but init will reap), waiting
+    /// up to 30 seconds for the kernel to deliver the kill.
+    async fn is_gone(pid: i32) -> bool {
+        let pid = nix::unistd::Pid::from_raw(pid);
+        for _ in 0..300 {
+            let zombie = std::fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|stat| {
+                stat.rsplit_once(')')
+                    .is_some_and(|(_, rest)| rest.trim_start().starts_with('Z'))
+            });
+            if zombie || nix::sys::signal::kill(pid, None) == Err(nix::errno::Errno::ESRCH) {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        false
+    }
+
+    #[tokio::test]
+    async fn test_graceful_kill_reaches_a_forked_child() -> buck2_error::Result<()> {
+        let (mut group, child) = spawn_forking_wrapper().await?;
+        group.kill(Some(10)).await?;
+        group.wait(futures::stream::pending()).await?;
+        assert!(
+            is_gone(child).await,
+            "the wrapper's child survived its kill"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_dropping_a_running_group_kills_it() -> buck2_error::Result<()> {
+        let (group, child) = spawn_forking_wrapper().await?;
+        drop(group);
+        assert!(
+            is_gone(child).await,
+            "the wrapper's child survived its handle"
+        );
+        Ok(())
+    }
+}
