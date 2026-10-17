@@ -78,7 +78,8 @@ pub struct SuspendCommand {
 
     /// After the daemon exits, also write its state to this file, one zstd-compressed tar, for
     /// `buck2 resume --import` to unpack on another checkout at the same path. The state stays
-    /// under buck-out as well.
+    /// under buck-out as well. Implies `--portable`, since the importing machine has none of
+    /// this one's `buck-out`.
     #[clap(long, value_name = "FILE")]
     export: Option<PathArg>,
 }
@@ -107,7 +108,7 @@ impl StreamingCommand for SuspendCommand {
                     context: Some(context),
                     subcommand: HydrationSubcommand::Suspend.into(),
                     wait: false,
-                    portable: Some(self.portable),
+                    portable: Some(self.portable || self.export.is_some()),
                 },
                 events_ctx,
                 ctx.console_interaction_stream(self.console_opts()),

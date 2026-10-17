@@ -256,6 +256,16 @@ pub(crate) fn export(cache_dir: &Path, out: &Path) -> buck2_error::Result<Export
             manifest.format
         ));
     }
+    // A bundle is resumed on a machine with none of this one's buck-out, and by a daemon whose
+    // environment differs in the per-run variables the MANIFEST leaves out: that is sound only
+    // for an image that has every artifact in the CAS and has its local actions run again.
+    if !manifest.portable {
+        return Err(buck2_error!(
+            ErrorTag::Input,
+            "The suspended state is not portable: export it with `buck2 suspend --export`, \
+             which writes a portable image"
+        ));
+    }
     let header = BundleHeader {
         magic: BUNDLE_MAGIC.to_owned(),
         bundle_format: BUNDLE_FORMAT,
@@ -775,6 +785,7 @@ mod tests {
             "format": FORMAT,
             "exe": EXE,
             "created_at_ms": 1000 + seed as u64,
+            "portable": true,
             "hostname": "h",
             "uid": 1,
         });
@@ -1174,5 +1185,27 @@ mod tests {
         let out = dir.path().join("out.tar.zst");
         assert!(export(&cache, &out).is_err());
         assert!(!out.exists());
+    }
+
+    #[test]
+    fn export_refuses_an_image_that_is_not_portable() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = dir.path().join("cache");
+        write_image(&cache, 1);
+        let manifest_path = cache.join(IMAGE_DIR).join(MANIFEST);
+        let mut manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
+        manifest["portable"] = serde_json::Value::Bool(false);
+        std::fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+        let before = snapshot(&cache);
+        let out = dir.path().join("out.tar.zst");
+        let err = format!("{:#}", export(&cache, &out).unwrap_err());
+        assert!(err.contains("not portable"), "{err}");
+        assert!(!out.exists());
+        assert_eq!(snapshot(&cache), before);
+        // A MANIFEST from before the field existed reads as not portable.
+        manifest.as_object_mut().unwrap().remove("portable");
+        std::fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+        assert!(export(&cache, &out).is_err());
     }
 }
