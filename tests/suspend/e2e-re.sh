@@ -11,7 +11,7 @@
 set -uo pipefail
 B=$1; W=$2; RE_CONFIG=$3
 RE_PROPERTIES=${RE_PROPERTIES:-'{"OSFamily": "Linux", "Arch": "amd64", "Pool": "usw2", "container-image": "docker://gcr.io/flame-public/rbe-ubuntu24-04@sha256:f7db0d4791247f032fdb4451b7c3ba90e567923a341cc6dc43abfc283436791a"}'}
-R=$W/results; F=$W/fixture; C=$W/cold; N=$W/not-portable
+R=$W/results; F=$W/fixture; C=$W/cold; N=$W/not-portable; L=$W/chain
 rm -rf "$W"; mkdir -p "$R"
 
 make_fixture() { # dir
@@ -82,6 +82,7 @@ SALT=$(date +%s%N)
 make_fixture "$F"
 make_fixture "$C"
 make_fixture "$N"
+make_fixture "$L"
 fail=0
 step() { # label, cmd...
   local l=$1; shift; local t0=$(date +%s.%N); "$@" > "$R/$l.log" 2>&1; local rc=$?; local t1=$(date +%s.%N)
@@ -153,6 +154,27 @@ fresh_runner
 export GITHUB_SHA=sha-pr
 step np-resume "$B" resume
 check "a non-portable image is refused on a fresh runner" grep -qE '^cold: the image is not portable: [1-9][0-9]* materialized artifacts' "$R/np-resume.log"
+"$B" kill > /dev/null 2>&1
+
+# A chain: the main daemon resumes its own image on the same machine with the same environment,
+# so nothing is dirtied, and is suspended again, portable, without a build in between. Its
+# local action did not run in the resumed daemon, and must still be in the second image, or the
+# fresh runner keeps main's output.
+cd "$L"
+export GITHUB_SHA=sha-main
+step ch-build-main "$B" build //:after
+step ch-suspend "$B" suspend
+step ch-resume-same "$B" resume
+check "chain: the same-host resume dirties nothing" grep -q '; 0 locally executed actions to run again' "$R/ch-resume-same.log"
+step ch-suspend-portable "$B" suspend --portable
+check "chain: the second image still lists the local action" grep -q ' 1 locally executed actions' "$R/ch-suspend-portable.log"
+fresh_runner
+export GITHUB_SHA=sha-pr
+step ch-resume "$B" resume
+check "chain: the fresh runner dirties the local action" grep -q '; 1 locally executed actions to run again' "$R/ch-resume.log"
+step ch-build-pr "$B" build //:after --show-full-output
+chafter=$(grep -E '^root//:after ' "$R/ch-build-pr.log" | awk '{print $2}')
+check "chain: the local action ran again with the PR's environment" grep -q '^sha-pr$' "$chafter"
 "$B" kill > /dev/null 2>&1
 
 echo "result fail=$fail" | tee -a $R/summary.tsv
