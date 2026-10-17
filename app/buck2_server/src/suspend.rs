@@ -135,7 +135,13 @@ fn config_digest(config: &LegacyBuckConfig) -> String {
     hasher.finalize().to_hex().to_string()
 }
 
+/// The digest of the running binary. On Linux this reads `/proc/self/exe`, which is the image
+/// this process runs even after the file at its path was replaced: hashing the path instead
+/// would describe whatever binary is there now, or fail once the old one is unlinked.
 fn exe_digest() -> buck2_error::Result<String> {
+    #[cfg(target_os = "linux")]
+    let exe = PathBuf::from("/proc/self/exe");
+    #[cfg(not(target_os = "linux"))]
     let exe = std::env::current_exe().buck_error_context("Locating the daemon executable")?;
     let mut hasher = blake3::Hasher::new();
     let mut file = std::fs::File::open(&exe)
