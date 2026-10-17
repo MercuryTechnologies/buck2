@@ -2,6 +2,33 @@ load("@root//buildbuddy:defs.bzl", "buildbuddy_remote_execution_platform")
 
 oncall("build_infra")
 
+# Where an action's tools come from, as a constraint an execution platform
+# carries so that a select in an exec_dep or a toolchain can read it.
+# `nix_daemon` promises that the executor bind-mounts a nix store at
+# /nix/store with its daemon's socket at /nix/var/nix/daemon-socket/socket,
+# and that the daemon substitutes cache.nixos.org-signed paths for a client
+# it does not trust. Lab's c1 executors do (lab's
+# infra/deploy/buildbuddy/usw2/values-executor-c1.yaml and
+# usw2/nix-daemon/nix.conf). `image` is everything else: tools come from
+# the container image alone.
+constraint(
+    name = "exec_store",
+    default = "image",
+    values = [
+        "image",
+        "nix_daemon",
+    ],
+    visibility = ["PUBLIC"],
+)
+
+config_setting(
+    name = "nix_daemon",
+    constraint_values = [
+        ":exec_store[nix_daemon]",
+    ],
+    visibility = ["PUBLIC"],
+)
+
 # Lab's own BuildBuddy remote execution: the usw2 pool of the c1 app on
 # lab-build-usw2, the backend lab's infra/deploy/aws/buildbuddy.buckconfig
 # names. The release build's target platforms are still
