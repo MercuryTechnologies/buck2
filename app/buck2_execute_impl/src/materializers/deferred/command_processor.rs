@@ -15,6 +15,7 @@ use std::task::Context;
 use std::task::Poll;
 
 use buck2_core::buck2_env;
+use buck2_core::fs::project::ProjectRoot;
 use buck2_core::fs::project_rel_path::ProjectRelativePath;
 use buck2_core::fs::project_rel_path::ProjectRelativePathBuf;
 use buck2_core::soft_error;
@@ -965,6 +966,31 @@ impl<T: IoHandler> DeferredMaterializerCommandProcessor<T> {
         method: Box<ArtifactMaterializationMethod>,
         event_dispatcher: &EventDispatcher,
     ) {
+        self.declare_impl(path, value, method, event_dispatcher, None)
+    }
+
+    /// [`Self::declare`] for a resume, which declares every artifact of a suspended daemon at
+    /// once: a path that nothing in the tree overlaps and that `probe` finds missing on disk has
+    /// nothing to delete, so no delete is queued for it. On a fresh machine that is every path.
+    pub(super) fn declare_for_resume(
+        &mut self,
+        path: &ProjectRelativePath,
+        value: ArtifactValue,
+        method: Box<ArtifactMaterializationMethod>,
+        event_dispatcher: &EventDispatcher,
+        probe: &mut ResumeDiskProbe,
+    ) {
+        self.declare_impl(path, value, method, event_dispatcher, Some(probe))
+    }
+
+    fn declare_impl(
+        &mut self,
+        path: &ProjectRelativePath,
+        value: ArtifactValue,
+        method: Box<ArtifactMaterializationMethod>,
+        event_dispatcher: &EventDispatcher,
+        probe: Option<&mut ResumeDiskProbe>,
+    ) {
         self.stats.declares.fetch_add(1, Ordering::Relaxed);
 
         // Check if artifact to be declared is same as artifact that's already materialized.
@@ -1051,16 +1077,23 @@ impl<T: IoHandler> DeferredMaterializerCommandProcessor<T> {
 
         let method = Arc::from(method);
 
-        let future = ProcessingFuture::Cleaning(clean_path(
-            &self.io,
-            path.to_owned(),
-            version,
-            self.command_sender.dupe(),
-            existing_futs,
-            &self.rt,
-            self.cancellations,
-            event_dispatcher,
-        ));
+        let nothing_to_clean = existing_futs.is_empty()
+            && probe.is_some_and(|probe| probe.is_absent(self.io.fs(), path));
+        let processing = if nothing_to_clean {
+            Processing::Done(version)
+        } else {
+            let future = ProcessingFuture::Cleaning(clean_path(
+                &self.io,
+                path.to_owned(),
+                version,
+                self.command_sender.dupe(),
+                existing_futs,
+                &self.rt,
+                self.cancellations,
+                event_dispatcher,
+            ));
+            Processing::active(future, version)
+        };
 
         let data = Box::new(ArtifactMaterializationData {
             deps: value.deps().duped(),
@@ -1070,7 +1103,7 @@ impl<T: IoHandler> DeferredMaterializerCommandProcessor<T> {
                 entry: value.entry().dupe(),
                 method,
             },
-            processing: Processing::active(future, version),
+            processing,
         });
         self.tree.insert(path.iter().map(|f| f.to_owned()), data);
     }
@@ -1655,6 +1688,46 @@ fn clean_path<T: IoHandler>(
     })
     .boxed()
     .shared()
+}
+
+/// What a resume learned about which paths are missing on disk. A fresh machine has no
+/// `buck-out`, so the first missing ancestor answers for every artifact below it without
+/// another stat.
+#[derive(Default)]
+pub(super) struct ResumeDiskProbe {
+    absent: BuckMutSet<ProjectRelativePathBuf>,
+}
+
+impl ResumeDiskProbe {
+    /// Whether nothing exists at `path`, not even a dangling symlink. An error other than "not
+    /// found" counts as present, which only costs a delete.
+    pub(super) fn is_absent(&mut self, fs: &ProjectRoot, path: &ProjectRelativePath) -> bool {
+        let mut ancestor = path.parent();
+        while let Some(a) = ancestor {
+            if self.absent.contains(a) {
+                return true;
+            }
+            ancestor = a.parent();
+        }
+        let missing = |p: &ProjectRelativePath| {
+            matches!(
+                std::fs::symlink_metadata(fs.resolve(p)),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound
+            )
+        };
+        if !missing(path) {
+            return false;
+        }
+        let mut ancestor = path.parent();
+        while let Some(a) = ancestor {
+            if a.is_empty() || !missing(a) {
+                break;
+            }
+            self.absent.insert(a.to_owned());
+            ancestor = a.parent();
+        }
+        true
+    }
 }
 
 /// A wrapper type around the Result it contains. Used to expose some extra methods.

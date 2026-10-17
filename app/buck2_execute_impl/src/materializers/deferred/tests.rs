@@ -839,6 +839,16 @@ pub(crate) mod state_machine {
         })
     }
 
+    fn file_entry(
+        digest_config: DigestConfig,
+        content: &[u8],
+    ) -> ActionDirectoryEntry<ActionSharedDirectory> {
+        DirectoryEntry::Leaf(ActionDirectoryMember::File(FileMetadata {
+            digest: TrackedFileDigest::from_content(content, digest_config.cas_digest_config()),
+            is_executable: false,
+        }))
+    }
+
     fn cas_method() -> Box<ArtifactMaterializationMethod> {
         Box::new(ArtifactMaterializationMethod::CasDownload {
             info: Arc::new(CasDownloadInfo::new_declared(
@@ -1762,7 +1772,7 @@ pub(crate) mod state_machine {
                     (
                         a.path.to_string(),
                         match a.state {
-                            SuspendedArtifactState::Materialized => "materialized",
+                            SuspendedArtifactState::Materialized { .. } => "materialized",
                             SuspendedArtifactState::CasDownload { .. } => "cas",
                             SuspendedArtifactState::LocalCopy { .. } => "copy",
                             SuspendedArtifactState::Write { .. } => "write",
@@ -1786,7 +1796,10 @@ pub(crate) mod state_machine {
             artifacts.push(SuspendedArtifact {
                 path: make_path("buck-out/v2/art/foo/missing"),
                 deps: None,
-                state: SuspendedArtifactState::Materialized,
+                state: SuspendedArtifactState::Materialized {
+                    entry: file_entry(io.digest_config(), b"missing"),
+                    cas: None,
+                },
             });
             let (dm, _) = make_materializer(io, None).await;
             let resumed = dm.resume_artifacts(artifacts).await?;
@@ -1795,6 +1808,7 @@ pub(crate) mod state_machine {
                 ResumedArtifacts {
                     reactivated: 1,
                     redeclared: 2,
+                    refetch: 0,
                     lost: 1,
                 }
             );
@@ -1827,6 +1841,118 @@ pub(crate) mod state_machine {
                 .next()
                 .await
                 .unwrap()?;
+            Ok(())
+        })
+        .await
+    }
+
+    fn suspended_materialized(
+        path: &ProjectRelativePathBuf,
+        content: &[u8],
+        cas: bool,
+    ) -> buck2_execute::materialize::materializer::SuspendedArtifact {
+        use buck2_execute::materialize::materializer::SuspendedArtifact;
+        use buck2_execute::materialize::materializer::SuspendedArtifactState;
+        SuspendedArtifact {
+            path: path.clone(),
+            deps: None,
+            state: SuspendedArtifactState::Materialized {
+                entry: file_entry(DigestConfig::testing_default(), content),
+                cas: cas.then(|| {
+                    CasDownloadInfo::new_declared(RemoteExecutorUseCase::buck2_default())
+                        .to_suspended()
+                }),
+            },
+        }
+    }
+
+    fn suspended_write(
+        path: &ProjectRelativePathBuf,
+        content: &[u8],
+    ) -> buck2_execute::materialize::materializer::SuspendedArtifact {
+        use buck2_execute::materialize::materializer::SuspendedArtifact;
+        use buck2_execute::materialize::materializer::SuspendedArtifactState;
+        SuspendedArtifact {
+            path: path.clone(),
+            deps: None,
+            state: SuspendedArtifactState::Write {
+                entry: file_entry(DigestConfig::testing_default(), content),
+                compressed: zstd::bulk::compress(content, 0).unwrap(),
+                decompressed_size: content.len() as u64,
+                is_executable: false,
+            },
+        }
+    }
+
+    /// A resumed materializer that lacks a materialized artifact with the same entry, on a fresh
+    /// machine or over a disk where the artifact changed, declares it again from its CAS recipe;
+    /// one with no recipe is lost. On a fresh tree no delete is queued for any of them.
+    #[tokio::test]
+    async fn suspended_artifacts_missing_from_disk_come_back_from_the_cas()
+    -> buck2_error::Result<()> {
+        use buck2_execute::materialize::materializer::ResumedArtifacts;
+
+        ignore_stack_overflow_checks_for_future(async {
+            let with_cas = make_path("buck-out/v2/art/foo/with_cas");
+            let without_cas = make_path("buck-out/v2/art/foo/without_cas");
+            let write = make_path("buck-out/v2/art/foo/write");
+
+            // A fresh machine: no buck-out and no persisted state.
+            let io = Arc::new(StubIoHandler::new(temp_root()));
+            let (dm, _) = make_materializer(io.dupe(), None).await;
+            let resumed = dm
+                .resume_artifacts(vec![
+                    suspended_materialized(&with_cas, b"cas", true),
+                    suspended_materialized(&without_cas, b"local", false),
+                    suspended_write(&write, b"write"),
+                ])
+                .await?;
+            assert_eq!(
+                resumed,
+                ResumedArtifacts {
+                    reactivated: 0,
+                    redeclared: 1,
+                    refetch: 1,
+                    lost: 1,
+                }
+            );
+            assert_eq!(io.take_log(), vec![]);
+            // Declared again from the CAS: asking for it downloads it.
+            dm.materialize_many(vec![with_cas.clone()])
+                .await?
+                .next()
+                .await
+                .unwrap()?;
+            assert_eq!(io.take_log(), vec![(Op::Materialize, with_cas.clone())]);
+            dm.abort();
+
+            // The same machine, where one artifact is on disk as suspended and the other changed.
+            let same = make_path("buck-out/v2/art/foo/same");
+            let io = Arc::new(StubIoHandler::new(temp_root()));
+            let (dm, _) = make_materializer(io.dupe(), None).await;
+            materialize_write(&same, b"same", &dm).await?;
+            materialize_write(&with_cas, b"old", &dm).await?;
+            dm.abort();
+            io.take_log();
+            let (dm, _) = make_materializer(io.dupe(), None).await;
+            let resumed = dm
+                .resume_artifacts(vec![
+                    suspended_materialized(&same, b"same", false),
+                    suspended_materialized(&with_cas, b"new", true),
+                ])
+                .await?;
+            assert_eq!(
+                resumed,
+                ResumedArtifacts {
+                    reactivated: 1,
+                    redeclared: 0,
+                    refetch: 1,
+                    lost: 0,
+                }
+            );
+            // The changed artifact is on disk, so it is deleted before the download.
+            assert_eq!(io.take_log(), vec![(Op::Clean, with_cas.clone())]);
+            dm.abort();
             Ok(())
         })
         .await
