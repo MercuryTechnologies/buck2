@@ -133,15 +133,26 @@ impl FsHashCrawler {
         let ignore_specs = self.ignore_specs.dupe();
         let new_snapshot =
             spawn_blocking(move || FsSnapshot::build(&root, &cells, &ignore_specs)).await??;
+        let (stats, changes) = self.take_changes(new_snapshot)?;
+        changes.write_to_dice(&mut dice)?;
+        dice.set_file_system_baseline(self.baseline.dupe())?;
+        Ok((stats, dice))
+    }
+
+    /// What a sync records: the paths whose stat moved since the last snapshot, which
+    /// `new_snapshot` replaces, and on a resumed crawler's first sync what changed while no
+    /// daemon ran.
+    fn take_changes(
+        &self,
+        new_snapshot: FsSnapshot,
+    ) -> buck2_error::Result<(buck2_data::FileWatcherStats, FileChangeTracker)> {
         let mut guard = self.snapshot.lock().unwrap();
         let old_snapshot = mem::replace(&mut *guard, new_snapshot);
         let (stats, mut changes) = old_snapshot.get_updates_for_dice(&guard, &self.ignore_specs)?;
         if let Some(pending) = self.pending.lock().unwrap().take() {
             changes.merge(pending);
         }
-        changes.write_to_dice(&mut dice)?;
-        dice.set_file_system_baseline(self.baseline.dupe())?;
-        Ok((stats, dice))
+        Ok((stats, changes))
     }
 }
 
@@ -1310,6 +1321,7 @@ mod tests {
         use crate::file_watcher::VcsImage;
         use crate::file_watcher::VcsTree;
         use crate::fs_hash_crawler::EntryImage;
+        use crate::fs_hash_crawler::FsHashCrawler;
         use crate::fs_hash_crawler::FsSnapshot;
         use crate::fs_hash_crawler::ResumeScan;
         use crate::fs_hash_crawler::resume_scan;
@@ -1442,6 +1454,21 @@ mod tests {
             ProjectRelativePath::new(path).unwrap().to_buf()
         }
 
+        /// Each file of `image`, and whether the suspend recorded a digest of its contents.
+        fn digests(image: &FileWatcherImage) -> Vec<(String, bool)> {
+            let mut out: Vec<(String, bool)> = image
+                .snapshot
+                .entries
+                .iter()
+                .filter_map(|(_, path, entry)| match entry {
+                    EntryImage::File { digest, .. } => Some((path.to_string(), digest.is_some())),
+                    _ => None,
+                })
+                .collect();
+            out.sort();
+            out
+        }
+
         fn set_modified(path: &AbsPathBuf, time: SystemTime) -> buck2_error::Result<()> {
             std::fs::OpenOptions::new()
                 .write(true)
@@ -1487,6 +1514,7 @@ mod tests {
             let fx = Fixture::new()?;
             fs_util::write(&fx.path("fresh"), "aaaa")?;
             let image = fx.suspend(None)?;
+            assert_eq!(digests(&image), vec![("fresh".to_owned(), false)]);
             fs_util::write(&fx.path("fresh"), "bbbb")?;
             assert_eq!(events(&fx.scan_foreign(&image)?), set(&[("fresh", M, F)]));
             Ok(())
@@ -1721,6 +1749,76 @@ mod tests {
                 .map(|e| (e.cell_path.path().to_string(), e.event, e.kind))
                 .collect();
             assert_eq!(later, set(&[("file", M, F)]));
+            Ok(())
+        }
+
+        /// A file the suspend found racily clean is a change on the machine that took the
+        /// image too, even with its full stat unchanged: the graph may hold bytes an edit in
+        /// the same clock tick replaced.
+        #[test]
+        fn racily_clean_file_is_a_change_on_the_same_host() -> buck2_error::Result<()> {
+            let fx = Fixture::new()?;
+            fx.aged("aged", "aaaa")?;
+            fs_util::write(&fx.path("fresh"), "bbbb")?;
+            let image = fx.suspend(None)?;
+            let scan = fx.scan(&image, false, || None)?;
+            assert_eq!(events(&scan), set(&[("fresh", M, F)]));
+            assert_eq!((scan.stat_equal, scan.hashed), (1, 0));
+            Ok(())
+        }
+
+        /// Across machines an equal stat proves nothing, since another machine's files can
+        /// carry the same times, inode and device (a cloned disk does): a file whose stat
+        /// equals the image's but whose recorded contents differ is read and reported.
+        #[test]
+        fn equal_stat_from_another_machine_is_read() -> buck2_error::Result<()> {
+            let fx = Fixture::new()?;
+            fx.aged("file", "aaaa")?;
+            let mut image = fx.suspend(None)?;
+            for (_, _, entry) in &mut image.snapshot.entries {
+                if let EntryImage::File { digest, .. } = entry {
+                    *digest = Some([7; 32]);
+                }
+            }
+            let scan = fx.scan(&image, true, || None)?;
+            assert_eq!(events(&scan), set(&[("file", M, F)]));
+            assert_eq!((scan.stat_equal, scan.hashed), (0, 1));
+            // On the machine that took it, the same stat is trusted.
+            let scan = fx.scan(&image, false, || None)?;
+            assert_eq!(events(&scan), Events::new());
+            assert_eq!((scan.stat_equal, scan.hashed), (1, 0));
+            Ok(())
+        }
+
+        /// A resumed crawler's first sync records what the resume scan found together with
+        /// what moved after the scan statted the files; the next sync records neither again.
+        #[test]
+        fn resumed_crawler_records_the_scan_on_its_first_sync() -> buck2_error::Result<()> {
+            let fx = Fixture::new()?;
+            fx.aged("scanned", "aaaa")?;
+            fx.aged("later", "bbbb")?;
+            fx.aged("kept", "kkkk")?;
+            let image = foreign(&fx.suspend(None)?);
+            // A same-size edit only the scan's content comparison finds, aged so that no
+            // sync finds it racily clean.
+            fx.aged("scanned", "AAAA")?;
+            let crawler = FsHashCrawler::resume(
+                &fx.root,
+                fx.cells.clone(),
+                fx.ignores.clone(),
+                ResumeInput {
+                    image: &image,
+                    cross_host: true,
+                    vcs: Box::new(|| None),
+                },
+            )?;
+            fx.aged("later", "BBBBB")?;
+            let sync = || -> buck2_error::Result<Vec<String>> {
+                let now = FsSnapshot::build(&fx.root, &fx.cells, &fx.ignores)?;
+                Ok(crawler.take_changes(now)?.1.testing_dirtied().0)
+            };
+            assert_eq!(sync()?, strings(&["root//later", "root//scanned"]));
+            assert_eq!(sync()?, Vec::<String>::new());
             Ok(())
         }
     }
