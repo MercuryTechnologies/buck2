@@ -319,3 +319,47 @@ impl StreamingCommand for ResumeCommand {
         &self.starlark_opts
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use buck2_cli_proto::DaemonProcessInfo;
+    use buck2_fs::paths::abs_norm_path::AbsNormPathBuf;
+
+    use super::*;
+
+    fn daemon_dir_with_pid(pid: Option<u32>) -> (tempfile::TempDir, DaemonDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let daemon_dir = DaemonDir {
+            path: AbsNormPathBuf::new(dir.path().to_path_buf()).unwrap(),
+        };
+        if let Some(pid) = pid {
+            let info = DaemonProcessInfo {
+                pid: pid as i64,
+                endpoint: "tcp:1".to_owned(),
+                version: "v".to_owned(),
+                auth_token: "t".to_owned(),
+            };
+            std::fs::write(daemon_dir.buckd_info(), serde_json::to_vec(&info).unwrap()).unwrap();
+        }
+        (dir, daemon_dir)
+    }
+
+    #[test]
+    fn a_live_daemon_pid_counts_as_running() {
+        let me = std::process::id();
+        let (_d, dir) = daemon_dir_with_pid(Some(me));
+        assert_eq!(running_daemon(&dir).unwrap(), Some(me));
+    }
+
+    #[test]
+    fn no_info_or_a_dead_pid_is_not_running() {
+        let (_d, dir) = daemon_dir_with_pid(None);
+        assert_eq!(running_daemon(&dir).unwrap(), None);
+
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        let dead = child.id();
+        child.wait().unwrap();
+        let (_d, dir) = daemon_dir_with_pid(Some(dead));
+        assert_eq!(running_daemon(&dir).unwrap(), None);
+    }
+}
