@@ -297,19 +297,72 @@ impl Dice {
 
         lap("value rows", &mut timings);
 
-        // The key table. A key is written once, with every projection's base before it, and
-        // read back at once: no key serializer ran before this feature, since paging writes
-        // values only, so a key that does not come back equal is left out rather than trusted.
-        let mut ordinals: HashMap<DiceKey, Option<u32>> = HashMap::default();
-        let mut keys: Vec<ImageKey> = Vec::new();
+        // The key table. Every key's row is written, with every projection's base, and read
+        // back: no key serializer ran before this feature, since paging writes values only, so
+        // a key that does not come back equal is left out rather than trusted. A key is read
+        // back from its row's data as written, not from the store, and only once every row is
+        // written and flushed, for the arcs a row names. Reading each row back from the store as
+        // it was written found it still in its shard's write buffer, and that read flushed the
+        // shard: one commit per key, 640 s for mwb's 1.3M keys; and a read of the store costs
+        // more than the decode, about 6 us a row whether one reader or many.
         let mut ordered: Vec<DiceKey> = entries.keys().copied().collect();
         ordered.sort_by_key(|k| k.index);
+        // Every key whose row was written or failed to be.
+        let mut tried: crate::HashSet<DiceKey> = crate::HashSet::default();
+        let mut checks: Vec<(DiceKey, DataKey, pagable::storage::data::PagableData)> =
+            Vec::new();
+        for &entry_key in &ordered {
+            let mut next = Some(entry_key);
+            while let Some(key) = next.take() {
+                if !tried.insert(key) {
+                    break;
+                }
+                let erased = self.key_index.get(key);
+                let base = match erased {
+                    DiceKeyErased::Key(_) => None,
+                    DiceKeyErased::Projection(p) => Some(p.base()),
+                };
+                let row = std::panic::catch_unwind(AssertUnwindSafe(|| {
+                    storage.write_key_row(erased, &finished)
+                }));
+                if let Ok(Ok((row, data))) = row {
+                    checks.push((key, row, data));
+                }
+                next = base;
+            }
+        }
+        lap("key rows written", &mut timings);
+        drop(tried);
+        storage.flush()?;
+        lap("key rows flushed", &mut timings);
+        let mut round_tripped: HashMap<DiceKey, DataKey> = HashMap::default();
+        for (key, row, data) in checks {
+            let erased = self.key_index.get(key);
+            let base = match erased {
+                DiceKeyErased::Key(_) => None,
+                DiceKeyErased::Projection(p) => Some(p.base()),
+            };
+            // The row's key names its data, so what is decoded is what a resume reads.
+            if data.compute_key() != row {
+                continue;
+            }
+            let back = std::panic::catch_unwind(AssertUnwindSafe(|| {
+                storage.decode_key_row(row, &data, base)
+            }));
+            if let Ok(Ok(back)) = back
+                && back == *erased
+                && back.hash() == erased.hash()
+            {
+                round_tripped.insert(key, row);
+            }
+        }
+        let mut ordinals: HashMap<DiceKey, Option<u32>> = HashMap::default();
+        let mut keys: Vec<ImageKey> = Vec::new();
         for key in ordered {
-            self.ensure_ordinal(key, &storage, &finished, &mut ordinals, &mut keys)
-                .await;
+            self.ensure_ordinal(key, &round_tripped, &mut ordinals, &mut keys);
         }
 
-        lap("key rows", &mut timings);
+        lap("key rows checked", &mut timings);
 
         // Mints of entry keys, recorded beside their key.
         for (key, entry) in &entries {
@@ -449,34 +502,31 @@ impl Dice {
         Ok(SuspendImage { bytes, stats })
     }
 
-    /// Gives `key` an ordinal in the key table, writing and checking its row, after its base
-    /// if it is a projection. `None` (recorded in `ordinals`) if it cannot round-trip.
-    async fn ensure_ordinal(
+    /// Gives `key` an ordinal in the key table, after its base if it is a projection. `None`
+    /// (recorded in `ordinals`) if its row, or its base's, did not round-trip.
+    fn ensure_ordinal(
         &self,
         key: DiceKey,
-        storage: &crate::storage::DiceStorage,
-        finished: &ArcSerCache,
+        round_tripped: &HashMap<DiceKey, DataKey>,
         ordinals: &mut HashMap<DiceKey, Option<u32>>,
         keys: &mut Vec<ImageKey>,
     ) -> Option<u32> {
         if let Some(ordinal) = ordinals.get(&key) {
             return *ordinal;
         }
-        let erased = self.key_index.get(key).dupe();
-        let (kind, base) = match &erased {
-            DiceKeyErased::Key(_) => (ImageKeyKind::Key, None),
+        let kind = match self.key_index.get(key) {
+            DiceKeyErased::Key(_) => ImageKeyKind::Key,
             DiceKeyErased::Projection(p) => {
-                let base = p.base();
                 let Some(base_ordinal) =
-                    Box::pin(self.ensure_ordinal(base, storage, finished, ordinals, keys)).await
+                    self.ensure_ordinal(p.base(), round_tripped, ordinals, keys)
                 else {
                     ordinals.insert(key, None);
                     return None;
                 };
-                (ImageKeyKind::Projection { base: base_ordinal }, Some(base))
+                ImageKeyKind::Projection { base: base_ordinal }
             }
         };
-        let ordinal = match round_trip(storage, &erased, base, finished).await {
+        let ordinal = match round_tripped.get(&key).copied() {
             Some(row_key) => {
                 let ordinal = u32::try_from(keys.len()).expect("fewer than 2^32 keys");
                 keys.push(ImageKey {
@@ -649,28 +699,5 @@ impl Dice {
             .ok_or_else(|| anyhow::anyhow!("resume needs pagable storage"))?;
         storage.verify_reads();
         storage.read_row(data_key(row)?).await
-    }
-}
-
-/// Writes `key`'s row and reads it back: the row if the key came back equal, with the same hash,
-/// `None` otherwise. Serializers that panic count as failures.
-async fn round_trip(
-    storage: &crate::storage::DiceStorage,
-    key: &DiceKeyErased,
-    base: Option<DiceKey>,
-    finished: &ArcSerCache,
-) -> Option<DataKey> {
-    let written =
-        std::panic::catch_unwind(AssertUnwindSafe(|| storage.write_key_row(key, finished)));
-    let row_key = match written {
-        Ok(Ok(row_key)) => row_key,
-        Ok(Err(_)) | Err(_) => return None,
-    };
-    let back =
-        futures::FutureExt::catch_unwind(AssertUnwindSafe(storage.read_key_row(row_key, base)))
-            .await;
-    match back {
-        Ok(Ok(back)) if back == *key && back.hash() == key.hash() => Some(row_key),
-        _ => None,
     }
 }

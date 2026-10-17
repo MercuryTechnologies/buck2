@@ -543,6 +543,7 @@ impl Key for Node {
         ctx: &mut DiceComputations,
         _cancellations: &CancellationContext,
     ) -> Self::Value {
+        Computes::record(ctx, self);
         let Node(i, n) = *self;
         let mut sum = *ctx.compute(&Input(i % LEAVES)).await.unwrap();
         for child in [2 * i + 1, 2 * i + 2] {
@@ -589,17 +590,36 @@ async fn suspend_bench() -> anyhow::Result<()> {
     let t = std::time::Instant::now();
     let image = dice.suspend_image(head).await?;
     eprintln!(
-        "suspend: {:.3}s, {} keys, {} certificates, {} bytes",
+        "suspend: {:.3}s, {} keys, {} certificates, {} bytes, digest {}",
         t.elapsed().as_secs_f64(),
         image.stats.keys,
         image.stats.certified,
-        image.bytes.len()
+        image.bytes.len(),
+        {
+            use std::hash::Hash;
+            use std::hash::Hasher;
+            // Fixed keys: the same in every process, so two builds' images compare.
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            image.bytes.hash(&mut h);
+            format!("{:016x}", h.finish())
+        }
     );
     for (step, d) in &image.stats.timings {
         eprintln!("  suspend {step}: {:.3}s", d.as_secs_f64());
     }
     assert_eq!(image.stats.dropped_total(), 0);
     drop(dice);
+    // `DICE_SUSPEND_BENCH_EVICT=<command>` runs `<command> <store>` here, e.g. `vmtouch -e`, to
+    // resume from a store the page cache does not hold, as on a runner the image was carried to.
+    if let Some(evict) = std::env::var_os("DICE_SUSPEND_BENCH_EVICT") {
+        let evict = evict.to_string_lossy().into_owned();
+        let mut words = evict.split_whitespace();
+        let status = std::process::Command::new(words.next().unwrap())
+            .args(words)
+            .arg(dir.path())
+            .status()?;
+        assert!(status.success());
+    }
 
     let (resumed, root) = open(&dir).await?;
     let t = std::time::Instant::now();
@@ -616,5 +636,137 @@ async fn suspend_bench() -> anyhow::Result<()> {
     inject(&resumed, root, &initial_inputs()).await;
     let tx = resumed.updater(root).commit().await;
     assert_eq!(*tx.compute(&Node(0, n)).await?, value);
+    Ok(())
+}
+
+/// A sqlite store that counts reads of rows it may still hold in a write buffer: rows stored
+/// since the last flush. sqlite finds such a row only by flushing its shard, a commit per read.
+struct CountingStore {
+    inner: pagable_storage::storage::sqlite::SqliteBackedPagableStorage,
+    unflushed: Mutex<std::collections::HashSet<pagable::DataKey>>,
+    buffered_reads: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl CountingStore {
+    fn note_read(&self, key: &pagable::DataKey) {
+        if self.unflushed.lock().unwrap().contains(key) {
+            self.buffered_reads
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+}
+
+#[async_trait]
+impl pagable::storage::traits::PagableStorage for CountingStore {
+    fn arc_cache(&self) -> &pagable::storage::traits::DeserializedArcCache {
+        self.inner.arc_cache()
+    }
+
+    fn fetch_data_blocking(
+        &self,
+        key: &pagable::DataKey,
+    ) -> anyhow::Result<Arc<pagable::storage::data::PagableData>> {
+        self.note_read(key);
+        self.inner.fetch_data_blocking(key)
+    }
+
+    async fn fetch_data(
+        &self,
+        key: &pagable::DataKey,
+    ) -> anyhow::Result<Arc<pagable::storage::data::PagableData>> {
+        self.note_read(key);
+        self.inner.fetch_data(key).await
+    }
+
+    fn schedule_for_paging(&self, arc: Box<dyn pagable::arc_erase::ArcEraseDyn>) {
+        self.inner.schedule_for_paging(arc)
+    }
+
+    fn storage_context(&self) -> &pagable::StorageContext {
+        self.inner.storage_context()
+    }
+
+    fn store_data_ticketed(
+        &self,
+        data: pagable::storage::data::PagableData,
+    ) -> anyhow::Result<(pagable::DataKey, pagable::storage::traits::WriteTicket)> {
+        let stored = self.inner.store_data_ticketed(data)?;
+        self.unflushed.lock().unwrap().insert(stored.0);
+        Ok(stored)
+    }
+
+    fn commit_frontier(&self) -> pagable::storage::traits::CommitFrontier {
+        self.inner.commit_frontier()
+    }
+
+    fn discard_unwritten(&self) {
+        self.inner.discard_unwritten()
+    }
+
+    fn flush(&self) -> anyhow::Result<()> {
+        self.inner.flush()?;
+        self.unflushed.lock().unwrap().clear();
+        Ok(())
+    }
+
+    fn release_memory(&self) {
+        self.inner.release_memory()
+    }
+}
+
+/// A suspend writes every key's row before it reads any back, so it never reads a row its
+/// store still buffers. It used to read each key back as it wrote it, which over sqlite flushed
+/// a shard per key: 640 s for mwb's 1.3M keys.
+#[tokio::test]
+async fn a_suspend_reads_no_key_row_its_store_still_buffers() -> anyhow::Result<()> {
+    const NODES: u32 = 2_000;
+    let dir = tempdir()?;
+    let buffered_reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let store = Arc::new(CountingStore {
+        inner: pagable_storage::storage::sqlite::SqliteBackedPagableStorage::try_new(
+            dir.path(),
+        )?,
+        unflushed: Mutex::new(Default::default()),
+        buffered_reads: buffered_reads.dupe(),
+    });
+    let open_over = |store: Arc<CountingStore>| async move {
+        let mut storage = DiceStorage::new(store);
+        storage.set_page_out_policy(PageOutPolicy::OncePerValue);
+        storage.set_eviction_policy(EvictionPolicy::OnIdle);
+        let mut builder = Dice::builder();
+        builder.set_pagable_storage(storage);
+        let dice = builder.build(DetectCycles::Disabled);
+        let root = dice.new_root().await;
+        (dice, root)
+    };
+
+    let (dice, root) = open_over(store.dupe()).await;
+    inject(&dice, root, &initial_inputs()).await;
+    let tx = dice.updater(root).commit().await;
+    let value = *tx.compute(&Node(0, NODES)).await?;
+    drop(tx);
+    dice.wait_for_idle().await;
+    let head = dice.head(root).await;
+    buffered_reads.store(0, std::sync::atomic::Ordering::Relaxed);
+    let image = dice.suspend_image(head).await?;
+    assert_eq!(image.stats.dropped_total(), 0);
+    assert!(image.stats.keys > NODES as usize, "{:?}", image.stats);
+    assert_eq!(
+        buffered_reads.load(std::sync::atomic::Ordering::Relaxed),
+        0,
+        "every buffered row read is a commit of its shard"
+    );
+    drop(dice);
+
+    // The image means what it meant: the resumed graph serves the value without computing.
+    let (resumed, root) = open_over(store).await;
+    let stats = resumed.restore_image(root, &image.bytes).await?;
+    assert_eq!(stats.dropped, 0);
+    assert_eq!(stats.keys, image.stats.keys);
+    inject(&resumed, root, &initial_inputs()).await;
+    let computes = Computes::default();
+    let tx = resumed.updater_with_data(root, computes.data()).commit().await;
+    assert_eq!(*tx.compute(&Node(0, NODES)).await?, value);
+    assert_eq!(computes.take(), Vec::<String>::new());
     Ok(())
 }
