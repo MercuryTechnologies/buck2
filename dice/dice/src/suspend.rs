@@ -193,6 +193,9 @@ pub struct ResumeStats {
     pub candidates: usize,
     /// Certificates `write` did not install.
     pub dropped: usize,
+    /// How long each step took: reading the key rows, reading the asserted values, reading the
+    /// certificates (with the resident values), and installing the head.
+    pub timings: Vec<(&'static str, std::time::Duration)>,
 }
 
 /// The graph's part of a suspended daemon: an [`Image`]'s bytes and what went into it.
@@ -492,6 +495,12 @@ impl Dice {
             ));
         }
         storage.verify_reads();
+        let mut timings = Vec::new();
+        let mut step = std::time::Instant::now();
+        let mut lap = |name: &'static str, timings: &mut Vec<_>| {
+            timings.push((name, step.elapsed()));
+            step = std::time::Instant::now();
+        };
 
         // Read every key before interning any, so a bad image interns nothing.
         let mut erased_keys: Vec<DiceKeyErased> = Vec::with_capacity(image.keys.len());
@@ -514,6 +523,7 @@ impl Dice {
             erased_keys.push(erased);
             dice_keys.push(dice_key);
         }
+        lap("key rows", &mut timings);
         let ordinal = |o: u32| -> anyhow::Result<DiceKey> {
             dice_keys
                 .get(o as usize)
@@ -540,6 +550,7 @@ impl Dice {
                 row,
             });
         }
+        lap("asserts", &mut timings);
         let mut certs = Vec::with_capacity(image.certs.len());
         for c in &image.certs {
             let key = ordinal(c.key)?;
@@ -559,6 +570,7 @@ impl Dice {
                 value,
             });
         }
+        lap("certificates", &mut timings);
         let mut dirtied = Vec::with_capacity(image.dirtied.len());
         for (k, p) in &image.dirtied {
             dirtied.push((ordinal(*k)?, priority_from_u8(*p)?));
@@ -579,12 +591,14 @@ impl Dice {
                 mints,
             })
             .await;
+        lap("head", &mut timings);
         Ok(ResumeStats {
             keys: image.keys.len(),
             asserted: counts.asserted,
             certified: counts.certified,
             candidates: counts.candidates,
             dropped: counts.dropped,
+            timings,
         })
     }
 }
