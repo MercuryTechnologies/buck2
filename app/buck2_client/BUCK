@@ -14,6 +14,7 @@ rust_library(
     deps = [
         "fbsource//third-party/rust:async-recursion",
         "fbsource//third-party/rust:async-trait",
+        "fbsource//third-party/rust:blake3",
         "fbsource//third-party/rust:bytesize",
         "fbsource//third-party/rust:clap",
         "fbsource//third-party/rust:futures",
@@ -25,6 +26,7 @@ rust_library(
         "fbsource//third-party/rust:serde",
         "fbsource//third-party/rust:serde_json",
         "fbsource//third-party/rust:shlex",
+        "fbsource//third-party/rust:tar",
         "fbsource//third-party/rust:threadpool",
         "fbsource//third-party/rust:tokio",
         "fbsource//third-party/rust:tokio-stream",
@@ -33,6 +35,7 @@ rust_library(
         "fbsource//third-party/rust:tracing",
         "fbsource//third-party/rust:uuid",
         "fbsource//third-party/rust:walkdir",
+        "fbsource//third-party/rust:zstd",
         "//buck2/app/buck2_cli_proto:buck2_cli_proto",
         "//buck2/app/buck2_client_ctx:buck2_client_ctx",
         "//buck2/app/buck2_common:buck2_common",
