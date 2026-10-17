@@ -127,6 +127,7 @@ use crate::daemon::server::TenantStateInitPreferences;
 use crate::daemon::tenting_provider::create_tenting_acl_provider;
 use crate::paging::PageOutThresholds;
 use crate::snapshot::DepFileDbSizeSampler;
+use crate::suspend::RestoreError;
 use crate::suspend::ResumeOutcome;
 use crate::suspend::ResumePrep;
 use crate::suspend::SuspendIdentity;
@@ -703,9 +704,19 @@ impl TenantState {
                         timings: restored.timings,
                         dirtied_local_actions: restored.dirtied_local_actions,
                     },
-                    Err(reason) => {
+                    Err(RestoreError::Cold(reason)) => {
                         buck2_build_api::configure_dice::initial_commit(&dice, root).await?;
                         ResumeOutcome::Cold { reason }
+                    }
+                    // The MANIFEST was claimed, so the next start finds no image and is cold.
+                    Err(RestoreError::Fatal(reason)) => {
+                        image.discard();
+                        return Err(buck2_error::buck2_error!(
+                            buck2_error::ErrorTag::Tier0,
+                            "Resuming the suspended daemon failed after its graph was \
+                             restored, so this daemon cannot run; the image was deleted and \
+                             the next daemon starts cold: {reason}"
+                        ));
                     }
                 };
                 image.discard();

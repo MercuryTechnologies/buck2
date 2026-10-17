@@ -709,59 +709,65 @@ impl LoadedImage {
     }
 
     /// Replays the image: the materializer's artifacts first, so that every output the graph
-    /// names is known before anything asks for it, then the graph onto `root`. A failure leaves
-    /// the graph untouched, for the caller to start cold.
+    /// names is known before anything asks for it, then the graph onto `root`, then the list
+    /// of local actions. Everything that can fail on a damaged image is read before the graph
+    /// is restored, so a [`RestoreError::Cold`] leaves the graph untouched, for the caller to
+    /// start cold. Once the graph holds the image, a failure is [`RestoreError::Fatal`].
     pub(crate) async fn restore(
         &self,
         dice: &Arc<Dice>,
         root: dice::BranchId,
         materializer: &dyn Materializer,
-    ) -> Result<RestoredImage, String> {
+    ) -> Result<RestoredImage, RestoreError> {
         let mut timings = vec![("load", self.loaded_in)];
+        // Read first: it is also the first read of the paging store, which turns on checking
+        // every row read against its key, so that a cold start over this store after a refusal
+        // below is checked as well.
+        let actions: LocalActionList = dice
+            .read_suspend_row(self.image.local_actions)
+            .await
+            .map_err(|e| RestoreError::Cold(format!("unreadable list of local actions: {e:#}")))?;
         let t = Instant::now();
         let mut resumed = ResumedArtifacts::default();
         for row in &self.image.artifact_rows {
             let artifacts: Vec<SuspendedArtifact> = dice
                 .read_suspend_row(*row)
                 .await
-                .map_err(|e| format!("unreadable materializer state: {e:#}"))?;
+                .map_err(|e| RestoreError::Cold(format!("unreadable materializer state: {e:#}")))?;
             resumed += materializer
                 .resume_artifacts(artifacts)
                 .await
-                .map_err(|e| format!("materializer: {e:#}"))?;
+                .map_err(|e| RestoreError::Cold(format!("materializer: {e:#}")))?;
         }
         timings.push(("materializer", t.elapsed()));
         if resumed.lost > 0 {
-            return Err(Refusal::NotPortable {
-                lost: resumed.lost,
-            }
-            .to_string());
+            return Err(RestoreError::Cold(
+                Refusal::NotPortable { lost: resumed.lost }.to_string(),
+            ));
         }
         let t = Instant::now();
         let stats = dice
             .restore_image(root, &self.image.dice)
             .await
-            .map_err(|e| format!("graph: {e:#}"))?;
+            .map_err(|e| RestoreError::Cold(format!("graph: {e:#}")))?;
         timings.push(("graph", t.elapsed()));
         timings.extend(stats.timings.iter().map(|(step, d)| (*step, *d)));
         // The suspended daemon's local actions join this daemon's, whether or not they are
         // dirtied: a value this daemon keeps from one of them is still that machine's, and a
         // later suspend of this daemon must list it for the resume after that to run it again.
         let t = Instant::now();
-        let actions: LocalActionList = dice
-            .read_suspend_row(self.image.local_actions)
-            .await
-            .map_err(|e| format!("unreadable list of local actions: {e:#}"))?;
         let existing = dice.updater(root).existing_state().await;
         if let Some(local) = LocalActions::of(existing.global_data()) {
             local.extend(&actions);
         }
         drop(existing);
-        let mut dirtied_local_actions = 0;
-        if self.dirty_local_actions {
-            dirtied_local_actions = actions.len();
-            dirty_keys(dice, root, build_keys(actions)).await?;
-        }
+        let dirtied_local_actions = if self.dirty_local_actions {
+            dirty_keys(dice, root, build_keys(actions))
+                .await
+                .map_err(RestoreError::Fatal)?
+        } else {
+            0
+        };
         timings.push(("local actions", t.elapsed()));
         Ok(RestoredImage {
             stats,
@@ -785,21 +791,38 @@ pub(crate) struct RestoredImage {
     pub(crate) dirtied_local_actions: usize,
 }
 
+/// Why [`LoadedImage::restore`] did not resume.
+pub(crate) enum RestoreError {
+    /// The graph is untouched: the daemon starts cold.
+    Cold(String),
+    /// The graph holds the image but not everything the image needs on top of it, such as its
+    /// local actions dirtied: this daemon must not run anything.
+    Fatal(String),
+}
+
 /// Dirties `keys` on `root`, as a rewind does, so that the next transaction computes each again.
+/// Returns how many distinct keys were dirtied. Duplicates are dropped first, since DICE refuses
+/// a key changed twice in one transaction.
 async fn dirty_keys<K: dice::Key>(
     dice: &Arc<Dice>,
     root: dice::BranchId,
     keys: Vec<K>,
-) -> Result<(), String> {
+) -> Result<usize, String> {
+    let mut seen = std::collections::HashSet::with_capacity(keys.len());
+    let keys: Vec<K> = keys
+        .into_iter()
+        .filter(|k| seen.insert(k.clone()))
+        .collect();
     if keys.is_empty() {
-        return Ok(());
+        return Ok(0);
     }
+    let n = keys.len();
     let mut updater = dice.updater(root);
     updater
         .changed(keys)
         .map_err(|e| format!("dirtying local actions: {e:#}"))?;
     updater.commit().await;
-    Ok(())
+    Ok(n)
 }
 
 fn write_durably(path: &Path, bytes: &[u8]) -> buck2_error::Result<()> {
@@ -1744,5 +1767,18 @@ mod tests {
         assert_eq!(*ctx.compute(&Counted(0)).await.unwrap(), 2);
         assert_eq!(*ctx.compute(&Counted(1)).await.unwrap(), 1);
         assert_eq!(COMPUTES[1].load(Ordering::SeqCst), 1);
+        drop(ctx);
+
+        // A key listed twice is dirtied once: DICE refuses a key changed twice in one
+        // transaction, and a refusal there would leave a restored graph undirtied.
+        assert_eq!(
+            dirty_keys(&dice, root, vec![Counted(1), Counted(1)])
+                .await
+                .unwrap(),
+            1
+        );
+        let ctx = dice.updater(root).commit().await;
+        assert_eq!(*ctx.compute(&Counted(1)).await.unwrap(), 2);
+        assert_eq!(*ctx.compute(&Counted(0)).await.unwrap(), 2);
     }
 }
