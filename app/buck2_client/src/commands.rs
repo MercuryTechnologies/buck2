@@ -29,5 +29,6 @@ pub mod run;
 pub mod server;
 pub mod status;
 pub mod subscribe;
+pub mod suspend;
 pub mod targets;
 pub mod test;

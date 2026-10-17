@@ -85,6 +85,7 @@ use buck2_file_watcher::dep_files::create_dep_file_cache;
 use buck2_file_watcher::file_watcher::FileWatcher;
 use buck2_fs::cwd::WorkingDirectory;
 use buck2_fs::paths::abs_norm_path::AbsNormPathBuf;
+use buck2_fs::paths::file_name::FileName;
 use buck2_fs::paths::file_name::FileNameBuf;
 #[cfg(not(fbcode_build))]
 use buck2_fs::paths::forward_rel_path::ForwardRelativePath;
@@ -125,6 +126,9 @@ use crate::daemon::server::TenantStateInitPreferences;
 use crate::daemon::tenting_provider::create_tenting_acl_provider;
 use crate::paging::PageOutThresholds;
 use crate::snapshot::DepFileDbSizeSampler;
+use crate::suspend::ResumeOutcome;
+use crate::suspend::ResumePrep;
+use crate::suspend::SuspendIdentity;
 
 /// For a buckd process there is a single DaemonState created at startup and never destroyed.
 #[derive(Allocative)]
@@ -263,6 +267,12 @@ pub struct RepoState {
     /// Resource-pressure thresholds for automatic idle page-out, selected for this tenant's
     /// isolation. `None` disables automatic idle page-out for this tenant.
     pub(crate) page_out_on_idle: Option<PageOutThresholds>,
+
+    /// What an image must match to be resumed by this tenant, `Some` iff `hydration.suspend`.
+    pub(crate) suspend: Option<SuspendIdentity>,
+
+    /// What this tenant's start did about a suspended image.
+    pub(crate) resume_outcome: ResumeOutcome,
 }
 
 struct TenantStateInit<'a> {
@@ -425,7 +435,33 @@ impl TenantState {
         let blocking_executor = shared.blocking_executor_factory.for_project(fs.dupe());
 
         let cache_dir_path = paths.cache_dir_path();
-        let valid_cache_dirs = paths.valid_cache_dirs();
+        let mut valid_cache_dirs = paths.valid_cache_dirs();
+
+        // A suspended image is checked before anything else touches the cache. One that is not
+        // resumed is deleted by the wipe below, with the paging store it names.
+        let suspend_identity = init_ctx
+            .daemon_startup_config
+            .hydration
+            .as_ref()
+            .and_then(|h| h.suspend.clone())
+            .map(|config| {
+                SuspendIdentity::new(
+                    config,
+                    &init_ctx.daemon_startup_config,
+                    root_config,
+                    paths.project_root(),
+                    paths.isolation().as_str(),
+                )
+            })
+            .transpose()?;
+        let resume_prep = match &suspend_identity {
+            Some(identity) => crate::suspend::prepare_resume(cache_dir_path.as_path(), identity),
+            None => ResumePrep::None,
+        };
+        if let ResumePrep::Ready(..) = &resume_prep {
+            valid_cache_dirs.push(FileName::unchecked_new(crate::suspend::DICE_STATE_DIR));
+            valid_cache_dirs.push(FileName::unchecked_new(crate::suspend::IMAGE_DIR));
+        }
 
         let deferred_materializer_configs = {
             let defer_write_actions = root_config
@@ -617,27 +653,70 @@ impl TenantState {
                 root_config,
                 tenting_acl_provider,
                 paths.dice_state_path().as_ref(),
+                matches!(resume_prep, ResumePrep::Ready(..)),
             )
             .await?;
+
+        let (resume_outcome, resumed_image) = match resume_prep {
+            ResumePrep::None => (ResumeOutcome::NoImage, None),
+            ResumePrep::Refused(reason) => (ResumeOutcome::Cold { reason }, None),
+            ResumePrep::Ready(image) => {
+                let outcome = match image.restore(&dice, root, &*materializer).await {
+                    Ok((stats, artifacts, timings)) => ResumeOutcome::Resumed {
+                        stats,
+                        artifacts,
+                        timings,
+                    },
+                    Err(reason) => {
+                        buck2_build_api::configure_dice::initial_commit(&dice, root).await?;
+                        ResumeOutcome::Cold { reason }
+                    }
+                };
+                image.discard();
+                let resumed = outcome.is_resumed();
+                (outcome, resumed.then_some(image))
+            }
+        };
+        tracing::info!("Suspended state: {}", resume_outcome.describe());
 
         let dep_file_cache = create_dep_file_cache();
 
         tracing::info!("Creating file watcher...");
-        let file_watcher = <dyn FileWatcher>::new(
-            fb,
-            paths.project_root(),
-            root_config,
-            cells.dupe(),
-            ignore_specs,
-            dep_file_cache.dupe(),
-            None,
-        )
-        .with_buck_error_context(|| {
-            format!(
-                "Error creating a FileWatcher for project root `{}`",
-                paths.project_root()
+        // A resumed graph's file reads are relative to the suspended watcher's baseline and
+        // snapshot. Should the watcher fail to resume, a fresh one has a new baseline, which
+        // invalidates every file read the image carried: correct, if no faster than cold.
+        let resumed_watcher = match &resumed_image {
+            Some(image) => <dyn FileWatcher>::new(
+                fb,
+                paths.project_root(),
+                root_config,
+                cells.dupe(),
+                ignore_specs.clone(),
+                dep_file_cache.dupe(),
+                Some(image.watcher()),
             )
-        })?;
+            .inspect_err(|e| tracing::warn!("Resuming the file watcher failed: {e:#}"))
+            .ok(),
+            None => None,
+        };
+        let file_watcher = match resumed_watcher {
+            Some(watcher) => watcher,
+            None => <dyn FileWatcher>::new(
+                fb,
+                paths.project_root(),
+                root_config,
+                cells.dupe(),
+                ignore_specs,
+                dep_file_cache.dupe(),
+                None,
+            )
+            .with_buck_error_context(|| {
+                format!(
+                    "Error creating a FileWatcher for project root `{}`",
+                    paths.project_root()
+                )
+            })?,
+        };
 
         // TODO(bobyf): Eagerly sync the file watcher here once the DICE commit panic is fixed.
 
@@ -767,6 +846,8 @@ impl TenantState {
                 .unwrap_or_else(RolloutPercentage::never)
                 .roll(),
             page_out_on_idle,
+            suspend: suspend_identity,
+            resume_outcome,
         });
 
         #[cfg(fbcode_build)]
