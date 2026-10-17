@@ -140,6 +140,65 @@ impl SuspendedArtifact {
     }
 }
 
+/// The artifacts of a suspend image by kind, for its report: what a resume on a fresh machine
+/// fetches, uploads or writes again.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct SuspendedArtifactCensus {
+    /// Materialized, with the CAS recipe of their download or execution.
+    pub materialized_cas: usize,
+    /// Materialized, with an upload as their recipe (`--portable`, or an unmaterialization).
+    pub materialized_uploaded: usize,
+    /// Materialized, with no recipe: only this disk has them.
+    pub materialized_local: usize,
+    pub declared_cas: usize,
+    pub declared_copy: usize,
+    pub declared_write: usize,
+    /// The compressed contents the declared writes hold.
+    pub declared_write_bytes: usize,
+}
+
+impl SuspendedArtifactCensus {
+    pub fn of(artifacts: &[SuspendedArtifact]) -> Self {
+        let mut c = Self::default();
+        for a in artifacts {
+            match &a.state {
+                SuspendedArtifactState::Materialized { cas: None, .. } => c.materialized_local += 1,
+                SuspendedArtifactState::Materialized {
+                    cas: Some((SuspendedCasOrigin::Uploaded, _)),
+                    ..
+                } => c.materialized_uploaded += 1,
+                SuspendedArtifactState::Materialized { cas: Some(_), .. } => {
+                    c.materialized_cas += 1
+                }
+                SuspendedArtifactState::CasDownload { .. } => c.declared_cas += 1,
+                SuspendedArtifactState::LocalCopy { .. } => c.declared_copy += 1,
+                SuspendedArtifactState::Write { compressed, .. } => {
+                    c.declared_write += 1;
+                    c.declared_write_bytes += compressed.len();
+                }
+            }
+        }
+        c
+    }
+}
+
+impl fmt::Display for SuspendedArtifactCensus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "materialized {} with a CAS recipe, {} uploaded, {} on this disk only; declared {} \
+             from the CAS, {} copies, {} writes ({} bytes)",
+            self.materialized_cas,
+            self.materialized_uploaded,
+            self.materialized_local,
+            self.declared_cas,
+            self.declared_copy,
+            self.declared_write,
+            self.declared_write_bytes
+        )
+    }
+}
+
 /// Splits a suspended daemon's artifacts into the rows a suspend writes, each of at most
 /// [`SUSPEND_ROW_MAX_ARTIFACTS`] artifacts and [`SUSPEND_ROW_MAX_BYTES`] bytes, so that neither
 /// SQLite's limit on one value (1 GB by default) nor the memory a row takes to write and read
@@ -1327,5 +1386,22 @@ mod tests {
         .collect();
         assert_eq!(sizes, vec![1, 1, 1, 1]);
         assert_eq!(suspend_rows(Vec::new()).count(), 0);
+    }
+
+    #[test]
+    fn census_counts_each_kind() {
+        let artifacts: Vec<_> = (0..6).map(|i| artifact(i, 10)).collect();
+        assert_eq!(
+            SuspendedArtifactCensus::of(&artifacts),
+            SuspendedArtifactCensus {
+                materialized_cas: 0,
+                materialized_uploaded: 2,
+                materialized_local: 2,
+                declared_cas: 0,
+                declared_copy: 0,
+                declared_write: 2,
+                declared_write_bytes: 20,
+            }
+        );
     }
 }
