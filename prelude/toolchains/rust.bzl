@@ -231,18 +231,31 @@ def _downloaded_rust_toolchain_impl(ctx):
     base_components = ctx.attrs.base_components
     extra_components = ctx.attrs.extra_components
     rustc_host_triple = ctx.attrs.rustc_host_triple
+    pins = ctx.attrs.channel_manifest_sha256
 
     manifest = ctx.actions.declare_output("rust-channel.toml", has_content_based_path = False)
     toolchain = ctx.actions.declare_output("rust-toolchain", dir = True, has_content_based_path = False)
 
     def download_manifest(ctx, artifacts, outputs):
         parsed = _parse_rust_toolchain(artifacts[rust_toolchain_file].read_string())
+        url = _channel_manifest_url(base_url, parsed.channel)
+
+        # The channel manifest names every component archive and its sha256,
+        # so pinning the manifest pins the whole toolchain. A pin list that
+        # lacks the channel fails here, by name, rather than downloading an
+        # unchecked manifest.
+        check = []
+        if pins:
+            if parsed.channel not in pins:
+                fail("no sha256 for rust channel {}; add it to channel_manifest_sha256 from {}.sha256".format(parsed.channel, url))
+            check = [pins[parsed.channel]]
         download = ctx.actions.write(
             "download_rust_manifest.sh",
             [
                 "#!/bin/sh",
                 "set -eu",
                 "curl -fsSL \"$1\" -o \"$2\"",
+                "if [ \"$#\" -gt 2 ]; then echo \"$3  $2\" | sha256sum -c -; fi",
             ],
             is_executable = True,
             has_content_based_path = False,
@@ -251,9 +264,9 @@ def _downloaded_rust_toolchain_impl(ctx):
             cmd_args([
                 "/bin/sh",
                 download,
-                _channel_manifest_url(base_url, parsed.channel),
+                url,
                 outputs[manifest].as_output(),
-            ]),
+            ] + check),
             category = "download_rust_manifest",
             prefer_remote = True,
         )
@@ -368,6 +381,10 @@ downloaded_rust_toolchain = rule(
             "DEFAULT": "",
             "prelude//os:windows": ".exe",
         })),
+        # The sha256 of each channel's manifest, keyed by the channel that
+        # rust-toolchain names, from the manifest's .sha256 file beside it.
+        # Empty means unchecked, as before.
+        "channel_manifest_sha256": attrs.dict(attrs.string(), attrs.string(), default = {}),
         "extra_components": attrs.list(attrs.string(), default = ["clippy"]),
         "rust_toolchain": attrs.source(),
         "rustc_host_triple": attrs.string(default = _DEFAULT_TRIPLE),

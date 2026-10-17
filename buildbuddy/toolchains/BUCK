@@ -258,6 +258,12 @@ python_wheel_toolchain(
 
 downloaded_rust_toolchain(
     name = "rust",
+    # From https://static.rust-lang.org/dist/<date>/channel-rust-nightly.toml.sha256.
+    # A rust-toolchain.toml bump adds its channel here, or the install fails.
+    channel_manifest_sha256 = {
+        "nightly-2026-05-22": "904b259e0c838741de7a50525c9fc359d12332c71ee236ad51c07598db6544c0",
+        "nightly-2026-07-05": "08c0aba8c8f95055700f4d781b7669f8f6522822ce1c078c207e2df75740905c",
+    },
     default_edition = "2024",
     # Release builds pass e.g. -c rust.rustc_flags="-Copt-level=3 -Cstrip=debuginfo";
     # the default is a debug build, as for cargo.
