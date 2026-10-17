@@ -24,7 +24,8 @@
 //! platforms, or the old and new binary during a rollout. The digest is computed over the
 //! executable `get_daemon_exe` names, which is the one whose build id decides the daemon's
 //! version constraint, and is cached under `~/.buck/binary-digest` keyed by the file's path,
-//! size, modification time and inode, so only the first run of a new binary reads it.
+//! size, modification and change times, device and inode, so only the first run of a new binary
+//! reads it.
 //!
 //! `BUCK2_IGNORE_EXPECTED_BINARY_DIGEST=1` skips the check for one deliberate override.
 
@@ -185,8 +186,10 @@ pub(crate) fn check_binary(
 }
 
 /// The cache entry's name: a hash of everything that identifies this file's current contents
-/// without reading them. A rewritten or replaced binary changes its mtime, size or inode, so it
-/// misses the cache rather than reusing a stale digest.
+/// without reading them. A replaced binary changes its inode. A binary rewritten in place keeps
+/// its inode and can keep its size and, through `touch -d` or `cp --preserve=timestamps`, its
+/// mtime, but any write sets its ctime to the current time and no unprivileged call can set it
+/// back (stat(2), inode(7)), so ctime is what makes a stale digest unreachable.
 fn cache_key(exe: &Path, algorithm: BinaryDigestAlgorithm) -> buck2_error::Result<String> {
     let meta = std::fs::metadata(exe)
         .with_buck_error_context(|| format!("Error reading metadata of {}", exe.display()))?;
@@ -196,19 +199,24 @@ fn cache_key(exe: &Path, algorithm: BinaryDigestAlgorithm) -> buck2_error::Resul
         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
         .map_or(0, |d| d.as_nanos());
     #[cfg(unix)]
-    let (dev, ino) = {
+    let (dev, ino, ctime) = {
         use std::os::unix::fs::MetadataExt;
-        (meta.dev(), meta.ino())
+        (
+            meta.dev(),
+            meta.ino(),
+            (meta.ctime() as i128) * 1_000_000_000 + meta.ctime_nsec() as i128,
+        )
     };
     #[cfg(not(unix))]
-    let (dev, ino) = (0u64, 0u64);
+    let (dev, ino, ctime) = (0u64, 0u64, 0i128);
     let mut hasher = blake3::Hasher::new();
     hasher.update(
         format!(
-            "v1\0{}\0{}\0{}\0{}\0{}\0{}",
+            "v2\0{}\0{}\0{}\0{}\0{}\0{}\0{}",
             exe.display(),
             meta.len(),
             mtime,
+            ctime,
             dev,
             ino,
             algorithm.name()
@@ -257,7 +265,17 @@ fn write_atomically(file: &Path, contents: &[u8]) -> std::io::Result<()> {
         .parent()
         .ok_or_else(|| std::io::Error::other("cache file has no parent"))?;
     std::fs::create_dir_all(dir)?;
-    let tmp = dir.join(format!(".tmp-{}", std::process::id()));
+    // Named after the entry as well as the pid: two processes with one pid (in different pid
+    // namespaces sharing a home directory) writing different entries through one temporary file
+    // would otherwise rename one binary's digest into the other's entry.
+    let name = file
+        .file_name()
+        .ok_or_else(|| std::io::Error::other("cache file has no name"))?;
+    let tmp = dir.join(format!(
+        ".tmp-{}-{}",
+        name.to_string_lossy(),
+        std::process::id()
+    ));
     std::fs::write(&tmp, contents)?;
     std::fs::rename(&tmp, file)
 }
@@ -377,5 +395,41 @@ mod tests {
             parse_expected("88d4266fd4e6338d13b845fcf289579d209c897823b9217da3e161936f031589")
                 .unwrap();
         assert_eq!(check_binary(&exe, &abcd, Some(&cache)).unwrap(), Ok(()));
+    }
+
+    /// A binary rewritten in place with the same size, inode and restored mtime must not reuse
+    /// the old digest.
+    #[cfg(unix)]
+    #[test]
+    fn test_cache_misses_in_place_rewrite_with_restored_mtime() {
+        let (dir, exe) = exe_with(b"abc");
+        let cache = dir.path().join("cache");
+        let abc = parse_expected(ABC_SHA256).unwrap();
+        assert_eq!(check_binary(&exe, &abc, Some(&cache)).unwrap(), Ok(()));
+
+        let before = std::fs::metadata(&exe).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&exe)
+            .and_then(|mut f| std::io::Write::write_all(&mut f, b"abd"))
+            .unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&exe)
+            .unwrap()
+            .set_modified(before.modified().unwrap())
+            .unwrap();
+        let after = std::fs::metadata(&exe).unwrap();
+        {
+            use std::os::unix::fs::MetadataExt;
+            assert_eq!(
+                (before.len(), before.ino(), before.modified().unwrap()),
+                (after.len(), after.ino(), after.modified().unwrap())
+            );
+        }
+
+        // The cache holds abc's digest for the old ctime; the rewritten file must be read again.
+        assert!(check_binary(&exe, &abc, Some(&cache)).unwrap().is_err());
     }
 }
