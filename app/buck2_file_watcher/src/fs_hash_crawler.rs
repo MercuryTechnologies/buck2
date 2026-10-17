@@ -9,7 +9,10 @@
  */
 
 use std::fs::Metadata;
+use std::io::Read;
 use std::mem;
+use std::path::Component;
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Duration;
@@ -38,6 +41,7 @@ use buck2_fs::async_fs_util::spawn_blocking;
 use buck2_fs::error::IoResultExt;
 use buck2_fs::fs_util;
 use buck2_fs::paths::abs_norm_path::AbsNormPath;
+use buck2_fs::paths::abs_norm_path::AbsNormPathBuf;
 use buck2_fs::paths::file_name::FileNameBuf;
 use buck2_hash::BuckMutMap;
 use buck2_hash::StdBuckHashMap;
@@ -48,7 +52,11 @@ use dupe::Dupe;
 use crate::file_watcher::FileWatcher;
 use crate::file_watcher::FileWatcherImage;
 use crate::file_watcher::FileWatcherImageKind;
+use crate::file_watcher::ResumeInput;
+use crate::file_watcher::SuspendVcs;
 use crate::file_watcher::SyncOutcome;
+use crate::file_watcher::VcsDelta;
+use crate::file_watcher::VcsImage;
 use crate::mergebase::Mergebase;
 use crate::stats::FileWatcherStats;
 
@@ -70,6 +78,9 @@ pub struct FsHashCrawler {
     snapshot: Arc<Mutex<FsSnapshot>>,
     /// The crawler never loses track of a change, so one baseline serves for its whole life.
     baseline: FileSystemBaseline,
+    /// For a resumed daemon, what changed while no daemon ran, until the first sync records it.
+    #[allocative(skip)]
+    pending: Mutex<Option<FileChangeTracker>>,
 }
 
 impl FsHashCrawler {
@@ -85,26 +96,31 @@ impl FsHashCrawler {
             ignore_specs: Arc::new(ignore_specs),
             snapshot,
             baseline: FileSystemBaseline::unique(),
+            pending: Mutex::new(None),
         })
     }
 
-    /// A crawler for a resumed daemon: its first sync reports every path whose stat differs
-    /// from `image`'s snapshot, the one the suspended daemon's last sync took, so what changed
-    /// while no daemon ran is recorded like any other change. It keeps the suspended daemon's
-    /// baseline, which the restored file reads are relative to.
+    /// A crawler for a resumed daemon. It compares the files now with the suspended snapshot
+    /// by [`resume_scan`], keeps what changed for its first sync, and takes the files now as
+    /// the snapshot that sync compares with, so an edit made after they were statted is
+    /// reported too. It keeps the suspended daemon's baseline, which the restored file reads
+    /// are relative to.
     pub fn resume(
         root: &ProjectRoot,
         cells: CellResolver,
         ignore_specs: StdBuckHashMap<CellName, IgnoreSet>,
-        image: &FileWatcherImage,
+        input: ResumeInput<'_>,
     ) -> buck2_error::Result<Self> {
-        let snapshot = FsSnapshot::from_image(&image.snapshot, &cells)?;
+        let baseline = FileSystemBaseline::from_image(&input.image.baseline);
+        let scan = resume_scan(root, &cells, &ignore_specs, input)?;
+        let (now, changes) = scan.into_dice(&ignore_specs);
         Ok(Self {
             root: root.dupe(),
             cells,
             ignore_specs: Arc::new(ignore_specs),
-            snapshot: Arc::new(Mutex::new(snapshot)),
-            baseline: FileSystemBaseline::from_image(&image.baseline),
+            snapshot: Arc::new(Mutex::new(now)),
+            baseline,
+            pending: Mutex::new(Some(changes)),
         })
     }
 
@@ -119,7 +135,10 @@ impl FsHashCrawler {
             spawn_blocking(move || FsSnapshot::build(&root, &cells, &ignore_specs)).await??;
         let mut guard = self.snapshot.lock().unwrap();
         let old_snapshot = mem::replace(&mut *guard, new_snapshot);
-        let (stats, changes) = old_snapshot.get_updates_for_dice(&guard, &self.ignore_specs)?;
+        let (stats, mut changes) = old_snapshot.get_updates_for_dice(&guard, &self.ignore_specs)?;
+        if let Some(pending) = self.pending.lock().unwrap().take() {
+            changes.merge(pending);
+        }
         changes.write_to_dice(&mut dice)?;
         dice.set_file_system_baseline(self.baseline.dupe())?;
         Ok((stats, dice))
@@ -130,15 +149,24 @@ impl FsHashCrawler {
 impl FileWatcher for FsHashCrawler {
     /// The snapshot of the last sync is `S`: an edit made before it statted a file was
     /// recorded by that sync, and one made after differs from `S`, so the resumed crawler
-    /// reports it.
+    /// reports it. A file whose stat moved since `S` gets no content digest, since what the
+    /// graph read of it is unknown.
     async fn suspend_image(
         &self,
         _project_root: &ProjectRoot,
+        vcs: SuspendVcs<'_>,
     ) -> buck2_error::Result<FileWatcherImage> {
+        let (snapshot, vcs) = tokio::task::block_in_place(|| {
+            self.snapshot
+                .lock()
+                .unwrap()
+                .suspend_image(&self.root, &self.cells, vcs)
+        })?;
         Ok(FileWatcherImage {
             kind: FileWatcherImageKind::FsHashCrawler,
             baseline: self.baseline.to_image(),
-            snapshot: self.snapshot.lock().unwrap().to_image(),
+            snapshot,
+            vcs,
         })
     }
 
@@ -166,11 +194,12 @@ impl FileWatcher for FsHashCrawler {
     }
 }
 
-#[derive(Ord, PartialOrd, Eq, PartialEq, Debug)]
-struct FsEvent {
-    cell_path: CellPath,
-    event: FileWatcherEventType,
-    kind: FileWatcherKind,
+/// One path a comparison of two sets of files reports.
+#[derive(Ord, PartialOrd, Eq, PartialEq, Debug, Clone)]
+pub struct FsEvent {
+    pub cell_path: CellPath,
+    pub event: FileWatcherEventType,
+    pub kind: FileWatcherKind,
 }
 
 /// What a file's stat says about its contents: any write changes the modification or change
@@ -179,6 +208,9 @@ struct FsEvent {
 struct FileStat {
     modified: Option<SystemTime>,
     len: u64,
+    /// The permission bits. buck2 reads only whether any executable bit is set; the rest are
+    /// compared only as part of a full stat on the machine that took it.
+    mode: u32,
     #[cfg(unix)]
     changed: (i64, i64),
     #[cfg(unix)]
@@ -195,6 +227,10 @@ impl FileStat {
             modified: metadata.modified().ok(),
             len: metadata.len(),
             #[cfg(unix)]
+            mode: metadata.mode() & 0o7777,
+            #[cfg(not(unix))]
+            mode: 0,
+            #[cfg(unix)]
             changed: (metadata.ctime(), metadata.ctime_nsec()),
             #[cfg(unix)]
             ino: metadata.ino(),
@@ -202,6 +238,247 @@ impl FileStat {
             dev: metadata.dev(),
         }
     }
+
+    /// What buck2 records about a file's mode (`buck2_common::io::fs::is_executable`).
+    fn executable(&self) -> bool {
+        self.mode & 0o111 != 0
+    }
+}
+
+/// A file's contents as a suspend read them.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ContentIds {
+    digest: [u8; 32],
+    /// The git blob id of the same bytes, kept only when the commit checked out at suspend
+    /// holds exactly these bytes at this path.
+    git_blob: Option<[u8; 20]>,
+}
+
+/// Reads a file once for its blake3 digest and git blob id (sha1 of `blob <len>\0` and the
+/// bytes), then stats it again. `None` unless the file is the one `expected` describes before
+/// and after the read, so the ids are those of the contents that stat saw.
+fn read_content_ids(path: &Path, expected: &FileStat) -> Option<ContentIds> {
+    use sha1::Digest;
+    let mut file = std::fs::File::open(path).ok()?;
+    if FileStat::from_metadata(&file.metadata().ok()?) != *expected {
+        return None;
+    }
+    let mut blake = blake3::Hasher::new();
+    let mut git = sha1::Sha1::new();
+    git.update(format!("blob {}\0", expected.len).as_bytes());
+    let mut buf = vec![0u8; 1 << 16];
+    let mut total: u64 = 0;
+    loop {
+        let n = file.read(&mut buf).ok()?;
+        if n == 0 {
+            break;
+        }
+        blake.update(&buf[..n]);
+        git.update(&buf[..n]);
+        total += n as u64;
+    }
+    let after = std::fs::symlink_metadata(path).ok()?;
+    if total != expected.len || !after.is_file() || FileStat::from_metadata(&after) != *expected {
+        return None;
+    }
+    Some(ContentIds {
+        digest: *blake3::Hasher::finalize(&blake).as_bytes(),
+        git_blob: Some(git.finalize().into()),
+    })
+}
+
+/// `f` over `items` on every core: suspend and resume read up to the whole tree.
+fn par_map<T: Send, R: Send>(items: Vec<T>, f: impl Fn(T) -> R + Sync) -> Vec<R> {
+    let threads = std::thread::available_parallelism()
+        .map_or(1, |n| n.get())
+        .min(items.len().div_ceil(64))
+        .max(1);
+    if threads == 1 {
+        return items.into_iter().map(f).collect();
+    }
+    let chunk = items.len().div_ceil(threads);
+    let mut chunks: Vec<Vec<T>> = Vec::with_capacity(threads);
+    let mut items = items.into_iter();
+    loop {
+        let next: Vec<T> = items.by_ref().take(chunk).collect();
+        if next.is_empty() {
+            break;
+        }
+        chunks.push(next);
+    }
+    let f = &f;
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = chunks
+            .into_iter()
+            .map(|chunk| scope.spawn(move || chunk.into_iter().map(f).collect::<Vec<R>>()))
+            .collect();
+        handles
+            .into_iter()
+            .flat_map(|h| h.join().expect("a hashing thread panicked"))
+            .collect()
+    })
+}
+
+/// Whether a link resolves outside the project: an absolute target elsewhere, or a relative
+/// one whose `..` steps climb above the root. Another machine's files there may differ.
+fn link_leaves_project(root: &ProjectRoot, link: &ProjectRelativePath, target: &str) -> bool {
+    let target = Path::new(target);
+    if target.is_absolute() {
+        return !target.starts_with(root.root().as_path());
+    }
+    let mut depth = link.as_str().split('/').count().saturating_sub(1);
+    for component in target.components() {
+        match component {
+            Component::Normal(_) => depth += 1,
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if depth == 0 {
+                    return true;
+                }
+                depth -= 1;
+            }
+            Component::RootDir | Component::Prefix(_) => return true,
+        }
+    }
+    false
+}
+
+/// What [`resume_scan`] found, and how it decided.
+pub struct ResumeScan {
+    /// Every path that changed while no daemon ran, or may have.
+    pub events: Vec<FsEvent>,
+    /// Files whose full stat equals the suspended one on the machine that took it.
+    pub stat_equal: usize,
+    /// Files git vouched for.
+    pub vouched: usize,
+    /// Files read to compare their contents with the suspended digest.
+    pub hashed: usize,
+    now: FsSnapshot,
+}
+
+impl ResumeScan {
+    /// The files as the scan found them, and the changes to record on the first sync.
+    pub(crate) fn into_dice(
+        self,
+        ignore_specs: &StdBuckHashMap<CellName, IgnoreSet>,
+    ) -> (FsSnapshot, FileChangeTracker) {
+        let (_stats, changes) = events_into_dice(&self.events, ignore_specs);
+        (self.now, changes)
+    }
+
+    /// The file contents and directory listings the first sync would dirty, as path strings.
+    #[doc(hidden)]
+    pub fn testing_dirtied(
+        &self,
+        ignore_specs: &StdBuckHashMap<CellName, IgnoreSet>,
+    ) -> (Vec<String>, Vec<String>) {
+        events_into_dice(&self.events, ignore_specs)
+            .1
+            .testing_dirtied()
+    }
+
+    /// Whether a file's stat moved since the scan statted it: what the crawler's next sync, or
+    /// notify's event, reports.
+    #[doc(hidden)]
+    pub fn testing_changed_since(
+        &self,
+        root: &ProjectRoot,
+        cells: &CellResolver,
+        ignore_specs: &StdBuckHashMap<CellName, IgnoreSet>,
+    ) -> buck2_error::Result<Vec<FsEvent>> {
+        let later = FsSnapshot::build(root, cells, ignore_specs)?;
+        self.now.get_updates(&later)
+    }
+}
+
+/// Compares the files now with a suspend image's snapshot and reports what changed while no
+/// daemon ran. A path is changed unless proven unchanged, since a false change costs time and
+/// a false "unchanged" a wrong result. For a file present in both:
+///
+/// 1. A different size or executable bit is a change.
+/// 2. On the machine that took the snapshot, an equal full stat (times, inode, device, mode)
+///    of a file not racily clean is no change. Across machines no stat is comparable.
+/// 3. Git vouches for a file when the snapshot holds its git blob id (the suspend read exactly
+///    the commit's bytes), git tracks it now, neither `git diff` from that commit nor
+///    `git status` names it, and nothing makes a checkout differ from its blob.
+/// 4. A file whose contents, read after it was statted here and unmoved by the read, hash to
+///    the snapshot's digest is no change.
+/// 5. Anything else is a change.
+///
+/// `input.vcs` is called after the files are statted, so an edit before git reads the tree is
+/// dirty to git, and one after differs from the stat this scan hands the watcher.
+pub fn resume_scan(
+    root: &ProjectRoot,
+    cells: &CellResolver,
+    ignore_specs: &StdBuckHashMap<CellName, IgnoreSet>,
+    input: ResumeInput<'_>,
+) -> buck2_error::Result<ResumeScan> {
+    let suspended = FsSnapshot::from_image(&input.image.snapshot, cells)?;
+    let now = FsSnapshot::build(root, cells, ignore_specs)?;
+    let vcs = (input.vcs)();
+    let mut scan = suspended.resume_changes(now, root, cells, input.cross_host, vcs.as_ref())?;
+    // Only the changes a sync would record count; ignored paths are dropped there.
+    scan.events.sort();
+    tracing::info!(
+        "Resumed file watcher: {} paths changed; {} files by stat, {} vouched by git, {} hashed; \
+         git {}",
+        scan.events.len(),
+        scan.stat_equal,
+        scan.vouched,
+        scan.hashed,
+        match &vcs {
+            None => "not recorded",
+            Some(v) if v.usable => "used",
+            Some(_) => "unusable",
+        }
+    );
+    Ok(scan)
+}
+
+/// The changes `events` mean for the graph, minus ignored paths.
+fn events_into_dice(
+    events: &[FsEvent],
+    ignore_specs: &StdBuckHashMap<CellName, IgnoreSet>,
+) -> (buck2_data::FileWatcherStats, FileChangeTracker) {
+    let mut changed = FileChangeTracker::new();
+    let mut stats = FileWatcherStats::new(Default::default(), events.len());
+    let mut ignored = 0;
+    for event in events {
+        let ignore = ignore_specs
+            .get(&event.cell_path.cell())
+            .is_some_and(|i| i.is_match(event.cell_path.path()));
+
+        if ignore {
+            ignored += 1;
+            continue;
+        }
+
+        stats.add(event.cell_path.to_string(), event.event, event.kind);
+        let path = event.cell_path;
+        match (event.event, event.kind) {
+            (FileWatcherEventType::Create, FileWatcherKind::File | FileWatcherKind::Symlink) => {
+                changed.file_added_or_removed(path);
+            }
+            (FileWatcherEventType::Create, FileWatcherKind::Directory) => {
+                changed.dir_added_or_removed(path);
+            }
+            (FileWatcherEventType::Modify, FileWatcherKind::File | FileWatcherKind::Symlink) => {
+                changed.file_contents_changed(path);
+            }
+            (FileWatcherEventType::Modify, FileWatcherKind::Directory) => {
+                // FIXME(JakobDegen): This should not be needed
+                changed.dir_entries_changed_force_invalidate(path);
+            }
+            (FileWatcherEventType::Delete, FileWatcherKind::File | FileWatcherKind::Symlink) => {
+                changed.file_added_or_removed(path);
+            }
+            (FileWatcherEventType::Delete, FileWatcherKind::Directory) => {
+                changed.dir_added_or_removed(path);
+            }
+        }
+    }
+    stats.add_ignored(ignored);
+    (stats.finish(), changed)
 }
 
 #[derive(Allocative)]
@@ -229,6 +506,9 @@ pub(crate) struct FsSnapshot {
     /// When the walk that took this snapshot began.
     #[allocative(skip)]
     started: SystemTime,
+    /// The contents a suspend read, for a snapshot restored from its image; empty otherwise.
+    #[allocative(skip)]
+    contents: BuckMutMap<CellPath, ContentIds>,
 }
 
 /// [`FsSnapshot`] as `buck2 suspend` writes it: every path by cell and cell-relative path.
@@ -244,9 +524,14 @@ enum EntryImage {
     File {
         modified: Option<(u64, u32)>,
         len: u64,
+        mode: u32,
         changed: (i64, i64),
         ino: u64,
         dev: u64,
+        /// blake3 of the contents, when the suspend read the contents its stat describes.
+        digest: Option<[u8; 32]>,
+        /// The git blob id, when the suspend's commit holds exactly these bytes here.
+        git_blob: Option<[u8; 20]>,
     },
     Directory,
     Symlink(Option<String>),
@@ -284,7 +569,55 @@ impl Walk<'_> {
 }
 
 impl FsSnapshot {
-    pub(crate) fn to_image(&self) -> FsSnapshotImage {
+    /// The image a suspend writes: this snapshot, with every file's contents read once.
+    /// `vcs` is called after the read, and a file keeps its git blob id only if the tree it
+    /// returns holds that blob at that path.
+    pub(crate) fn suspend_image(
+        &self,
+        root: &ProjectRoot,
+        cells: &CellResolver,
+        vcs: SuspendVcs<'_>,
+    ) -> buck2_error::Result<(FsSnapshotImage, Option<VcsImage>)> {
+        let mut files = Vec::new();
+        for (cell_path, info) in self.entries.iter() {
+            if let EntryInfo::File(stat) = info
+                && !self.racily_clean(stat)
+            {
+                let path = root.resolve(cells.resolve_path(*cell_path)?);
+                files.push((*cell_path, *stat, path));
+            }
+        }
+        let read = par_map(
+            files,
+            |(cell_path, stat, path): (CellPath, FileStat, AbsNormPathBuf)| {
+                (cell_path, read_content_ids(path.as_path(), &stat))
+            },
+        );
+        let mut contents: BuckMutMap<CellPath, ContentIds> = read
+            .into_iter()
+            .filter_map(|(cell_path, ids)| Some((cell_path, ids?)))
+            .collect();
+        let vcs = match vcs() {
+            Some(tree) => {
+                for (cell_path, ids) in contents.iter_mut() {
+                    let path = cells.resolve_path(*cell_path)?;
+                    if tree.blobs.get(&path) != ids.git_blob.as_ref() {
+                        ids.git_blob = None;
+                    }
+                }
+                Some(tree.image)
+            }
+            None => {
+                for ids in contents.values_mut() {
+                    ids.git_blob = None;
+                }
+                None
+            }
+        };
+        Ok((self.image_with(&contents), vcs))
+    }
+
+    fn image_with(&self, contents: &BuckMutMap<CellPath, ContentIds>) -> FsSnapshotImage {
         let started = self
             .started
             .duration_since(SystemTime::UNIX_EPOCH)
@@ -304,6 +637,9 @@ impl FsSnapshot {
                                     .map(|d| (d.as_secs(), d.subsec_nanos()))
                             }),
                             len: stat.len,
+                            mode: stat.mode,
+                            digest: contents.get(cell_path).map(|ids| ids.digest),
+                            git_blob: contents.get(cell_path).and_then(|ids| ids.git_blob),
                             #[cfg(unix)]
                             changed: stat.changed,
                             #[cfg(not(unix))]
@@ -335,6 +671,7 @@ impl FsSnapshot {
         cells: &CellResolver,
     ) -> buck2_error::Result<Self> {
         let mut entries = BuckMutMap::default();
+        let mut contents = BuckMutMap::default();
         for (cell, path, entry) in &image.entries {
             let cell = cells
                 .cells()
@@ -354,16 +691,29 @@ impl FsSnapshot {
                 EntryImage::File {
                     modified,
                     len,
+                    mode,
                     changed,
                     ino,
                     dev,
+                    digest,
+                    git_blob,
                 } => {
                     let _unused = (changed, ino, dev);
+                    if let Some(digest) = digest {
+                        contents.insert(
+                            cell_path,
+                            ContentIds {
+                                digest: *digest,
+                                git_blob: *git_blob,
+                            },
+                        );
+                    }
                     EntryInfo::File(FileStat {
                         modified: modified.map(|(secs, nanos)| {
                             SystemTime::UNIX_EPOCH + Duration::new(secs, nanos)
                         }),
                         len: *len,
+                        mode: *mode,
                         #[cfg(unix)]
                         changed: *changed,
                         #[cfg(unix)]
@@ -380,6 +730,7 @@ impl FsSnapshot {
         Ok(FsSnapshot {
             entries,
             started: SystemTime::UNIX_EPOCH + Duration::new(image.started.0, image.started.1),
+            contents,
         })
     }
 
@@ -402,6 +753,7 @@ impl FsSnapshot {
         let mut snapshot = FsSnapshot {
             entries: BuckMutMap::default(),
             started,
+            contents: BuckMutMap::default(),
         };
         snapshot.build_fs_snapshot(&walk, root.root())?;
         Ok(snapshot)
@@ -484,53 +836,121 @@ impl FsSnapshot {
         ignore_specs: &StdBuckHashMap<CellName, IgnoreSet>,
     ) -> buck2_error::Result<(buck2_data::FileWatcherStats, FileChangeTracker)> {
         let events = self.get_updates(new_snapshot)?;
-        let mut changed = FileChangeTracker::new();
-        let mut stats = FileWatcherStats::new(Default::default(), events.len());
-        let mut ignored = 0;
-        for event in events.into_iter() {
-            let ignore = ignore_specs
-                .get(&event.cell_path.cell())
-                .is_some_and(|i| i.is_match(event.cell_path.path()));
+        Ok(events_into_dice(&events, ignore_specs))
+    }
 
-            if ignore {
-                ignored += 1;
+    /// [`resume_scan`]'s comparison of this, the suspended snapshot, with `now`.
+    fn resume_changes(
+        &self,
+        now: FsSnapshot,
+        root: &ProjectRoot,
+        cells: &CellResolver,
+        cross_host: bool,
+        vcs: Option<&VcsDelta>,
+    ) -> buck2_error::Result<ResumeScan> {
+        let vcs = vcs.filter(|vcs| vcs.usable);
+        let mut events = Vec::new();
+        let mut stat_equal = 0;
+        let mut vouched = 0;
+        let mut to_hash = Vec::new();
+        let changed = |cell_path: &CellPath, kind| FsEvent {
+            cell_path: *cell_path,
+            event: FileWatcherEventType::Modify,
+            kind,
+        };
+        for (cell_path, prev_info) in self.entries.iter() {
+            let Some(current_info) = now.entries.get(cell_path) else {
+                events.push(FsEvent {
+                    cell_path: *cell_path,
+                    event: FileWatcherEventType::Delete,
+                    kind: prev_info.to_file_watcher_kind(),
+                });
                 continue;
-            }
-
-            stats.add(event.cell_path.to_string(), event.event, event.kind);
-            match (event.event, event.kind) {
-                (
-                    FileWatcherEventType::Create,
-                    FileWatcherKind::File | FileWatcherKind::Symlink,
-                ) => {
-                    changed.file_added_or_removed(event.cell_path);
+            };
+            match (current_info, prev_info) {
+                (EntryInfo::File(cur), EntryInfo::File(prev)) => {
+                    if cur.len != prev.len || cur.executable() != prev.executable() {
+                        events.push(changed(cell_path, FileWatcherKind::File));
+                        continue;
+                    }
+                    if !cross_host && cur == prev && !self.racily_clean(prev) {
+                        stat_equal += 1;
+                        continue;
+                    }
+                    let Some(ids) = self.contents.get(cell_path) else {
+                        events.push(changed(cell_path, FileWatcherKind::File));
+                        continue;
+                    };
+                    let path = cells.resolve_path(*cell_path)?;
+                    if ids.git_blob.is_some()
+                        && let Some(vcs) = vcs
+                        && vcs.tracked.contains(&path)
+                        && !vcs.changed.contains(&path)
+                    {
+                        vouched += 1;
+                        continue;
+                    }
+                    to_hash.push((*cell_path, *cur, ids.digest, root.resolve(&path)));
                 }
-                (FileWatcherEventType::Create, FileWatcherKind::Directory) => {
-                    changed.dir_added_or_removed(event.cell_path);
+                (EntryInfo::Directory, EntryInfo::Directory) => (),
+                (EntryInfo::Symlink(cur), EntryInfo::Symlink(prev)) => {
+                    let leaves = |target: &str| -> buck2_error::Result<bool> {
+                        Ok(cross_host
+                            && link_leaves_project(root, &cells.resolve_path(*cell_path)?, target))
+                    };
+                    let unchanged = match (cur, prev) {
+                        (Some(cur), Some(prev)) => cur == prev && !leaves(cur)?,
+                        _ => false,
+                    };
+                    if !unchanged {
+                        events.push(changed(cell_path, FileWatcherKind::Symlink));
+                    }
                 }
-                (
-                    FileWatcherEventType::Modify,
-                    FileWatcherKind::File | FileWatcherKind::Symlink,
-                ) => {
-                    changed.file_contents_changed(event.cell_path);
-                }
-                (FileWatcherEventType::Modify, FileWatcherKind::Directory) => {
-                    // FIXME(JakobDegen): This should not be needed
-                    changed.dir_entries_changed_force_invalidate(event.cell_path);
-                }
-                (
-                    FileWatcherEventType::Delete,
-                    FileWatcherKind::File | FileWatcherKind::Symlink,
-                ) => {
-                    changed.file_added_or_removed(event.cell_path);
-                }
-                (FileWatcherEventType::Delete, FileWatcherKind::Directory) => {
-                    changed.dir_added_or_removed(event.cell_path);
+                (current_info, prev_info) => {
+                    events.push(FsEvent {
+                        cell_path: *cell_path,
+                        event: FileWatcherEventType::Delete,
+                        kind: prev_info.to_file_watcher_kind(),
+                    });
+                    events.push(FsEvent {
+                        cell_path: *cell_path,
+                        event: FileWatcherEventType::Create,
+                        kind: current_info.to_file_watcher_kind(),
+                    });
                 }
             }
         }
-        stats.add_ignored(ignored);
-        Ok((stats.finish(), changed))
+        for (cell_path, info) in now.entries.iter() {
+            if !self.entries.contains_key(cell_path) {
+                events.push(FsEvent {
+                    cell_path: *cell_path,
+                    event: FileWatcherEventType::Create,
+                    kind: info.to_file_watcher_kind(),
+                });
+            }
+        }
+        let hashed = to_hash.len();
+        let differ = par_map(
+            to_hash,
+            |(cell_path, stat, digest, path): (CellPath, FileStat, [u8; 32], AbsNormPathBuf)| {
+                let same =
+                    read_content_ids(path.as_path(), &stat).is_some_and(|ids| ids.digest == digest);
+                (!same).then_some(cell_path)
+            },
+        );
+        events.extend(
+            differ
+                .into_iter()
+                .flatten()
+                .map(|cell_path| changed(&cell_path, FileWatcherKind::File)),
+        );
+        Ok(ResumeScan {
+            events,
+            stat_equal,
+            vouched,
+            hashed,
+            now,
+        })
     }
 
     fn build_fs_snapshot(

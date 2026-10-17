@@ -46,8 +46,11 @@ use tracing::info;
 use crate::file_watcher::FileWatcher;
 use crate::file_watcher::FileWatcherImage;
 use crate::file_watcher::FileWatcherImageKind;
+use crate::file_watcher::ResumeInput;
+use crate::file_watcher::SuspendVcs;
 use crate::file_watcher::SyncOutcome;
 use crate::fs_hash_crawler::FsSnapshot;
+use crate::fs_hash_crawler::resume_scan;
 use crate::mergebase::Mergebase;
 use crate::stats::FileWatcherStats;
 
@@ -354,24 +357,23 @@ impl NotifyFileWatcher {
         })
     }
 
-    /// A watcher for a resumed daemon. The watch is registered before the files are compared
-    /// with the suspended snapshot, so a change made during the comparison is reported by the
+    /// A watcher for a resumed daemon. The watch is registered before [`resume_scan`] stats
+    /// the files and asks git, so a change made during the comparison is reported by the
     /// comparison, by an event, or by both, and never by neither. The first sync records both.
     pub fn resume(
         root: &ProjectRoot,
         cells: CellResolver,
         ignore_specs: StdBuckHashMap<CellName, IgnoreSet>,
-        image: &FileWatcherImage,
+        input: ResumeInput<'_>,
     ) -> buck2_error::Result<Self> {
         let watcher = Self::with_baseline(
             root,
             cells.dupe(),
             ignore_specs,
-            FileSystemBaseline::from_image(&image.baseline),
+            FileSystemBaseline::from_image(&input.image.baseline),
         )?;
-        let suspended = FsSnapshot::from_image(&image.snapshot, &cells)?;
-        let now = FsSnapshot::build(root, &cells, &watcher.ignore_specs)?;
-        let (_stats, changes) = suspended.get_updates_for_dice(&now, &watcher.ignore_specs)?;
+        let scan = resume_scan(root, &cells, &watcher.ignore_specs, input)?;
+        let (_now, changes) = scan.into_dice(&watcher.ignore_specs);
         *watcher.pending.lock().unwrap() = Some(changes);
         Ok(watcher)
     }
@@ -441,6 +443,7 @@ impl FileWatcher for NotifyFileWatcher {
     async fn suspend_image(
         &self,
         project_root: &ProjectRoot,
+        vcs: SuspendVcs<'_>,
     ) -> buck2_error::Result<FileWatcherImage> {
         let snapshot = tokio::task::block_in_place(|| {
             let snapshot = FsSnapshot::build(&self.root, &self.cells, &self.ignore_specs)?;
@@ -476,10 +479,15 @@ impl FileWatcher for NotifyFileWatcher {
                 ));
             }
         }
+        // The contents after the check: a suspend that fails it reads nothing. A file edited
+        // since `S` statted it gets no digest, which the read's stat comparison decides.
+        let (snapshot, vcs) =
+            tokio::task::block_in_place(|| snapshot.suspend_image(&self.root, &self.cells, vcs))?;
         Ok(FileWatcherImage {
             kind: FileWatcherImageKind::Notify,
             baseline: self.baseline.lock().unwrap().to_image(),
-            snapshot: snapshot.to_image(),
+            snapshot,
+            vcs,
         })
     }
 

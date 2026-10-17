@@ -726,7 +726,7 @@ impl TenantState {
                 cells.dupe(),
                 ignore_specs.clone(),
                 dep_file_cache.dupe(),
-                Some(image.watcher()),
+                Some(image.resume_input(paths.project_root())),
             )
             .inspect_err(|e| tracing::warn!("Resuming the file watcher failed: {e:#}"))
             .ok(),

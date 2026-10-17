@@ -214,6 +214,26 @@ impl FileChangeTracker {
         self.maybe_modified_dirs.extend(other.maybe_modified_dirs);
     }
 
+    /// The file contents and directory listings this tracker dirties, as sorted path strings,
+    /// for tests that assert the exact set a file watcher reports.
+    #[doc(hidden)]
+    pub fn testing_dirtied(&self) -> (Vec<String>, Vec<String>) {
+        let mut files: Vec<String> = self
+            .files_to_dirty
+            .iter()
+            .map(|k| k.0.to_string())
+            .collect();
+        let mut dirs: Vec<String> = self
+            .dirs_to_dirty
+            .iter()
+            .map(|k| k.path.to_string())
+            .collect();
+        files.sort();
+        dirs.sort();
+        dirs.dedup();
+        (files, dirs)
+    }
+
     fn entry_added_or_removed(&mut self, path: CellPath) {
         self.paths_to_dirty.insert(PathMetadataKey(path));
         self.exists_matching_exact_case_to_dirty

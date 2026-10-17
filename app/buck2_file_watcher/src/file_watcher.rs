@@ -8,6 +8,8 @@
  * above-listed licenses.
  */
 
+use std::collections::HashMap;
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use allocative::Allocative;
@@ -20,6 +22,7 @@ use buck2_core::buck2_env;
 use buck2_core::cells::CellResolver;
 use buck2_core::cells::name::CellName;
 use buck2_core::fs::project::ProjectRoot;
+use buck2_core::fs::project_rel_path::ProjectRelativePathBuf;
 #[cfg(fbcode_build)]
 use buck2_core::soft_error;
 use buck2_error::BuckErrorContext;
@@ -32,8 +35,11 @@ use dupe::Dupe;
 use crate::dep_files::DepFileCache;
 #[cfg(fbcode_build)]
 use crate::edenfs::interface::EdenFsFileWatcher;
-use crate::fs_hash_crawler::FsHashCrawler;
+pub use crate::fs_hash_crawler::FsEvent;
+pub use crate::fs_hash_crawler::FsHashCrawler;
 use crate::fs_hash_crawler::FsSnapshotImage;
+pub use crate::fs_hash_crawler::ResumeScan;
+pub use crate::fs_hash_crawler::resume_scan;
 use crate::mergebase::Mergebase;
 use crate::notify::NotifyFileWatcher;
 use crate::watchman::interface::WatchmanFileWatcher;
@@ -49,9 +55,12 @@ pub trait FileWatcher: Allocative + Send + Sync + 'static {
     /// What `buck2 suspend` records so that a resumed daemon's watcher can report every change
     /// made while no daemon ran. Called after a sync whose changes are committed, with no
     /// command running: the image must account for every change made since that sync, or fail.
+    /// `vcs` is called once, after every file's contents were read, and its tree decides which
+    /// files git may vouch for at resume.
     async fn suspend_image(
         &self,
         _project_root: &ProjectRoot,
+        _vcs: SuspendVcs<'_>,
     ) -> buck2_error::Result<FileWatcherImage> {
         Err(buck2_error!(
             ErrorTag::Input,
@@ -93,6 +102,54 @@ pub struct FileWatcherImage {
     pub kind: FileWatcherImageKind,
     pub baseline: FileSystemBaselineImage,
     pub snapshot: FsSnapshotImage,
+    /// The git commit checked out when the snapshot's contents were read, if the project is in
+    /// a git repository.
+    pub vcs: Option<VcsImage>,
+}
+
+/// The commit a suspend image's git blob ids were checked against.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct VcsImage {
+    /// `git rev-parse HEAD`, read after every file's contents were read.
+    pub head: String,
+    /// `git rev-parse --show-prefix`: the project root relative to the repository's top level,
+    /// empty or ending in `/`.
+    pub toplevel_to_project: String,
+}
+
+/// What a suspend asks of git once the files are read: the commit, and the blob id of every
+/// regular file that commit holds under the project.
+pub struct VcsTree {
+    pub image: VcsImage,
+    pub blobs: HashMap<ProjectRelativePathBuf, [u8; 20]>,
+}
+
+/// Called by [`FileWatcher::suspend_image`] after the contents pass; `None` when the project is
+/// not in a git repository git can read.
+pub type SuspendVcs<'a> = Box<dyn FnOnce() -> Option<VcsTree> + Send + 'a>;
+
+/// What git says changed between the suspend image's commit and the files now. A path git may
+/// vouch for is in `tracked` and not in `changed`, and only while `usable`.
+#[derive(Clone, Debug, Default)]
+pub struct VcsDelta {
+    /// `git ls-files`: what the index tracks now.
+    pub tracked: HashSet<ProjectRelativePathBuf>,
+    /// `git diff --name-only <suspended head> HEAD`, and every path `git status` reports.
+    pub changed: HashSet<ProjectRelativePathBuf>,
+    /// False when any git call failed, or when a setting or attribute lets a checkout's bytes
+    /// differ from its blob's; then git vouches for nothing.
+    pub usable: bool,
+}
+
+/// What a resumed daemon's watcher compares its files with.
+pub struct ResumeInput<'a> {
+    pub image: &'a FileWatcherImage,
+    /// The image was written on another machine: stats taken there say nothing about the files
+    /// here, and a link outside the project may point somewhere else.
+    pub cross_host: bool,
+    /// Called once, after the watcher has started watching and has statted every file, so an
+    /// edit before git reads the tree is seen by git and one after it by the watcher.
+    pub vcs: Box<dyn FnOnce() -> Option<VcsDelta> + 'a>,
 }
 
 /// Whether a sync accounted for everything that changed since the previous one.
@@ -147,7 +204,7 @@ impl dyn FileWatcher {
         cells: CellResolver,
         ignore_specs: StdBuckHashMap<CellName, IgnoreSet>,
         dep_file_cache: Arc<dyn DepFileCache>,
-        resume: Option<&FileWatcherImage>,
+        resume: Option<ResumeInput<'_>>,
     ) -> buck2_error::Result<Arc<dyn FileWatcher>> {
         if !project_root.root().as_path().exists() {
             return Err(buck2_error!(
@@ -201,22 +258,23 @@ impl dyn FileWatcher {
             watcher_conf
         };
 
-        if let Some(image) = resume {
-            if image.kind.config_value() != watcher_conf {
+        if let Some(input) = resume {
+            let kind = input.image.kind;
+            if kind.config_value() != watcher_conf {
                 return Err(buck2_error!(
                     ErrorTag::Input,
                     "the suspended daemon used the `{}` file watcher, this one `{}`",
-                    image.kind.config_value(),
+                    kind.config_value(),
                     watcher_conf
                 ));
             }
-            return match image.kind {
+            return match kind {
                 FileWatcherImageKind::Notify => Ok(Arc::new(
-                    NotifyFileWatcher::resume(project_root, cells, ignore_specs, image)
+                    NotifyFileWatcher::resume(project_root, cells, ignore_specs, input)
                         .buck_error_context("Resuming notify file watcher")?,
                 )),
                 FileWatcherImageKind::FsHashCrawler => Ok(Arc::new(
-                    FsHashCrawler::resume(project_root, cells, ignore_specs, image)
+                    FsHashCrawler::resume(project_root, cells, ignore_specs, input)
                         .buck_error_context("Resuming fs_crawler file watcher")?,
                 )),
             };

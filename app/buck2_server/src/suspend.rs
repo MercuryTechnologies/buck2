@@ -41,6 +41,7 @@ use buck2_execute::materialize::materializer::ResumedArtifacts;
 use buck2_execute::materialize::materializer::SuspendedArtifact;
 use buck2_file_watcher::file_watcher::FileWatcher;
 use buck2_file_watcher::file_watcher::FileWatcherImage;
+use buck2_file_watcher::file_watcher::ResumeInput;
 use dice::Dice;
 use dice::DiceTransaction;
 use dice::ResumeStats;
@@ -57,7 +58,7 @@ const MANIFEST_CONSUMED: &str = "MANIFEST.consumed";
 const IMAGE: &str = "image.bin";
 const MAGIC: &str = "BUCK2SUS";
 /// Bumped on any change to [`Manifest`] or [`ImageFile`].
-const FORMAT: u32 = 1;
+const FORMAT: u32 = 2;
 
 /// Environment variables that differ between two runs of the same job and that nothing a daemon
 /// computes depends on, left out of the environment digest; a name ending in `*` is a prefix.
@@ -321,6 +322,8 @@ impl ResumeOutcome {
 /// An image that passed every check, ready to replay.
 pub(crate) struct LoadedImage {
     image: ImageFile,
+    /// The image was written on another machine, so no file stat it holds is comparable.
+    cross_host: bool,
     image_dir: PathBuf,
     loaded_in: Duration,
 }
@@ -348,8 +351,9 @@ pub(crate) fn prepare_resume(cache_dir: &Path, identity: &SuspendIdentity) -> Re
         return ResumePrep::Refused("the MANIFEST could not be claimed".to_owned());
     }
     match check(&manifest_bytes, &image_dir, cache_dir, identity) {
-        Ok(image) => ResumePrep::Ready(LoadedImage {
+        Ok((image, cross_host)) => ResumePrep::Ready(LoadedImage {
             image,
+            cross_host,
             image_dir,
             loaded_in: start.elapsed(),
         }),
@@ -362,7 +366,7 @@ fn check(
     image_dir: &Path,
     cache_dir: &Path,
     identity: &SuspendIdentity,
-) -> Result<ImageFile, String> {
+) -> Result<(ImageFile, bool), String> {
     let m: Manifest =
         serde_json::from_slice(manifest_bytes).map_err(|e| format!("unreadable MANIFEST: {e}"))?;
     if m.magic != MAGIC || m.format != FORMAT {
@@ -431,12 +435,18 @@ fn check(
     let (image, _): (ImageFile, usize) =
         bincode::serde::decode_from_slice(&bytes, bincode::config::standard())
             .map_err(|e| format!("undecodable image: {e}"))?;
-    Ok(image)
+    Ok((image, m.hostname != hostname()))
 }
 
 impl LoadedImage {
-    pub(crate) fn watcher(&self) -> &FileWatcherImage {
-        &self.image.watcher
+    /// What the resumed file watcher compares the files with.
+    pub(crate) fn resume_input<'a>(&'a self, project_root: &'a ProjectRoot) -> ResumeInput<'a> {
+        let _unused = project_root;
+        ResumeInput {
+            image: &self.image.watcher,
+            cross_host: self.cross_host,
+            vcs: Box::new(|| None),
+        }
     }
 
     /// Replays the image: the materializer's artifacts first, so that every output the graph
@@ -575,7 +585,7 @@ async fn suspend_inner(
     // resume, and one made before is in the graph or fails the suspend.
     let watcher = inputs
         .file_watcher
-        .suspend_image(inputs.project_root)
+        .suspend_image(inputs.project_root, Box::new(|| None))
         .await?;
     lap("files", &mut timings);
 
