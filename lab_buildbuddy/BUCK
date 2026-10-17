@@ -63,3 +63,77 @@ buildbuddy_remote_execution_platform(
     },
     visibility = ["PUBLIC"],
 )
+
+# The gnu link sysroot for build scripts and proc macros, which the
+# execution platform builds for x86_64-unknown-linux-gnu and runs under the
+# image's loader. It comes from four store paths of the nixpkgs that lab's
+# thin worker image is built from: glibc (the image loader's own), gcc for
+# crtbegin/crtend and libgcc, xgcc-libgcc for libgcc_s (on the loader's
+# search path), and zlib for the host rustc's libLLVM and rust-lld
+# (`rustc-libs`). The executor's nix daemon realises them, and the script
+# copies the files the links need into this action's output, checked against
+# gnu-exec-sysroot-x86_64.sha256, so every other action takes them by digest
+# and names no store path. A path bump goes with an image bump in usw2_c1;
+# :gnu-exec-sysroot-x86_64-manifest prints the new manifest.
+genrule(
+    name = "gnu-exec-sysroot-x86_64",
+    outs = {
+        "rustc-libs": ["rustc-libs"],
+        "sysroot": ["sysroot"],
+    },
+    cmd = "sh $SRCDIR/gnu_exec_sysroot.sh $OUT $SRCDIR/gnu-exec-sysroot-x86_64.sha256 /nix/store/q4wq65gl3r8fy746v9bbwgx4gzn0r2kl-glibc-2.40-66 /nix/store/sa7j7cddyblhcb3ch3ds10w7nw75yjj1-gcc-14.3.0 /nix/store/j4kybm2h5l6ing0i494zwdswp672pmgv-xgcc-14.3.0-libgcc /nix/store/vx438ll7xvv9q5ns8mqpphsg2dxg9yi9-zlib-1.3.1",
+    srcs = [
+        "gnu-exec-sysroot-x86_64.sha256",
+        "gnu_exec_sysroot.sh",
+    ],
+    target_compatible_with = [
+        "lab_buildbuddy//:nix_daemon",
+        "prelude//cpu:x86_64",
+        "prelude//os:linux",
+    ],
+    visibility = ["PUBLIC"],
+)
+
+genrule(
+    name = "gnu-exec-sysroot-x86_64-manifest",
+    out = "gnu-exec-sysroot-x86_64.sha256",
+    cmd = "sh $SRCDIR/gnu_exec_sysroot.sh $TMP/layout --print /nix/store/q4wq65gl3r8fy746v9bbwgx4gzn0r2kl-glibc-2.40-66 /nix/store/sa7j7cddyblhcb3ch3ds10w7nw75yjj1-gcc-14.3.0 /nix/store/j4kybm2h5l6ing0i494zwdswp672pmgv-xgcc-14.3.0-libgcc /nix/store/vx438ll7xvv9q5ns8mqpphsg2dxg9yi9-zlib-1.3.1 > $OUT",
+    srcs = ["gnu_exec_sysroot.sh"],
+    target_compatible_with = [
+        "lab_buildbuddy//:nix_daemon",
+        "prelude//cpu:x86_64",
+        "prelude//os:linux",
+    ],
+)
+
+# Links and runs a C program against the sysroot as the cxx toolchain links
+# a build script, and fails if the linker opened a file outside the sysroot
+# and the LLVM tree. A check, not on the release build's path.
+genrule(
+    name = "gnu-exec-sysroot-x86_64-selftest",
+    out = "trace.txt",
+    cmd = "sh $SRCDIR/gnu_exec_sysroot_selftest.sh $(location buildbuddy_toolchains//:llvm_dist) $(location lab_buildbuddy//:gnu-exec-sysroot-x86_64[sysroot]) $OUT",
+    srcs = ["gnu_exec_sysroot_selftest.sh"],
+    target_compatible_with = [
+        "lab_buildbuddy//:nix_daemon",
+        "prelude//cpu:x86_64",
+        "prelude//os:linux",
+    ],
+)
+
+# The host rustc's extra runtime libraries for the execution platform, as
+# buildbuddy_toolchains//:rust's host_runtime_libs. An alias, so the select
+# reads the execution platform's constraints.
+filegroup(
+    name = "no-rustc-runtime-libs",
+    srcs = [],
+)
+
+alias(
+    name = "rustc-runtime-libs",
+    actual = select({
+        "DEFAULT": "lab_buildbuddy//:no-rustc-runtime-libs",
+        "lab_buildbuddy//:nix_daemon": "lab_buildbuddy//:gnu-exec-sysroot-x86_64[rustc-libs]",
+    }),
+    visibility = ["PUBLIC"],
+)
