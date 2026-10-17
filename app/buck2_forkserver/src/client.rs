@@ -25,6 +25,7 @@ use dupe::Dupe;
 use futures::future;
 use futures::future::Future;
 use futures::future::FutureExt;
+use futures::future::Shared;
 use futures::stream;
 use futures::stream::StreamExt;
 use tokio::process::Child;
@@ -58,6 +59,9 @@ struct ForkserverClientInner {
     /// Error from the forkserver process, if any.
     #[allocative(skip)]
     error: Arc<ArcSwapOption<buck2_error::Error>>,
+    /// Resolves with that error once the forkserver process has exited.
+    #[allocative(skip)]
+    exited: Shared<oneshot::Receiver<Arc<buck2_error::Error>>>,
     pid: u32,
     #[allocative(skip)]
     rpc: buck2_forkserver_proto::forkserver_client::ForkserverClient<Channel>,
@@ -78,6 +82,7 @@ impl ForkserverClient {
         let pid = child.id().expect("Child has not been polled");
 
         let error = Arc::new(ArcSwapOption::empty());
+        let (exited_tx, exited_rx) = oneshot::channel();
 
         tokio::task::spawn(buck2_util::async_move_clone!(error, {
             let err = match child.wait().await {
@@ -85,13 +90,30 @@ impl ForkserverClient {
                 Err(e) => ForkserverError::WaitError(e),
             };
 
-            let err = buck2_error::Error::from(err).context("Forkserver is unavailable");
-            error.swap(Some(Arc::new(err)));
+            let err = Arc::new(buck2_error::Error::from(err).context("Forkserver is unavailable"));
+            error.swap(Some(err.dupe()));
+            // Nobody listens when the daemon is already on its way out.
+            let _ignored = exited_tx.send(err);
         }));
 
         Ok(Self {
-            inner: Arc::new(ForkserverClientInner { error, pid, rpc }),
+            inner: Arc::new(ForkserverClientInner {
+                error,
+                exited: exited_rx.shared(),
+                pid,
+                rpc,
+            }),
         })
+    }
+
+    /// Resolves when the forkserver process exits, with the error that every command sent to it
+    /// fails with from then on. It never resolves while the forkserver runs.
+    pub async fn exited(&self) -> Arc<buck2_error::Error> {
+        match self.inner.exited.clone().await {
+            Ok(err) => err,
+            // The watcher task was dropped with the runtime, so the daemon is exiting.
+            Err(_) => future::pending().await,
+        }
     }
 
     pub fn pid(&self) -> u32 {
@@ -205,9 +227,11 @@ mod tests {
     impl ForkserverClient {
         /// A client of a forkserver served in this process, which never exits.
         fn for_test(channel: Channel) -> Self {
+            let (_never_sent, exited) = oneshot::channel();
             Self {
                 inner: Arc::new(ForkserverClientInner {
                     error: Arc::new(ArcSwapOption::empty()),
+                    exited: exited.shared(),
                     pid: std::process::id(),
                     rpc: Self::rpc(channel),
                 }),
