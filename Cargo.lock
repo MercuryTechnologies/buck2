@@ -2814,6 +2814,7 @@ dependencies = [
  "notify",
  "regex",
  "serde",
+ "sha1 0.11.0",
  "starlark_map",
  "tempfile",
  "tokio",

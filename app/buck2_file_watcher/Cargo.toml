@@ -29,6 +29,7 @@ hex.workspace = true
 notify.workspace = true
 regex.workspace = true
 serde.workspace = true
+sha1.workspace = true
 starlark_map.workspace = true
 tokio.workspace = true
 tracing.workspace = true
