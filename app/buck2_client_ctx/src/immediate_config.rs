@@ -18,7 +18,6 @@ use buck2_common::invocation_roots::InvocationRoots;
 use buck2_common::invocation_roots::find_invocation_roots;
 use buck2_common::legacy_configs::cells::BuckConfigBasedCells;
 use buck2_common::legacy_configs::configs::LegacyBuckConfig;
-#[cfg(fbcode_build)]
 use buck2_common::legacy_configs::key::BuckconfigKeyRef;
 use buck2_common::settings::parser::parse_settings;
 use buck2_core::buck2_env;
@@ -167,6 +166,24 @@ impl<'a> ImmediateConfigContext<'a> {
         {
             Ok(false)
         }
+    }
+
+    /// `[buck2] expected_binary_digest` from the project's buckconfig files (`.buckconfig`,
+    /// `.buckconfig.d/*` and `.buckconfig.local`, not `-c` arguments), which
+    /// `expected_binary_digest::check_expected_binary_digest` reads before any daemon is touched.
+    pub(crate) fn expected_binary_digest(&self) -> buck2_error::Result<Option<String>> {
+        Ok(self
+            .data()?
+            .root_config
+            .get(BuckconfigKeyRef {
+                section: "buck2",
+                property: crate::expected_binary_digest::EXPECTED_BINARY_DIGEST_KEY,
+            })
+            .map(ToOwned::to_owned))
+    }
+
+    pub(crate) fn project_root_for_display(&self) -> buck2_error::Result<String> {
+        Ok(self.data()?.project_filesystem.root().to_string())
     }
 
     /// Resolves a cell path (i.e., contains `//`) into an absolute path. The cell path must have

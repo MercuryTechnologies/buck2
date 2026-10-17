@@ -30,6 +30,7 @@ pub mod daemon_constraints;
 pub mod event_log_options;
 pub mod events_ctx;
 pub mod exit_result;
+pub mod expected_binary_digest;
 pub mod file_tailers;
 pub mod final_console;
 pub mod ide_support;
