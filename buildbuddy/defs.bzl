@@ -17,6 +17,11 @@ def _configuration(ctx):
     constraints = dict()
     constraints.update(ctx.attrs.cpu_configuration[ConfigurationInfo].constraints)
     constraints.update(ctx.attrs.os_configuration[ConfigurationInfo].constraints)
+
+    # What a platform promises its actions beyond os and cpu, for a select
+    # in an exec_dep or a toolchain to read. Absent from local platforms.
+    for extra in getattr(ctx.attrs, "constraints", []):
+        constraints.update(extra[ConfigurationInfo].constraints)
     return ConfigurationInfo(constraints = constraints, values = {})
 
 def _remote_execution_properties(ctx):
@@ -60,6 +65,7 @@ def _buildbuddy_remote_execution_platform_impl(ctx):
 buildbuddy_remote_execution_platform = rule(
     attrs = {
         "arch": attrs.option(attrs.string(), default = None),
+        "constraints": attrs.list(attrs.dep(providers = [ConfigurationInfo]), default = []),
         "container_image": attrs.option(attrs.string(), default = None),
         "cpu_configuration": attrs.dep(default = "prelude//cpu:x86_64", providers = [ConfigurationInfo]),
         "local_enabled": attrs.bool(default = False),
