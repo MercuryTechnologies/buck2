@@ -15205,6 +15205,9 @@ third_party_rust_library(
     crate = "objc2",
     crate_root = "objc2-0.6.4.crate/src/lib.rs",
     edition = "2021",
+    env = {
+        "CARGO_PKG_VERSION": "0.6.4",
+    },
     features = [
         "alloc",
         "std",
