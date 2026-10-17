@@ -108,6 +108,7 @@ impl StreamingCommand for HydrationCommand {
                     context: Some(context),
                     subcommand: self.subcommand().into(),
                     wait: self.wait(),
+                    portable: None,
                 },
                 events_ctx,
                 ctx.console_interaction_stream(self.console_opts()),
