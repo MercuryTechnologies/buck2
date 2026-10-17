@@ -53,26 +53,42 @@ cd "$F"
 # Files written within buck2's racy window (2 s) of a file-watcher sync are reported changed again
 # at the next one; start the scenario with sources older than that, as a checkout usually is.
 sleep 3
-step() { # label, cmd...
-  local l=$1; shift; local t0=$(date +%s.%N); "$@" > "$R/$l.log" 2>&1; local rc=$?; local t1=$(date +%s.%N)
+step() { # label, cmd...: the command runs under a trace id of its own, kept in $R/<label>.id
+  local l=$1; shift; local id=$(cat /proc/sys/kernel/random/uuid); echo "$id" > "$R/$l.id"
+  local t0=$(date +%s.%N); (export BUCK_WRAPPER_UUID=$id; "$@") > "$R/$l.log" 2>&1; local rc=$?; local t1=$(date +%s.%N)
   local cmds=$(grep -o 'Commands: [0-9]*[^)]*)' "$R/$l.log" | tail -1)
   printf '%s\trc=%s\twall=%.3fs\t%s\n' "$l" $rc $(echo "$t1 $t0" | awk '{print $1-$2}') "${cmds:-}" | tee -a $R/summary.tsv
 }
 daemon_pid() { cat "$HOME/.buck/buckd/$(echo "$F" | sed 's#/#_#g' | sed 's#^_##')/v2/buckd.info" 2>/dev/null | grep -o '"pid":[0-9]*' | cut -d: -f2; }
-evlog() { "$B" log last 2>/dev/null; }
-analyses() { "$B" log show "$(evlog)" 2>/dev/null | grep -c '"Analysis"'; }
+# The event log of the command a step ran, by its trace id. `buck2 log last` sorts the logs by
+# name and a log can appear after its command returns, so it read the resume's log for the build
+# after a resume (same second, "resume" sorts after "build"), and the previous command's log for
+# a quick build. Waits up to 30 s for the log to appear.
+evlog() {
+  local id f i; id=$(cat "$R/$1.id" 2>/dev/null) || return
+  for i in $(seq 1 60); do
+    f=$(ls buck-out/v2/log/*_"$id"_events.pb.zst 2>/dev/null | head -1)
+    [ -n "$f" ] && { echo "$f"; return; }
+    sleep 0.5
+  done
+}
+# A step's analyses, what-ran and what-ran count. A step whose event log is not found reads `?`,
+# not 0, since a zero from no log looks like a zero from a build that ran nothing.
+analyses() { local f; f=$(evlog "$1"); [ -n "$f" ] || { echo '?'; return; }; "$B" log show "$f" 2>/dev/null | grep -c '"Analysis"'; }
+what_ran() { local f; f=$(evlog "$1"); [ -n "$f" ] || { echo "no event log for step $1"; return; }; "$B" log what-ran "$f" 2>&1; }
+what_ran_count() { local f; f=$(evlog "$1"); [ -n "$f" ] || { echo '?'; return; }; "$B" log what-ran "$f" 2>/dev/null | grep -vc '^$'; }
 : > $R/summary.tsv
 echo "buck2 $("$B" --version 2>&1 | head -1) watcher=$WATCHER $(date -u +%FT%TZ)" | tee -a $R/summary.tsv
 
 # Baselines: a cold daemon, then the same daemon warm.
 step cold-build "$B" build //:g39
-echo "cold-build analyses=$(analyses)" | tee -a $R/summary.tsv
+echo "cold-build analyses=$(analyses cold-build)" | tee -a $R/summary.tsv
 step warm-build "$B" build //:g39
-echo "warm-build analyses=$(analyses)" | tee -a $R/summary.tsv
+echo "warm-build analyses=$(analyses warm-build)" | tee -a $R/summary.tsv
 # A new daemon over the same buck-out (kill, then build): what a job without suspend gets.
 "$B" kill > /dev/null 2>&1
 step killed-daemon-build "$B" build //:g39
-echo "killed-daemon-build analyses=$(analyses)" | tee -a $R/summary.tsv
+echo "killed-daemon-build analyses=$(analyses killed-daemon-build)" | tee -a $R/summary.tsv
 "$B" kill > /dev/null 2>&1
 step daemon-start-no-image "$B" resume
 step warm-build-2 "$B" build //:g39
@@ -86,14 +102,14 @@ du -sb buck-out/v2/cache/suspend buck-out/v2/cache/dice_state 2>&1 | tee -a $R/s
 ls -la buck-out/v2/cache/suspend >> $R/summary.tsv 2>&1
 step resume-1 "$B" resume --require
 step resumed-build "$B" build //:g39
-echo "resumed-build analyses=$(analyses) what-ran=$("$B" log what-ran "$(evlog)" 2>/dev/null | grep -vc '^$')" | tee -a $R/summary.tsv
-"$B" log what-ran "$(evlog)" > $R/resumed-build.what-ran 2>&1
+echo "resumed-build analyses=$(analyses resumed-build) what-ran=$(what_ran_count resumed-build)" | tee -a $R/summary.tsv
+what_ran resumed-build > $R/resumed-build.what-ran
 
 # 2. suspend, edit one source, resume through a build: only that genrule and its dependents run.
 step suspend-2 "$B" suspend
 echo "edited" >> src/20.txt
 step resumed-edit-build "$B" build //:g39
-"$B" log what-ran "$(evlog)" > $R/resumed-edit-build.what-ran 2>&1
+what_ran resumed-edit-build > $R/resumed-edit-build.what-ran
 echo "resumed-edit-build ran: $(grep -o 'root//:g[0-9]*' $R/resumed-edit-build.what-ran | sort -u -t g -k2 -n | tr '\n' ' ')" | tee -a $R/summary.tsv
 step resume-2-status "$B" resume
 
@@ -101,7 +117,7 @@ step resume-2-status "$B" resume
 echo "edited before suspend" >> src/30.txt
 step suspend-3 "$B" suspend
 step resumed-after-pre-suspend-edit "$B" build //:g39
-"$B" log what-ran "$(evlog)" > $R/resumed-after-pre-suspend-edit.what-ran 2>&1
+what_ran resumed-after-pre-suspend-edit > $R/resumed-after-pre-suspend-edit.what-ran
 echo "resumed-after-pre-suspend-edit ran: $(grep -o 'root//:g[0-9]*' $R/resumed-after-pre-suspend-edit.what-ran | sort -u -t g -k2 -n | tr '\n' ' ')" | tee -a $R/summary.tsv
 g39=$(find buck-out/v2 -path '*__g39__*' -name g39.txt -type f | head -1)
 echo "g39 contains the pre-suspend edit: $(grep -c "edited before suspend" "$g39" 2>&1) ($g39)" | tee -a $R/summary.tsv
@@ -142,12 +158,12 @@ step setting-on-again-resume "$B" resume --require
 step suspend-8-same-c "$B" suspend -c suspend_e2e.v=1
 step resume-8-same-c "$B" resume --require -c suspend_e2e.v=1
 step resumed-build-same-c "$B" build -c suspend_e2e.v=1 //:g39 //:cfg
-echo "resumed-build-same-c analyses=$(analyses) what-ran=$("$B" log what-ran "$(evlog)" 2>/dev/null | grep -vc '^$')" | tee -a $R/summary.tsv
+echo "resumed-build-same-c analyses=$(analyses resumed-build-same-c) what-ran=$(what_ran_count resumed-build-same-c)" | tee -a $R/summary.tsv
 step suspend-8-no-c "$B" suspend
 step resume-8-no-c "$B" resume --require
 step resumed-build-no-c "$B" build -c suspend_e2e.v=1 //:g39 //:cfg
-"$B" log what-ran "$(evlog)" > $R/resumed-build-no-c.what-ran 2>&1
-echo "resumed-build-no-c analyses=$(analyses) ran: $(grep -o 'root//:[a-z0-9]*' $R/resumed-build-no-c.what-ran | sort -u | tr '\n' ' ')" | tee -a $R/summary.tsv
+what_ran resumed-build-no-c > $R/resumed-build-no-c.what-ran
+echo "resumed-build-no-c analyses=$(analyses resumed-build-no-c) ran: $(grep -o 'root//:[a-z0-9]*' $R/resumed-build-no-c.what-ran | sort -u | tr '\n' ' ')" | tee -a $R/summary.tsv
 
 # 9. a command that starts while a suspend runs: the suspend fails and deletes its image, or
 #    the command starts after it and deletes the MANIFEST; either way nothing resumes it.
@@ -186,7 +202,7 @@ if other_host true 2> "$R/unshare-probe.log"; then
   step suspend-10b "$B" suspend
   step other-host-same-identity-resume other_host "$B" resume --require
   step other-host-same-identity-build "$B" build //:g39
-  echo "other-host-same-identity-build what-ran=$("$B" log what-ran "$(evlog)" 2>/dev/null | grep -vc '^$')" | tee -a $R/summary.tsv
+  echo "other-host-same-identity-build what-ran=$(what_ran_count other-host-same-identity-build)" | tee -a $R/summary.tsv
   "$B" kill > /dev/null 2>&1
   # 10c. another identity refuses, naming it, even on the same host.
   "$B" build //:g39 > /dev/null 2>&1
@@ -219,7 +235,7 @@ if other_host true 2> /dev/null; then
   step other-host-chained-resume other_host "$B" resume --require
   step other-host-chained-build "$B" build //:g39
   echo "other-host-chained-resume: $(grep -o '\(resumed\|cold\)[^;]*\|[0-9]* locally executed actions to run again' "$R/other-host-chained-resume.log" | tr '\n' ' ')" | tee -a $R/summary.tsv
-  echo "other-host-chained-build what-ran=$("$B" log what-ran "$(evlog)" 2>/dev/null | grep -vc '^$')" | tee -a $R/summary.tsv
+  echo "other-host-chained-build what-ran=$(what_ran_count other-host-chained-build)" | tee -a $R/summary.tsv
 fi
 sed -i '/^host_identity = /d' .buckconfig
 
