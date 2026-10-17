@@ -527,3 +527,94 @@ async fn a_damaged_store_fails_the_reads_of_a_resume() -> anyhow::Result<()> {
     assert!(damaged.restore_image(root, &image.bytes).await.is_err());
     Ok(())
 }
+
+/// Node `i` of a binary tree of `Tree.0` nodes over [`Input`]s: the bench's graph.
+#[derive(Allocative, Clone, Dupe, Debug, Display, PartialEq, Eq, Hash, Pagable)]
+#[display("Node({_0}/{_1})")]
+#[pagable_typetag(DiceKeyDyn)]
+struct Node(u32, u32);
+
+#[async_trait]
+impl Key for Node {
+    type Value = u64;
+
+    async fn compute(
+        &self,
+        ctx: &mut DiceComputations,
+        _cancellations: &CancellationContext,
+    ) -> Self::Value {
+        let Node(i, n) = *self;
+        let mut sum = *ctx.compute(&Input(i % LEAVES)).await.unwrap();
+        for child in [2 * i + 1, 2 * i + 2] {
+            if child < n {
+                sum += *ctx.compute(&Node(child, n)).await.unwrap();
+            }
+        }
+        sum
+    }
+
+    fn equality_behavior() -> EqualityBehavior<Self::Value> {
+        EqualityBehavior::Compare(|x, y| x == y)
+    }
+
+    fn value_serialize() -> impl ValueSerialize<Value = Self::Value> {
+        PagableValueSerialize::<Self::Value>::new()
+    }
+}
+
+/// Times a suspend and a resume of a graph of `DICE_SUSPEND_BENCH_KEYS` keys (default 100,000)
+/// over a sqlite store under `DICE_SUSPEND_BENCH_DIR` (default a temporary directory), printing
+/// each step. Not a test: `cargo test -p dice --release -- --ignored --nocapture suspend_bench`.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn suspend_bench() -> anyhow::Result<()> {
+    let n: u32 = std::env::var("DICE_SUSPEND_BENCH_KEYS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(100_000);
+    let dir = match std::env::var_os("DICE_SUSPEND_BENCH_DIR") {
+        Some(d) => tempfile::tempdir_in(d)?,
+        None => tempdir()?,
+    };
+    let (dice, root) = open(&dir).await?;
+    inject(&dice, root, &initial_inputs()).await;
+    let t = std::time::Instant::now();
+    let tx = dice.updater(root).commit().await;
+    let value = *tx.compute(&Node(0, n)).await?;
+    drop(tx);
+    dice.wait_for_idle().await;
+    eprintln!("compute {n} nodes: {:.3}s", t.elapsed().as_secs_f64());
+
+    let head = dice.head(root).await;
+    let t = std::time::Instant::now();
+    let image = dice.suspend_image(head).await?;
+    eprintln!(
+        "suspend: {:.3}s, {} keys, {} certificates, {} bytes",
+        t.elapsed().as_secs_f64(),
+        image.stats.keys,
+        image.stats.certified,
+        image.bytes.len()
+    );
+    for (step, d) in &image.stats.timings {
+        eprintln!("  suspend {step}: {:.3}s", d.as_secs_f64());
+    }
+    assert_eq!(image.stats.dropped_total(), 0);
+    drop(dice);
+
+    let (resumed, root) = open(&dir).await?;
+    let t = std::time::Instant::now();
+    let stats = resumed.restore_image(root, &image.bytes).await?;
+    eprintln!(
+        "resume: {:.3}s, {} keys",
+        t.elapsed().as_secs_f64(),
+        stats.keys
+    );
+    for (step, d) in &stats.timings {
+        eprintln!("  resume {step}: {:.3}s", d.as_secs_f64());
+    }
+    assert_eq!(stats.dropped, 0);
+    inject(&resumed, root, &initial_inputs()).await;
+    let tx = resumed.updater(root).commit().await;
+    assert_eq!(*tx.compute(&Node(0, n)).await?, value);
+    Ok(())
+}
