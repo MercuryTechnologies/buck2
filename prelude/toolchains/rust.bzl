@@ -232,6 +232,13 @@ def _downloaded_rust_toolchain_impl(ctx):
     extra_components = ctx.attrs.extra_components
     rustc_host_triple = ctx.attrs.rustc_host_triple
     pins = ctx.attrs.channel_manifest_sha256
+    suffix = ctx.attrs.binary_suffix
+
+    # Shared libraries the host rustc needs that the execution platform's
+    # loader does not find on its own; see the attribute.
+    runtime_libs = []
+    if ctx.attrs.host_runtime_libs != None:
+        runtime_libs = ctx.attrs.host_runtime_libs[DefaultInfo].default_outputs
 
     manifest = ctx.actions.declare_output("rust-channel.toml", has_content_based_path = False)
     toolchain = ctx.actions.declare_output("rust-toolchain", dir = True, has_content_based_path = False)
@@ -310,7 +317,7 @@ def _downloaded_rust_toolchain_impl(ctx):
                 "rm -rf \"$work\"",
                 "mkdir -p \"$work\" \"$out\"",
                 "i=0",
-                "while [ \"$#\" -gt 0 ]; do",
+                "while [ \"$#\" -gt 0 ] && [ \"$1\" != -- ]; do",
                 "  url=\"$1\"",
                 "  sha256=\"$2\"",
                 "  shift 2",
@@ -330,24 +337,34 @@ def _downloaded_rust_toolchain_impl(ctx):
                 "  sh \"$install_sh\" --prefix=\"$out\" --disable-ldconfig",
                 "done",
                 "rm -rf \"$work\"",
+                "if [ \"$#\" -gt 0 ]; then shift; fi",
+                "for lib in \"$@\"; do",
+                "  if [ -d \"$lib\" ]; then",
+                "    for f in \"$lib\"/*; do if [ -e \"$f\" ]; then cp -L \"$f\" \"$out/lib/\"; fi; done",
+                "  else",
+                "    cp -L \"$lib\" \"$out/lib/\"",
+                "  fi",
+                "done",
+                # A shared library the loader cannot find fails here, in one
+                # action, rather than in every compile that runs rustc.
+                "\"$out/bin/rustc{}\" -vV >/dev/null".format(suffix),
             ],
             is_executable = True,
             has_content_based_path = False,
         )
         ctx.actions.run(
-            cmd_args(["/bin/sh", installer, outputs[toolchain].as_output()] + archives),
+            cmd_args(["/bin/sh", installer, outputs[toolchain].as_output()] + archives + ["--"] + runtime_libs),
             category = "install_rust_toolchain",
             prefer_remote = True,
         )
 
     ctx.actions.dynamic_output(
         dynamic = [rust_toolchain_file, manifest],
-        inputs = [],
+        inputs = runtime_libs,
         outputs = [toolchain.as_output()],
         f = install_toolchain,
     )
 
-    suffix = ctx.attrs.binary_suffix
     rustc = toolchain.project("bin/rustc" + suffix)
     rustdoc = toolchain.project("bin/rustdoc" + suffix)
     clippy_driver = toolchain.project("bin/clippy-driver" + suffix)
@@ -386,6 +403,13 @@ downloaded_rust_toolchain = rule(
         # Empty means unchecked, as before.
         "channel_manifest_sha256": attrs.dict(attrs.string(), attrs.string(), default = {}),
         "extra_components": attrs.list(attrs.string(), default = ["clippy"]),
+        # Files, or directories of files, copied into the toolchain's lib/,
+        # where the RUNPATH of rustc, librustc_driver and rust-lld looks
+        # ($ORIGIN/../lib). For an execution platform whose loader lacks a
+        # library the gnu host toolchain links, such as libz.so.1 for
+        # libLLVM. An exec_dep, so a select in it sees the execution
+        # platform's constraints rather than the target's.
+        "host_runtime_libs": attrs.option(attrs.exec_dep(), default = None),
         "rust_toolchain": attrs.source(),
         "rustc_host_triple": attrs.string(default = _DEFAULT_TRIPLE),
     },
