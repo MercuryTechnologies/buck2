@@ -8,6 +8,18 @@
 # @generated
 # Update with ./update.py > releases.bzl
 releases = {
+    # Hand-added, not from update.py: the two static Linux protoc builds that
+    # BUCK selects for Linux execution platforms.
+    "29.3": {
+        "protoc-29.3-linux-x86_64.zip": {
+            "url": "https://github.com/protocolbuffers/protobuf/releases/download/v29.3/protoc-29.3-linux-x86_64.zip",
+            "sha256": "3e866620c5be27664f3d2fa2d656b5f3e09b5152b42f1bedbf427b333e90021a"
+        },
+        "protoc-29.3-linux-aarch_64.zip": {
+            "url": "https://github.com/protocolbuffers/protobuf/releases/download/v29.3/protoc-29.3-linux-aarch_64.zip",
+            "sha256": "6427349140e01f06e049e707a58709a4f221ae73ab9a0425bc4a00c8d0e1ab32"
+        }
+    },
     "21.4": {
         "protoc-21.4-win32.zip": {
             "url": "https://github.com/protocolbuffers/protobuf/releases/download/v21.4/protoc-21.4-win32.zip",
