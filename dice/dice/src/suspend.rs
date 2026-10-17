@@ -174,6 +174,10 @@ pub struct SuspendStats {
     pub rows_written: usize,
     /// Keys left out, by cause and key type.
     pub dropped: BTreeMap<(SuspendDrop, &'static str), usize>,
+    /// How long each step took: the page-out, reading the head, writing the values only memory
+    /// held, writing and checking the key rows, ordering the certificates, making the store
+    /// durable, and encoding the image.
+    pub timings: Vec<(&'static str, std::time::Duration)>,
 }
 
 impl SuspendStats {
@@ -220,11 +224,19 @@ impl Dice {
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("suspend needs pagable storage"))?
             .dupe();
+        let mut timings = Vec::new();
+        let mut step = std::time::Instant::now();
+        let mut lap = |name: &'static str, timings: &mut Vec<_>| {
+            timings.push((name, step.elapsed()));
+            step = std::time::Instant::now();
+        };
         // The values a page-out writes are written the usual way, in parallel; what is left is
         // what paging keeps in memory.
         self.page_out().await?;
+        lap("page out", &mut timings);
 
         let head = self.state_handle.dump_head(at).await;
+        lap("head", &mut timings);
         let mut stats = SuspendStats::default();
         let finished = ArcSerCache::new();
 
@@ -283,6 +295,8 @@ impl Dice {
             );
         }
 
+        lap("value rows", &mut timings);
+
         // The key table. A key is written once, with every projection's base before it, and
         // read back at once: no key serializer ran before this feature, since paging writes
         // values only, so a key that does not come back equal is left out rather than trusted.
@@ -294,6 +308,8 @@ impl Dice {
             self.ensure_ordinal(key, &storage, &finished, &mut ordinals, &mut keys)
                 .await;
         }
+
+        lap("key rows", &mut timings);
 
         // Mints of entry keys, recorded beside their key.
         for (key, entry) in &entries {
@@ -417,7 +433,9 @@ impl Dice {
         stats.keys = keys.len();
         stats.asserted = asserted.len();
         stats.certified = certs.len();
+        lap("certificates", &mut timings);
         storage.flush_and_sync()?;
+        lap("sync", &mut timings);
         let image = Image {
             format: IMAGE_FORMAT,
             keys,
@@ -426,6 +444,8 @@ impl Dice {
             dirtied: dirtied_keys,
         };
         let bytes = postcard::to_stdvec(&image)?;
+        lap("encode", &mut timings);
+        stats.timings = timings;
         Ok(SuspendImage { bytes, stats })
     }
 
