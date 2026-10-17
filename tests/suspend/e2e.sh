@@ -47,6 +47,8 @@ printf 'load("@prelude//toolchains:demo.bzl", "system_demo_toolchains")\nsystem_
 : > "$F/BUCK"
 for i in $(seq 0 39); do echo "base $i" > "$F/src/$i.txt"; if [ $i -eq 0 ]; then dep=""; else dep=", \":g$((i-1))\""; fi
   printf 'genrule(name = "g%d", srcs = ["src/%d.txt"%s], out = "g%d.txt", cmd = "sleep 0.5; cat $SRCS > $OUT")\n' $i $i "$dep" $i >> "$F/BUCK"; done
+# One target that reads a buckconfig value builds pass with -c (scenario 8).
+printf 'genrule(name = "cfg", out = "cfg.txt", cmd = "sleep 0.5; echo %%s > $OUT" %% read_config("suspend_e2e", "v", "unset"))\n' >> "$F/BUCK"
 cd "$F"
 # Files written within buck2's racy window (2 s) of a file-watcher sync are reported changed again
 # at the next one; start the scenario with sources older than that, as a checkout usually is.
@@ -101,7 +103,8 @@ step suspend-3 "$B" suspend
 step resumed-after-pre-suspend-edit "$B" build //:g39
 "$B" log what-ran "$(evlog)" > $R/resumed-after-pre-suspend-edit.what-ran 2>&1
 echo "resumed-after-pre-suspend-edit ran: $(grep -o 'root//:g[0-9]*' $R/resumed-after-pre-suspend-edit.what-ran | sort -u -t g -k2 -n | tr '\n' ' ')" | tee -a $R/summary.tsv
-grep -c "edited before suspend" buck-out/v2/gen/root/*/g39.txt 2>/dev/null | head -1 | sed 's/^/g39 contains the pre-suspend edit: /' | tee -a $R/summary.tsv
+g39=$(find buck-out/v2/gen -name g39.txt -type f | head -1)
+echo "g39 contains the pre-suspend edit: $(grep -c "edited before suspend" "$g39" 2>&1) ($g39)" | tee -a $R/summary.tsv
 
 # 4. a different binary refuses the image.
 step suspend-4 "$B" suspend
@@ -130,6 +133,32 @@ ls buck-out/v2/cache/ > $R/cache-after-setting-off.txt 2>&1
 "$B" kill > /dev/null 2>&1
 sed -i 's/^suspend = false/suspend = true/' .buckconfig
 step setting-on-again-resume "$B" resume --require
+
+# 8. builds that pass -c: a suspend and a resume given the same -c keep everything; without it,
+#    the suspend's own transaction records the setting unset, and the build after the resume
+#    reruns what reads it.
+"$B" kill > /dev/null 2>&1
+"$B" build -c suspend_e2e.v=1 //:g39 //:cfg > /dev/null 2>&1
+step suspend-8-same-c "$B" suspend -c suspend_e2e.v=1
+step resume-8-same-c "$B" resume --require -c suspend_e2e.v=1
+step resumed-build-same-c "$B" build -c suspend_e2e.v=1 //:g39 //:cfg
+echo "resumed-build-same-c analyses=$(analyses) what-ran=$("$B" log what-ran "$(evlog)" 2>/dev/null | grep -vc '^$')" | tee -a $R/summary.tsv
+step suspend-8-no-c "$B" suspend
+step resume-8-no-c "$B" resume --require
+step resumed-build-no-c "$B" build -c suspend_e2e.v=1 //:g39 //:cfg
+"$B" log what-ran "$(evlog)" > $R/resumed-build-no-c.what-ran 2>&1
+echo "resumed-build-no-c analyses=$(analyses) ran: $(grep -o 'root//:[a-z0-9]*' $R/resumed-build-no-c.what-ran | sort -u | tr '\n' ' ')" | tee -a $R/summary.tsv
+
+# 9. a command that starts while a suspend runs: the suspend fails and deletes its image, or
+#    the command starts after it and deletes the MANIFEST; either way nothing resumes it.
+"$B" build //:g39 > /dev/null 2>&1
+("$B" suspend > $R/suspend-9-race.log 2>&1; echo "suspend-9-race rc=$?" | tee -a $R/summary.tsv) &
+sleep 0.1
+"$B" uquery //:g0 > $R/race-uquery.log 2>&1
+wait
+echo "race: suspend said: $(grep -o 'cannot run beside[^;]*\|a command started while[^;]*\|suspended: image' $R/suspend-9-race.log | head -1); uquery: $(grep -o 'Connected to new buck2 daemon\|resumed[^;]*\|cold[^;]*' $R/race-uquery.log | head -1)" | tee -a $R/summary.tsv
+step resume-9-after-race "$B" resume
+echo "after-race: $(grep -o '^\(resumed\|cold\)[^;]*' $R/resume-9-after-race.log | head -1)" | tee -a $R/summary.tsv
 
 "$B" kill > /dev/null 2>&1
 echo "done $(date -u +%FT%TZ)" | tee -a $R/summary.tsv
