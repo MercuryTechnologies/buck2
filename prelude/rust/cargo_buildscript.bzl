@@ -54,6 +54,12 @@ load(
 )
 load(":rust_toolchain.bzl", "PanicRuntime")
 
+# The bash that runs a build script's cc shim, as an argv. The default
+# finds bash on PATH through /usr/bin/env, as upstream does; an execution
+# platform that should take nothing from /usr sets `[prelude] bash`, such as
+# `/bin/bash`. Read here, not in a shared .bzl, so this file gains no load.
+_BASH = read_root_config("prelude", "bash", "/usr/bin/env bash").split(" ")
+
 def _make_rustc_shim(ctx: AnalysisContext, cwd: Artifact) -> cmd_args:
     # Build scripts expect to receive a `rustc` which "just works." However,
     # our rustc sometimes has no sysroot available, so we need to make a shim
@@ -161,7 +167,7 @@ def _make_cc_shim(ctx: AnalysisContext, name: str, cmd: cmd_args) -> cmd_args:
         wrapper, _ = ctx.actions.write(
             script,
             [
-                "#!/usr/bin/env bash",
+                "#!" + " ".join(_BASH),
                 # Capture buildscript-selected working directory.
                 "cc_original_dir=$(pwd)",
                 # Change directory to the script's location in buck-out, then up

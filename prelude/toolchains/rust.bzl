@@ -231,18 +231,38 @@ def _downloaded_rust_toolchain_impl(ctx):
     base_components = ctx.attrs.base_components
     extra_components = ctx.attrs.extra_components
     rustc_host_triple = ctx.attrs.rustc_host_triple
+    pins = ctx.attrs.channel_manifest_sha256
+    suffix = ctx.attrs.binary_suffix
+
+    # Shared libraries the host rustc needs that the execution platform's
+    # loader does not find on its own; see the attribute.
+    runtime_libs = []
+    if ctx.attrs.host_runtime_libs != None:
+        runtime_libs = ctx.attrs.host_runtime_libs[DefaultInfo].default_outputs
 
     manifest = ctx.actions.declare_output("rust-channel.toml", has_content_based_path = False)
     toolchain = ctx.actions.declare_output("rust-toolchain", dir = True, has_content_based_path = False)
 
     def download_manifest(ctx, artifacts, outputs):
         parsed = _parse_rust_toolchain(artifacts[rust_toolchain_file].read_string())
+        url = _channel_manifest_url(base_url, parsed.channel)
+
+        # The channel manifest names every component archive and its sha256,
+        # so pinning the manifest pins the whole toolchain. A pin list that
+        # lacks the channel fails here, by name, rather than downloading an
+        # unchecked manifest.
+        check = []
+        if pins:
+            if parsed.channel not in pins:
+                fail("no sha256 for rust channel {}; add it to channel_manifest_sha256 from {}.sha256".format(parsed.channel, url))
+            check = [pins[parsed.channel]]
         download = ctx.actions.write(
             "download_rust_manifest.sh",
             [
                 "#!/bin/sh",
                 "set -eu",
                 "curl -fsSL \"$1\" -o \"$2\"",
+                "if [ \"$#\" -gt 2 ]; then echo \"$3  $2\" | sha256sum -c -; fi",
             ],
             is_executable = True,
             has_content_based_path = False,
@@ -251,9 +271,9 @@ def _downloaded_rust_toolchain_impl(ctx):
             cmd_args([
                 "/bin/sh",
                 download,
-                _channel_manifest_url(base_url, parsed.channel),
+                url,
                 outputs[manifest].as_output(),
-            ]),
+            ] + check),
             category = "download_rust_manifest",
             prefer_remote = True,
         )
@@ -297,7 +317,7 @@ def _downloaded_rust_toolchain_impl(ctx):
                 "rm -rf \"$work\"",
                 "mkdir -p \"$work\" \"$out\"",
                 "i=0",
-                "while [ \"$#\" -gt 0 ]; do",
+                "while [ \"$#\" -gt 0 ] && [ \"$1\" != -- ]; do",
                 "  url=\"$1\"",
                 "  sha256=\"$2\"",
                 "  shift 2",
@@ -308,7 +328,8 @@ def _downloaded_rust_toolchain_impl(ctx):
                 "  curl -fsSL \"$url\" -o \"$archive\"",
                 "  echo \"$sha256  $archive\" | sha256sum -c -",
                 "  tar -xJf \"$archive\" -C \"$unpack\"",
-                "  install_sh=\"$(find \"$unpack\" -mindepth 2 -maxdepth 2 -name install.sh -print | sed -n '1p')\"",
+                "  install_sh=\"\"",
+                "  for f in \"$unpack\"/*/install.sh; do if [ -f \"$f\" ]; then install_sh=\"$f\"; break; fi; done",
                 "  if [ -z \"$install_sh\" ]; then",
                 "    echo \"could not find install.sh in $archive\" >&2",
                 "    exit 1",
@@ -316,24 +337,34 @@ def _downloaded_rust_toolchain_impl(ctx):
                 "  sh \"$install_sh\" --prefix=\"$out\" --disable-ldconfig",
                 "done",
                 "rm -rf \"$work\"",
+                "if [ \"$#\" -gt 0 ]; then shift; fi",
+                "for lib in \"$@\"; do",
+                "  if [ -d \"$lib\" ]; then",
+                "    for f in \"$lib\"/*; do if [ -e \"$f\" ]; then cp -L \"$f\" \"$out/lib/\"; fi; done",
+                "  else",
+                "    cp -L \"$lib\" \"$out/lib/\"",
+                "  fi",
+                "done",
+                # A shared library the loader cannot find fails here, in one
+                # action, rather than in every compile that runs rustc.
+                "\"$out/bin/rustc{}\" -vV >/dev/null".format(suffix),
             ],
             is_executable = True,
             has_content_based_path = False,
         )
         ctx.actions.run(
-            cmd_args(["/bin/sh", installer, outputs[toolchain].as_output()] + archives),
+            cmd_args(["/bin/sh", installer, outputs[toolchain].as_output()] + archives + ["--"] + runtime_libs),
             category = "install_rust_toolchain",
             prefer_remote = True,
         )
 
     ctx.actions.dynamic_output(
         dynamic = [rust_toolchain_file, manifest],
-        inputs = [],
+        inputs = runtime_libs,
         outputs = [toolchain.as_output()],
         f = install_toolchain,
     )
 
-    suffix = ctx.attrs.binary_suffix
     rustc = toolchain.project("bin/rustc" + suffix)
     rustdoc = toolchain.project("bin/rustdoc" + suffix)
     clippy_driver = toolchain.project("bin/clippy-driver" + suffix)
@@ -367,7 +398,18 @@ downloaded_rust_toolchain = rule(
             "DEFAULT": "",
             "prelude//os:windows": ".exe",
         })),
+        # The sha256 of each channel's manifest, keyed by the channel that
+        # rust-toolchain names, from the manifest's .sha256 file beside it.
+        # Empty means unchecked, as before.
+        "channel_manifest_sha256": attrs.dict(attrs.string(), attrs.string(), default = {}),
         "extra_components": attrs.list(attrs.string(), default = ["clippy"]),
+        # Files, or directories of files, copied into the toolchain's lib/,
+        # where the RUNPATH of rustc, librustc_driver and rust-lld looks
+        # ($ORIGIN/../lib). For an execution platform whose loader lacks a
+        # library the gnu host toolchain links, such as libz.so.1 for
+        # libLLVM. An exec_dep, so a select in it sees the execution
+        # platform's constraints rather than the target's.
+        "host_runtime_libs": attrs.option(attrs.exec_dep(), default = None),
         "rust_toolchain": attrs.source(),
         "rustc_host_triple": attrs.string(default = _DEFAULT_TRIPLE),
     },
