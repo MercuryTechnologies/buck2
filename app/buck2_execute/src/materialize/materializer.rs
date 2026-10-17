@@ -114,6 +114,57 @@ pub struct SuspendedCopy {
     pub executable_bit_override: Option<bool>,
 }
 
+/// The most artifacts one row of a suspend image holds.
+pub const SUSPEND_ROW_MAX_ARTIFACTS: usize = 4096;
+/// The most bytes, as [`SuspendedArtifact::inline_bytes`] estimates them, that one row of a
+/// suspend image holds. An artifact larger than this gets a row of its own.
+pub const SUSPEND_ROW_MAX_BYTES: usize = 64 << 20;
+
+impl SuspendedArtifact {
+    /// What this artifact adds to the row it is written in. A `Write`'s contents dominate. A
+    /// directory adds nothing here, because the paging store writes each shared directory as a
+    /// row of its own.
+    pub fn inline_bytes(&self) -> usize {
+        const FIXED: usize = 64;
+        let path = self.path.as_str().len();
+        let state = match &self.state {
+            SuspendedArtifactState::Materialized { .. }
+            | SuspendedArtifactState::CasDownload { .. } => 0,
+            SuspendedArtifactState::LocalCopy { srcs, .. } => srcs
+                .iter()
+                .map(|c| FIXED + c.src.as_str().len() + c.dest.as_str().len())
+                .sum(),
+            SuspendedArtifactState::Write { compressed, .. } => compressed.len(),
+        };
+        FIXED + path + state
+    }
+}
+
+/// Splits a suspended daemon's artifacts into the rows a suspend writes, each of at most
+/// [`SUSPEND_ROW_MAX_ARTIFACTS`] artifacts and [`SUSPEND_ROW_MAX_BYTES`] bytes, so that neither
+/// SQLite's limit on one value (1 GB by default) nor the memory a row takes to write and read
+/// grows with the number of artifacts. Each row is taken from `artifacts` as it is yielded.
+pub fn suspend_rows(
+    artifacts: Vec<SuspendedArtifact>,
+) -> impl Iterator<Item = Vec<SuspendedArtifact>> {
+    let mut artifacts = artifacts.into_iter().peekable();
+    std::iter::from_fn(move || {
+        let mut row = Vec::new();
+        let mut bytes = 0;
+        while let Some(next) = artifacts.peek() {
+            let size = next.inline_bytes();
+            if !row.is_empty()
+                && (row.len() == SUSPEND_ROW_MAX_ARTIFACTS || bytes + size > SUSPEND_ROW_MAX_BYTES)
+            {
+                break;
+            }
+            bytes += size;
+            row.push(artifacts.next()?);
+        }
+        (!row.is_empty()).then_some(row)
+    })
+}
+
 /// What a resume did with a suspended daemon's artifacts.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct ResumedArtifacts {
@@ -1185,3 +1236,88 @@ pub enum CleanStaleArtifactsPolicy {
     },
 }
 
+#[cfg(test)]
+mod tests {
+    use buck2_common::file_ops::metadata::FileMetadata;
+    use buck2_common::file_ops::metadata::TrackedFileDigest;
+    use buck2_core::fs::project_rel_path::ProjectRelativePath;
+    use pagable::PagableDeserialize;
+    use pagable::PagableSerialize;
+    use pagable::testing::TestingDeserializer;
+    use pagable::testing::TestingSerializer;
+
+    use super::*;
+    use crate::digest_config::DigestConfig;
+
+    fn artifact(i: usize, write_bytes: usize) -> SuspendedArtifact {
+        let path = ProjectRelativePath::new(&format!("buck-out/v2/gen/a{i}"))
+            .unwrap()
+            .to_owned();
+        let entry = DirectoryEntry::Leaf(ActionDirectoryMember::File(FileMetadata {
+            digest: TrackedFileDigest::from_content(
+                format!("{i}").as_bytes(),
+                DigestConfig::testing_default().cas_digest_config(),
+            ),
+            is_executable: false,
+        }));
+        let state = match i % 3 {
+            0 => SuspendedArtifactState::Materialized {
+                entry,
+                cas: Some(
+                    CasDownloadInfo::new_uploaded(RemoteExecutorUseCase::buck2_default())
+                        .to_suspended(),
+                ),
+            },
+            1 => SuspendedArtifactState::Materialized { entry, cas: None },
+            _ => SuspendedArtifactState::Write {
+                entry,
+                compressed: vec![7; write_bytes],
+                decompressed_size: write_bytes as u64,
+                is_executable: false,
+            },
+        };
+        SuspendedArtifact {
+            path,
+            deps: None,
+            state,
+        }
+    }
+
+    fn round_trip(row: &Vec<SuspendedArtifact>) -> Vec<SuspendedArtifact> {
+        let mut ser = TestingSerializer::new();
+        row.pagable_serialize(&mut ser).unwrap();
+        let bytes = ser.finish();
+        let mut de = TestingDeserializer::new(&bytes);
+        Vec::<SuspendedArtifact>::pagable_deserialize(&mut de).unwrap()
+    }
+
+    /// 10,000 artifacts make three rows, and the rows read back as the list that was split.
+    #[test]
+    fn suspend_rows_bound_the_artifact_count() {
+        let rows: Vec<_> = suspend_rows((0..10_000).map(|i| artifact(i, 10)).collect()).collect();
+        assert_eq!(
+            rows.iter().map(Vec::len).collect::<Vec<_>>(),
+            vec![4096, 4096, 1808]
+        );
+        let back: Vec<SuspendedArtifact> = rows.iter().flat_map(round_trip).collect();
+        let expected: Vec<SuspendedArtifact> = (0..10_000).map(|i| artifact(i, 10)).collect();
+        assert!(back == expected);
+    }
+
+    /// Rows also stop at 64 MiB of contents, and an artifact larger than that has a row of its
+    /// own rather than none.
+    #[test]
+    fn suspend_rows_bound_the_bytes() {
+        let big = 33 << 20;
+        let sizes: Vec<usize> = suspend_rows(vec![
+            artifact(2, big),
+            artifact(5, big),
+            artifact(8, SUSPEND_ROW_MAX_BYTES + 1),
+            artifact(11, 10),
+        ])
+        .map(|row| row.len())
+        .collect();
+        assert_eq!(sizes, vec![1, 1, 1, 1]);
+        assert_eq!(suspend_rows(Vec::new()).count(), 0);
+    }
+}

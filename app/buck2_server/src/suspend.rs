@@ -42,6 +42,7 @@ use buck2_error::buck2_error;
 use buck2_execute::materialize::materializer::Materializer;
 use buck2_execute::materialize::materializer::ResumedArtifacts;
 use buck2_execute::materialize::materializer::SuspendedArtifact;
+use buck2_execute::materialize::materializer::suspend_rows;
 use buck2_file_watcher::file_watcher::FileWatcher;
 use buck2_file_watcher::file_watcher::FileWatcherImage;
 use buck2_file_watcher::file_watcher::ResumeInput;
@@ -399,7 +400,8 @@ struct Manifest {
 #[derive(Serialize, Deserialize)]
 struct ImageFile {
     dice: Vec<u8>,
-    artifacts: SuspendRow,
+    /// The materializer's artifacts, in rows of `suspend_rows`'s bounds.
+    artifact_rows: Vec<SuspendRow>,
     artifact_count: usize,
     watcher: FileWatcherImage,
 }
@@ -637,14 +639,17 @@ impl LoadedImage {
     ) -> Result<(ResumeStats, ResumedArtifacts, Vec<(&'static str, Duration)>), String> {
         let mut timings = vec![("load", self.loaded_in)];
         let t = Instant::now();
-        let artifacts: Vec<SuspendedArtifact> =
-            dice.read_suspend_row(self.image.artifacts)
+        let mut resumed = ResumedArtifacts::default();
+        for row in &self.image.artifact_rows {
+            let artifacts: Vec<SuspendedArtifact> = dice
+                .read_suspend_row(*row)
                 .await
                 .map_err(|e| format!("unreadable materializer state: {e:#}"))?;
-        let resumed = materializer
-            .resume_artifacts(artifacts)
-            .await
-            .map_err(|e| format!("materializer: {e:#}"))?;
+            resumed += materializer
+                .resume_artifacts(artifacts)
+                .await
+                .map_err(|e| format!("materializer: {e:#}"))?;
+        }
         timings.push(("materializer", t.elapsed()));
         if resumed.lost > 0 {
             return Err(format!(
@@ -774,11 +779,14 @@ async fn suspend_inner(
 
     let artifacts = inputs.materializer.suspend_artifacts().await?;
     let artifact_count = artifacts.len();
-    let artifacts_row = inputs
-        .dice
-        .write_suspend_row(&artifacts)
-        .map_err(|e| buck2_error!(ErrorTag::Tier0, "writing the materializer state: {e:#}"))?;
-    drop(artifacts);
+    let mut artifact_rows = Vec::new();
+    for row in suspend_rows(artifacts) {
+        artifact_rows.push(
+            inputs.dice.write_suspend_row(&row).map_err(|e| {
+                buck2_error!(ErrorTag::Tier0, "writing the materializer state: {e:#}")
+            })?,
+        );
+    }
     lap("materializer", &mut timings);
 
     let dice_state = inputs.cache_dir.join(DICE_STATE_DIR);
@@ -802,7 +810,7 @@ async fn suspend_inner(
 
     let file = ImageFile {
         dice: image.bytes,
-        artifacts: artifacts_row,
+        artifact_rows,
         artifact_count,
         watcher,
     };
@@ -846,10 +854,11 @@ async fn suspend_inner(
     let stats = &image.stats;
     let mut out = String::new();
     out.push_str(&format!(
-        "suspended: image {} bytes, paging store {} bytes, {} artifacts\n",
+        "suspended: image {} bytes, paging store {} bytes, {} artifacts in {} rows\n",
         bytes.len(),
         dice_state_bytes,
-        artifact_count
+        artifact_count,
+        file.artifact_rows.len()
     ));
     out.push_str(&format!(
         "graph: {} keys, {} asserted, {} certificates ({} candidates), {} values written now, \
