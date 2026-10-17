@@ -588,12 +588,22 @@ fn tonic_status_rpc_status(status: &tonic::Status) -> Option<Status> {
 }
 
 /// A Status that the client's own connection produced as it went away, as opposed to one the
-/// server sent, which has no source. hyper fails a request with Canceled when the connection it
-/// was queued on closes under it (hyper 1.10.1 src/client/dispatch.rs:223) or is no longer ready
-/// for it (src/client/conn/http2.rs:196), which tonic reports as CANCELLED (tonic 0.14.6
-/// src/status.rs:440-442). A stream in flight when the connection closes with GOAWAY fails with
-/// h2's error, which tonic reports by the GOAWAY's reason (src/status.rs:384-412), as
-/// RESOURCE_EXHAUSTED for the ENHANCE_YOUR_CALM that h2 sends itself after too many resets.
+/// server sent, which has no source.
+///
+/// A stream in flight when the connection closes with a GOAWAY that has an error fails with h2's
+/// error, which tonic reports by the GOAWAY's reason (tonic 0.14.6 src/status.rs:384-412), as
+/// RESOURCE_EXHAUSTED for the ENHANCE_YOUR_CALM that h2 sends itself after too many resets. The
+/// server may already have run such a request, and only this client knows to reconnect and send
+/// it again, or to Execute the action again when it was a WaitExecution.
+///
+/// hyper fails a request with Canceled when the connection it was queued on closes under it
+/// (hyper 1.10.1 src/client/dispatch.rs:223) or is no longer ready for it
+/// (src/client/conn/http2.rs:196), which tonic reports as CANCELLED (src/status.rs:440-442). The
+/// request never left hyper, so the GoawayRetry layer of the tonic fork that Cargo.toml patches in
+/// (MercuryTechnologies/grpc-rust lab/goaway-retry-0.14.6) sends it again on
+/// another connection, up to 16 times, before buck2 sees a Status. A Canceled that reaches this
+/// function is one tonic gave up on, and it is retried here as a broken connection like any
+/// other.
 fn tonic_status_lost_with_connection(status: &tonic::Status) -> bool {
     let mut source = std::error::Error::source(status);
     while let Some(error) = source {
@@ -12035,6 +12045,11 @@ mod tests {
     // `grpc-status` go as literals without indexing, so the client's decoder needs no state.
     const H2_RESPONSE_HEADERS: &[u8] = b"\x88\x0f\x10\x10application/grpc";
     const H2_OK_TRAILERS: &[u8] = b"\x00\x0bgrpc-status\x010";
+    /// A trailers-only response, as a server sends a status with no message: :status 200, the
+    /// gRPC content type, then grpc-status 1 (CANCELLED) and its grpc-message.
+    const H2_CANCELLED_TRAILERS_ONLY: &[u8] = b"\x88\x0f\x10\x10application/grpc\
+        \x00\x0bgrpc-status\x011\
+        \x00\x0cgrpc-message\x1dconnection closed by executor";
 
     /// When the raw server sends a stream's trailers.
     #[derive(Clone, Copy)]
@@ -12068,6 +12083,9 @@ mod tests {
         HeadersThenClose,
         /// Holds the stream open without even its response headers.
         Nothing,
+        /// Ends the stream with this header block: a trailers-only response, which carries the
+        /// status a server sends instead of an answer.
+        TrailersOnly(&'static [u8]),
         /// Answers with one encoded message, as a unary call such as a CAS read does, and the
         /// trailers.
         Unary(Vec<u8>),
@@ -12231,6 +12249,15 @@ mod tests {
                             return Ok(());
                         }
                         RawReply::Nothing => continue,
+                        RawReply::TrailersOnly(block) => {
+                            frames.send(h2_frame(
+                                H2_HEADERS,
+                                H2_FLAG_END_HEADERS | H2_FLAG_END_STREAM,
+                                stream,
+                                block,
+                            ))?;
+                            continue;
+                        }
                         RawReply::HeadersThenClose => {
                             frames.send(h2_frame(
                                 H2_HEADERS,
@@ -12577,6 +12604,51 @@ mod tests {
             log.connections.load(Ordering::SeqCst) - connections_before >= 2,
             "a retry after a timeout reconnects first"
         );
+        server.abort();
+        Ok(())
+    }
+
+    /// A CANCELLED the server sends is its answer: neither the GoawayRetry layer of the tonic fork,
+    /// which retries only a request the connection refused or never sent, nor buck2's own retries
+    /// send the request again, whatever the status's message says.
+    #[tokio::test]
+    async fn a_cancelled_the_server_sends_over_the_wire_is_not_sent_again() -> anyhow::Result<()> {
+        let requests = Arc::new(AtomicUsize::new(0));
+        let (address, _log, server) = serve_raw_h2({
+            let requests = requests.clone();
+            move |_| {
+                requests.fetch_add(1, Ordering::SeqCst);
+                RawReply::TrailersOnly(H2_CANCELLED_TRAILERS_ONLY)
+            }
+        })
+        .await?;
+        let client = raw_h2_client(address, 2).await?;
+
+        let err = client
+            .get_action_result(
+                &RemoteExecutionMetadata::default(),
+                ActionResultRequest {
+                    digest: TDigest {
+                        hash: "ab".repeat(32),
+                        size_in_bytes: 1,
+                        _dot_dot: (),
+                    },
+                    platform: None,
+                    _dot_dot: (),
+                },
+            )
+            .await
+            .err()
+            .expect("the server cancelled the lookup");
+
+        let err = err.downcast_ref::<REClientError>().expect("REClientError");
+        assert_eq!(err.code, TCode::CANCELLED, "{}", err.message);
+        assert!(
+            err.message.contains("connection closed by executor"),
+            "{}",
+            err.message
+        );
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
         server.abort();
         Ok(())
     }
