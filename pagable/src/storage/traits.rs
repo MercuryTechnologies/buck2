@@ -555,124 +555,160 @@ pub trait PagableStorage: Send + Sync + 'static {
         finished: &ArcSerCache,
         storage_context: &StorageContext,
     ) -> Result<(DataKey, WriteTicket), PageOutError> {
-        enum Task {
-            Start {
-                arc: Box<dyn ArcEraseDyn>,
-                slot: Arc<ArcSerSlot>,
-            },
-            Finish {
-                arc: Box<dyn ArcEraseDyn>,
-                slot: Arc<ArcSerSlot>,
-                data: Vec<u8>,
-                child_slots: Vec<Arc<ArcSerSlot>>,
-            },
-        }
+        let item_slots = page_out_arcs(self, item_arcs, finished, storage_context)?;
+        resolve_and_store(self, item_data, &item_slots)
+    }
 
-        // Slots resolve once per graph edge — here and where child arcs are
-        // extracted below — and then travel with their task, keeping the
-        // claim, finish, and resolve stages free of concurrent map probes.
-        let mut cache = ArcSerCacheLocal::new(finished);
-        let item_slots: Vec<Arc<ArcSerSlot>> = item_arcs
-            .iter()
-            .map(|arc| cache.get_or_insert(&**arc))
-            .collect();
-
-        // Pushed once per item: a page-out writes about twenty arc rows per
-        // value, and a push per arc from every worker contends on one lock.
-        // Holds every arc this item's row references, written here or by
-        // another item still in progress, so that once this item is handed
-        // back and its value evicted, nothing its row references is unbound.
-        let mut written = Vec::new();
-        let mut tasks: Vec<Task> = item_arcs
-            .iter()
-            .zip(&item_slots)
-            .map(|(arc, slot)| Task::Start {
-                arc: arc.clone_dyn(),
-                slot: slot.dupe(),
+    /// [`page_out_item`](Self::page_out_item), also returning the row as stored, so a caller
+    /// can read it back without a read of the store.
+    fn page_out_item_with_data(
+        &self,
+        item_data: Vec<u8>,
+        item_arcs: Vec<Box<dyn ArcEraseDyn>>,
+        finished: &ArcSerCache,
+        storage_context: &StorageContext,
+    ) -> Result<(DataKey, PagableData), PageOutError> {
+        let item_slots = page_out_arcs(self, item_arcs, finished, storage_context)?;
+        let (arcs, _ticket) = resolve_slots(&item_slots)?;
+        let (key, _ticket) = self
+            .store_data_ticketed(PagableData {
+                data: item_data.clone(),
+                arcs: arcs.clone(),
             })
-            .collect();
+            .map_err(PageOutError::Failed)?;
+        let data = PagableData {
+            data: item_data,
+            arcs,
+        };
+        finished.bind_covered(self, &self.commit_frontier());
+        Ok((key, data))
+    }
+}
 
-        while let Some(task) = tasks.pop() {
-            match task {
-                Task::Start { arc, slot } => {
-                    if !slot.try_claim() {
-                        let Some((key, ticket)) = slot.wait() else {
-                            return Err(PageOutError::AlreadyFailed);
-                        };
-                        written.push((arc, key, ticket));
-                        continue;
-                    }
+/// Writes every arc `item_arcs` reaches that has no row yet, returning a slot per item arc that
+/// resolves to its row.
+fn page_out_arcs<S: PagableStorage + ?Sized>(
+    storage: &S,
+    item_arcs: Vec<Box<dyn ArcEraseDyn>>,
+    finished: &ArcSerCache,
+    storage_context: &StorageContext,
+) -> Result<Vec<Arc<ArcSerSlot>>, PageOutError> {
+    enum Task {
+        Start {
+            arc: Box<dyn ArcEraseDyn>,
+            slot: Arc<ArcSerSlot>,
+        },
+        Finish {
+            arc: Box<dyn ArcEraseDyn>,
+            slot: Arc<ArcSerSlot>,
+            data: Vec<u8>,
+            child_slots: Vec<Arc<ArcSerSlot>>,
+        },
+    }
 
-                    if let Some(key) = arc.data_key() {
-                        self.associate_arc_with_data_key(&*arc, key);
+    // Slots resolve once per graph edge — here and where child arcs are
+    // extracted below — and then travel with their task, keeping the
+    // claim, finish, and resolve stages free of concurrent map probes.
+    let mut cache = ArcSerCacheLocal::new(finished);
+    let item_slots: Vec<Arc<ArcSerSlot>> = item_arcs
+        .iter()
+        .map(|arc| cache.get_or_insert(&**arc))
+        .collect();
+
+    // Pushed once per item: a page-out writes about twenty arc rows per
+    // value, and a push per arc from every worker contends on one lock.
+    // Holds every arc this item's row references, written here or by
+    // another item still in progress, so that once this item is handed
+    // back and its value evicted, nothing its row references is unbound.
+    let mut written = Vec::new();
+    let mut tasks: Vec<Task> = item_arcs
+        .iter()
+        .zip(&item_slots)
+        .map(|(arc, slot)| Task::Start {
+            arc: arc.clone_dyn(),
+            slot: slot.dupe(),
+        })
+        .collect();
+
+    while let Some(task) = tasks.pop() {
+        match task {
+            Task::Start { arc, slot } => {
+                if !slot.try_claim() {
+                    let Some((key, ticket)) = slot.wait() else {
+                        return Err(PageOutError::AlreadyFailed);
+                    };
+                    written.push((arc, key, ticket));
+                    continue;
+                }
+
+                if let Some(key) = arc.data_key() {
+                    storage.associate_arc_with_data_key(&*arc, key);
+                    slot.set_success(key, WriteTicket::DURABLE);
+                    continue;
+                }
+
+                let mut serializer = SerializerForPaging::new(storage_context);
+                let (data, arcs) = match arc.serialize(&mut serializer) {
+                    Ok(ArcSerializeOutcome::Serialized) => serializer.finish(),
+                    Ok(ArcSerializeOutcome::ReuseDataKey(key)) => {
+                        storage.associate_arc_with_data_key(&*arc, key);
                         slot.set_success(key, WriteTicket::DURABLE);
                         continue;
                     }
+                    Err(e) => {
+                        slot.set_failed();
+                        return Err(PageOutError::Failed(e));
+                    }
+                };
 
-                    let mut serializer = SerializerForPaging::new(storage_context);
-                    let (data, arcs) = match arc.serialize(&mut serializer) {
-                        Ok(ArcSerializeOutcome::Serialized) => serializer.finish(),
-                        Ok(ArcSerializeOutcome::ReuseDataKey(key)) => {
-                            self.associate_arc_with_data_key(&*arc, key);
-                            slot.set_success(key, WriteTicket::DURABLE);
-                            continue;
-                        }
-                        Err(e) => {
-                            slot.set_failed();
-                            return Err(PageOutError::Failed(e));
-                        }
-                    };
+                let child_slots: Vec<Arc<ArcSerSlot>> =
+                    arcs.iter().map(|arc| cache.get_or_insert(&**arc)).collect();
+                let subtasks: Vec<_> = arcs
+                    .iter()
+                    .zip(&child_slots)
+                    .filter(|(_, s)| s.result.get().copied().flatten().is_none())
+                    .map(|(arc, s)| Task::Start {
+                        arc: arc.clone_dyn(),
+                        slot: s.dupe(),
+                    })
+                    .collect();
 
-                    let child_slots: Vec<Arc<ArcSerSlot>> =
-                        arcs.iter().map(|arc| cache.get_or_insert(&**arc)).collect();
-                    let subtasks: Vec<_> = arcs
-                        .iter()
-                        .zip(&child_slots)
-                        .filter(|(_, s)| s.result.get().copied().flatten().is_none())
-                        .map(|(arc, s)| Task::Start {
-                            arc: arc.clone_dyn(),
-                            slot: s.dupe(),
-                        })
-                        .collect();
-
-                    tasks.push(Task::Finish {
-                        arc,
-                        slot,
-                        data,
-                        child_slots,
-                    });
-                    tasks.extend(subtasks);
-                }
-                Task::Finish {
+                tasks.push(Task::Finish {
                     arc,
                     slot,
                     data,
                     child_slots,
-                } => match resolve_and_store(self, data, &child_slots) {
-                    Ok((key, ticket)) => {
-                        slot.set_success(key, ticket);
-                        written.push((arc, key, ticket));
-                    }
-                    Err(e) => {
-                        slot.set_failed();
-                        return Err(e);
-                    }
-                },
+                });
+                tasks.extend(subtasks);
             }
+            Task::Finish {
+                arc,
+                slot,
+                data,
+                child_slots,
+            } => match resolve_and_store(storage, data, &child_slots) {
+                Ok((key, ticket)) => {
+                    slot.set_success(key, ticket);
+                    written.push((arc, key, ticket));
+                }
+                Err(e) => {
+                    slot.set_failed();
+                    return Err(e);
+                }
+            },
         }
-
-        if !written.is_empty() {
-            finished.unbound.lock().append(&mut written);
-        }
-        resolve_and_store(self, item_data, &item_slots)
     }
+
+    if !written.is_empty() {
+        finished.unbound.lock().append(&mut written);
+    }
+    Ok(item_slots)
 }
 
-fn resolve_and_store(
-    storage: &(impl PagableStorage + ?Sized),
-    data: Vec<u8>,
+/// The rows `child_slots` resolve to, and a ticket covering them all.
+fn resolve_slots(
     child_slots: &[Arc<ArcSerSlot>],
-) -> Result<(DataKey, WriteTicket), PageOutError> {
+) -> Result<(Vec<DataKey>, WriteTicket), PageOutError> {
     let mut keys = Vec::with_capacity(child_slots.len());
     let mut ticket = WriteTicket::DURABLE;
     for slot in child_slots {
@@ -682,6 +718,15 @@ fn resolve_and_store(
         keys.push(key);
         ticket = ticket.join(child_ticket);
     }
+    Ok((keys, ticket))
+}
+
+fn resolve_and_store(
+    storage: &(impl PagableStorage + ?Sized),
+    data: Vec<u8>,
+    child_slots: &[Arc<ArcSerSlot>],
+) -> Result<(DataKey, WriteTicket), PageOutError> {
+    let (keys, ticket) = resolve_slots(child_slots)?;
     let (key, own) = storage
         .store_data_ticketed(PagableData { data, arcs: keys })
         .map_err(PageOutError::Failed)?;
