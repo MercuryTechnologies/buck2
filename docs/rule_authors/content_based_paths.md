@@ -231,9 +231,13 @@ ctx.actions.download_file(out, url, sha256 = "...", has_content_based_path = Tru
 
 ### Default behavior
 
-Outputs use content-based paths by default, whether declared explicitly with
-`declare_output` or implicitly by passing a string name to an action. Individual
-calls can opt out by passing `has_content_based_path = False`.
+Outputs use configuration-based paths unless a call passes
+`has_content_based_path = True`, whether declared explicitly with
+`declare_output` or implicitly by passing a string name to an action. Upstream
+made content-based paths the default; this fork keeps the earlier default,
+because a rule that derives a directory from one artifact's path and expects
+another artifact in it (buck2-haskell's `-hiedir`) writes to the wrong place
+once the two carry different content hashes.
 
 ### In prelude rules
 

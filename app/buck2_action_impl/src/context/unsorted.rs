@@ -68,7 +68,7 @@ pub(crate) fn analysis_actions_methods_unsorted(builder: &mut MethodsBuilder) {
         } else {
             OutputType::FileOrDirectory
         };
-        let has_content_based_path = has_content_based_path.unwrap_or(true);
+        let has_content_based_path = has_content_based_path.unwrap_or(false);
         let path_resolution_method = if has_content_based_path {
             BuckOutPathKind::ContentHash
         } else {

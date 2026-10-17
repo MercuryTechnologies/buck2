@@ -186,9 +186,9 @@ class ArtifactPathSketchTest(BuckTestCase):
         assert count is not None
         assert count == approx(2.0, abs=0.5)
         # Size: src.txt contents ("source_content" = 14 bytes) + link.txt symlink
-        # target string (a content-based path; ~27 bytes).
+        # target string (a project-relative path; ~10 bytes for "../src.txt").
         assert size is not None
-        assert size == approx(41.0, abs=5.0)
+        assert size == approx(24.0, abs=5.0)
 
     @buck_test()
     async def test_estimated_symlinked_dir(self, buck: Buck) -> None:
@@ -204,6 +204,6 @@ class ArtifactPathSketchTest(BuckTestCase):
         assert count is not None
         assert count == approx(4.0, abs=0.5)
         # Size: src1.txt + src2.txt ("content1"/"content2" = 8 bytes each) + two
-        # content-based symlink target strings (~32 bytes each).
+        # symlink target strings (~14 bytes each for "../../srcN.txt").
         assert size is not None
-        assert size == approx(80.0, abs=6.0)
+        assert size == approx(44.0, abs=6.0)

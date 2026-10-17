@@ -215,7 +215,7 @@ impl<'v> AnalysisRegistry<'v> {
                     match has_content_based_path {
                         Some(true) => BuckOutPathKind::ContentHash,
                         Some(false) => BuckOutPathKind::Configuration,
-                        None => BuckOutPathKind::ContentHash,
+                        None => BuckOutPathKind::Configuration,
                     },
                     heap,
                 )?;
