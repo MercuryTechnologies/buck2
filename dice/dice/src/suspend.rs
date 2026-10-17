@@ -572,27 +572,54 @@ impl Dice {
             step = std::time::Instant::now();
         };
 
-        // Read every key before interning any, so a bad image interns nothing.
-        let mut erased_keys: Vec<DiceKeyErased> = Vec::with_capacity(image.keys.len());
-        let mut dice_keys: Vec<DiceKey> = Vec::with_capacity(image.keys.len());
-        for k in &image.keys {
-            let base = match k.kind {
-                ImageKeyKind::Key => None,
-                ImageKeyKind::Projection { base } => Some(
-                    *dice_keys
-                        .get(base as usize)
-                        .ok_or_else(|| anyhow::anyhow!("projection base {base} out of order"))?,
-                ),
-            };
-            let erased = storage.read_key_row(data_key(k.row)?, base).await?;
-            // Interned as read: a projection's base must be interned before its projection is
-            // read, since the projection is keyed by the base's id.
-            let dice_key = self
-                .key_index
-                .index(CowDiceKeyHashed::erased(erased.dupe()));
-            erased_keys.push(erased);
-            dice_keys.push(dice_key);
+        // The key rows are read in parallel, a level at a time: a projection's base must be
+        // interned before its projection is read, since the projection is keyed by the base's
+        // id, so the keys go first, then the projections of keys, and so on. Read one at a time,
+        // mwb's 1.3M rows took 18 s.
+        let mut rows = Vec::with_capacity(image.keys.len());
+        for (i, k) in image.keys.iter().enumerate() {
+            if let ImageKeyKind::Projection { base } = k.kind
+                && base as usize >= i
+            {
+                return Err(anyhow::anyhow!("projection base {base} out of order"));
+            }
+            rows.push(data_key(k.row)?);
         }
+        let mut erased_keys: Vec<Option<DiceKeyErased>> = vec![None; image.keys.len()];
+        let mut interned: Vec<Option<DiceKey>> = vec![None; image.keys.len()];
+        let mut pending: Vec<usize> = (0..image.keys.len()).collect();
+        while !pending.is_empty() {
+            let (ready, rest): (Vec<usize>, Vec<usize>) =
+                pending.into_iter().partition(|&i| match image.keys[i].kind {
+                    ImageKeyKind::Key => true,
+                    ImageKeyKind::Projection { base } => interned[base as usize].is_some(),
+                });
+            let base_of = |i: usize| match image.keys[i].kind {
+                ImageKeyKind::Key => None,
+                ImageKeyKind::Projection { base } => interned[base as usize],
+            };
+            let reads = storage
+                .read_key_rows(ready.iter().map(|&i| (rows[i], base_of(i))).collect())
+                .await;
+            for (i, read) in ready.into_iter().zip(reads) {
+                let erased = read?;
+                interned[i] = Some(
+                    self.key_index
+                        .index(CowDiceKeyHashed::erased(erased.dupe())),
+                );
+                erased_keys[i] = Some(erased);
+            }
+            pending = rest;
+        }
+        // Every key was read: the bases come first, so each level made progress.
+        let erased_keys: Vec<DiceKeyErased> = erased_keys
+            .into_iter()
+            .map(|k| k.expect("every key row was read"))
+            .collect();
+        let dice_keys: Vec<DiceKey> = interned
+            .into_iter()
+            .map(|k| k.expect("every key was interned"))
+            .collect();
         lap("key rows", &mut timings);
         let ordinal = |o: u32| -> anyhow::Result<DiceKey> {
             dice_keys
