@@ -15,11 +15,12 @@
 //! snapshot of the files, beside the paging store (`cache/dice_state`) that holds the values. The
 //! `MANIFEST`, written last, records everything a later daemon must match for the image to mean
 //! what it meant: the binary, the startup config, the environment, the root buckconfig, the
-//! project, the host and the user. A daemon that starts with the setting on and finds a matching
+//! project, the host identity (`hydration.host_identity`, by default the hostname) and the user. A daemon that starts with the setting on and finds a matching
 //! image resumes from it; every other start deletes it, so an image is used at most once and never
 //! over state another daemon changed.
 
 use std::collections::BTreeMap;
+use std::fmt;
 use std::io::Write;
 use std::path::Path;
 use std::path::PathBuf;
@@ -29,6 +30,8 @@ use std::time::Instant;
 use std::time::SystemTime;
 
 use allocative::Allocative;
+use buck2_common::init::DaemonStartupConfig;
+use buck2_common::init::HOST_IDENTITY_PROPERTY;
 use buck2_common::init::SuspendConfig;
 use buck2_common::legacy_configs::configs::LegacyBuckConfig;
 use buck2_common::legacy_configs::key::BuckconfigKeyRef;
@@ -56,11 +59,17 @@ const MANIFEST: &str = "MANIFEST";
 const MANIFEST_CONSUMED: &str = "MANIFEST.consumed";
 const IMAGE: &str = "image.bin";
 const MAGIC: &str = "BUCK2SUS";
-/// Bumped on any change to [`Manifest`] or [`ImageFile`].
-const FORMAT: u32 = 1;
+/// Bumped on any change to [`Manifest`] or [`ImageFile`]. 2: the host identity.
+const FORMAT: u32 = 2;
+/// How far the clock may be behind the suspend's and still resume: two runners' clocks are never
+/// exactly in step. Nothing a resume trusts compares a time across the step except ctime on the
+/// same identity, which a clock stepped back cannot make equal to the suspended value except by
+/// coincidence.
+const CLOCK_SKEW_MS: u64 = 5 * 60 * 1000;
 
 /// Environment variables that differ between two runs of the same job and that nothing a daemon
-/// computes depends on, left out of the environment digest; a name ending in `*` is a prefix.
+/// computes depends on, left out of the environment digest. A name ending in `*` is a prefix and a
+/// name starting with `*` a suffix.
 const PER_RUN_ENV: &[&str] = &[
     "_",
     "BUCK2_DAEMON_UUID",
@@ -69,6 +78,8 @@ const PER_RUN_ENV: &[&str] = &[
     "BUILDBUDDY_INVOCATION_ID",
     "COLUMNS",
     "GITHUB_*",
+    "HOST",
+    "HOSTNAME",
     "INVOCATION_ID",
     "LINES",
     "OLDPWD",
@@ -81,27 +92,68 @@ const PER_RUN_ENV: &[&str] = &[
     "WINDOWID",
 ];
 
+/// Credentials, left out of the environment digest and of the per-variable digests, because an
+/// image may be uploaded and shared and a digest of a secret should not travel with it, and
+/// because a PR runner holds its own credential rather than main's. Nothing a daemon computes may
+/// depend on a credential's value; an action that reads one is not reproducible in any case.
+const CREDENTIAL_ENV: &[&str] = &[
+    "BUILDBUDDY_API_KEY",
+    "*_API_KEY",
+    "*_TOKEN",
+    "*_SECRET",
+    "*_PASSWORD",
+];
+
+fn env_pattern_matches(pattern: &str, name: &str) -> bool {
+    if let Some(prefix) = pattern.strip_suffix('*') {
+        name.starts_with(prefix)
+    } else if let Some(suffix) = pattern.strip_prefix('*') {
+        name.ends_with(suffix)
+    } else {
+        name == pattern
+    }
+}
+
 fn blake3_hex(data: &[u8]) -> String {
     blake3::hash(data).to_hex().to_string()
 }
 
+/// Whether a variable is left out of the environment check: a per-run variable, a credential, or
+/// one `suspend_env_ignore` names (with the same `*` patterns).
 fn ignored(name: &str, extra: &[String]) -> bool {
-    PER_RUN_ENV.iter().any(|p| match p.strip_suffix('*') {
-        Some(prefix) => name.starts_with(prefix),
-        None => name == *p,
-    }) || extra.iter().any(|e| e == name)
+    PER_RUN_ENV
+        .iter()
+        .chain(CREDENTIAL_ENV)
+        .any(|p| env_pattern_matches(p, name))
+        || extra.iter().any(|e| env_pattern_matches(e, name))
 }
 
 /// The digest of the environment, and a short digest of each variable's value by name, so that
 /// a refusal can name what changed without recording any value.
-fn env_digest(extra_ignored: &[String]) -> (String, BTreeMap<String, String>) {
-    let mut vars: Vec<(String, String)> = std::env::vars_os()
-        .map(|(k, v)| {
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct EnvDigest {
+    digest: String,
+    vars: BTreeMap<String, String>,
+}
+
+fn env_digest(extra_ignored: &[String]) -> EnvDigest {
+    env_digest_of(
+        std::env::vars_os().map(|(k, v)| {
             (
                 k.to_string_lossy().into_owned(),
                 v.to_string_lossy().into_owned(),
             )
-        })
+        }),
+        extra_ignored,
+    )
+}
+
+fn env_digest_of(
+    vars: impl IntoIterator<Item = (String, String)>,
+    extra_ignored: &[String],
+) -> EnvDigest {
+    let mut vars: Vec<(String, String)> = vars
+        .into_iter()
         .filter(|(k, _)| !ignored(k, extra_ignored))
         .collect();
     vars.sort();
@@ -114,23 +166,29 @@ fn env_digest(extra_ignored: &[String]) -> (String, BTreeMap<String, String>) {
         hasher.update(&[0]);
         by_name.insert(k.clone(), blake3_hex(v.as_bytes())[..16].to_owned());
     }
-    (hasher.finalize().to_hex().to_string(), by_name)
+    EnvDigest {
+        digest: hasher.finalize().to_hex().to_string(),
+        vars: by_name,
+    }
 }
 
 /// The digest of a resolved buckconfig, which the daemon read once at startup and DICE does not
-/// track (ignore specs, digest algorithms, materializer settings and the like).
+/// track (ignore specs, digest algorithms, materializer settings and the like). The host identity
+/// is left out: it is checked on its own, so that a refusal names it.
 fn config_digest(config: &LegacyBuckConfig) -> String {
+    // Each entry carries its section, so that a section left empty by the skip hashes as if it
+    // were absent.
     let mut hasher = blake3::Hasher::new();
     for (section, values) in config.iter() {
-        hasher.update(section.as_bytes());
-        hasher.update(&[0]);
         for (key, value) in values {
-            hasher.update(key.as_bytes());
-            hasher.update(&[0]);
-            hasher.update(value.as_bytes());
-            hasher.update(&[0]);
+            if section == "buck2_hydration" && key == HOST_IDENTITY_PROPERTY {
+                continue;
+            }
+            for part in [section, key, value] {
+                hasher.update(part.as_bytes());
+                hasher.update(&[0]);
+            }
         }
-        hasher.update(&[1]);
     }
     hasher.finalize().to_hex().to_string()
 }
@@ -149,17 +207,6 @@ fn exe_digest() -> buck2_error::Result<String> {
     std::io::copy(&mut file, &mut hasher)
         .with_buck_error_context(|| format!("Reading `{}`", exe.display()))?;
     Ok(hasher.finalize().to_hex().to_string())
-}
-
-fn hostname() -> String {
-    let mut buf = [0u8; 256];
-    // SAFETY: the buffer is valid for its length.
-    let rc = unsafe { libc::gethostname(buf.as_mut_ptr().cast(), buf.len()) };
-    if rc != 0 {
-        return String::new();
-    }
-    let len = buf.iter().position(|b| *b == 0).unwrap_or(buf.len());
-    String::from_utf8_lossy(&buf[..len]).into_owned()
 }
 
 fn uid() -> u32 {
@@ -204,12 +251,14 @@ pub(crate) struct SuspendIdentity {
     isolation: String,
     /// `buck2.file_watcher` as this daemon resolved it.
     pub(crate) watcher: String,
+    /// `hydration.host_identity`, or the hostname.
+    host_identity: String,
 }
 
 impl SuspendIdentity {
     pub(crate) fn new(
         config: SuspendConfig,
-        startup_config: &buck2_common::init::DaemonStartupConfig,
+        startup_config: &DaemonStartupConfig,
         root_config: &LegacyBuckConfig,
         project_root: &ProjectRoot,
         isolation: &str,
@@ -223,7 +272,12 @@ impl SuspendIdentity {
         }
         Ok(Self {
             config,
-            startup_config: blake3_hex(startup_config.serialize()?.as_bytes()),
+            startup_config: blake3_hex(
+                startup_config
+                    .without_host_identity()
+                    .serialize()?
+                    .as_bytes(),
+            ),
             root_config: config_digest(root_config),
             project_root: project_root.root().to_string(),
             isolation: isolation.to_owned(),
@@ -234,8 +288,83 @@ impl SuspendIdentity {
                 })
                 .unwrap_or("notify")
                 .to_owned(),
+            host_identity: crate::daemon::disk_state::host_identity(startup_config),
         })
     }
+}
+
+/// Why an image was not resumed. Each check has its own reason, so that a test can tell that a
+/// change refused for the reason it should and not for an earlier one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Refusal {
+    /// The MANIFEST is unreadable, or names another magic or format.
+    Format(String),
+    Binary,
+    StartupConfig,
+    /// The variables whose values differ, or that one side has and the other lacks.
+    Env(Vec<String>),
+    RootConfig,
+    Project,
+    HostIdentity,
+    User,
+    Watcher,
+    Clock,
+    TooLarge {
+        bytes: u64,
+    },
+    NoPagingStore,
+    ImageCorrupt(String),
+}
+
+impl fmt::Display for Refusal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let differs = |f: &mut fmt::Formatter<'_>, what: &str| {
+            write!(f, "{what} differs from the suspended daemon's")
+        };
+        match self {
+            Refusal::Format(detail) => write!(f, "image format: {detail}"),
+            Refusal::Binary => differs(f, "the buck2 binary"),
+            Refusal::StartupConfig => differs(f, "the daemon startup config"),
+            Refusal::Env(names) => write!(
+                f,
+                "the environment differs from the suspended daemon's: {}",
+                names.join(", ")
+            ),
+            Refusal::RootConfig => differs(f, "the root buckconfig"),
+            Refusal::Project => differs(f, "the project root or isolation dir"),
+            Refusal::HostIdentity => differs(f, "the host identity"),
+            Refusal::User => differs(f, "the user"),
+            Refusal::Watcher => differs(f, "the file watcher"),
+            Refusal::Clock => write!(
+                f,
+                "the clock is more than {} minutes earlier than the suspend",
+                CLOCK_SKEW_MS / 60_000
+            ),
+            Refusal::TooLarge { bytes } => write!(
+                f,
+                "the paging store is {bytes} bytes, over `buck2_hydration.suspend_max_db_gb`"
+            ),
+            Refusal::NoPagingStore => write!(f, "the paging store is missing"),
+            Refusal::ImageCorrupt(detail) => write!(f, "the image is corrupt: {detail}"),
+        }
+    }
+}
+
+/// What this daemon observes, for [`compare`] against a MANIFEST.
+struct Observed<'a> {
+    identity: &'a SuspendIdentity,
+    exe: String,
+    env: EnvDigest,
+    uid: u32,
+    now_ms: u64,
+}
+
+/// The part of a MANIFEST that every format has, read first so that an image of another format
+/// refuses as such rather than as an unreadable MANIFEST.
+#[derive(Deserialize)]
+struct ManifestHeader {
+    magic: String,
+    format: u32,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -250,6 +379,10 @@ struct Manifest {
     root_config: String,
     project_root: String,
     isolation: String,
+    /// `hydration.host_identity`, or the hostname: checked.
+    host_identity: String,
+    /// The hostname, whatever the identity: not checked. It tells a resume on the same machine
+    /// from one on another machine of the same identity.
     hostname: String,
     uid: u32,
     watcher: String,
@@ -353,8 +486,77 @@ pub(crate) fn prepare_resume(cache_dir: &Path, identity: &SuspendIdentity) -> Re
             image_dir,
             loaded_in: start.elapsed(),
         }),
-        Err(reason) => ResumePrep::Refused(reason),
+        Err(refusal) => ResumePrep::Refused(refusal.to_string()),
     }
+}
+
+fn parse_manifest(manifest_bytes: &[u8]) -> Result<Manifest, Refusal> {
+    let header: ManifestHeader = serde_json::from_slice(manifest_bytes)
+        .map_err(|e| Refusal::Format(format!("unreadable MANIFEST: {e}")))?;
+    if header.magic != MAGIC || header.format != FORMAT {
+        return Err(Refusal::Format(format!(
+            "{} {}, this binary reads {MAGIC} {FORMAT}",
+            header.magic, header.format
+        )));
+    }
+    serde_json::from_slice(manifest_bytes)
+        .map_err(|e| Refusal::ImageCorrupt(format!("unreadable MANIFEST: {e}")))
+}
+
+/// The checks that need no I/O, in the order a refusal reports them: the first that fails names
+/// the reason.
+fn compare(m: &Manifest, o: &Observed<'_>) -> Result<(), Refusal> {
+    if m.magic != MAGIC || m.format != FORMAT {
+        return Err(Refusal::Format(format!("{} {}", m.magic, m.format)));
+    }
+    if m.exe != o.exe {
+        return Err(Refusal::Binary);
+    }
+    if m.startup_config != o.identity.startup_config {
+        return Err(Refusal::StartupConfig);
+    }
+    if m.env != o.env.digest {
+        let vars = &o.env.vars;
+        let mut changed: Vec<String> = vars
+            .iter()
+            .filter(|(k, v)| m.env_vars.get(*k) != Some(*v))
+            .map(|(k, _)| k.clone())
+            .chain(
+                m.env_vars
+                    .keys()
+                    .filter(|k| !vars.contains_key(*k))
+                    .cloned(),
+            )
+            .collect();
+        changed.sort();
+        changed.dedup();
+        return Err(Refusal::Env(changed));
+    }
+    if m.root_config != o.identity.root_config {
+        return Err(Refusal::RootConfig);
+    }
+    if m.project_root != o.identity.project_root || m.isolation != o.identity.isolation {
+        return Err(Refusal::Project);
+    }
+    if m.host_identity != o.identity.host_identity {
+        return Err(Refusal::HostIdentity);
+    }
+    if m.uid != o.uid {
+        return Err(Refusal::User);
+    }
+    if m.watcher != o.identity.watcher {
+        return Err(Refusal::Watcher);
+    }
+    if o.now_ms.saturating_add(CLOCK_SKEW_MS) < m.created_at_ms {
+        return Err(Refusal::Clock);
+    }
+    let max = o.identity.config.max_db_gb.saturating_mul(1 << 30);
+    if m.dice_state_bytes > max {
+        return Err(Refusal::TooLarge {
+            bytes: m.dice_state_bytes,
+        });
+    }
+    Ok(())
 }
 
 fn check(
@@ -362,75 +564,38 @@ fn check(
     image_dir: &Path,
     cache_dir: &Path,
     identity: &SuspendIdentity,
-) -> Result<ImageFile, String> {
-    let m: Manifest =
-        serde_json::from_slice(manifest_bytes).map_err(|e| format!("unreadable MANIFEST: {e}"))?;
-    if m.magic != MAGIC || m.format != FORMAT {
-        return Err(format!("image format {} {}", m.magic, m.format));
-    }
-    let refuse = |what: &str| Err(format!("{what} differs from the suspended daemon's"));
-    if m.exe != exe_digest().map_err(|e| format!("{e:#}"))? {
-        return refuse("the buck2 binary");
-    }
-    if m.startup_config != identity.startup_config {
-        return refuse("the daemon startup config");
-    }
-    let (env, vars) = env_digest(&identity.config.env_ignore);
-    if m.env != env {
-        let mut changed: Vec<&str> = vars
-            .iter()
-            .filter(|(k, v)| m.env_vars.get(*k) != Some(*v))
-            .map(|(k, _)| k.as_str())
-            .chain(
-                m.env_vars
-                    .keys()
-                    .filter(|k| !vars.contains_key(*k))
-                    .map(|k| k.as_str()),
-            )
-            .collect();
-        changed.sort();
-        changed.dedup();
-        return Err(format!(
-            "the environment differs from the suspended daemon's: {}",
-            changed.join(", ")
-        ));
-    }
-    if m.root_config != identity.root_config {
-        return refuse("the root buckconfig");
-    }
-    if m.project_root != identity.project_root || m.isolation != identity.isolation {
-        return refuse("the project root or isolation dir");
-    }
-    if m.hostname != hostname() {
-        return refuse("the hostname");
-    }
-    if m.uid != uid() {
-        return refuse("the user");
-    }
-    if m.watcher != identity.watcher {
-        return refuse("the file watcher");
-    }
-    if now_ms() < m.created_at_ms {
-        return Err("the clock is earlier than the suspend".to_owned());
-    }
-    let max = identity.config.max_db_gb.saturating_mul(1 << 30);
-    if m.dice_state_bytes > max {
-        return Err(format!(
-            "the paging store is {} bytes, over `buck2_hydration.suspend_max_db_gb`",
-            m.dice_state_bytes
-        ));
-    }
+) -> Result<ImageFile, Refusal> {
+    let m = parse_manifest(manifest_bytes)?;
+    let observed = Observed {
+        identity,
+        // A binary that cannot hash itself cannot show it is the suspended one.
+        exe: exe_digest().map_err(|_| Refusal::Binary)?,
+        env: env_digest(&identity.config.env_ignore),
+        uid: uid(),
+        now_ms: now_ms(),
+    };
+    compare(&m, &observed)?;
+    check_files(&m, image_dir, cache_dir)
+}
+
+/// The checks that read the image's files.
+fn check_files(m: &Manifest, image_dir: &Path, cache_dir: &Path) -> Result<ImageFile, Refusal> {
     if !cache_dir.join(DICE_STATE_DIR).is_dir() {
-        return Err("the paging store is missing".to_owned());
+        return Err(Refusal::NoPagingStore);
     }
-    let bytes =
-        std::fs::read(image_dir.join(IMAGE)).map_err(|e| format!("unreadable image: {e}"))?;
-    if bytes.len() as u64 != m.image_len || blake3_hex(&bytes) != m.image {
-        return Err("the image is truncated or corrupt".to_owned());
+    let bytes = std::fs::read(image_dir.join(IMAGE))
+        .map_err(|e| Refusal::ImageCorrupt(format!("unreadable image: {e}")))?;
+    if bytes.len() as u64 != m.image_len {
+        return Err(Refusal::ImageCorrupt("truncated".to_owned()));
+    }
+    if blake3_hex(&bytes) != m.image {
+        return Err(Refusal::ImageCorrupt(
+            "the blake3 digest differs".to_owned(),
+        ));
     }
     let (image, _): (ImageFile, usize) =
         bincode::serde::decode_from_slice(&bytes, bincode::config::standard())
-            .map_err(|e| format!("undecodable image: {e}"))?;
+            .map_err(|e| Refusal::ImageCorrupt(format!("undecodable image: {e}")))?;
     Ok(image)
 }
 
@@ -619,7 +784,10 @@ async fn suspend_inner(
     sync_filesystem(&inputs.buck_out)?;
     lap("sync", &mut timings);
 
-    let (env, env_vars) = env_digest(&inputs.identity.config.env_ignore);
+    let EnvDigest {
+        digest: env,
+        vars: env_vars,
+    } = env_digest(&inputs.identity.config.env_ignore);
     let dice_state_bytes = dir_size(&dice_state);
     let manifest = Manifest {
         magic: MAGIC.to_owned(),
@@ -631,7 +799,8 @@ async fn suspend_inner(
         root_config: inputs.identity.root_config.clone(),
         project_root: inputs.identity.project_root.clone(),
         isolation: inputs.identity.isolation.clone(),
-        hostname: hostname(),
+        host_identity: inputs.identity.host_identity.clone(),
+        hostname: buck2_events::metadata::hostname().unwrap_or_default(),
         uid: uid(),
         watcher: inputs.identity.watcher.clone(),
         created_at_ms: now_ms(),
@@ -705,18 +874,28 @@ mod tests {
     fn per_run_variables_are_left_out() {
         assert!(ignored("GITHUB_RUN_ID", &[]));
         assert!(ignored("TERM", &[]));
+        assert!(ignored("HOSTNAME", &[]));
+        assert!(ignored("BUILDBUDDY_API_KEY", &[]));
+        assert!(ignored("ANY_TOKEN", &[]));
         assert!(!ignored("PATH", &[]));
+        assert!(!ignored("TOKEN_FILE", &[]));
         assert!(ignored("CI_JOB_ID", &["CI_JOB_ID".to_owned()]));
+        assert!(ignored("ACTIONS_X", &["ACTIONS_*".to_owned()]));
     }
 
     #[test]
-    fn config_digest_follows_values() -> buck2_error::Result<()> {
+    fn config_digest_follows_values_but_not_the_identity() -> buck2_error::Result<()> {
         use buck2_common::legacy_configs::configs::testing::parse;
         let a = parse(&[("c", "[s]\nk = 1\n")], "c")?;
         let b = parse(&[("c", "[s]\nk = 1\n")], "c")?;
         let c = parse(&[("c", "[s]\nk = 2\n")], "c")?;
+        let d = parse(
+            &[("c", "[s]\nk = 1\n[buck2_hydration]\nhost_identity = x\n")],
+            "c",
+        )?;
         assert_eq!(config_digest(&a), config_digest(&b));
         assert_ne!(config_digest(&a), config_digest(&c));
+        assert_eq!(config_digest(&a), config_digest(&d));
         Ok(())
     }
 
@@ -732,6 +911,7 @@ mod tests {
             root_config: "r".to_owned(),
             project_root: "/p".to_owned(),
             isolation: "v2".to_owned(),
+            host_identity: "a".to_owned(),
             hostname: "h".to_owned(),
             uid: 1,
             watcher: "notify".to_owned(),
@@ -742,6 +922,7 @@ mod tests {
         };
         let back: Manifest = serde_json::from_slice(&serde_json::to_vec(&m).unwrap()).unwrap();
         assert_eq!(back.env_vars, m.env_vars);
+        assert_eq!(back.host_identity, "a");
         assert_eq!(back.created_at_ms, 2);
     }
 }
