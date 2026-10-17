@@ -103,7 +103,7 @@ step suspend-3 "$B" suspend
 step resumed-after-pre-suspend-edit "$B" build //:g39
 "$B" log what-ran "$(evlog)" > $R/resumed-after-pre-suspend-edit.what-ran 2>&1
 echo "resumed-after-pre-suspend-edit ran: $(grep -o 'root//:g[0-9]*' $R/resumed-after-pre-suspend-edit.what-ran | sort -u -t g -k2 -n | tr '\n' ' ')" | tee -a $R/summary.tsv
-g39=$(find buck-out/v2/gen -name g39.txt -type f | head -1)
+g39=$(find buck-out/v2 -path '*__g39__*' -name g39.txt -type f | head -1)
 echo "g39 contains the pre-suspend edit: $(grep -c "edited before suspend" "$g39" 2>&1) ($g39)" | tee -a $R/summary.tsv
 
 # 4. a different binary refuses the image.
@@ -157,6 +157,9 @@ sleep 0.1
 "$B" uquery //:g0 > $R/race-uquery.log 2>&1
 wait
 echo "race: suspend said: $(grep -o 'cannot run beside[^;]*\|a command started while[^;]*\|suspended: image' $R/suspend-9-race.log | head -1); uquery: $(grep -o 'Connected to new buck2 daemon\|resumed[^;]*\|cold[^;]*' $R/race-uquery.log | head -1)" | tee -a $R/summary.tsv
+# A failed suspend leaves the daemon running, so `resume` would report how that daemon started;
+# kill it first, so the next daemon shows whether any image survived.
+"$B" kill > /dev/null 2>&1
 step resume-9-after-race "$B" resume
 echo "after-race: $(grep -o '^\(resumed\|cold\)[^;]*' $R/resume-9-after-race.log | head -1)" | tee -a $R/summary.tsv
 
