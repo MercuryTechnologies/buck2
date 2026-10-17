@@ -4809,6 +4809,7 @@ dependencies = [
  "pagable_storage",
  "parking_lot 0.12.5",
  "pin-project",
+ "postcard",
  "ref-cast",
  "scopeguard",
  "serde",

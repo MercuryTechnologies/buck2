@@ -212,6 +212,9 @@ pub struct DiceStorage {
     page_out_policy: PageOutPolicy,
     /// When the values a page-out writes leave memory; see [`EvictionPolicy`].
     eviction_policy: EvictionPolicy,
+    /// Shared with the `MeteredPagableStorage` wrapping `storage`; see its field.
+    #[allocative(skip)]
+    verify_reads: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// What the core state is given about paging: where to record what paging moves, and which
@@ -226,8 +229,14 @@ impl DiceStorage {
     /// Construct a `DiceStorage` from any [`PagableStorage`] backend.
     pub fn new(storage: Arc<dyn PagableStorage>) -> Self {
         let io_metrics = Arc::new(StorageIoMetrics::default());
+        let verify_reads = Arc::new(std::sync::atomic::AtomicBool::new(false));
         Self {
-            storage: Arc::new(MeteredPagableStorage::new(storage, io_metrics.dupe())),
+            storage: Arc::new(MeteredPagableStorage::with_verify(
+                storage,
+                io_metrics.dupe(),
+                verify_reads.dupe(),
+            )),
+            verify_reads,
             page_in_metrics: Arc::new(PageInMetrics::default()),
             io_metrics,
             paging_memory: Arc::new(PagingMemoryMetrics::default()),
@@ -578,6 +587,128 @@ impl DiceStorage {
         }
     }
 
+    /// Writes `value` as a row, as a page-out would but leaving the value as it is: for
+    /// `buck2 suspend`, which needs a row for every value its image names, those a page-out
+    /// keeps resident included. `None` if the key's serializer declines the value.
+    pub(crate) fn write_value_row(
+        &self,
+        key_dyn: &DiceKeyErased,
+        value: &DiceValidValue,
+        finished: &ArcSerCache,
+    ) -> anyhow::Result<Option<DataKey>> {
+        let storage_context = self.storage.storage_context();
+        let mut serializer = SerializerForPaging::new(storage_context);
+        let serialized = match key_dyn {
+            DiceKeyErased::Key(k) => k.pagable_serialize_value(value.as_dyn(), &mut serializer),
+            DiceKeyErased::Projection(p) => p
+                .proj()
+                .pagable_serialize_value(value.as_dyn(), &mut serializer),
+        };
+        match serialized {
+            None => Ok(None),
+            Some(Err(e)) => Err(e),
+            Some(Ok(())) => {
+                let (data, arcs) = serializer.finish();
+                Ok(Some(self.storage.page_out_item(
+                    data,
+                    arcs,
+                    finished,
+                    storage_context,
+                )?))
+            }
+        }
+    }
+
+    /// Writes a key as a row: its type tag and its fields, the projection alone for a
+    /// projection key (its base is the image's business).
+    pub(crate) fn write_key_row(
+        &self,
+        key: &DiceKeyErased,
+        finished: &ArcSerCache,
+    ) -> anyhow::Result<DataKey> {
+        use pagable::PagableSerialize;
+        let storage_context = self.storage.storage_context();
+        let mut serializer = SerializerForPaging::new(storage_context);
+        match key {
+            DiceKeyErased::Key(k) => (**k).pagable_serialize(&mut serializer)?,
+            DiceKeyErased::Projection(p) => p.proj().pagable_serialize(&mut serializer)?,
+        }
+        let (data, arcs) = serializer.finish();
+        Ok(self
+            .storage
+            .page_out_item(data, arcs, finished, storage_context)?)
+    }
+
+    /// Writes any pagable value as a row.
+    pub(crate) fn write_row<T: pagable::PagableSerialize>(
+        &self,
+        value: &T,
+        finished: &ArcSerCache,
+    ) -> anyhow::Result<DataKey> {
+        let storage_context = self.storage.storage_context();
+        let mut serializer = SerializerForPaging::new(storage_context);
+        value.pagable_serialize(&mut serializer)?;
+        let (data, arcs) = serializer.finish();
+        Ok(self
+            .storage
+            .page_out_item(data, arcs, finished, storage_context)?)
+    }
+
+    /// Reads a row [`Self::write_row`] wrote.
+    pub(crate) async fn read_row<T: for<'de> pagable::PagableDeserialize<'de>>(
+        &self,
+        row: DataKey,
+    ) -> anyhow::Result<T> {
+        let data = self.storage.fetch_data(&row).await?;
+        let handle = self.storage_handle();
+        let mut deserializer = handle.root_deserializer(row, &data);
+        Ok(T::pagable_deserialize(&mut deserializer)?)
+    }
+
+    /// Reads back a key [`Self::write_key_row`] wrote: a projection key is read as its
+    /// projection on `base`.
+    pub(crate) async fn read_key_row(
+        &self,
+        row: DataKey,
+        base: Option<DiceKey>,
+    ) -> anyhow::Result<DiceKeyErased> {
+        use pagable::PagableBoxDeserialize;
+        let data = self.storage.fetch_data(&row).await?;
+        let handle = self.storage_handle();
+        let mut deserializer = handle.root_deserializer(row, &data);
+        Ok(match base {
+            None => DiceKeyErased::Key(Arc::from(
+                <dyn crate::key::DiceKeyDyn as PagableBoxDeserialize>::deserialize_box(
+                    &mut deserializer,
+                )?,
+            )),
+            Some(base) => DiceKeyErased::projection_from_parts(
+                base,
+                Arc::from(
+                    <dyn crate::key::DiceProjectionDyn as PagableBoxDeserialize>::deserialize_box(
+                        &mut deserializer,
+                    )?,
+                ),
+            ),
+        })
+    }
+
+    /// Commits every row written so far and makes the store durable: the sqlite writer runs
+    /// without a journal or syncs, so a suspend flushes and then fsyncs each file itself.
+    pub(crate) fn flush_and_sync(&self) -> anyhow::Result<()> {
+        self.storage.flush()?;
+        if let Some(path) = &self.path {
+            sync_dir_recursive(path)?;
+        }
+        Ok(())
+    }
+
+    /// From now on, check each row read against its key; see `MeteredPagableStorage`.
+    pub(crate) fn verify_reads(&self) {
+        self.verify_reads
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
     /// Rehydrate all paged-out values in parallel, sending rehydrate messages
     /// back to the core state thread.
     pub(crate) async fn page_in(
@@ -861,11 +992,41 @@ impl StorageIoMetrics {
 struct MeteredPagableStorage {
     inner: Arc<dyn PagableStorage>,
     metrics: Arc<StorageIoMetrics>,
+    /// Set once the store holds rows a previous process wrote (a resumed daemon): each read is
+    /// then checked against its `DataKey`, so a row damaged while no daemon ran fails its read,
+    /// which demand recovery turns into a recompute, rather than handing back a wrong value.
+    verify_reads: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl MeteredPagableStorage {
     fn new(inner: Arc<dyn PagableStorage>, metrics: Arc<StorageIoMetrics>) -> Self {
-        Self { inner, metrics }
+        Self::with_verify(
+            inner,
+            metrics,
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        )
+    }
+
+    fn with_verify(
+        inner: Arc<dyn PagableStorage>,
+        metrics: Arc<StorageIoMetrics>,
+        verify_reads: Arc<std::sync::atomic::AtomicBool>,
+    ) -> Self {
+        Self {
+            inner,
+            metrics,
+            verify_reads,
+        }
+    }
+
+    fn verified(&self, key: &DataKey, data: Arc<PagableData>) -> anyhow::Result<Arc<PagableData>> {
+        if self.verify_reads.load(Ordering::Relaxed) && data.compute_key() != *key {
+            return Err(anyhow::anyhow!(
+                "row {key:?} does not hold the data its key names: the paging store was \
+                 changed while the daemon was suspended"
+            ));
+        }
+        Ok(data)
     }
 }
 
@@ -878,13 +1039,13 @@ impl PagableStorage for MeteredPagableStorage {
     fn fetch_data_blocking(&self, key: &DataKey) -> anyhow::Result<Arc<PagableData>> {
         let data = self.inner.fetch_data_blocking(key)?;
         self.metrics.record_in(data.data.len() as u64);
-        Ok(data)
+        self.verified(key, data)
     }
 
     async fn fetch_data(&self, key: &DataKey) -> anyhow::Result<Arc<PagableData>> {
         let data = self.inner.fetch_data(key).await?;
         self.metrics.record_in(data.data.len() as u64);
-        Ok(data)
+        self.verified(key, data)
     }
 
     fn schedule_for_paging(&self, arc: Box<dyn ArcEraseDyn>) {
@@ -929,6 +1090,19 @@ fn env_concurrency(var: &str) -> usize {
                 .map(|n| n.get())
                 .unwrap_or(1)
         })
+}
+
+/// fsyncs every file under `path` and the directories that hold them.
+fn sync_dir_recursive(path: &Path) -> std::io::Result<()> {
+    for entry in std::fs::read_dir(path)? {
+        let entry = entry?;
+        if entry.file_type()?.is_dir() {
+            sync_dir_recursive(&entry.path())?;
+        } else {
+            std::fs::File::open(entry.path())?.sync_all()?;
+        }
+    }
+    std::fs::File::open(path)?.sync_all()
 }
 
 /// Sum the sizes of all files under `path`, recursing into subdirectories. Any

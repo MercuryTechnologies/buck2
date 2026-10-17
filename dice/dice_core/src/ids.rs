@@ -46,6 +46,12 @@ impl Revision {
         self.0.get()
     }
 
+    /// The revision [`Self::as_u32`] returned, for an environment that persists its state and
+    /// replays it into a new core (dice's suspend image). `None` for 0.
+    pub fn from_u32(v: u32) -> Option<Self> {
+        NonZeroU32::new(v).map(Revision)
+    }
+
     /// Panics on 0.
     #[doc(hidden)]
     pub fn testing_new(v: u32) -> Self {

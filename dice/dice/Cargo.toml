@@ -32,6 +32,7 @@ pagable = { workspace = true, optional = true }
 pagable_storage.workspace = true
 parking_lot.workspace = true
 pin-project.workspace = true
+postcard.workspace = true
 ref-cast.workspace = true
 scopeguard.workspace = true
 serde.workspace = true
