@@ -38,6 +38,13 @@ use buck2_build_api::actions::local_actions::build_keys;
 use buck2_common::init::SuspendConfig;
 use buck2_common::legacy_configs::configs::LegacyBuckConfig;
 use buck2_common::legacy_configs::key::BuckconfigKeyRef;
+pub(crate) use buck2_common::suspend_image::DICE_STATE_DIR;
+use buck2_common::suspend_image::FORMAT;
+use buck2_common::suspend_image::IMAGE;
+pub(crate) use buck2_common::suspend_image::IMAGE_DIR;
+use buck2_common::suspend_image::MAGIC;
+use buck2_common::suspend_image::MANIFEST;
+use buck2_common::suspend_image::MANIFEST_CONSUMED;
 use buck2_core::fs::project::ProjectRoot;
 use buck2_error::BuckErrorContext;
 use buck2_error::ErrorTag;
@@ -57,17 +64,6 @@ use dice::SuspendRow;
 use serde::Deserialize;
 use serde::Serialize;
 
-/// The directory under the tenant's cache dir that holds an image.
-pub(crate) const IMAGE_DIR: &str = "suspend";
-/// The paging store's directory under the cache dir (`TenantPaths::dice_state_path`).
-pub(crate) const DICE_STATE_DIR: &str = "dice_state";
-const MANIFEST: &str = "MANIFEST";
-const MANIFEST_CONSUMED: &str = "MANIFEST.consumed";
-const IMAGE: &str = "image.bin";
-const MAGIC: &str = "BUCK2SUS";
-/// Bumped on any change to [`Manifest`] or [`ImageFile`], or to what their rows hold. 2: the host
-/// identity, the snapshot's digests and the artifacts' CAS recipes.
-const FORMAT: u32 = 2;
 /// How far the clock may be behind the suspend's and still resume: two runners' clocks are never
 /// exactly in step. Nothing a resume trusts compares a time across the step except ctime on the
 /// same identity, which a clock stepped back cannot make equal to the suspended value except by
@@ -210,12 +206,7 @@ fn exe_digest() -> buck2_error::Result<String> {
     let exe = PathBuf::from("/proc/self/exe");
     #[cfg(not(target_os = "linux"))]
     let exe = std::env::current_exe().buck_error_context("Locating the daemon executable")?;
-    let mut hasher = blake3::Hasher::new();
-    let mut file = std::fs::File::open(&exe)
-        .with_buck_error_context(|| format!("Opening `{}`", exe.display()))?;
-    std::io::copy(&mut file, &mut hasher)
-        .with_buck_error_context(|| format!("Reading `{}`", exe.display()))?;
-    Ok(hasher.finalize().to_hex().to_string())
+    buck2_common::suspend_image::exe_digest(&exe)
 }
 
 fn uid() -> u32 {
