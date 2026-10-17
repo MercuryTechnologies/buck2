@@ -11,6 +11,7 @@
 use std::fmt::Debug;
 use std::iter::empty;
 use std::iter::once;
+use std::sync::LazyLock;
 use std::sync::atomic;
 use std::sync::atomic::AtomicU64;
 
@@ -73,8 +74,15 @@ pub struct WorkerInfo<'v> {
 }
 
 fn next_id() -> u64 {
+    // Ids live in analysis results, which a daemon resumed with `buck2 suspend` reads back from
+    // the suspended one; counting from 1 in every process could give a new worker the id of a
+    // restored one, and the worker pool is keyed by id. The high half is random per process.
+    static BASE: LazyLock<u64> = LazyLock::new(|| {
+        use std::hash::BuildHasher;
+        std::collections::hash_map::RandomState::new().hash_one(std::process::id()) << 32
+    });
     static LAST_ID: AtomicU64 = AtomicU64::new(0);
-    LAST_ID.fetch_add(1, atomic::Ordering::Relaxed) + 1
+    *BASE | (LAST_ID.fetch_add(1, atomic::Ordering::Relaxed) + 1)
 }
 
 #[starlark_module]
