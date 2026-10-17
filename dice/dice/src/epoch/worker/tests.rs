@@ -441,10 +441,10 @@ async fn spawn_with_previously_cancelled_task_that_finished() {
 
     #[derive(Allocative, Clone, Dupe, Debug, Display, PartialEq, Eq, Hash, Pagable)]
     #[pagable_typetag(DiceKeyDyn)]
-    struct Finish;
+    struct FinishOnce;
 
     #[async_trait]
-    impl Key for Finish {
+    impl Key for FinishOnce {
         type Value = ();
 
         async fn compute(
@@ -463,7 +463,7 @@ async fn spawn_with_previously_cancelled_task_that_finished() {
         }
     }
 
-    let k = dice.key_index.index_key(Finish);
+    let k = dice.key_index.index_key(FinishOnce);
     let (previous_task, prev_task_promise) = spawn_task(k, eval.dupe(), None);
     // wait for it to finish then trigger cancel
     previous_task

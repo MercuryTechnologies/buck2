@@ -85,6 +85,78 @@ pub(crate) struct ComputedValueUpdate {
     pub(crate) epsilon: EpsilonToken,
 }
 
+/// One key as the head of a branch resolves it, for `buck2 suspend` (`crate::suspend`).
+pub(crate) struct HeadEntry {
+    pub(crate) key: DiceKey,
+    pub(crate) revision: Revision,
+    pub(crate) source: HeadSource,
+    pub(crate) value: HeadValue,
+    /// The revision the key's mint hands out next.
+    pub(crate) mint: Revision,
+    /// Whether the key is an `InjectedKey`.
+    pub(crate) injected: bool,
+}
+
+/// Why a key is in a head's dump.
+pub(crate) enum HeadSource {
+    /// Valid through an assertion.
+    Asserted {
+        priority: InvalidationSourcePriority,
+    },
+    /// Valid through a certificate.
+    Certified { cert: Arc<DiceCert> },
+    /// Unknown at the head, with the certificate the next compute of the key would try to
+    /// re-establish, or compare its value with. A key the head dirtied (`dirtied`) is unknown
+    /// because its own untracked input changed; any other is unknown because something it read
+    /// is. A live daemon keeps such certificates, so that a recompute that finds the same value
+    /// cuts off; a resumed one keeps them too.
+    Candidate {
+        cert: Arc<DiceCert>,
+        dirtied: Option<InvalidationSourcePriority>,
+    },
+}
+
+/// The value behind a head entry's revision.
+pub(crate) enum HeadValue {
+    /// A row holds it: the value is paged out, or resident and backed by the row.
+    Row(DataKey),
+    /// Only memory holds it.
+    Resident(DiceValidValue),
+}
+
+/// An assertion a resume replays: the key had `revision`, with this value, at the suspended head.
+pub(crate) struct RestoredAssert {
+    pub(crate) key: DiceKey,
+    pub(crate) revision: Revision,
+    pub(crate) priority: InvalidationSourcePriority,
+    pub(crate) injected: bool,
+    pub(crate) value: DiceValidValue,
+    pub(crate) row: DataKey,
+}
+
+/// A certificate a resume replays, with the value its revision names: paged out, or resident for
+/// a key whose values never page out (a projection).
+pub(crate) struct RestoredCert {
+    pub(crate) key: DiceKey,
+    pub(crate) revision: Revision,
+    pub(crate) deps: SeriesParallelDeps,
+    pub(crate) value: MaybeResident<DiceValidValue>,
+}
+
+/// What a replay of a suspended head did.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RestoreCounts {
+    pub(crate) asserted: usize,
+    /// Certificates `write` installed and that resolve at the head.
+    pub(crate) certified: usize,
+    /// Certificates `write` installed and the replayed dirties closed: unknown at the head,
+    /// offered as candidates, as on the suspended head.
+    pub(crate) candidates: usize,
+    /// Certificates `write` did not install: a premise did not resolve to its recorded
+    /// revision, which happens when a key the certificate read was dropped from the image.
+    pub(crate) dropped: usize,
+}
+
 /// The values retained for one key.
 #[derive(Allocative, Default)]
 struct KeyValues {
@@ -767,6 +839,174 @@ impl VersionedGraph {
                 stored.make_resident(value, policy);
             }
         });
+    }
+
+    /// Every key the head of `v`'s branch resolves at `v`, with the value its revision names
+    /// and the source of its validity. Keys that resolve `Unknown` are left out: their values may
+    /// be stale, and a resume recomputes them.
+    pub(crate) fn dump_head(&self, v: VersionNumber) -> Vec<HeadEntry> {
+        let mut out = Vec::with_capacity(self.values.len());
+        if !self.core.is_live(v.branch()) {
+            return out;
+        }
+        for (key, kv) in &self.values {
+            let (revision, source) = match self.core.lookup(*key, v) {
+                Lookup::Valid {
+                    revision,
+                    source: ValidSource::Asserted { assertion },
+                } => (
+                    revision,
+                    HeadSource::Asserted {
+                        priority: assertion.data,
+                    },
+                ),
+                Lookup::Valid {
+                    revision,
+                    source: ValidSource::Claim { cert, .. },
+                } => (revision, HeadSource::Certified { cert: cert.dupe() }),
+                Lookup::Unknown { candidate, .. } => {
+                    let Some(cert) = self.core.nearest_certificate(*key, v) else {
+                        continue;
+                    };
+                    // A candidate stamped with another ε than the head's: the key itself was
+                    // dirtied since.
+                    let dirtied = match candidate {
+                        Some(_) => None,
+                        None => match self.core.dirtied_at(*key, v) {
+                            Some(dirtied) => Some(dirtied.data),
+                            // Another branch's certificate under another ε: nothing to replay.
+                            None => continue,
+                        },
+                    };
+                    (
+                        cert.revision,
+                        HeadSource::Candidate {
+                            cert: cert.dupe(),
+                            dirtied,
+                        },
+                    )
+                }
+            };
+            let value = match kv.entry(revision) {
+                Some(PagableValue::PagedOut(data_key)) => HeadValue::Row(*data_key),
+                Some(PagableValue::Backed(backed)) => HeadValue::Row(backed.data_key),
+                Some(resident) => HeadValue::Resident(
+                    resident
+                        .as_hydrated()
+                        .expect("every state but PagedOut is resident")
+                        .dupe(),
+                ),
+                None => unreachable!("{key:?} resolves to {revision:?} but retains no value"),
+            };
+            out.push(HeadEntry {
+                key: *key,
+                revision,
+                source,
+                value,
+                mint: kv.mint.peek(),
+                injected: kv.injected,
+            });
+        }
+        out
+    }
+
+    /// Replays a suspended head onto `branch`, which must be a new root nothing has been committed
+    /// to: one commit of the assertions at their recorded revisions, then each certificate
+    /// through `write`, premises first, with its ε reset to [`EpsilonToken::INITIAL`] (nothing
+    /// has been dirtied on a new root, and no token minted in this process equals it). `write`
+    /// installs a certificate only where every premise resolves to its recorded revision, so a
+    /// certificate whose premise the image dropped is not installed, and its value is let go.
+    ///
+    /// The certificates of keys the suspended head held as candidates are written as any other,
+    /// and then the keys it had dirtied are dirtied again in one more commit, which closes them
+    /// and everything that read them: candidates again, as they were.
+    pub(crate) fn restore_head(
+        &mut self,
+        branch: BranchId,
+        asserts: Vec<RestoredAssert>,
+        certs: Vec<RestoredCert>,
+        dirtied: Vec<(DiceKey, InvalidationSourcePriority)>,
+        mints: Vec<(DiceKey, Revision)>,
+    ) -> RestoreCounts {
+        let mut counts = RestoreCounts::default();
+        let mut changes = Vec::with_capacity(asserts.len());
+        let policy = self.page_out_policy;
+        for a in asserts {
+            self.with_values(a.key, |kv| {
+                assert!(
+                    kv.entries.is_empty(),
+                    "{:?} holds values before its restore",
+                    a.key
+                );
+                kv.injected = a.injected;
+                let entry = if a.injected {
+                    PagableValue::NonPageable(a.value)
+                } else {
+                    let mut entry = PagableValue::PagedOut(a.row);
+                    entry.make_resident(a.value, policy);
+                    entry
+                };
+                kv.insert(a.revision, entry);
+            });
+            changes.push(Change::Assert {
+                key: a.key,
+                revision: a.revision,
+                data: a.priority,
+            });
+            counts.asserted += 1;
+        }
+        self.core.commit(branch, changes);
+        let mut installed = Vec::with_capacity(certs.len());
+        for c in certs {
+            let RestoredCert {
+                key,
+                revision,
+                deps,
+                value,
+            } = c;
+            self.with_values(key, |kv| {
+                assert!(
+                    kv.entry(revision).is_none(),
+                    "{key:?} holds {revision:?} before its restore"
+                );
+                let entry = match value {
+                    MaybeResident::Resident(value) => PagableValue::NonPageable(value),
+                    MaybeResident::PagedOut(data_key) => PagableValue::PagedOut(data_key),
+                };
+                kv.insert(revision, entry);
+            });
+            let cert = Arc::new(Cert::new(key, revision, deps, EpsilonToken::INITIAL));
+            let outcome = self.core.write(cert, TrackedInvalidationPaths::clean());
+            if outcome.installed_anywhere() {
+                installed.push((key, revision));
+            } else {
+                let core = &self.core;
+                Self::with_values_of(&mut self.values, &mut self.index, policy, key, |kv| {
+                    kv.entries.retain(|(r, _)| core.is_referenced(key, *r));
+                });
+                counts.dropped += 1;
+            }
+        }
+        if !dirtied.is_empty() {
+            self.core.commit(
+                branch,
+                dirtied
+                    .into_iter()
+                    .map(|(key, data)| Change::Dirty { key, data }),
+            );
+        }
+        let head = self.core.head(branch);
+        for (key, revision) in installed {
+            if self.core.lookup(key, head).valid_revision() == Some(revision) {
+                counts.certified += 1;
+            } else {
+                counts.candidates += 1;
+            }
+        }
+        for (key, next) in mints {
+            self.with_values(key, |kv| kv.mint.advance_to(next));
+        }
+        counts
     }
 
     /// Asserts, by full scan, that the paging index matches the values, that the core's own

@@ -14,12 +14,15 @@ use pagable::DataKey;
 use crate::api::key::InvalidationSourcePriority;
 use crate::api::storage_type::StorageType;
 use crate::core::graph::ComputedValueUpdate;
+use crate::core::graph::HeadEntry;
+use crate::core::graph::RestoreCounts;
 use crate::core::graph::VersionedGraph;
 use crate::core::graph::introspection::VersionedGraphIntrospectable;
 use crate::core::graph::revision::EpsilonToken;
 use crate::core::graph::types::Candidate;
 use crate::core::graph::types::VersionedGraphKey;
 use crate::core::graph::types::VersionedGraphResult;
+use crate::core::state::RestoreHead;
 use crate::core::versions::IdleStatus;
 use crate::core::versions::VersionTracker;
 use crate::core::versions::introspection::VersionIntrospectable;
@@ -239,6 +242,24 @@ impl ActorState {
     /// such value is retained any more.
     pub(super) fn rehydrate(&mut self, key: DiceKey, data_key: DataKey, value: DiceValidValue) {
         self.graph.rehydrate(key, data_key, value);
+    }
+
+    /// Every key valid at `v`, for `buck2 suspend`; see [`VersionedGraph::dump_head`].
+    pub(super) fn dump_head(&self, v: VersionNumber) -> Vec<HeadEntry> {
+        self.graph.dump_head(v)
+    }
+
+    /// Replays a suspended head; see [`VersionedGraph::restore_head`].
+    pub(super) fn restore_head(&mut self, restore: RestoreHead) -> RestoreCounts {
+        let RestoreHead {
+            branch,
+            asserts,
+            certs,
+            dirtied,
+            mints,
+        } = restore;
+        self.graph
+            .restore_head(branch, asserts, certs, dirtied, mints)
     }
 
     /// Returns some metrics about the current state of DICE. Don't do expensive things here.

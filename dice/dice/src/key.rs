@@ -74,6 +74,14 @@ impl DiceKeyErased {
         Self::Key(StdArc::new(k))
     }
 
+    /// A projection key read back from a suspended daemon's image.
+    pub(crate) fn projection_from_parts(
+        base: DiceKey,
+        proj: StdArc<dyn DiceProjectionDyn>,
+    ) -> Self {
+        Self::Projection(ProjectionWithBase { base, proj })
+    }
+
     #[allow(unused)] // counterpart of projection to `key`
     pub(crate) fn proj<K: ProjectionKey>(base: DiceKey, k: K) -> Self {
         Self::Projection(ProjectionWithBase {
@@ -281,6 +289,15 @@ impl<'a> CowDiceKeyHashed<'a> {
         let hash = key.hash();
         CowDiceKeyHashed {
             cow: CowDiceKey::Ref(key),
+            hash,
+        }
+    }
+
+    /// An owned key of any kind, read back from a suspended daemon's image.
+    pub(crate) fn erased(key: DiceKeyErased) -> CowDiceKeyHashed<'static> {
+        let hash = key.hash();
+        CowDiceKeyHashed {
+            cow: CowDiceKey::Owned(key),
             hash,
         }
     }
