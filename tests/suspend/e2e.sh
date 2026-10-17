@@ -163,5 +163,43 @@ echo "race: suspend said: $(grep -o 'cannot run beside[^;]*\|a command started w
 step resume-9-after-race "$B" resume
 echo "after-race: $(grep -o '^\(resumed\|cold\)[^;]*' $R/resume-9-after-race.log | head -1)" | tee -a $R/summary.tsv
 
+# 10. the host identity (`buck2_hydration.host_identity`, by default the hostname). Another
+#     hostname is made with a user and UTS namespace: root in an outer one sets the hostname, and
+#     an inner one maps the caller's uid and gid back, so the user check still passes.
+other_host() { # cmd... run under hostname e2e-other-host, same uid and gid
+  unshare --user --map-root-user --uts sh -c \
+    'uid=$0; gid=$1; shift; hostname e2e-other-host &&
+       exec unshare --user --map-user="$uid" --map-group="$gid" "$@"' \
+    "$(id -u)" "$(id -g)" "$@"
+}
+if other_host true 2> "$R/unshare-probe.log"; then
+  # 10a. default identity: another hostname refuses, naming the identity.
+  "$B" kill > /dev/null 2>&1
+  "$B" build //:g39 > /dev/null 2>&1
+  step suspend-10a "$B" suspend
+  step other-host-default-identity-resume other_host "$B" resume --require
+  "$B" kill > /dev/null 2>&1
+  # 10b. a configured identity: another hostname with the same identity resumes, and builds
+  #      nothing.
+  sed -i 's/^suspend = true$/suspend = true\nhost_identity = e2e-identity-a/' .buckconfig
+  "$B" build //:g39 > /dev/null 2>&1
+  step suspend-10b "$B" suspend
+  step other-host-same-identity-resume other_host "$B" resume --require
+  step other-host-same-identity-build "$B" build //:g39
+  echo "other-host-same-identity-build what-ran=$("$B" log what-ran "$(evlog)" 2>/dev/null | grep -vc '^$')" | tee -a $R/summary.tsv
+  "$B" kill > /dev/null 2>&1
+  # 10c. another identity refuses, naming it, even on the same host.
+  "$B" build //:g39 > /dev/null 2>&1
+  step suspend-10c "$B" suspend
+  sed -i 's/^host_identity = e2e-identity-a$/host_identity = e2e-identity-b/' .buckconfig
+  step other-identity-resume "$B" resume --require
+  sed -i '/^host_identity = /d' .buckconfig
+  for l in other-host-default-identity-resume other-host-same-identity-resume other-identity-resume; do
+    echo "$l: $(grep -o '\(resumed\|cold\)[^;]*' "$R/$l.log" | head -1)" | tee -a $R/summary.tsv
+  done
+else
+  echo "identity scenarios not run: unshare cannot make another hostname ($(head -c 200 "$R/unshare-probe.log"))" | tee -a $R/summary.tsv
+fi
+
 "$B" kill > /dev/null 2>&1
 echo "done $(date -u +%FT%TZ)" | tee -a $R/summary.tsv
