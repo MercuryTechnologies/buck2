@@ -51,7 +51,7 @@ use crate::re::error::RemoteExecutionError;
 /// are known only from here: an output never declared to the new materializer would be skipped
 /// as unknown when something asks for it, and one left inactive would be deleted by
 /// `clean --stale`.
-#[derive(Debug, pagable::Pagable)]
+#[derive(Debug, PartialEq, pagable::Pagable)]
 pub struct SuspendedArtifact {
     pub path: ProjectRelativePathBuf,
     /// The artifacts this one depends on (its symlinks' targets), rooted at the project root.
@@ -59,11 +59,19 @@ pub struct SuspendedArtifact {
     pub state: SuspendedArtifactState,
 }
 
-#[derive(Debug, pagable::Pagable)]
+#[derive(Debug, PartialEq, pagable::Pagable)]
 pub enum SuspendedArtifactState {
-    /// On disk and in the materializer's persisted state, which a restarted materializer loads
-    /// as inactive; the resume marks it active again.
-    Materialized,
+    /// On disk and in the materializer's persisted state. A restarted materializer that loads
+    /// the same `entry` from that state marks it active again. One that does not, because the
+    /// image moved to another machine or the state lost the path, declares it again from `cas`,
+    /// and with no `cas` the artifact is lost and the resume refused.
+    Materialized {
+        entry: ActionDirectoryEntry<ActionSharedDirectory>,
+        /// How to fetch the artifact again from the CAS: the recipe the materializer kept when
+        /// it downloaded it, or the upload of `buck2 suspend --portable` for an artifact
+        /// produced locally.
+        cas: Option<(SuspendedCasOrigin, RemoteExecutorUseCase)>,
+    },
     /// Declared, to be downloaded from the CAS.
     CasDownload {
         entry: ActionDirectoryEntry<ActionSharedDirectory>,
@@ -85,7 +93,7 @@ pub enum SuspendedArtifactState {
 }
 
 /// [`CasDownloadInfoOrigin`] as a suspended daemon records it.
-#[derive(Debug, pagable::Pagable)]
+#[derive(Debug, PartialEq, pagable::Pagable)]
 pub enum SuspendedCasOrigin {
     Execution {
         action_digest: ActionDigest,
@@ -101,7 +109,7 @@ pub enum SuspendedCasOrigin {
 }
 
 /// A [`CopiedArtifact`] as a suspended daemon records it.
-#[derive(Debug, pagable::Pagable)]
+#[derive(Debug, PartialEq, pagable::Pagable)]
 pub struct SuspendedCopy {
     pub src: ProjectRelativePathBuf,
     pub dest: ProjectRelativePathBuf,
@@ -112,13 +120,25 @@ pub struct SuspendedCopy {
 /// What a resume did with a suspended daemon's artifacts.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct ResumedArtifacts {
-    /// Materialized artifacts marked active again.
+    /// Materialized artifacts whose entry the persisted state still had, marked active again.
     pub reactivated: usize,
     /// Declared artifacts declared again.
     pub redeclared: usize,
-    /// Materialized artifacts the persisted state no longer had: their content cannot be
-    /// trusted, so the resume is refused.
+    /// Materialized artifacts this disk does not have with the same entry, declared again to
+    /// be downloaded from the CAS.
+    pub refetch: usize,
+    /// Materialized artifacts this disk does not have with the same entry and that have no CAS
+    /// recipe: nothing can bring their content back, so the resume is refused.
     pub lost: usize,
+}
+
+impl std::ops::AddAssign for ResumedArtifacts {
+    fn add_assign(&mut self, other: Self) {
+        self.reactivated += other.reactivated;
+        self.redeclared += other.redeclared;
+        self.refetch += other.refetch;
+        self.lost += other.lost;
+    }
 }
 
 impl CasDownloadInfo {

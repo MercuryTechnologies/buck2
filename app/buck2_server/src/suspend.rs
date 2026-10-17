@@ -60,7 +60,8 @@ const MANIFEST: &str = "MANIFEST";
 const MANIFEST_CONSUMED: &str = "MANIFEST.consumed";
 const IMAGE: &str = "image.bin";
 const MAGIC: &str = "BUCK2SUS";
-/// Bumped on any change to [`Manifest`] or [`ImageFile`]. 2: the host identity.
+/// Bumped on any change to [`Manifest`] or [`ImageFile`], or to what their rows hold. 2: the host
+/// identity, the snapshot's digests and the artifacts' CAS recipes.
 const FORMAT: u32 = 2;
 /// How far the clock may be behind the suspend's and still resume: two runners' clocks are never
 /// exactly in step. Nothing a resume trusts compares a time across the step except ctime on the
@@ -432,14 +433,15 @@ impl ResumeOutcome {
             } => {
                 let mut out = format!(
                     "resumed: {} keys, {} asserted, {} valid, {} candidates, {} not installed; \
-                     artifacts: {} reactivated, {} declared again",
+                     artifacts: {} reactivated, {} declared again, {} to fetch from the CAS",
                     stats.keys,
                     stats.asserted,
                     stats.certified,
                     stats.candidates,
                     stats.dropped,
                     artifacts.reactivated,
-                    artifacts.redeclared
+                    artifacts.redeclared,
+                    artifacts.refetch
                 );
                 for (step, d) in timings {
                     out.push_str(&format!("; {step} {:.3}s", d.as_secs_f64()));
@@ -646,7 +648,8 @@ impl LoadedImage {
         timings.push(("materializer", t.elapsed()));
         if resumed.lost > 0 {
             return Err(format!(
-                "{} materialized artifacts are no longer in the materializer's state",
+                "the image is not portable: {} materialized artifacts are not on this disk \
+                 and have no CAS recipe",
                 resumed.lost
             ));
         }

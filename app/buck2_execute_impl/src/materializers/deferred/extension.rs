@@ -59,11 +59,13 @@ use crate::materializers::deferred::MaterializerCommand;
 use crate::materializers::deferred::ProcessingFuture;
 use crate::materializers::deferred::WriteFile;
 use crate::materializers::deferred::artifact_tree::ArtifactTree;
+use crate::materializers::deferred::artifact_tree::artifact_metadata_matches_entry;
 use crate::materializers::deferred::artifact_tree::artifact_metadata_size;
 use crate::materializers::deferred::clean_stale::CleanScratchExtensionCommand;
 use crate::materializers::deferred::clean_stale::CleanStaleArtifactsCommand;
 use crate::materializers::deferred::clean_stale::CleanStaleArtifactsExtensionCommand;
 use crate::materializers::deferred::clean_stale::CleanStaleArtifactsExtensionCommandKind;
+use crate::materializers::deferred::command_processor::ResumeDiskProbe;
 use crate::materializers::deferred::io_handler::IoHandler;
 use crate::materializers::deferred::io_handler::create_ttl_refresh;
 
@@ -401,9 +403,22 @@ fn suspend_artifacts<T: IoHandler>(
         let path = ProjectRelativePathBuf::from(path);
         let state = match &data.stage {
             ArtifactMaterializationStage::Materialized { active: false, .. } => continue,
-            ArtifactMaterializationStage::Materialized { active: true, .. } => {
-                SuspendedArtifactState::Materialized
-            }
+            ArtifactMaterializationStage::Materialized {
+                active: true,
+                metadata,
+                rematerialization_method,
+                ..
+            } => SuspendedArtifactState::Materialized {
+                entry: metadata.dupe(),
+                cas: rematerialization_method.as_ref().and_then(|m| {
+                    match m.materialization_method().as_ref() {
+                        ArtifactMaterializationMethod::CasDownload { info } => {
+                            Some(info.to_suspended())
+                        }
+                        _ => None,
+                    }
+                }),
+            },
             ArtifactMaterializationStage::Declared { entry, method } => match method.as_ref() {
                 ArtifactMaterializationMethod::CasDownload { info } => {
                     let (origin, re_use_case) = info.to_suspended();
@@ -474,33 +489,50 @@ fn resume_artifacts<T: IoHandler>(
 ) -> buck2_error::Result<ResumedArtifacts> {
     let dispatcher = EventDispatcher::null();
     let mut resumed = ResumedArtifacts::default();
+    let mut probe = ResumeDiskProbe::default();
     for SuspendedArtifact { path, deps, state } in artifacts {
         let (entry, method) = match state {
-            SuspendedArtifactState::Materialized => {
+            SuspendedArtifactState::Materialized { entry, cas } => {
+                // The persisted state vouches for what is on disk: the artifact is still there
+                // only if the state has this very entry at this path.
                 let mut path_iter = path.iter();
-                match processor.tree.prefix_get_mut(&mut path_iter) {
-                    Some(data) if path_iter.next().is_none() => match &mut data.stage {
-                        ArtifactMaterializationStage::Materialized { active, .. } => {
-                            *active = true;
-                            data.deps = deps;
-                            resumed.reactivated += 1;
-                        }
-                        ArtifactMaterializationStage::Declared { .. } => resumed.lost += 1,
-                    },
-                    _ => resumed.lost += 1,
+                if let Some(data) = processor.tree.prefix_get_mut(&mut path_iter)
+                    && path_iter.next().is_none()
+                    && let ArtifactMaterializationStage::Materialized {
+                        active, metadata, ..
+                    } = &mut data.stage
+                    && artifact_metadata_matches_entry(metadata, &entry)
+                {
+                    *active = true;
+                    data.deps = deps;
+                    resumed.reactivated += 1;
+                    continue;
                 }
-                continue;
+                let Some((origin, re_use_case)) = cas else {
+                    resumed.lost += 1;
+                    continue;
+                };
+                resumed.refetch += 1;
+                (
+                    entry,
+                    ArtifactMaterializationMethod::CasDownload {
+                        info: Arc::new(CasDownloadInfo::from_suspended(&origin, re_use_case)?),
+                    },
+                )
             }
             SuspendedArtifactState::CasDownload {
                 entry,
                 origin,
                 re_use_case,
-            } => (
-                entry,
-                ArtifactMaterializationMethod::CasDownload {
-                    info: Arc::new(CasDownloadInfo::from_suspended(&origin, re_use_case)?),
-                },
-            ),
+            } => {
+                resumed.redeclared += 1;
+                (
+                    entry,
+                    ArtifactMaterializationMethod::CasDownload {
+                        info: Arc::new(CasDownloadInfo::from_suspended(&origin, re_use_case)?),
+                    },
+                )
+            }
             SuspendedArtifactState::LocalCopy { entry, srcs } => {
                 let copied: Vec<CopiedArtifact> = srcs
                     .into_iter()
@@ -512,6 +544,7 @@ fn resume_artifacts<T: IoHandler>(
                     })
                     .collect();
                 let tree = crate::materializers::deferred::copy_srcs_tree(&path, &copied)?;
+                resumed.redeclared += 1;
                 (
                     entry,
                     ArtifactMaterializationMethod::LocalCopy(tree, copied),
@@ -522,22 +555,25 @@ fn resume_artifacts<T: IoHandler>(
                 compressed,
                 decompressed_size,
                 is_executable,
-            } => (
-                entry,
-                ArtifactMaterializationMethod::Write(Arc::new(WriteFile {
-                    compressed_data: compressed.into_boxed_slice(),
-                    decompressed_size: decompressed_size as usize,
-                    is_executable,
-                })),
-            ),
+            } => {
+                resumed.redeclared += 1;
+                (
+                    entry,
+                    ArtifactMaterializationMethod::Write(Arc::new(WriteFile {
+                        compressed_data: compressed.into_boxed_slice(),
+                        decompressed_size: decompressed_size as usize,
+                        is_executable,
+                    })),
+                )
+            }
         };
-        processor.declare(
+        processor.declare_for_resume(
             &path,
             ArtifactValue::new(entry, deps),
             Box::new(method),
             &dispatcher,
+            &mut probe,
         );
-        resumed.redeclared += 1;
     }
     Ok(resumed)
 }
