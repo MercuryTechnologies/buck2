@@ -41,6 +41,10 @@ pub struct ManifestHead {
     /// The blake3 of the daemon binary that wrote the image.
     pub exe: String,
     pub created_at_ms: u64,
+    /// Written by `buck2 suspend --portable`: every artifact has a CAS recipe, and the image
+    /// lists the actions that ran locally, for the resumed daemon to run again.
+    #[serde(default)]
+    pub portable: bool,
 }
 
 impl ManifestHead {

@@ -97,6 +97,29 @@ const PER_RUN_ENV: &[&str] = &[
     "WINDOWID",
 ];
 
+/// The per-run variables of a shell or an invocation rather than of a CI job: they change on every
+/// command, and no action is expected to read them. Every other variable the environment check
+/// leaves out (`GITHUB_*`, `HOSTNAME`, `suspend_env_ignore`'s list) is digested on its own, and a
+/// resume whose digest differs runs again every action that ran locally, since those inherit the
+/// daemon's environment. Credentials are in neither digest.
+const SESSION_ENV: &[&str] = &[
+    "_",
+    "BUCK2_DAEMON_UUID",
+    "BUCK_WRAPPER_START_TIME_MS",
+    "BUCK_WRAPPER_UUID",
+    "BUILDBUDDY_INVOCATION_ID",
+    "COLUMNS",
+    "INVOCATION_ID",
+    "LINES",
+    "OLDPWD",
+    "PWD",
+    "SHLVL",
+    "SSH_*",
+    "TERM",
+    "TMUX*",
+    "WINDOWID",
+];
+
 /// Credentials, left out of the environment digest and of the per-variable digests, because an
 /// image may be uploaded and shared and a digest of a secret should not travel with it, and
 /// because a PR runner holds its own credential rather than main's. Nothing a daemon computes may
@@ -139,6 +162,9 @@ fn ignored(name: &str, extra: &[String]) -> bool {
 struct EnvDigest {
     digest: String,
     vars: BTreeMap<String, String>,
+    /// The digest of the variables left out of `digest` that a local action might read: neither
+    /// a credential nor in [`SESSION_ENV`].
+    run: String,
 }
 
 fn env_digest(extra_ignored: &[String]) -> EnvDigest {
@@ -157,23 +183,33 @@ fn env_digest_of(
     vars: impl IntoIterator<Item = (String, String)>,
     extra_ignored: &[String],
 ) -> EnvDigest {
-    let mut vars: Vec<(String, String)> = vars
-        .into_iter()
-        .filter(|(k, _)| !ignored(k, extra_ignored))
-        .collect();
+    let mut vars: Vec<(String, String)> = vars.into_iter().collect();
     vars.sort();
     let mut hasher = blake3::Hasher::new();
+    let mut run = blake3::Hasher::new();
     let mut by_name = BTreeMap::new();
     for (k, v) in &vars {
-        hasher.update(k.as_bytes());
-        hasher.update(&[0]);
-        hasher.update(v.as_bytes());
-        hasher.update(&[0]);
-        by_name.insert(k.clone(), blake3_hex(v.as_bytes())[..16].to_owned());
+        let target = if !ignored(k, extra_ignored) {
+            by_name.insert(k.clone(), blake3_hex(v.as_bytes())[..16].to_owned());
+            &mut hasher
+        } else if CREDENTIAL_ENV
+            .iter()
+            .chain(SESSION_ENV)
+            .any(|p| env_pattern_matches(p, k))
+        {
+            continue;
+        } else {
+            &mut run
+        };
+        target.update(k.as_bytes());
+        target.update(&[0]);
+        target.update(v.as_bytes());
+        target.update(&[0]);
     }
     EnvDigest {
         digest: hasher.finalize().to_hex().to_string(),
         vars: by_name,
+        run: run.finalize().to_hex().to_string(),
     }
 }
 
@@ -314,6 +350,11 @@ pub(crate) enum Refusal {
     },
     NoPagingStore,
     ImageCorrupt(String),
+    /// Materialized artifacts that are neither on this disk with the suspended entry nor
+    /// available from the CAS.
+    NotPortable {
+        lost: usize,
+    },
 }
 
 impl fmt::Display for Refusal {
@@ -346,6 +387,11 @@ impl fmt::Display for Refusal {
             ),
             Refusal::NoPagingStore => write!(f, "the paging store is missing"),
             Refusal::ImageCorrupt(detail) => write!(f, "the image is corrupt: {detail}"),
+            Refusal::NotPortable { lost } => write!(
+                f,
+                "the image is not portable: {lost} materialized artifacts are not on this disk \
+                 and have no CAS recipe (suspend with `--portable` to upload them)"
+            ),
         }
     }
 }
@@ -392,14 +438,18 @@ struct Manifest {
     dice_state_bytes: u64,
     /// Written by `buck2 suspend --portable`: every materialized artifact has a CAS recipe.
     portable: bool,
+    /// [`EnvDigest::run`]: the per-run variables the environment check leaves out.
+    run_env: String,
 }
 
 impl Manifest {
     /// Whether a daemon resuming this image runs again every action the suspended daemon ran
     /// on its own machine: those read the daemon's environment and machine, which a portable
-    /// image or another host does not promise to match.
-    fn dirties_local_actions(&self, hostname_now: &str) -> bool {
-        self.portable || self.hostname != hostname_now
+    /// image, another host, or other values of the per-run variables the environment check
+    /// leaves out do not promise to match. Leaving those variables out of the check is sound
+    /// only because of this.
+    fn dirties_local_actions(&self, hostname_now: &str, run_env_now: &str) -> bool {
+        self.portable || self.hostname != hostname_now || self.run_env != run_env_now
     }
 }
 
@@ -607,7 +657,11 @@ fn check(
     // machine is never comparable with this one's.
     let hostname = buck2_events::metadata::hostname().unwrap_or_default();
     let cross_host = m.hostname != hostname;
-    Ok((image, cross_host, m.dirties_local_actions(&hostname)))
+    Ok((
+        image,
+        cross_host,
+        m.dirties_local_actions(&hostname, &observed.env.run),
+    ))
 }
 
 /// The checks that read the image's files.
@@ -670,11 +724,10 @@ impl LoadedImage {
         }
         timings.push(("materializer", t.elapsed()));
         if resumed.lost > 0 {
-            return Err(format!(
-                "the image is not portable: {} materialized artifacts are not on this disk \
-                 and have no CAS recipe (suspend with `--portable` to upload them)",
-                resumed.lost
-            ));
+            return Err(Refusal::NotPortable {
+                lost: resumed.lost,
+            }
+            .to_string());
         }
         let t = Instant::now();
         let stats = dice
@@ -898,6 +951,7 @@ async fn suspend_inner(
     let EnvDigest {
         digest: env,
         vars: env_vars,
+        run: run_env,
     } = env_digest(&inputs.identity.config.env_ignore);
     let dice_state_bytes = dir_size(&dice_state);
     let manifest = Manifest {
@@ -919,6 +973,7 @@ async fn suspend_inner(
         image: blake3_hex(&bytes),
         dice_state_bytes,
         portable: inputs.portable,
+        run_env,
     };
     let manifest_bytes = serde_json::to_vec_pretty(&manifest)
         .map_err(|e| buck2_error!(ErrorTag::Tier0, "encoding the MANIFEST: {e}"))?;
@@ -1025,6 +1080,7 @@ mod tests {
                 startup_config: self.identity.startup_config.clone(),
                 env: o.env.digest,
                 env_vars: o.env.vars,
+                run_env: o.env.run,
                 root_config: self.identity.root_config.clone(),
                 project_root: self.identity.project_root.clone(),
                 isolation: self.identity.isolation.clone(),
@@ -1458,13 +1514,59 @@ mod tests {
         assert_eq!(back.env_vars, m.env_vars);
         assert_eq!(back.host_identity, "A");
         assert_eq!(back.created_at_ms, m.created_at_ms);
-        assert!(!back.dirties_local_actions("suspend-host"));
-        assert!(back.dirties_local_actions("other"));
+        let run = m.run_env.clone();
+        assert!(!back.dirties_local_actions("suspend-host", &run));
+        assert!(back.dirties_local_actions("other", &run));
         let portable = Manifest {
             portable: true,
             ..back
         };
-        assert!(portable.dirties_local_actions("suspend-host"));
+        assert!(portable.dirties_local_actions("suspend-host", &run));
+    }
+
+    /// The environment check leaves the per-run variables out, which is sound only because a
+    /// resume that sees other values runs every local action again, on the same host too. A
+    /// change of a shell's variables or of a credential does neither.
+    #[test]
+    fn per_run_variables_that_change_dirty_local_actions() {
+        let project = ProjectRootTemp::new().unwrap();
+        let suspended = side(project.path());
+        let manifest = suspended.manifest();
+        let dirties = |name: &str, value: &str| {
+            let mut resuming = side(project.path());
+            set(&mut resuming.env, name, value);
+            let o = resuming.observed();
+            assert_eq!(compare(&manifest, &o), Ok(()), "{name}");
+            manifest.dirties_local_actions("suspend-host", &o.env.run)
+        };
+        assert!(!dirties("PATH", "/bin"));
+        for (name, value) in [
+            ("GITHUB_SHA", "bbb"),
+            ("RUNNER_NAME", "runner-2"),
+            ("HOSTNAME", "runner-2"),
+            ("GIT_COMMIT", "bbb"),
+            ("ACTIONS_ID_TOKEN_REQUEST_URL", "https://a/2"),
+            ("ImageVersion", "20261002.1"),
+        ] {
+            assert!(dirties(name, value), "{name}");
+        }
+        for (name, value) in [
+            ("TERM", "dumb"),
+            ("PWD", "/elsewhere"),
+            ("BUILDBUDDY_API_KEY", "pr-key"),
+            ("FOO_TOKEN", "t2"),
+        ] {
+            assert!(!dirties(name, value), "{name}");
+        }
+    }
+
+    #[test]
+    fn a_lost_artifact_refuses_as_not_portable() {
+        let text = Refusal::NotPortable { lost: 2 }.to_string();
+        assert!(
+            text.starts_with("the image is not portable: 2 materialized artifacts"),
+            "{text}"
+        );
     }
 
     /// The dirtying a resume applies to locally executed actions: the dirtied key computes

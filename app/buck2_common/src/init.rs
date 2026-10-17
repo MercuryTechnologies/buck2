@@ -585,8 +585,8 @@ pub struct SuspendConfig {
 /// The variables a CI runner sets differently on every run of one job, beyond those the daemon
 /// always ignores (`GITHUB_*`, `RUNNER_*` and the like): the default of
 /// `buck2_hydration.suspend_env_ignore`. Leaving them out is sound only because the actions that
-/// inherit the daemon's environment, the local ones, are not trusted across a move between
-/// machines.
+/// inherit the daemon's environment, the local ones, run again on a resume that sees other values
+/// for them, or another host, or a portable image.
 pub const DEFAULT_SUSPEND_ENV_IGNORE: &[&str] = &[
     "ACTIONS_*",
     "GIT_BASE_BRANCH",
