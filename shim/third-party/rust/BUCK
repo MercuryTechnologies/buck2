@@ -26,6 +26,20 @@ git_fetch(
 )
 
 git_fetch(
+    name = "grpc-rust-300f37145319b96d.git",
+    repo = "https://github.com/MercuryTechnologies/grpc-rust.git",
+    rev = "07fd98f0b9c1b8d76bcf29f7c04527b26ee62bac",
+    visibility = [],
+)
+
+git_fetch(
+    name = "hyper-325facbb82c056ec.git",
+    repo = "https://github.com/MercuryTechnologies/hyper.git",
+    rev = "c32cafeea14f28c8f760debb3c8e6b7735077794",
+    visibility = [],
+)
+
+git_fetch(
     name = "opentelemetry-rust-47cac287c081d394.git",
     repo = "https://github.com/MercuryTechnologies/opentelemetry-rust.git",
     rev = "25294f306063813a4432baf91314b92e3efe12cf",
@@ -9930,19 +9944,11 @@ third_party_rust_alias(
     visibility = ["PUBLIC"],
 )
 
-http_archive(
-    name = "hyper-1.11.0.crate",
-    sha256 = "d22053281f852e11534f5198498373cbb59295120a20771d90f7ed1897490a72",
-    strip_prefix = "hyper-1.11.0",
-    urls = ["https://static.crates.io/crates/hyper/1.11.0/download"],
-    visibility = [],
-)
-
 third_party_rust_library(
     name = "hyper-1",
-    srcs = [":hyper-1.11.0.crate"],
+    srcs = [":hyper-325facbb82c056ec.git"],
     crate = "hyper",
-    crate_root = "hyper-1.11.0.crate/src/lib.rs",
+    crate_root = "hyper-325facbb82c056ec/src/lib.rs",
     edition = "2021",
     features = [
         "client",
@@ -27697,29 +27703,21 @@ third_party_rust_alias(
     visibility = ["PUBLIC"],
 )
 
-http_archive(
-    name = "tonic-0.14.6.crate",
-    sha256 = "ac2a5518c70fa84342385732db33fb3f44bc4cc748936eb5833d2df34d6445ef",
-    strip_prefix = "tonic-0.14.6",
-    urls = ["https://static.crates.io/crates/tonic/0.14.6/download"],
-    visibility = [],
-)
-
 third_party_rust_library(
     name = "tonic-0.14",
-    srcs = [":tonic-0.14.6.crate"],
+    srcs = [":grpc-rust-300f37145319b96d.git"],
     crate = "tonic",
-    crate_root = "tonic-0.14.6.crate/src/lib.rs",
+    crate_root = "grpc-rust-300f37145319b96d/tonic/src/lib.rs",
     edition = "2024",
     env = {
         "CARGO_BIN_NAME": "tonic",
         "CARGO_CRATE_NAME": "tonic",
-        "CARGO_MANIFEST_DIR": "tonic-0.14.6.crate",
+        "CARGO_MANIFEST_DIR": "grpc-rust-300f37145319b96d",
         "CARGO_PKG_AUTHORS": "Lucio Franco <luciofranco14@gmail.com>",
         "CARGO_PKG_DESCRIPTION": "A gRPC over HTTP/2 implementation focused on high performance, interoperability, and flexibility.\n",
         "CARGO_PKG_HOMEPAGE": "https://github.com/hyperium/tonic",
         "CARGO_PKG_NAME": "tonic",
-        "CARGO_PKG_README": "README.md",
+        "CARGO_PKG_README": "../README.md",
         "CARGO_PKG_REPOSITORY": "https://github.com/hyperium/tonic",
         "CARGO_PKG_RUST_VERSION": "1.88",
         "CARGO_PKG_VERSION": "0.14.6",
