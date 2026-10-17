@@ -465,3 +465,65 @@ async fn an_input_dirtied_before_the_suspend_cuts_off_after_the_resume() -> anyh
     );
     Ok(())
 }
+
+/// Flips the last byte of every row in every shard of the paging store under `dir`, as damage
+/// to the store while no daemon ran would.
+fn damage_every_row(dir: &std::path::Path) -> anyhow::Result<usize> {
+    let mut damaged = 0;
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        for e in std::fs::read_dir(&d)? {
+            let path = e?.path();
+            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            if path.is_dir() {
+                stack.push(path);
+            } else if name.starts_with("pagable.") && name.ends_with(".db") {
+                let conn = rusqlite::Connection::open(&path)?;
+                let rows: Vec<(i64, Vec<u8>)> = conn
+                    .prepare("SELECT rowid, value FROM pagable_data")?
+                    .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+                    .collect::<Result<_, _>>()?;
+                for (rowid, mut value) in rows {
+                    if let Some(last) = value.last_mut() {
+                        *last ^= 0xff;
+                    }
+                    conn.execute(
+                        "UPDATE pagable_data SET value = ?1 WHERE rowid = ?2",
+                        rusqlite::params![value, rowid],
+                    )?;
+                    damaged += 1;
+                }
+            }
+        }
+    }
+    Ok(damaged)
+}
+
+/// A row written beside the image (the materializer's artifacts, the local actions) reads back
+/// in the next process, and once the store is damaged it fails its read rather than handing back
+/// other data, as do the rows `restore_image` hydrates; `buck2 resume` turns either failure into
+/// a cold start.
+#[tokio::test]
+async fn a_damaged_store_fails_the_reads_of_a_resume() -> anyhow::Result<()> {
+    let dir = tempdir()?;
+    let (dice, root) = open(&dir).await?;
+    inject(&dice, root, &initial_inputs()).await;
+    compute_all(&dice, root, &Computes::default()).await?;
+    let row = dice.write_suspend_row(&vec![1u64, 2, 3])?;
+    let head = dice.head(root).await;
+    let image = dice.suspend_image(head).await?;
+    drop(dice);
+
+    let (resumed, _) = open(&dir).await?;
+    assert_eq!(
+        resumed.read_suspend_row::<Vec<u64>>(row).await?,
+        vec![1, 2, 3]
+    );
+    drop(resumed);
+
+    assert!(damage_every_row(dir.path())? > 0);
+    let (damaged, root) = open(&dir).await?;
+    assert!(damaged.read_suspend_row::<Vec<u64>>(row).await.is_err());
+    assert!(damaged.restore_image(root, &image.bytes).await.is_err());
+    Ok(())
+}
