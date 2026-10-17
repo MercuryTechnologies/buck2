@@ -106,15 +106,32 @@ impl SetLocalActions for DiceData {
 mod tests {
     use super::*;
 
+    /// Every kind, so that moving one between the arms of `ran_here` fails here.
     #[test]
     fn only_kinds_that_ran_here_count() {
         use buck2_data::ActionExecutionKind as K;
-        assert!(LocalActions::ran_here(Some(K::Local)));
-        assert!(LocalActions::ran_here(Some(K::LocalWorker)));
         assert!(LocalActions::ran_here(None));
-        assert!(!LocalActions::ran_here(Some(K::Remote)));
-        assert!(!LocalActions::ran_here(Some(K::ActionCache)));
-        assert!(!LocalActions::ran_here(Some(K::Simple)));
+        for kind in [
+            K::NotSet,
+            K::Local,
+            K::LocalDepFile,
+            K::LocalWorker,
+            K::LocalActionCache,
+        ] {
+            assert!(LocalActions::ran_here(Some(kind)), "{kind:?}");
+        }
+        for kind in [
+            K::Remote,
+            K::ActionCache,
+            K::Simple,
+            K::Deferred,
+            K::RemoteDepFileCache,
+            K::RemoteWorker,
+            K::RemoteServedFromCache,
+            K::RemoteDeduplicated,
+        ] {
+            assert!(!LocalActions::ran_here(Some(kind)), "{kind:?}");
+        }
     }
 
     /// A resumed daemon's set holds the suspended daemon's actions beside its own, so that its
