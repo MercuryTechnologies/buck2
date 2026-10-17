@@ -13,10 +13,37 @@ protoc_distribution(
     version = "21.4",
 )
 
+# protoc 21.4 for Linux links libstdc++ dynamically, so it runs only where
+# the execution image has one. From 23.0 the Linux release binaries are
+# static. A protoc runs on the execution platform ($(exe) in shims.bzl), so
+# the select below sees the execution platform's os and cpu, and a Linux
+# executor runs a static 29.3 whatever host drives the build. The include
+# tree stays 21.4's (google_protobuf): with it, 29.3 writes the same
+# descriptor sets as 21.4 for every buck2 proto, and prost generates Rust
+# from the descriptor sets alone.
+protoc_distribution(
+    name = "distribution-29.3-linux-x86_64",
+    platform = "linux-x86_64",
+    version = "29.3",
+)
+
+protoc_distribution(
+    name = "distribution-29.3-linux-aarch_64",
+    platform = "linux-aarch_64",
+    version = "29.3",
+)
+
 # @lint-ignore BUCKLINT: avoid "Direct usage of native rules is not allowed."
 alias(
     name = "protoc",
-    actual = ":distribution[protoc]",
+    actual = select({
+        "DEFAULT": ":distribution[protoc]",
+        "prelude//os:linux": select({
+            "DEFAULT": ":distribution[protoc]",
+            "prelude//cpu:arm64": ":distribution-29.3-linux-aarch_64[protoc]",
+            "prelude//cpu:x86_64": ":distribution-29.3-linux-x86_64[protoc]",
+        }),
+    }),
     visibility = ["PUBLIC"],
 )
 
