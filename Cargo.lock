@@ -4791,6 +4791,7 @@ dependencies = [
  "pin-project",
  "postcard",
  "ref-cast",
+ "rusqlite",
  "scopeguard",
  "serde",
  "smallvec",
