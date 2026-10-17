@@ -182,6 +182,12 @@ pub trait StreamingCommand: Sized + Send + Sync {
         false
     }
 
+    /// Runs before the client connects to a daemon or starts one, for work that must happen
+    /// while none runs (`buck2 resume --import`).
+    async fn before_connect(&self, _ctx: &ClientCommandContext<'_>) -> buck2_error::Result<()> {
+        Ok(())
+    }
+
     fn trace_io(&self) -> DesiredTraceIoState {
         DesiredTraceIoState::Existing
     }
@@ -237,6 +243,7 @@ impl<T: StreamingCommand> BuckSubcommand for T {
         events_ctx: &mut EventsCtx,
     ) -> ExitResult {
         let work = async {
+            self.before_connect(&ctx).await?;
             let mut connect_options = if T::existing_only() {
                 BuckdConnectOptions::ExistingOnly
             } else {
