@@ -56,6 +56,13 @@ impl LocalActions {
         self.0.insert(key.dupe());
     }
 
+    /// Records the actions a suspended daemon ran on its machine, when this daemon resumes it.
+    pub fn extend(&self, list: &LocalActionList) {
+        for key in list {
+            self.record(key);
+        }
+    }
+
     pub fn contains(&self, key: &ActionKey) -> bool {
         self.0.contains(key)
     }
@@ -108,5 +115,26 @@ mod tests {
         assert!(!LocalActions::ran_here(Some(K::Remote)));
         assert!(!LocalActions::ran_here(Some(K::ActionCache)));
         assert!(!LocalActions::ran_here(Some(K::Simple)));
+    }
+
+    /// A resumed daemon's set holds the suspended daemon's actions beside its own, so that its
+    /// own suspend lists both.
+    #[test]
+    fn extend_keeps_both_daemons_actions() {
+        use buck2_artifact::actions::key::ActionIndex;
+        use buck2_core::deferred::key::DeferredHolderKey;
+
+        let key = |i| {
+            ActionKey::new(
+                DeferredHolderKey::testing_new("cell//pkg:t"),
+                ActionIndex::new(i),
+            )
+        };
+        let local = LocalActions::default();
+        local.record(&key(0));
+        local.extend(&vec![key(1), key(0)]);
+        let mut listed = local.snapshot();
+        listed.sort_by_key(|k| k.action_index().0);
+        assert_eq!(listed, vec![key(0), key(1)]);
     }
 }

@@ -201,5 +201,27 @@ else
   echo "identity scenarios not run: unshare cannot make another hostname ($(head -c 200 "$R/unshare-probe.log"))" | tee -a $R/summary.tsv
 fi
 
+# 11. a chained resume keeps the local actions of the daemon before it: resume on the same host
+#     (nothing dirtied), build nothing, suspend again. The second image must still list the
+#     actions the first daemon ran, so that a resume elsewhere runs them again.
+"$B" kill > /dev/null 2>&1
+sed -i 's/^suspend = true$/suspend = true\nhost_identity = e2e-identity-a/' .buckconfig
+for i in $(seq 0 39); do echo "chain $i" > "src/$i.txt"; done
+touch -d '1 hour ago' src/*.txt
+step chain-build "$B" build //:g39
+step suspend-11a "$B" suspend
+step resume-11a "$B" resume --require
+step chain-resumed-build "$B" build //:g39
+step suspend-11b "$B" suspend
+locals() { grep -o '[0-9]* locally executed actions' "$R/$1.log" | head -1 | cut -d' ' -f1; }
+echo "chain: first image lists $(locals suspend-11a) local actions, the chained one $(locals suspend-11b)" | tee -a $R/summary.tsv
+if other_host true 2> /dev/null; then
+  step other-host-chained-resume other_host "$B" resume --require
+  step other-host-chained-build "$B" build //:g39
+  echo "other-host-chained-resume: $(grep -o '\(resumed\|cold\)[^;]*\|[0-9]* locally executed actions to run again' "$R/other-host-chained-resume.log" | tr '\n' ' ')" | tee -a $R/summary.tsv
+  echo "other-host-chained-build what-ran=$("$B" log what-ran "$(evlog)" 2>/dev/null | grep -vc '^$')" | tee -a $R/summary.tsv
+fi
+sed -i '/^host_identity = /d' .buckconfig
+
 "$B" kill > /dev/null 2>&1
 echo "done $(date -u +%FT%TZ)" | tee -a $R/summary.tsv
