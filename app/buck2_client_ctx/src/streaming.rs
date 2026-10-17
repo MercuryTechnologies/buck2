@@ -193,6 +193,15 @@ pub trait StreamingCommand: Sized + Send + Sync {
         Ok(())
     }
 
+    /// The least time to wait for a daemon this command starts, over the environment's
+    /// timeouts; `None` leaves them as they are.
+    fn daemon_startup_timeout_floor(
+        &self,
+        _ctx: &ClientCommandContext<'_>,
+    ) -> buck2_error::Result<Option<std::time::Duration>> {
+        Ok(None)
+    }
+
     fn trace_io(&self) -> DesiredTraceIoState {
         DesiredTraceIoState::Existing
     }
@@ -269,6 +278,7 @@ impl<T: StreamingCommand> BuckSubcommand for T {
                         ctx.agent_advice(Advice::NewIsolationDir)?
                     },
                     trace_id: ctx.trace_id.dupe(),
+                    startup_timeout_floor: self.daemon_startup_timeout_floor(&ctx)?,
                     #[cfg(all(fbcode_build, target_os = "linux"))]
                     allow_daemon_start_unsandboxed_via_wrapper: ctx
                         .immediate_config

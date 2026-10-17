@@ -310,6 +310,10 @@ pub struct BuckdConnectDaemonOptions {
     /// unsandboxing arbitrary Buck commands or user-provided executables.
     #[cfg(all(fbcode_build, target_os = "linux"))]
     pub(crate) allow_daemon_start_unsandboxed_via_wrapper: bool,
+    /// The least time to give a daemon to start, over `BUCKD_STARTUP_TIMEOUT` and
+    /// `BUCKD_STARTUP_INIT_TIMEOUT`: a daemon that resumes a suspended state restores it before
+    /// it answers, which takes minutes for a large graph.
+    pub(crate) startup_timeout_floor: Option<Duration>,
 }
 
 async fn get_channel(
@@ -484,6 +488,7 @@ impl<'a> BuckdLifecycle<'a> {
                 &daemon_env_vars,
                 &constraints.daemon_startup_config,
                 &daemon_id,
+                options.startup_timeout_floor,
             )
             .await
         } else {
@@ -518,9 +523,10 @@ impl<'a> BuckdLifecycle<'a> {
         daemon_env_vars: &[(&OsStr, OsString)],
         daemon_startup_config: &DaemonStartupConfig,
         daemon_id: &DaemonId,
+        startup_timeout_floor: Option<Duration>,
     ) -> buck2_error::Result<()> {
         let project_dir = self.paths.project_root();
-        let timeout_secs = buckd_startup_timeout()?;
+        let timeout_secs = buckd_startup_timeout()?.max(startup_timeout_floor.unwrap_or_default());
 
         // Create a unique name that we know won't overlap with other buck2 daemons and has enough
         // information to understand at least a little bit about which daemon it is
@@ -826,7 +832,8 @@ async fn establish_connection(
 ) -> buck2_error::Result<BootstrapBuckdClient> {
     // There are many places where `establish_connection_inner` may hang.
     // If it does, better print something to the user instead of hanging quietly forever.
-    let timeout = buckd_startup_init_timeout()?;
+    let timeout =
+        buckd_startup_init_timeout()?.max(options.startup_timeout_floor.unwrap_or_default());
     let deadline = StartupDeadline::duration_from_now(timeout)?;
     deadline
         .down(
