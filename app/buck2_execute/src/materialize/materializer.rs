@@ -41,6 +41,131 @@ use crate::directory::ActionSharedDirectory;
 use crate::execute::action_digest::ActionDigest;
 use crate::re::error::RemoteExecutionError;
 
+/// An artifact the materializer tracks for a running daemon, as `buck2 suspend` records it, so
+/// that the materializer of a daemon resumed from it knows the artifact again.
+///
+/// A resumed daemon's graph holds the values of actions that never run again, and their outputs
+/// are known only from here: an output never declared to the new materializer would be skipped
+/// as unknown when something asks for it, and one left inactive would be deleted by
+/// `clean --stale`.
+#[derive(Debug, pagable::Pagable)]
+pub struct SuspendedArtifact {
+    pub path: ProjectRelativePathBuf,
+    /// The artifacts this one depends on (its symlinks' targets), rooted at the project root.
+    pub deps: Option<ActionSharedDirectory>,
+    pub state: SuspendedArtifactState,
+}
+
+#[derive(Debug, pagable::Pagable)]
+pub enum SuspendedArtifactState {
+    /// On disk and in the materializer's persisted state, which a restarted materializer loads
+    /// as inactive; the resume marks it active again.
+    Materialized,
+    /// Declared, to be downloaded from the CAS.
+    CasDownload {
+        entry: ActionDirectoryEntry<ActionSharedDirectory>,
+        origin: SuspendedCasOrigin,
+        re_use_case: RemoteExecutorUseCase,
+    },
+    /// Declared, to be copied from local paths.
+    LocalCopy {
+        entry: ActionDirectoryEntry<ActionSharedDirectory>,
+        srcs: Vec<SuspendedCopy>,
+    },
+    /// Declared, to be written: the compressed contents the materializer held.
+    Write {
+        entry: ActionDirectoryEntry<ActionSharedDirectory>,
+        compressed: Vec<u8>,
+        decompressed_size: u64,
+        is_executable: bool,
+    },
+}
+
+/// [`CasDownloadInfoOrigin`] as a suspended daemon records it.
+#[derive(Debug, pagable::Pagable)]
+pub enum SuspendedCasOrigin {
+    Execution {
+        action_digest: ActionDigest,
+        /// Seconds and nanoseconds since the epoch.
+        action_instant: (i64, i32),
+        ttl_seconds: i64,
+    },
+    Declared,
+    Probed,
+    Uploaded,
+    TestArtifact,
+}
+
+/// A [`CopiedArtifact`] as a suspended daemon records it.
+#[derive(Debug, pagable::Pagable)]
+pub struct SuspendedCopy {
+    pub src: ProjectRelativePathBuf,
+    pub dest: ProjectRelativePathBuf,
+    pub dest_entry: ActionDirectoryEntry<ActionSharedDirectory>,
+    pub executable_bit_override: Option<bool>,
+}
+
+/// What a resume did with a suspended daemon's artifacts.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct ResumedArtifacts {
+    /// Materialized artifacts marked active again.
+    pub reactivated: usize,
+    /// Declared artifacts declared again.
+    pub redeclared: usize,
+    /// Materialized artifacts the persisted state no longer had: their content cannot be
+    /// trusted, so the resume is refused.
+    pub lost: usize,
+}
+
+impl CasDownloadInfo {
+    /// How `buck2 suspend` records this.
+    pub fn to_suspended(&self) -> (SuspendedCasOrigin, RemoteExecutorUseCase) {
+        let origin = match &self.origin {
+            CasDownloadInfoOrigin::Execution(e) => SuspendedCasOrigin::Execution {
+                action_digest: e.action_digest.dupe(),
+                action_instant: (
+                    e.action_instant.as_second(),
+                    e.action_instant.subsec_nanosecond(),
+                ),
+                ttl_seconds: e.ttl.as_secs(),
+            },
+            CasDownloadInfoOrigin::Declared => SuspendedCasOrigin::Declared,
+            CasDownloadInfoOrigin::Probed => SuspendedCasOrigin::Probed,
+            CasDownloadInfoOrigin::Uploaded => SuspendedCasOrigin::Uploaded,
+            CasDownloadInfoOrigin::TestArtifact => SuspendedCasOrigin::TestArtifact,
+        };
+        (origin, self.re_use_case)
+    }
+
+    /// The info a suspended daemon recorded with [`Self::to_suspended`].
+    pub fn from_suspended(
+        origin: &SuspendedCasOrigin,
+        re_use_case: RemoteExecutorUseCase,
+    ) -> buck2_error::Result<Self> {
+        let origin = match origin {
+            SuspendedCasOrigin::Execution {
+                action_digest,
+                action_instant,
+                ttl_seconds,
+            } => CasDownloadInfoOrigin::Execution(ActionExecutionOrigin {
+                action_digest: action_digest.dupe(),
+                action_instant: Timestamp::new(action_instant.0, action_instant.1).map_err(
+                    |e| buck2_error::buck2_error!(ErrorTag::Tier0, "suspended action time: {e}"),
+                )?,
+                ttl: SignedDuration::from_secs(*ttl_seconds),
+            }),
+            SuspendedCasOrigin::Declared => CasDownloadInfoOrigin::Declared,
+            SuspendedCasOrigin::Probed => CasDownloadInfoOrigin::Probed,
+            SuspendedCasOrigin::Uploaded => CasDownloadInfoOrigin::Uploaded,
+            SuspendedCasOrigin::TestArtifact => CasDownloadInfoOrigin::TestArtifact,
+        };
+        Ok(Self {
+            origin,
+            re_use_case,
+        })
+    }
+}
+
 pub struct WriteRequest {
     pub path: ProjectRelativePathBuf,
     pub content: Vec<u8>,
@@ -394,6 +519,28 @@ pub trait Materializer: Allocative + Send + Sync + 'static {
         &self,
         artifacts: Vec<(ProjectRelativePathBuf, ArtifactValue)>,
     ) -> buck2_error::Result<DeclareMatchOutcome>;
+
+    /// The materializer's part of `buck2 suspend`: every artifact the running daemon declared,
+    /// materialized or not. Called with no command running.
+    async fn suspend_artifacts(&self) -> buck2_error::Result<Vec<SuspendedArtifact>> {
+        Err(buck2_error::buck2_error!(
+            ErrorTag::Input,
+            "`buck2 suspend` supports the deferred materializer with \
+             `buck2.sqlite_materializer_state = true` only"
+        ))
+    }
+
+    /// Declares again, or marks active again, what [`Materializer::suspend_artifacts`] returned
+    /// in the suspended daemon. Called at startup, before any command.
+    async fn resume_artifacts(
+        &self,
+        _artifacts: Vec<SuspendedArtifact>,
+    ) -> buck2_error::Result<ResumedArtifacts> {
+        Err(buck2_error::buck2_error!(
+            ErrorTag::Input,
+            "this materializer cannot resume a suspended daemon's artifacts"
+        ))
+    }
 
     /// Ask the materializer if there is a "tracked" artifact at the given path.
     ///

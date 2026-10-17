@@ -22,14 +22,22 @@ use allocative::ident_key;
 use buck2_core::fs::project_rel_path::ProjectRelativePathBuf;
 use buck2_data::clean_stale_result::PolicyMode;
 use buck2_data::clean_stale_result::Trigger;
+use buck2_directory::directory::immutable_directory::ImmutableDirectory;
 use buck2_error::BuckErrorContext;
 use buck2_events::dispatch::EventDispatcher;
 use buck2_events::dispatch::get_dispatcher;
 use buck2_events::dispatch::get_dispatcher_opt;
+use buck2_execute::artifact_value::ArtifactValue;
+use buck2_execute::materialize::materializer::CasDownloadInfo;
 use buck2_execute::materialize::materializer::CleanStaleArtifactsArgs;
 use buck2_execute::materialize::materializer::CleanStaleArtifactsPolicy;
+use buck2_execute::materialize::materializer::CopiedArtifact;
 use buck2_execute::materialize::materializer::MaterializerEntry;
 use buck2_execute::materialize::materializer::MaterializerIterItem;
+use buck2_execute::materialize::materializer::ResumedArtifacts;
+use buck2_execute::materialize::materializer::SuspendedArtifact;
+use buck2_execute::materialize::materializer::SuspendedArtifactState;
+use buck2_execute::materialize::materializer::SuspendedCopy;
 use buck2_fs::error::IoResultExt;
 use buck2_fs::fs_util;
 use buck2_fs::paths::abs_path::AbsPath;
@@ -52,6 +60,7 @@ use crate::materializers::deferred::DeferredMaterializerAccessor;
 use crate::materializers::deferred::DeferredMaterializerCommandProcessor;
 use crate::materializers::deferred::MaterializerCommand;
 use crate::materializers::deferred::ProcessingFuture;
+use crate::materializers::deferred::WriteFile;
 use crate::materializers::deferred::artifact_tree::ArtifactTree;
 use crate::materializers::deferred::artifact_tree::artifact_metadata_size;
 use crate::materializers::deferred::clean_stale::CleanScratchExtensionCommand;
@@ -364,7 +373,206 @@ impl<T: IoHandler> ExtensionCommand<T> for FlushAccessTimes {
     }
 }
 
+/// Every artifact the running daemon declared, for `buck2 suspend`.
+#[derive(Derivative)]
+#[derivative(Debug)]
+struct SuspendArtifacts {
+    #[derivative(Debug = "ignore")]
+    sender: Sender<buck2_error::Result<Vec<SuspendedArtifact>>>,
+}
+
+impl<T: IoHandler> ExtensionCommand<T> for SuspendArtifacts {
+    fn execute(self: Box<Self>, processor: &mut DeferredMaterializerCommandProcessor<T>) {
+        let _ignored = self.sender.send(suspend_artifacts(processor));
+    }
+}
+
+fn suspend_artifacts<T: IoHandler>(
+    processor: &mut DeferredMaterializerCommandProcessor<T>,
+) -> buck2_error::Result<Vec<SuspendedArtifact>> {
+    if processor.sqlite_db.is_none() {
+        return Err(buck2_error::buck2_error!(
+            buck2_error::ErrorTag::Input,
+            "`buck2 suspend` needs `buck2.sqlite_materializer_state = true`: without it a \
+             restarted materializer knows nothing of what is on disk"
+        ));
+    }
+    // What a resumed materializer reads back from sqlite carries the access times as of now.
+    processor.flush_access_times();
+    let mut out = Vec::new();
+    for (path, data) in processor.tree.iter_with_paths() {
+        let path = ProjectRelativePathBuf::from(path);
+        let state = match &data.stage {
+            ArtifactMaterializationStage::Materialized { active: false, .. } => continue,
+            ArtifactMaterializationStage::Materialized { active: true, .. } => {
+                SuspendedArtifactState::Materialized
+            }
+            ArtifactMaterializationStage::Declared { entry, method } => match method.as_ref() {
+                ArtifactMaterializationMethod::CasDownload { info } => {
+                    let (origin, re_use_case) = info.to_suspended();
+                    SuspendedArtifactState::CasDownload {
+                        entry: entry.dupe(),
+                        origin,
+                        re_use_case,
+                    }
+                }
+                ArtifactMaterializationMethod::LocalCopy(_, copied) => {
+                    SuspendedArtifactState::LocalCopy {
+                        entry: entry.dupe(),
+                        srcs: copied
+                            .iter()
+                            .map(|c| SuspendedCopy {
+                                src: c.src.clone(),
+                                dest: c.dest.clone(),
+                                dest_entry: c
+                                    .dest_entry
+                                    .clone()
+                                    .map_dir(|d| d.shared(&*buck2_execute::directory::INTERNER)),
+                                executable_bit_override: c.executable_bit_override,
+                            })
+                            .collect(),
+                    }
+                }
+                ArtifactMaterializationMethod::Write(write) => SuspendedArtifactState::Write {
+                    entry: entry.dupe(),
+                    compressed: write.compressed_data.to_vec(),
+                    decompressed_size: write.decompressed_size as u64,
+                    is_executable: write.is_executable,
+                },
+                #[cfg(test)]
+                ArtifactMaterializationMethod::Test => continue,
+            },
+        };
+        out.push(SuspendedArtifact {
+            path,
+            deps: data.deps.dupe(),
+            state,
+        });
+    }
+    Ok(out)
+}
+
+/// What a suspended daemon's materializer tracked, replayed at startup: materialized artifacts
+/// marked active again, declared ones declared again, through the same `declare` a running
+/// daemon uses, which keeps an artifact already on disk as it is.
+#[derive(Derivative)]
+#[derivative(Debug)]
+struct ResumeArtifacts {
+    #[derivative(Debug = "ignore")]
+    artifacts: Vec<SuspendedArtifact>,
+    #[derivative(Debug = "ignore")]
+    sender: Sender<buck2_error::Result<ResumedArtifacts>>,
+}
+
+impl<T: IoHandler> ExtensionCommand<T> for ResumeArtifacts {
+    fn execute(self: Box<Self>, processor: &mut DeferredMaterializerCommandProcessor<T>) {
+        let result = resume_artifacts(processor, self.artifacts);
+        let _ignored = self.sender.send(result);
+    }
+}
+
+fn resume_artifacts<T: IoHandler>(
+    processor: &mut DeferredMaterializerCommandProcessor<T>,
+    artifacts: Vec<SuspendedArtifact>,
+) -> buck2_error::Result<ResumedArtifacts> {
+    let dispatcher = EventDispatcher::null();
+    let mut resumed = ResumedArtifacts::default();
+    for SuspendedArtifact { path, deps, state } in artifacts {
+        let (entry, method) = match state {
+            SuspendedArtifactState::Materialized => {
+                let mut path_iter = path.iter();
+                match processor.tree.prefix_get_mut(&mut path_iter) {
+                    Some(data) if path_iter.next().is_none() => match &mut data.stage {
+                        ArtifactMaterializationStage::Materialized { active, .. } => {
+                            *active = true;
+                            data.deps = deps;
+                            resumed.reactivated += 1;
+                        }
+                        ArtifactMaterializationStage::Declared { .. } => resumed.lost += 1,
+                    },
+                    _ => resumed.lost += 1,
+                }
+                continue;
+            }
+            SuspendedArtifactState::CasDownload {
+                entry,
+                origin,
+                re_use_case,
+            } => (
+                entry,
+                ArtifactMaterializationMethod::CasDownload {
+                    info: Arc::new(CasDownloadInfo::from_suspended(&origin, re_use_case)?),
+                },
+            ),
+            SuspendedArtifactState::LocalCopy { entry, srcs } => {
+                let copied: Vec<CopiedArtifact> = srcs
+                    .into_iter()
+                    .map(|c| CopiedArtifact {
+                        src: c.src,
+                        dest: c.dest,
+                        dest_entry: c.dest_entry.map_dir(ImmutableDirectory::Shared),
+                        executable_bit_override: c.executable_bit_override,
+                    })
+                    .collect();
+                let tree = crate::materializers::deferred::copy_srcs_tree(&path, &copied)?;
+                (
+                    entry,
+                    ArtifactMaterializationMethod::LocalCopy(tree, copied),
+                )
+            }
+            SuspendedArtifactState::Write {
+                entry,
+                compressed,
+                decompressed_size,
+                is_executable,
+            } => (
+                entry,
+                ArtifactMaterializationMethod::Write(Arc::new(WriteFile {
+                    compressed_data: compressed.into_boxed_slice(),
+                    decompressed_size: decompressed_size as usize,
+                    is_executable,
+                })),
+            ),
+        };
+        processor.declare(
+            &path,
+            ArtifactValue::new(entry, deps),
+            Box::new(method),
+            &dispatcher,
+        );
+        resumed.redeclared += 1;
+    }
+    Ok(resumed)
+}
+
 impl<T: IoHandler> DeferredMaterializerAccessor<T> {
+    pub(super) async fn suspend_artifacts_impl(
+        &self,
+    ) -> buck2_error::Result<Vec<SuspendedArtifact>> {
+        let (sender, receiver) = oneshot::channel();
+        self.command_sender.send(MaterializerCommand::Extension(
+            Box::new(SuspendArtifacts { sender }) as _,
+            get_dispatcher_opt(),
+        ))?;
+        receiver
+            .await
+            .buck_error_context("No response from materializer")?
+    }
+
+    pub(super) async fn resume_artifacts_impl(
+        &self,
+        artifacts: Vec<SuspendedArtifact>,
+    ) -> buck2_error::Result<ResumedArtifacts> {
+        let (sender, receiver) = oneshot::channel();
+        self.command_sender.send(MaterializerCommand::Extension(
+            Box::new(ResumeArtifacts { artifacts, sender }) as _,
+            get_dispatcher_opt(),
+        ))?;
+        receiver
+            .await
+            .buck_error_context("No response from materializer")?
+    }
+
     pub(super) fn iterate_impl(
         &self,
     ) -> buck2_error::Result<BoxStream<'static, MaterializerIterItem>> {

@@ -35,6 +35,7 @@ use buck2_common::file_ops::metadata::FileMetadata;
 use buck2_common::file_ops::metadata::TrackedFileDigest;
 use buck2_common::liveliness_observer::LivelinessGuard;
 use buck2_core::fs::project::ProjectRoot;
+use buck2_core::fs::project_rel_path::ProjectRelativePath;
 use buck2_core::fs::project_rel_path::ProjectRelativePathBuf;
 use buck2_directory::directory::directory::Directory;
 use buck2_directory::directory::directory_iterator::DirectoryIterator;
@@ -68,6 +69,8 @@ use buck2_execute::materialize::materializer::Materializer;
 use buck2_execute::materialize::materializer::MaterializerBackgroundCleanupGuard;
 use buck2_execute::materialize::materializer::MaterializerIterItem;
 use buck2_execute::materialize::materializer::ReadLease;
+use buck2_execute::materialize::materializer::ResumedArtifacts;
+use buck2_execute::materialize::materializer::SuspendedArtifact;
 use buck2_execute::materialize::materializer::WriteLease;
 use buck2_execute::materialize::materializer::WriteRequest;
 use buck2_execute::re::manager::ReConnectionManager;
@@ -503,28 +506,7 @@ impl<T: IoHandler + Allocative> Materializer for DeferredMaterializerAccessor<T>
         value: ArtifactValue,
         srcs: Vec<CopiedArtifact>,
     ) -> buck2_error::Result<()> {
-        // TODO(rafaelc): get rid of this tree; it'd save a lot of memory.
-        let mut srcs_tree = FileTree::new();
-        for copied_artifact in srcs.iter() {
-            let dest = copied_artifact.dest.strip_prefix(&path)?;
-
-            {
-                let mut walk = unordered_entry_walk(
-                    copied_artifact
-                        .dest_entry
-                        .as_ref()
-                        .map_dir(Directory::as_ref),
-                );
-                while let Some((path, entry)) = walk.next() {
-                    if let DirectoryEntry::Leaf(ActionDirectoryMember::File(..)) = entry {
-                        let path = path.get();
-                        let dest_iter = dest.iter().chain(path.iter()).map(|f| f.to_owned());
-                        let src = copied_artifact.src.join(&path);
-                        srcs_tree.insert(dest_iter, src);
-                    }
-                }
-            }
-        }
+        let srcs_tree = copy_srcs_tree(&path, &srcs)?;
         let cmd = MaterializerCommand::Declare(
             DeclareArtifactPayload {
                 path,
@@ -746,6 +728,17 @@ impl<T: IoHandler + Allocative> Materializer for DeferredMaterializerAccessor<T>
 
     fn iterate(&self) -> buck2_error::Result<BoxStream<'static, MaterializerIterItem>> {
         self.iterate_impl()
+    }
+
+    async fn suspend_artifacts(&self) -> buck2_error::Result<Vec<SuspendedArtifact>> {
+        self.suspend_artifacts_impl().await
+    }
+
+    async fn resume_artifacts(
+        &self,
+        artifacts: Vec<SuspendedArtifact>,
+    ) -> buck2_error::Result<ResumedArtifacts> {
+        self.resume_artifacts_impl(artifacts).await
     }
 
     async fn allocative(&self) -> buck2_error::Result<allocative::FlameGraphOutput> {
@@ -1050,6 +1043,33 @@ async fn join_all_existing_futs(
     }
 
     Ok(())
+}
+
+/// The map from each file of a copy to its source that `LocalCopy` materializes from.
+// TODO(rafaelc): get rid of this tree; it'd save a lot of memory.
+pub(crate) fn copy_srcs_tree(
+    path: &ProjectRelativePath,
+    srcs: &[CopiedArtifact],
+) -> buck2_error::Result<FileTree<ProjectRelativePathBuf>> {
+    let mut srcs_tree = FileTree::new();
+    for copied_artifact in srcs.iter() {
+        let dest = copied_artifact.dest.strip_prefix(path)?;
+        let mut walk = unordered_entry_walk(
+            copied_artifact
+                .dest_entry
+                .as_ref()
+                .map_dir(Directory::as_ref),
+        );
+        while let Some((path, entry)) = walk.next() {
+            if let DirectoryEntry::Leaf(ActionDirectoryMember::File(..)) = entry {
+                let path = path.get();
+                let dest_iter = dest.iter().chain(path.iter()).map(|f| f.to_owned());
+                let src = copied_artifact.src.join(&path);
+                srcs_tree.insert(dest_iter, src);
+            }
+        }
+    }
+    Ok(srcs_tree)
 }
 
 #[derive(Allocative, Derivative)]
