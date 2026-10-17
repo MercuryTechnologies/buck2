@@ -663,9 +663,19 @@ mod tests {
         repo.git(&["config", "core.autocrlf", "false"]);
         assert!(repo.delta(&image).usable);
 
+        repo.git(&["config", "core.eol", "crlf"]);
+        assert!(!repo.delta(&image).usable);
+        repo.git(&["config", "--unset", "core.eol"]);
+        assert!(repo.delta(&image).usable);
+
         repo.git(&["update-index", "--skip-worktree", "b"]);
         assert!(!repo.delta(&image).usable);
         repo.git(&["update-index", "--no-skip-worktree", "b"]);
+        assert!(repo.delta(&image).usable);
+
+        repo.git(&["update-index", "--assume-unchanged", "b"]);
+        assert!(!repo.delta(&image).usable);
+        repo.git(&["update-index", "--no-assume-unchanged", "b"]);
         assert!(repo.delta(&image).usable);
 
         // Uncommitted, in the working tree only: `git status` applies it all the same.
@@ -707,5 +717,52 @@ mod tests {
             let scan = repo.scan_git(&image);
             assert_eq!(events(&scan), set(&[("f", M)]), "{setting:?}");
         }
+    }
+
+    /// An attribute the suspended commit set and HEAD no longer does still makes git unusable:
+    /// the files the suspend read were checked out under it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_attribute_of_the_suspended_commit_makes_git_unusable() {
+        let repo = Repo::new();
+        repo.write("a.txt", "a");
+        repo.write(".gitattributes", "*.txt filter=fake\n");
+        repo.commit("A");
+        let image = repo.suspend(&repo.crawler()).await;
+        std::fs::remove_file(repo.dir().join(".gitattributes")).unwrap();
+        repo.commit("B");
+        assert!(!repo.delta(&image).usable);
+    }
+
+    /// A project below the repository's top level: paths are relative to the project, files
+    /// outside it are left out, and a resume whose project sits elsewhere in the repository
+    /// does not use git.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_project_below_the_top_level_names_paths_from_the_project() {
+        let repo = Repo::new();
+        repo.write("outside", "o");
+        repo.write("sub/inside", "i");
+        repo.write("sub/d/f", "f");
+        repo.commit("A");
+        let sub = ProjectRoot::new(AbsNormPathBuf::new(repo.dir().join("sub")).unwrap()).unwrap();
+
+        let tree = suspend_tree(sub.root()).unwrap();
+        assert_eq!(tree.image.toplevel_to_project, "sub/");
+        let blobs: BTreeSet<String> = tree.blobs.keys().map(|p| p.to_string()).collect();
+        assert_eq!(blobs, lines("inside\nd/f"));
+
+        repo.write("sub/inside", "edited");
+        repo.write("outside", "edited");
+        let delta = resume_delta(sub.root(), &tree.image);
+        assert!(delta.usable);
+        let tracked: BTreeSet<String> = delta.tracked.iter().map(|p| p.to_string()).collect();
+        assert_eq!(tracked, lines("inside\nd/f"));
+        let changed: BTreeSet<String> = delta.changed.iter().map(|p| p.to_string()).collect();
+        assert_eq!(changed, lines("inside"));
+
+        let at_top = VcsImage {
+            toplevel_to_project: String::new(),
+            ..tree.image
+        };
+        assert!(!resume_delta(sub.root(), &at_top).usable);
     }
 }
