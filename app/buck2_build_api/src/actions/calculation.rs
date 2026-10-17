@@ -75,6 +75,7 @@ use crate::actions::execute::action_executor::ActionExecutionMetadata;
 use crate::actions::execute::action_executor::ActionOutputs;
 use crate::actions::execute::action_executor::BuckActionExecutor;
 use crate::actions::execute::action_executor::HasActionExecutor;
+use crate::actions::local_actions::LocalActions;
 use crate::actions::rewind::ActionRewindRequest;
 use crate::actions::rewind::HasActionRewindTracker;
 use crate::artifact_groups::ArtifactGroup;
@@ -213,6 +214,16 @@ async fn build_action_no_redirect_impl(
         spans,
         waiting_data: action_execution_data.waiting_data,
     })?;
+
+    if LocalActions::ran_here(
+        action_execution_data
+            .action_result
+            .is_ok()
+            .then_some(execution_metrics.execution_kind),
+    ) && let Some(local) = LocalActions::of(ctx.global_data())
+    {
+        local.record(action.key());
+    }
 
     ctx.action_executed(execution_metrics)?;
 
