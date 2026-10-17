@@ -43,7 +43,10 @@ download_llvm_distribution(
     archive_type = "tar.gz",
     sha256 = "3590e82cd56ff58cdf71732b0fbc3eb8f21d4fc00b8592d1329af522381f08cc",
     target = "linux-amd64-musl",
-    url = "https://github.com/sluongng/buck2/releases/download/v0.202624.0/llvm-toolchain-minimal-22.1.7-linux-amd64-musl.tar.gz",
+    # The same bytes as sluongng/buck2's release v0.202624.0, which repacked
+    # hermeticbuild/hermetic-llvm's llvm-22.1.7-1 as gzip, mirrored to a
+    # release of this fork so the build does not hang on a personal account.
+    url = "https://github.com/MercuryTechnologies/buck2/releases/download/toolchains-llvm-22.1.7-2026-10-17/llvm-toolchain-minimal-22.1.7-linux-amd64-musl.tar.gz",
     visibility = ["lab_buildbuddy//..."],
 )
 
