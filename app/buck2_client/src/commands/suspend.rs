@@ -8,6 +8,8 @@
  * above-listed licenses.
  */
 
+mod bundle;
+
 use std::time::Duration;
 use std::time::Instant;
 
@@ -25,6 +27,7 @@ use buck2_client_ctx::daemon::client::BuckdLifecycleLock;
 use buck2_client_ctx::daemon::client::NoPartialResultHandler;
 use buck2_client_ctx::events_ctx::EventsCtx;
 use buck2_client_ctx::exit_result::ExitResult;
+use buck2_client_ctx::path_arg::PathArg;
 use buck2_client_ctx::startup_deadline::StartupDeadline;
 use buck2_client_ctx::streaming::StreamingCommand;
 use buck2_error::ExitCode;
@@ -60,6 +63,12 @@ pub struct SuspendCommand {
     /// build events, as `buck2 kill --bes-drain-timeout` does.
     #[clap(long, value_name = "DURATION", default_value = "0s")]
     bes_drain_timeout: humantime::Duration,
+
+    /// After the daemon exits, also write its state to this file, one zstd-compressed tar, for
+    /// `buck2 resume --import` to unpack on another checkout at the same path. The state stays
+    /// under buck-out as well.
+    #[clap(long, value_name = "FILE")]
+    export: Option<PathArg>,
 }
 
 #[async_trait(?Send)]
@@ -113,6 +122,28 @@ impl StreamingCommand for SuspendCommand {
             start.elapsed().as_secs_f64(),
             written.as_secs_f64()
         )?;
+
+        // Still under the lifecycle lock, so no daemon starts and consumes the image while it
+        // is read.
+        if let Some(out) = &self.export {
+            let out = out.resolve(&ctx.working_dir);
+            let cache_dir = ctx.paths()?.cache_dir_path();
+            let t = Instant::now();
+            let summary = tokio::task::spawn_blocking({
+                let out = out.clone();
+                move || bundle::export(cache_dir.as_path(), out.as_path())
+            })
+            .await??;
+            buck2_client_ctx::println!(
+                "exported {}: {} files, {} bytes compressed to {} in {:.3}s",
+                out.display(),
+                summary.members,
+                summary.bytes,
+                summary.compressed,
+                t.elapsed().as_secs_f64()
+            )?;
+        }
+        drop(lifecycle_lock);
         ExitResult::success()
     }
 
