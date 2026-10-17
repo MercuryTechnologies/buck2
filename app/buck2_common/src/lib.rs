@@ -53,6 +53,7 @@ pub mod self_test_timeout;
 pub mod settings;
 pub mod sqlite;
 pub mod starlark_profiler;
+pub mod suspend_image;
 pub mod target_aliases;
 pub mod temp_path;
 pub mod tenant;
