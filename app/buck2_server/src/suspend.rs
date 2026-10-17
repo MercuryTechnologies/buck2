@@ -1592,6 +1592,86 @@ mod tests {
         }
     }
 
+    /// [`check`] as a resume runs it, against this process: an image it accepts, and whether
+    /// that image counts as another machine's files and dirties the local actions. The hostname
+    /// is not checked, but it and `portable` decide `cross_host`.
+    #[test]
+    fn check_tells_another_host_and_dirties_local_actions() {
+        use buck2_common::file_ops::baseline::FileSystemBaseline;
+        use buck2_file_watcher::file_watcher::FileWatcherImageKind;
+
+        let project = ProjectRootTemp::new().unwrap();
+        let identity = side(project.path()).identity;
+        let dir = tempfile::tempdir().unwrap();
+        let cache = dir.path();
+        let image_dir = cache.join(IMAGE_DIR);
+        std::fs::create_dir_all(&image_dir).unwrap();
+        std::fs::create_dir_all(cache.join(DICE_STATE_DIR)).unwrap();
+        let file = ImageFile {
+            dice: Vec::new(),
+            artifact_rows: Vec::new(),
+            artifact_count: 0,
+            local_actions: [0; 16],
+            watcher: FileWatcherImage {
+                kind: FileWatcherImageKind::Notify,
+                baseline: FileSystemBaseline::unique().to_image(),
+                snapshot: serde_json::from_str(r#"{"started":[0,0],"entries":[]}"#).unwrap(),
+                vcs: None,
+            },
+        };
+        let bytes = bincode::serde::encode_to_vec(&file, bincode::config::standard()).unwrap();
+        std::fs::write(image_dir.join(IMAGE), &bytes).unwrap();
+        let env = env_digest(&identity.config.env_ignore);
+        let here = buck2_events::metadata::hostname().unwrap_or_default();
+        let manifest = |hostname: &str, portable: bool, run_env: &str| {
+            serde_json::to_vec(&Manifest {
+                magic: MAGIC.to_owned(),
+                format: FORMAT,
+                exe: exe_digest().unwrap(),
+                startup_config: identity.startup_config.clone(),
+                env: env.digest.clone(),
+                env_vars: env.vars.clone(),
+                root_config: identity.root_config.clone(),
+                project_root: identity.project_root.clone(),
+                isolation: identity.isolation.clone(),
+                host_identity: identity.host_identity.clone(),
+                hostname: hostname.to_owned(),
+                uid: uid(),
+                watcher: identity.watcher.clone(),
+                created_at_ms: now_ms(),
+                image_len: bytes.len() as u64,
+                image: blake3_hex(&bytes),
+                dice_state_bytes: 0,
+                portable,
+                run_env: run_env.to_owned(),
+            })
+            .unwrap()
+        };
+        let resume = |manifest: Vec<u8>| -> (bool, bool) {
+            let (_, cross_host, dirty) = check(&manifest, &image_dir, cache, &identity)
+                .unwrap_or_else(|r| panic!("refused: {r}"));
+            (cross_host, dirty)
+        };
+        assert_eq!(resume(manifest(&here, false, &env.run)), (false, false));
+        assert_eq!(resume(manifest(&here, true, &env.run)), (true, true));
+        assert_eq!(resume(manifest(&here, false, "other")), (false, true));
+        let elsewhere = format!("{here}-elsewhere");
+        assert_eq!(resume(manifest(&elsewhere, false, &env.run)), (true, true));
+
+        // An image is resumed once: the start that reads its MANIFEST claims it, and the next
+        // start finds none.
+        std::fs::write(image_dir.join(MANIFEST), manifest(&here, false, &env.run)).unwrap();
+        assert!(matches!(
+            prepare_resume(cache, &identity),
+            ResumePrep::Ready(_)
+        ));
+        assert!(!image_dir.join(MANIFEST).exists());
+        assert!(matches!(prepare_resume(cache, &identity), ResumePrep::None));
+    }
+
+    /// The text of the refusal [`LoadedImage::restore`] returns when the materializer lost
+    /// artifacts; that it is returned is checked end to end, by `tests/suspend/e2e-re.sh`'s
+    /// non-portable image on a fresh checkout.
     #[test]
     fn a_lost_artifact_refuses_as_not_portable() {
         let text = Refusal::NotPortable { lost: 2 }.to_string();
