@@ -957,12 +957,12 @@ async fn deleting_a_branch_releases_its_values_and_strands_its_transactions() ->
     #[derive(Clone, Dupe, Debug, Display, Eq, Hash, PartialEq, Allocative, Pagable)]
     #[display("{:?}", self)]
     #[pagable_typetag(DiceKeyDyn)]
-    struct Counted;
+    struct CountedOnBranch;
 
     static COUNTED_COMPUTES: AtomicUsize = AtomicUsize::new(0);
 
     #[async_trait]
-    impl Key for Counted {
+    impl Key for CountedOnBranch {
         type Value = i32;
 
         async fn compute(
@@ -993,7 +993,7 @@ async fn deleting_a_branch_releases_its_values_and_strands_its_transactions() ->
     let mut updater = dice.updater(branch);
     updater.changed_to(vec![(Foo(0), 2)])?;
     let branch_ctx = updater.commit().await;
-    assert_eq!(*branch_ctx.compute(&Counted).await?, 12);
+    assert_eq!(*branch_ctx.compute(&CountedOnBranch).await?, 12);
     assert_eq!(COUNTED_COMPUTES.load(Ordering::SeqCst), 1);
     assert_eq!(dice.pagable_node_counts().await.resident, 1);
 
@@ -1002,7 +1002,7 @@ async fn deleting_a_branch_releases_its_values_and_strands_its_transactions() ->
 
     // The stranded transaction still answers from its own cache, and computes what it has not
     // seen; neither is kept.
-    assert_eq!(*branch_ctx.compute(&Counted).await?, 12);
+    assert_eq!(*branch_ctx.compute(&CountedOnBranch).await?, 12);
     assert_eq!(COUNTED_COMPUTES.load(Ordering::SeqCst), 1);
     assert_eq!(*branch_ctx.compute(&Foo(0)).await?, 2);
     let stranded = dice.updater(branch);
@@ -1010,7 +1010,7 @@ async fn deleting_a_branch_releases_its_values_and_strands_its_transactions() ->
     assert_eq!(dice.pagable_node_counts().await.resident, 0);
 
     // The branch it was forked from never saw any of it.
-    assert_eq!(*root_ctx.compute(&Counted).await?, 11);
+    assert_eq!(*root_ctx.compute(&CountedOnBranch).await?, 11);
     assert_eq!(COUNTED_COMPUTES.load(Ordering::SeqCst), 2);
     assert_eq!(dice.pagable_node_counts().await.resident, 1);
     Ok(())

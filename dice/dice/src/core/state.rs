@@ -26,8 +26,13 @@ use tokio::sync::oneshot::Sender;
 
 use crate::api::key::InvalidationSourcePriority;
 use crate::api::storage_type::StorageType;
+use crate::core::graph::HeadEntry;
+use crate::core::graph::RestoreCounts;
+use crate::core::graph::RestoredAssert;
+use crate::core::graph::RestoredCert;
 use crate::core::graph::introspection::VersionedGraphIntrospectable;
 use crate::core::graph::revision::EpsilonToken;
+use crate::core::graph::revision::Revision;
 use crate::core::graph::types::Candidate;
 use crate::core::graph::types::VersionedGraphKey;
 use crate::core::graph::types::VersionedGraphResult;
@@ -392,6 +397,24 @@ impl CoreStateHandle {
         })
     }
 
+    /// Every key valid at `v`, with its value or row: what `buck2 suspend` writes.
+    pub(crate) fn dump_head(
+        &self,
+        v: VersionNumber,
+    ) -> impl Future<Output = Vec<HeadEntry>> + use<> {
+        let (resp, recv) = oneshot::channel();
+        self.call(StateRequest::DumpHead { v, resp }, recv)
+    }
+
+    /// Replays a suspended head onto a new root.
+    pub(crate) fn restore_head(
+        &self,
+        restore: RestoreHead,
+    ) -> impl Future<Output = RestoreCounts> + use<> {
+        let (resp, recv) = oneshot::channel();
+        self.call(StateRequest::RestoreHead { restore, resp }, recv)
+    }
+
     /// Collect metrics
     pub(crate) fn metrics(&self) -> Metrics {
         let (resp, recv) = oneshot::channel();
@@ -487,6 +510,15 @@ impl Drop for UnclaimedBranch {
             actor.delete_branch(branch);
         }
     }
+}
+
+/// A suspended head to replay onto `branch`, a new root: see `VersionedGraph::restore_head`.
+pub(crate) struct RestoreHead {
+    pub(crate) branch: BranchId,
+    pub(crate) asserts: Vec<RestoredAssert>,
+    pub(crate) certs: Vec<RestoredCert>,
+    pub(crate) dirtied: Vec<(DiceKey, InvalidationSourcePriority)>,
+    pub(crate) mints: Vec<(DiceKey, Revision)>,
 }
 
 /// Core state is accessed via message passing to a single threaded processor
@@ -598,6 +630,16 @@ pub(super) enum StateRequest {
         key: DiceKey,
         data_key: DataKey,
         value: DiceValidValue,
+    },
+    /// Every key valid at `v`, for `buck2 suspend`.
+    DumpHead {
+        v: VersionNumber,
+        resp: Sender<Vec<HeadEntry>>,
+    },
+    /// Replay a suspended head onto a new root.
+    RestoreHead {
+        restore: RestoreHead,
+        resp: Sender<RestoreCounts>,
     },
     /// Collect metrics
     Metrics { resp: Sender<Metrics> },

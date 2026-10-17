@@ -178,6 +178,12 @@ impl StateProcessor {
             } => {
                 self.state.rehydrate(key, data_key, value);
             }
+            StateRequest::DumpHead { v, resp } => {
+                drop(resp.send(self.state.dump_head(v)));
+            }
+            StateRequest::RestoreHead { restore, resp } => {
+                drop(resp.send(self.state.restore_head(restore)));
+            }
             StateRequest::Metrics { resp } => {
                 let _ignored = resp.send(self.state.metrics());
             }

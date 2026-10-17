@@ -29,6 +29,9 @@ use crate::api::key::NoValueSerialize;
 use crate::api::key::ValueSerialize;
 use crate::api::storage_type::StorageType;
 use crate::core::graph::ComputedValueUpdate;
+use crate::core::graph::RestoreCounts;
+use crate::core::graph::RestoredAssert;
+use crate::core::graph::RestoredCert;
 use crate::core::graph::VersionedGraph;
 use crate::core::graph::revision::EpsilonToken;
 use crate::core::graph::types::Candidate;
@@ -801,4 +804,222 @@ fn introspection_covers_every_live_branch() {
         vec![&(other, key(0))]
     );
     assert!(after.edges.values().all(|deps| deps.is_empty()));
+}
+
+/// The head of `root` at `v` as `buck2 suspend` dumps it, replayed onto a new graph as a resume
+/// does, mapping every key to itself.
+fn replay(graph: &VersionedGraph, v: VersionNumber) -> (VersionedGraph, BranchId, RestoreCounts) {
+    use crate::core::graph::HeadSource;
+    use crate::core::graph::HeadValue;
+
+    let mut asserts = Vec::new();
+    let mut certs = Vec::new();
+    let mut dirtied = Vec::new();
+    let mut mints = Vec::new();
+    for entry in graph.dump_head(v) {
+        mints.push((entry.key, entry.mint));
+        match entry.source {
+            HeadSource::Asserted { priority } => {
+                let HeadValue::Resident(value) = entry.value else {
+                    panic!("an injected value stays resident");
+                };
+                asserts.push(RestoredAssert {
+                    key: entry.key,
+                    revision: entry.revision,
+                    priority,
+                    injected: entry.injected,
+                    value,
+                    row: DataKey::testing_new(1),
+                });
+            }
+            source @ (HeadSource::Certified { .. } | HeadSource::Candidate { .. }) => {
+                let cert = match source {
+                    HeadSource::Certified { cert } => cert,
+                    HeadSource::Candidate {
+                        cert,
+                        dirtied: priority,
+                    } => {
+                        if let Some(priority) = priority {
+                            dirtied.push((entry.key, priority));
+                        }
+                        cert
+                    }
+                    HeadSource::Asserted { .. } => unreachable!(),
+                };
+                let value = match entry.value {
+                    HeadValue::Row(row) => MaybeResident::PagedOut(row),
+                    HeadValue::Resident(value) => MaybeResident::Resident(value),
+                };
+                let deps = cert
+                    .deps
+                    .to_image(|k| Some(k.index))
+                    .expect("every key has an ordinal");
+                certs.push(RestoredCert {
+                    key: entry.key,
+                    revision: entry.revision,
+                    deps: SeriesParallelDeps::from_image(&deps, |o| Some(key(o)))
+                        .expect("ordinals map back"),
+                    value,
+                });
+            }
+        }
+    }
+    let mut restored = VersionedGraph::new();
+    restored.set_page_out_policy(PageOutPolicy::OncePerKey);
+    let root = restored.new_root();
+    let counts = restored.restore_head(root, asserts, certs, dirtied, mints);
+    restored.assert_consistent();
+    (restored, root, counts)
+}
+
+/// A replayed head resolves every key the dumped one did, to the same revision, and a
+/// re-injection of an equal value keeps it.
+#[test]
+fn replayed_head_resolves_like_the_dumped_one() {
+    let (mut graph, root) = with_leaf();
+    let v = graph.head(root);
+    let computed = compute(&mut graph, key(1), v, value(7));
+    page_out(&mut graph, key(1), 5);
+
+    let (mut restored, root2, counts) = replay(&graph, v);
+    assert_eq!(
+        counts,
+        RestoreCounts {
+            asserted: 1,
+            certified: 1,
+            candidates: 0,
+            dropped: 0
+        }
+    );
+    let head = restored.head(root2);
+    let got = restored
+        .get(VersionedGraphKey::new(head, key(1)))
+        .unpack_match()
+        .expect("the certificate resolves on the new root")
+        .revision();
+    assert_eq!(got, computed.revision());
+
+    let again = inject(&mut restored, root2, key(0), 100);
+    assert!(
+        restored
+            .get(VersionedGraphKey::new(again, key(1)))
+            .unpack_match()
+            .is_some(),
+        "re-injecting an equal value keeps every dependent valid"
+    );
+    let changed = inject(&mut restored, root2, key(0), 101);
+    assert!(
+        restored
+            .get(VersionedGraphKey::new(changed, key(1)))
+            .unpack_match()
+            .is_none(),
+        "a changed input invalidates its dependents after a resume as before"
+    );
+}
+
+/// A certificate whose premise the image does not carry covers nothing, and its value is let go.
+#[test]
+fn replay_drops_a_certificate_whose_premise_is_missing() {
+    let (mut graph, root) = with_leaf();
+    let v = graph.head(root);
+    compute(&mut graph, key(1), v, value(7));
+    page_out(&mut graph, key(1), 5);
+
+    use crate::core::graph::HeadSource;
+    use crate::core::graph::HeadValue;
+    let certs: Vec<RestoredCert> = graph
+        .dump_head(v)
+        .into_iter()
+        .filter_map(|e| match (e.source, e.value) {
+            (HeadSource::Certified { cert }, HeadValue::Row(row)) => Some(RestoredCert {
+                key: e.key,
+                revision: e.revision,
+                deps: SeriesParallelDeps::from_image(
+                    &cert.deps.to_image(|k| Some(k.index)).unwrap(),
+                    |o| Some(key(o)),
+                )
+                .unwrap(),
+                value: MaybeResident::PagedOut(row),
+            }),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(certs.len(), 1);
+    let mut restored = VersionedGraph::new();
+    let root2 = restored.new_root();
+    let counts = restored.restore_head(root2, Vec::new(), certs, Vec::new(), Vec::new());
+    restored.assert_consistent();
+    assert_eq!(counts.dropped, 1);
+    assert_eq!(counts.certified, 0);
+    let head = restored.head(root2);
+    assert!(
+        restored
+            .get(VersionedGraphKey::new(head, key(1)))
+            .unpack_match()
+            .is_none()
+    );
+}
+
+/// A key recomputed after a resume never gets a revision its image already named: the paged-out
+/// value behind that revision cannot be compared, so reusing the number would name two values.
+#[test]
+fn replay_keeps_the_mints() {
+    let (mut graph, root) = with_leaf();
+    let v = graph.head(root);
+    let first = compute(&mut graph, key(1), v, value(7));
+    page_out(&mut graph, key(1), 5);
+
+    let (mut restored, root2, _) = replay(&graph, v);
+    let changed = inject(&mut restored, root2, key(0), 101);
+    let recomputed = compute(&mut restored, key(1), changed, value(8));
+    assert_ne!(recomputed.revision(), first.revision());
+}
+
+/// A key the head had dirtied, and a key that read it, come back unknown with their
+/// certificates as candidates: the dirtied key's to compare a recompute against, its
+/// dependent's to re-establish, as on a live daemon.
+#[test]
+fn replay_keeps_candidates_of_a_dirtied_key() {
+    let (mut graph, root) = with_leaf();
+    let v = graph.head(root);
+    let leaf_value = compute(&mut graph, key(1), v, value(7));
+    let deps = SeriesParallelDeps::serial_from_edges(vec![DepEdge::new(
+        key(1),
+        leaf_value.revision().expect("valid"),
+    )]);
+    let epsilon = graph.core.epsilon(key(2), v);
+    graph.update_computed(
+        VersionedGraphKey::new(v, key(2)),
+        ComputedValueUpdate {
+            value: value(8),
+            deps,
+            epsilon,
+        },
+        TrackedInvalidationPaths::clean(),
+    );
+    graph.assert_consistent();
+    page_out(&mut graph, key(1), 5);
+    page_out(&mut graph, key(2), 6);
+    let dirtied = dirty(&mut graph, root, key(1));
+
+    let (restored, root2, counts) = replay(&graph, dirtied);
+    assert_eq!(
+        counts,
+        RestoreCounts {
+            asserted: 1,
+            certified: 0,
+            candidates: 2,
+            dropped: 0
+        }
+    );
+    let head = restored.head(root2);
+    let candidate = |k| match restored.get(VersionedGraphKey::new(head, k)) {
+        VersionedGraphResult::Unknown {
+            candidate: Some(candidate),
+            ..
+        } => candidate.revalidatable,
+        other => panic!("{k:?}: expected an Unknown with a candidate, got {other:?}"),
+    };
+    assert!(!candidate(key(1)), "the dirtied key's input changed");
+    assert!(candidate(key(2)), "its dependent may be re-established");
 }

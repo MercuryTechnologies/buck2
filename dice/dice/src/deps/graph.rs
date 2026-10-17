@@ -264,6 +264,73 @@ impl PartialEq for SeriesParallelDeps {
     }
 }
 
+/// A certificate's deps as a suspended daemon's image records them (`crate::suspend`): each dep
+/// key as its ordinal in the image's key table, with the series-parallel shape kept as is, so a
+/// restored certificate is the same trace as the one dumped.
+#[derive(Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) enum DepsImage {
+    None,
+    One(u32, u32),
+    Many {
+        /// `(key ordinal, revision)` per edge, in order.
+        edges: Vec<(u32, u32)>,
+        spec: Vec<u32>,
+        trailing_deps_start: u32,
+    },
+}
+
+impl SeriesParallelDeps {
+    /// The image form, or `None` if `ordinal` has no ordinal for some dep key.
+    pub(crate) fn to_image(
+        &self,
+        mut ordinal: impl FnMut(DiceKey) -> Option<u32>,
+    ) -> Option<DepsImage> {
+        let mut edge = |e: &DepEdge| Some((ordinal(e.key)?, e.revision.as_u32()));
+        Some(match self {
+            SeriesParallelDeps::None => DepsImage::None,
+            SeriesParallelDeps::One(e) => {
+                let (k, r) = edge(e)?;
+                DepsImage::One(k, r)
+            }
+            SeriesParallelDeps::Many(many) => DepsImage::Many {
+                edges: many
+                    .deps
+                    .iter()
+                    .map(&mut edge)
+                    .collect::<Option<Vec<_>>>()?,
+                spec: many.spec.iter().copied().collect(),
+                trailing_deps_start: many.trailing_deps_start,
+            },
+        })
+    }
+
+    /// The deps an image recorded, with `key` mapping each ordinal to the key interned for it.
+    /// Fails on a revision of 0, which no certificate can hold.
+    pub(crate) fn from_image(
+        image: &DepsImage,
+        mut key: impl FnMut(u32) -> Option<DiceKey>,
+    ) -> Option<Self> {
+        let mut edge = |(k, r): (u32, u32)| Some(DepEdge::new(key(k)?, Revision::from_u32(r)?));
+        Some(match image {
+            DepsImage::None => SeriesParallelDeps::None,
+            DepsImage::One(k, r) => SeriesParallelDeps::One(edge((*k, *r))?),
+            DepsImage::Many {
+                edges,
+                spec,
+                trailing_deps_start,
+            } => SeriesParallelDeps::Many(Box::new(SPDepsMany {
+                deps: edges
+                    .iter()
+                    .map(|e| edge(*e))
+                    .collect::<Option<Vec<_>>>()?
+                    .into(),
+                spec: spec.clone().into(),
+                trailing_deps_start: *trailing_deps_start,
+            })),
+        })
+    }
+}
+
 impl dice_core::Premises for SeriesParallelDeps {
     fn premises(&self) -> impl Iterator<Item = dice_core::Premise> + '_ {
         self.iter_edges().map(|edge| dice_core::Premise {

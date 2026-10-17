@@ -206,6 +206,7 @@ mod key_index;
 pub(crate) mod metrics;
 pub(crate) mod opaque;
 pub(crate) mod storage;
+pub(crate) mod suspend;
 pub(crate) mod updater;
 pub(crate) mod value;
 mod versions;
@@ -269,6 +270,11 @@ pub use crate::storage::DiceStorage;
 pub use crate::storage::EvictionPolicy;
 pub use crate::storage::PagableStorageBackend;
 pub use crate::storage::PageOutPolicy;
+pub use crate::suspend::ResumeStats;
+pub use crate::suspend::Row as SuspendRow;
+pub use crate::suspend::SuspendDrop;
+pub use crate::suspend::SuspendImage;
+pub use crate::suspend::SuspendStats;
 pub use crate::value::DiceValueDyn;
 
 pub mod testing {

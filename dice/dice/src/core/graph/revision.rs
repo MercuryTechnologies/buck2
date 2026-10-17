@@ -30,6 +30,19 @@ impl RevisionMint {
         self.0 = r.next();
         r
     }
+
+    /// The revision the next `mint` hands out.
+    pub(crate) fn peek(&self) -> Revision {
+        self.0
+    }
+
+    /// Makes the next `mint` hand out `next` or later: a restored key keeps the revisions its
+    /// suspended daemon minted, so none is handed out twice.
+    pub(crate) fn advance_to(&mut self, next: Revision) {
+        if next.as_u32() > self.0.as_u32() {
+            self.0 = next;
+        }
+    }
 }
 
 impl Default for RevisionMint {
