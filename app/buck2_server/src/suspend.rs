@@ -868,7 +868,439 @@ fn free_bytes(path: &Path) -> Option<u64> {
 
 #[cfg(test)]
 mod tests {
+    use buck2_common::init::DaemonStartupConfig;
+    use buck2_common::legacy_configs::configs::testing::parse;
+    use buck2_common::settings::BuckSettings;
+    use buck2_core::fs::project::ProjectRootTemp;
+
     use super::*;
+
+    const ROOT: &str =
+        "[buck2_hydration]\nenable_paging = true\nsuspend = true\nhost_identity = A\n[s]\nk = 1\n";
+
+    /// One side of a suspend and resume: what a daemon resolved at startup and what it observes.
+    struct Side {
+        identity: SuspendIdentity,
+        exe: String,
+        env: Vec<(String, String)>,
+        uid: u32,
+        now_ms: u64,
+    }
+
+    impl Side {
+        fn observed(&self) -> Observed<'_> {
+            Observed {
+                identity: &self.identity,
+                exe: self.exe.clone(),
+                env: env_digest_of(self.env.clone(), &self.identity.config.env_ignore),
+                uid: self.uid,
+                now_ms: self.now_ms,
+            }
+        }
+
+        /// The MANIFEST a suspend on this side writes.
+        fn manifest(&self) -> Manifest {
+            let o = self.observed();
+            Manifest {
+                magic: MAGIC.to_owned(),
+                format: FORMAT,
+                exe: o.exe,
+                startup_config: self.identity.startup_config.clone(),
+                env: o.env.digest,
+                env_vars: o.env.vars,
+                root_config: self.identity.root_config.clone(),
+                project_root: self.identity.project_root.clone(),
+                isolation: self.identity.isolation.clone(),
+                host_identity: self.identity.host_identity.clone(),
+                hostname: "suspend-host".to_owned(),
+                uid: self.uid,
+                watcher: self.identity.watcher.clone(),
+                created_at_ms: self.now_ms,
+                image_len: 0,
+                image: String::new(),
+                dice_state_bytes: 1 << 20,
+            }
+        }
+    }
+
+    fn identity_of(
+        startup: &DaemonStartupConfig,
+        root: &LegacyBuckConfig,
+        project: &ProjectRoot,
+        isolation: &str,
+    ) -> SuspendIdentity {
+        let config = startup
+            .hydration
+            .as_ref()
+            .and_then(|h| h.suspend.clone())
+            .expect("suspend is on");
+        SuspendIdentity::new(config, startup, root, project, isolation).unwrap()
+    }
+
+    fn startup_of(root: &LegacyBuckConfig) -> DaemonStartupConfig {
+        DaemonStartupConfig::new(root, &BuckSettings::empty(), false).unwrap()
+    }
+
+    fn root_of(text: &str) -> LegacyBuckConfig {
+        parse(&[("c", text)], "c").unwrap()
+    }
+
+    fn env() -> Vec<(String, String)> {
+        [
+            ("PATH", "/bin"),
+            ("HOME", "/home/runner"),
+            ("GITHUB_RUN_ID", "1"),
+            ("GITHUB_SHA", "aaa"),
+            ("RUNNER_NAME", "runner-1"),
+            ("HOSTNAME", "runner-1"),
+            ("ACTIONS_ID_TOKEN_REQUEST_URL", "https://a/1"),
+            ("GIT_COMMIT", "aaa"),
+            ("GIT_PR_NUMBER", "1"),
+            ("ImageVersion", "20261001.1"),
+            ("BUILDBUDDY_API_KEY", "main-key"),
+            ("FOO_TOKEN", "t1"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_owned(), v.to_owned()))
+        .collect()
+    }
+
+    fn set(env: &mut Vec<(String, String)>, name: &str, value: &str) {
+        env.retain(|(k, _)| k != name);
+        env.push((name.to_owned(), value.to_owned()));
+    }
+
+    fn side(project: &ProjectRoot) -> Side {
+        side_with(project, &root_of(ROOT))
+    }
+
+    fn side_with(project: &ProjectRoot, root: &LegacyBuckConfig) -> Side {
+        Side {
+            identity: identity_of(&startup_of(root), root, project, "v2"),
+            exe: "exe-1".to_owned(),
+            env: env(),
+            uid: 1000,
+            now_ms: 1_800_000_000_000,
+        }
+    }
+
+    /// Suspends on `side(..)`, lets `change` alter the resuming side, and compares.
+    fn resume_after(change: impl FnOnce(&mut Side, &ProjectRoot)) -> Result<(), Refusal> {
+        let project = ProjectRootTemp::new().unwrap();
+        let suspended = side(project.path());
+        let manifest = suspended.manifest();
+        let mut resuming = side(project.path());
+        change(&mut resuming, project.path());
+        compare(&manifest, &resuming.observed())
+    }
+
+    #[test]
+    fn an_unchanged_daemon_resumes() {
+        assert_eq!(resume_after(|_, _| {}), Ok(()));
+    }
+
+    #[test]
+    fn another_binary_refuses() {
+        assert_eq!(
+            resume_after(|s, _| s.exe = "exe-2".to_owned()),
+            Err(Refusal::Binary)
+        );
+    }
+
+    #[test]
+    fn another_startup_config_refuses() {
+        assert_eq!(
+            resume_after(|s, project| {
+                let root = root_of(ROOT);
+                let mut startup = startup_of(&root);
+                startup.num_tokio_workers = Some(7);
+                s.identity = identity_of(&startup, &root, project, "v2");
+            }),
+            Err(Refusal::StartupConfig)
+        );
+    }
+
+    #[test]
+    fn another_identity_in_the_startup_config_refuses_as_the_identity() {
+        assert_eq!(
+            resume_after(|s, project| {
+                let root = root_of(ROOT);
+                let mut startup = startup_of(&root);
+                startup.host_identity = Some("B".to_owned());
+                s.identity = identity_of(&startup, &root, project, "v2");
+            }),
+            Err(Refusal::HostIdentity)
+        );
+    }
+
+    #[test]
+    fn another_identity_in_the_root_config_refuses_as_the_identity() {
+        assert_eq!(
+            resume_after(|s, project| {
+                let root = root_of(&ROOT.replace("host_identity = A", "host_identity = B"));
+                s.identity = identity_of(&startup_of(&root), &root, project, "v2");
+            }),
+            Err(Refusal::HostIdentity)
+        );
+    }
+
+    #[test]
+    fn the_identity_defaults_to_the_hostname() {
+        let root = root_of(&ROOT.replace("host_identity = A\n", ""));
+        let project = ProjectRootTemp::new().unwrap();
+        let identity = identity_of(&startup_of(&root), &root, project.path(), "v2");
+        assert_eq!(
+            identity.host_identity,
+            buck2_events::metadata::hostname().unwrap_or_default()
+        );
+    }
+
+    #[test]
+    fn another_path_refuses_and_names_it() {
+        assert_eq!(
+            resume_after(|s, _| set(&mut s.env, "PATH", "/usr/bin")),
+            Err(Refusal::Env(vec!["PATH".to_owned()]))
+        );
+        assert_eq!(
+            resume_after(|s, _| s.env.retain(|(k, _)| k != "HOME")),
+            Err(Refusal::Env(vec!["HOME".to_owned()]))
+        );
+    }
+
+    #[test]
+    fn per_run_variables_do_not_refuse() {
+        for (name, value) in [
+            ("GITHUB_RUN_ID", "2"),
+            ("GITHUB_SHA", "bbb"),
+            ("RUNNER_NAME", "runner-2"),
+            ("HOSTNAME", "runner-2"),
+            ("HOST", "runner-2"),
+            ("ACTIONS_ID_TOKEN_REQUEST_URL", "https://a/2"),
+            ("ACTIONS_CACHE_URL", "https://cache/2"),
+            ("GIT_COMMIT", "bbb"),
+            ("GIT_PR_NUMBER", "2"),
+            ("ImageVersion", "20261002.1"),
+        ] {
+            assert_eq!(
+                resume_after(|s, _| set(&mut s.env, name, value)),
+                Ok(()),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn credentials_do_not_refuse_and_leave_no_digest() {
+        assert_eq!(
+            resume_after(|s, _| {
+                set(&mut s.env, "BUILDBUDDY_API_KEY", "pr-key");
+                set(&mut s.env, "FOO_TOKEN", "t2");
+                set(&mut s.env, "BAR_SECRET", "s");
+                set(&mut s.env, "BAZ_PASSWORD", "p");
+                set(&mut s.env, "OTHER_API_KEY", "k");
+            }),
+            Ok(())
+        );
+        let project = ProjectRootTemp::new().unwrap();
+        let manifest = side(project.path()).manifest();
+        assert!(manifest.env_vars.contains_key("PATH"));
+        for name in ["BUILDBUDDY_API_KEY", "FOO_TOKEN"] {
+            assert!(!manifest.env_vars.contains_key(name), "{name}");
+        }
+        let text = serde_json::to_string(&manifest).unwrap();
+        let key_digest = &blake3_hex(b"main-key")[..16];
+        assert!(!text.contains(key_digest));
+    }
+
+    #[test]
+    fn suspend_env_ignore_replaces_the_default_list() {
+        let project = ProjectRootTemp::new().unwrap();
+        let root = root_of(&ROOT.replace(
+            "suspend = true\n",
+            "suspend = true\nsuspend_env_ignore = CI_*\n",
+        ));
+        let manifest = side_with(project.path(), &root).manifest();
+        let resume = |change: &dyn Fn(&mut Side)| {
+            let mut s = side_with(project.path(), &root);
+            change(&mut s);
+            compare(&manifest, &s.observed())
+        };
+        assert_eq!(resume(&|s| set(&mut s.env, "CI_JOB_ID", "9")), Ok(()));
+        assert_eq!(
+            resume(&|s| set(&mut s.env, "GIT_COMMIT", "bbb")),
+            Err(Refusal::Env(vec!["GIT_COMMIT".to_owned()]))
+        );
+        // A list that differs is a startup config that differs.
+        assert_eq!(
+            compare(
+                &side(project.path()).manifest(),
+                &side_with(project.path(), &root).observed()
+            ),
+            Err(Refusal::StartupConfig)
+        );
+    }
+
+    #[test]
+    fn another_root_config_value_refuses() {
+        assert_eq!(
+            resume_after(|s, project| {
+                let root = root_of(&ROOT.replace("k = 1", "k = 2"));
+                s.identity = identity_of(&startup_of(&root), &root, project, "v2");
+            }),
+            Err(Refusal::RootConfig)
+        );
+    }
+
+    #[test]
+    fn another_project_or_isolation_refuses() {
+        let other = ProjectRootTemp::new().unwrap();
+        assert_eq!(
+            resume_after(|s, _| {
+                let root = root_of(ROOT);
+                s.identity = identity_of(&startup_of(&root), &root, other.path(), "v2");
+            }),
+            Err(Refusal::Project)
+        );
+        assert_eq!(
+            resume_after(|s, project| {
+                let root = root_of(ROOT);
+                s.identity = identity_of(&startup_of(&root), &root, project, "v3");
+            }),
+            Err(Refusal::Project)
+        );
+    }
+
+    #[test]
+    fn another_user_refuses() {
+        assert_eq!(resume_after(|s, _| s.uid = 1001), Err(Refusal::User));
+    }
+
+    #[test]
+    fn another_watcher_refuses() {
+        // The watcher is a root config value, so a real change refuses as the root config first;
+        // this checks the watcher's own comparison.
+        assert_eq!(
+            resume_after(|s, _| s.identity.watcher = "fs_hash_crawler".to_owned()),
+            Err(Refusal::Watcher)
+        );
+    }
+
+    #[test]
+    fn a_clock_a_little_behind_resumes_and_one_far_behind_refuses() {
+        assert_eq!(resume_after(|s, _| s.now_ms -= 60_000), Ok(()));
+        assert_eq!(
+            resume_after(|s, _| s.now_ms -= 10 * 60_000),
+            Err(Refusal::Clock)
+        );
+        assert_eq!(resume_after(|s, _| s.now_ms += 86_400_000), Ok(()));
+    }
+
+    #[test]
+    fn another_format_or_magic_refuses() {
+        let project = ProjectRootTemp::new().unwrap();
+        let s = side(project.path());
+        let mut m = s.manifest();
+        m.format = 1;
+        assert!(matches!(
+            compare(&m, &s.observed()),
+            Err(Refusal::Format(_))
+        ));
+        let mut m = s.manifest();
+        m.magic = "OTHER".to_owned();
+        assert!(matches!(
+            compare(&m, &s.observed()),
+            Err(Refusal::Format(_))
+        ));
+    }
+
+    #[test]
+    fn a_format_1_manifest_refuses_as_the_format() {
+        // FORMAT 1 had `hostname` and no `host_identity`: its MANIFEST must refuse as another
+        // format, not as an unreadable one.
+        let text = br#"{"magic":"BUCK2SUS","format":1,"exe":"e","hostname":"h"}"#;
+        assert!(matches!(parse_manifest(text), Err(Refusal::Format(_))));
+        assert!(matches!(
+            parse_manifest(b"{not json"),
+            Err(Refusal::Format(_))
+        ));
+        let project = ProjectRootTemp::new().unwrap();
+        let m = side(project.path()).manifest();
+        let mut text = serde_json::to_vec(&m).unwrap();
+        assert!(parse_manifest(&text).is_ok());
+        // A MANIFEST of this format with a field gone is corrupt.
+        let cut = String::from_utf8(text.clone())
+            .unwrap()
+            .replace(r#""uid":1000,"#, "");
+        text = cut.into_bytes();
+        assert!(matches!(
+            parse_manifest(&text),
+            Err(Refusal::ImageCorrupt(_))
+        ));
+    }
+
+    #[test]
+    fn a_paging_store_over_the_cap_refuses() {
+        let project = ProjectRootTemp::new().unwrap();
+        let s = side(project.path());
+        let mut m = s.manifest();
+        m.dice_state_bytes = (s.identity.config.max_db_gb << 30) + 1;
+        assert!(matches!(
+            compare(&m, &s.observed()),
+            Err(Refusal::TooLarge { .. })
+        ));
+    }
+
+    #[test]
+    fn the_refusal_names_the_identity() {
+        assert_eq!(
+            Refusal::HostIdentity.to_string(),
+            "the host identity differs from the suspended daemon's"
+        );
+    }
+
+    #[test]
+    fn a_missing_paging_store_or_a_damaged_image_refuses() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = dir.path();
+        let image_dir = cache.join(IMAGE_DIR);
+        std::fs::create_dir_all(&image_dir).unwrap();
+        let bytes = b"not an image".to_vec();
+        std::fs::write(image_dir.join(IMAGE), &bytes).unwrap();
+        let project = ProjectRootTemp::new().unwrap();
+        let mut m = side(project.path()).manifest();
+        m.image_len = bytes.len() as u64;
+        m.image = blake3_hex(&bytes);
+
+        assert!(matches!(
+            check_files(&m, &image_dir, cache),
+            Err(Refusal::NoPagingStore)
+        ));
+        std::fs::create_dir_all(cache.join(DICE_STATE_DIR)).unwrap();
+        // The digest matches, but the bytes are no image.
+        assert!(matches!(
+            check_files(&m, &image_dir, cache),
+            Err(Refusal::ImageCorrupt(_))
+        ));
+        let mut flipped = bytes.clone();
+        flipped[3] ^= 1;
+        std::fs::write(image_dir.join(IMAGE), &flipped).unwrap();
+        assert_eq!(
+            check_files(&m, &image_dir, cache).err(),
+            Some(Refusal::ImageCorrupt(
+                "the blake3 digest differs".to_owned()
+            ))
+        );
+        std::fs::write(image_dir.join(IMAGE), &bytes[..4]).unwrap();
+        assert_eq!(
+            check_files(&m, &image_dir, cache).err(),
+            Some(Refusal::ImageCorrupt("truncated".to_owned()))
+        );
+        std::fs::remove_file(image_dir.join(IMAGE)).unwrap();
+        assert!(matches!(
+            check_files(&m, &image_dir, cache),
+            Err(Refusal::ImageCorrupt(_))
+        ));
+    }
 
     #[test]
     fn per_run_variables_are_left_out() {
@@ -885,7 +1317,6 @@ mod tests {
 
     #[test]
     fn config_digest_follows_values_but_not_the_identity() -> buck2_error::Result<()> {
-        use buck2_common::legacy_configs::configs::testing::parse;
         let a = parse(&[("c", "[s]\nk = 1\n")], "c")?;
         let b = parse(&[("c", "[s]\nk = 1\n")], "c")?;
         let c = parse(&[("c", "[s]\nk = 2\n")], "c")?;
@@ -896,33 +1327,18 @@ mod tests {
         assert_eq!(config_digest(&a), config_digest(&b));
         assert_ne!(config_digest(&a), config_digest(&c));
         assert_eq!(config_digest(&a), config_digest(&d));
+        let e = parse(&[("c", "[t]\nk = 1\n")], "c")?;
+        assert_ne!(config_digest(&a), config_digest(&e));
         Ok(())
     }
 
     #[test]
     fn manifest_round_trips() {
-        let m = Manifest {
-            magic: MAGIC.to_owned(),
-            format: FORMAT,
-            exe: "e".to_owned(),
-            startup_config: "s".to_owned(),
-            env: "v".to_owned(),
-            env_vars: BTreeMap::from([("PATH".to_owned(), "x".to_owned())]),
-            root_config: "r".to_owned(),
-            project_root: "/p".to_owned(),
-            isolation: "v2".to_owned(),
-            host_identity: "a".to_owned(),
-            hostname: "h".to_owned(),
-            uid: 1,
-            watcher: "notify".to_owned(),
-            created_at_ms: 2,
-            image_len: 3,
-            image: "i".to_owned(),
-            dice_state_bytes: 4,
-        };
+        let project = ProjectRootTemp::new().unwrap();
+        let m = side(project.path()).manifest();
         let back: Manifest = serde_json::from_slice(&serde_json::to_vec(&m).unwrap()).unwrap();
         assert_eq!(back.env_vars, m.env_vars);
-        assert_eq!(back.host_identity, "a");
-        assert_eq!(back.created_at_ms, 2);
+        assert_eq!(back.host_identity, "A");
+        assert_eq!(back.created_at_ms, m.created_at_ms);
     }
 }
