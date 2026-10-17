@@ -82,8 +82,10 @@ pub use traits::PagableSerializer;
 pub use traits::StorageContext;
 pub use traits::StorageState;
 pub use value_serialize::NoValueSerialize;
+pub use value_serialize::NoneValueSerialize;
 pub use value_serialize::OkPagableValueSerialize;
 pub use value_serialize::PagableValueSerialize;
+pub use value_serialize::ResidentValueSerialize;
 pub use value_serialize::TodoValueSerialize;
 pub use value_serialize::ValueSerialize;
 

@@ -96,6 +96,13 @@ impl DiceKeyErased {
         }
     }
 
+    pub(crate) fn value_pages_out(&self) -> bool {
+        match self {
+            DiceKeyErased::Key(k) => k.value_pages_out(),
+            DiceKeyErased::Projection(k) => k.proj.value_pages_out(),
+        }
+    }
+
     pub(crate) fn hash(&self) -> u64 {
         match self {
             DiceKeyErased::Key(k) => k.hash(),
@@ -338,6 +345,9 @@ pub trait DiceKeyDyn: Allocative + Display + Send + Sync + PagableTagged + 'stat
         &self,
         deser: &mut dyn PagableDeserializer<'de>,
     ) -> pagable::Result<StdArc<dyn DiceValueDyn>>;
+
+    /// Whether a page-out may evict this key's values (`ValueSerialize::pages_out`).
+    fn value_pages_out(&self) -> bool;
 }
 
 #[async_trait]
@@ -404,6 +414,10 @@ where
         let typed_value: K::Value = K::value_serialize().pagable_deserialize_value(deser)?;
         Ok(StdArc::new(DiceKeyValue::<K>::new(typed_value)))
     }
+
+    fn value_pages_out(&self) -> bool {
+        K::value_serialize().pages_out()
+    }
 }
 
 #[cfg_attr(feature = "pagable", pagable_typetag)]
@@ -440,6 +454,9 @@ pub trait DiceProjectionDyn: Allocative + Display + Send + Sync + PagableTagged 
         &self,
         deser: &mut dyn PagableDeserializer<'de>,
     ) -> pagable::Result<StdArc<dyn DiceValueDyn>>;
+
+    /// See [`DiceKeyDyn::value_pages_out`].
+    fn value_pages_out(&self) -> bool;
 }
 
 impl<K> DiceProjectionDyn for K
@@ -505,6 +522,10 @@ where
     ) -> pagable::Result<StdArc<dyn DiceValueDyn>> {
         let typed_value: K::Value = K::value_serialize().pagable_deserialize_value(deser)?;
         Ok(StdArc::new(DiceProjectValue::<K>::new(typed_value)))
+    }
+
+    fn value_pages_out(&self) -> bool {
+        K::value_serialize().pages_out()
     }
 }
 

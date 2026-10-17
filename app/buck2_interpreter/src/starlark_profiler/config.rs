@@ -25,10 +25,10 @@ use dice::DiceTransactionUpdater;
 use dice::EqualityBehavior;
 use dice::InjectedKey;
 use dice::Key;
-use dice::NoValueSerialize;
 use dice::OkPagableValueSerialize;
 use dice::PagableValueSerialize;
 use dice::ProjectionKey;
+use dice::ResidentValueSerialize;
 use dice::ValueSerialize;
 use dice_futures::cancellation::CancellationContext;
 use dupe::Dupe;
@@ -216,8 +216,10 @@ impl ProjectionKey for StarlarkProfileModeForKind {
 
     type Value = buck2_error::Result<StarlarkProfileMode>;
 
+    /// Resident, like every projection; `buck2 suspend` writes the `Ok` values, since every
+    /// Starlark evaluation reads one and a missing one would recompute it on resume.
     fn value_serialize() -> impl ValueSerialize<Value = Self::Value> {
-        NoValueSerialize::<Self::Value>::new()
+        ResidentValueSerialize::new(OkPagableValueSerialize::<Self::Value>::new())
     }
 
     fn compute(

@@ -27,11 +27,12 @@ use dice::DiceTransactionUpdater;
 use dice::EqualityBehavior;
 use dice::InjectedKey;
 use dice::Key;
-use dice::NoValueSerialize;
+use dice::NoneValueSerialize;
 use dice::OkPagableValueSerialize;
 use dice::OpaqueValue;
 use dice::PagableValueSerialize;
 use dice::ProjectionKey;
+use dice::ResidentValueSerialize;
 use dice::ValueSerialize;
 use dice_futures::cancellation::CancellationContext;
 use dupe::Dupe;
@@ -266,8 +267,11 @@ impl ProjectionKey for LegacyBuckConfigErrorKey {
         EqualityBehavior::Compare(|x, y| x.is_none() && y.is_none())
     }
 
+    /// Projections are read without a page-in, so their values stay resident; `buck2 suspend`
+    /// still writes the `None` that every parsed config projects, or every key that read a
+    /// config would be recomputed on resume.
     fn value_serialize() -> impl ValueSerialize<Value = Self::Value> {
-        NoValueSerialize::<Self::Value>::new()
+        ResidentValueSerialize::new(NoneValueSerialize::<Self::Value>::new())
     }
 }
 
@@ -302,8 +306,10 @@ impl ProjectionKey for LegacyBuckConfigPropertyProjectionKey {
         EqualityBehavior::Compare(|x, y| x == y)
     }
 
+    /// Resident, like every projection, and written by `buck2 suspend`: see
+    /// `LegacyBuckConfigErrorKey`.
     fn value_serialize() -> impl ValueSerialize<Value = Self::Value> {
-        NoValueSerialize::<Self::Value>::new()
+        ResidentValueSerialize::new(PagableValueSerialize::<Self::Value>::new())
     }
 }
 
