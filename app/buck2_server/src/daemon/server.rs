@@ -330,15 +330,37 @@ impl Interceptor for BuckCheckAuthTokenInterceptor {
     }
 }
 
+/// What `buck2 suspend` needs to know about the streaming commands around it.
+///
+/// An image describes the daemon as the suspend dumped it. A command that runs beside the
+/// suspend, or after it and before the client's kill ends the daemon, can change what the image
+/// describes: commit file changes, declare or overwrite outputs. So a suspend that a command
+/// started during fails and deletes its image, and a command that starts after a suspend
+/// published one deletes its MANIFEST before it runs. `status` and `kill` are not streaming
+/// commands, so they still answer.
+#[derive(Default)]
+struct SuspendLatch {
+    /// Streaming commands registered as active so far. Each command counts itself after it is
+    /// in `ACTIVE_COMMANDS`, so a suspend that reads `started` and then finds itself the only
+    /// active command has seen every command counted before the read finish, and any command it
+    /// has not seen moves `started` before the suspend publishes.
+    started: u64,
+    /// The MANIFEST of the image a suspend published, and the guard that keeps the
+    /// materializer's background cleanup from deleting outputs the image records as on disk,
+    /// held until the process exits or a later command takes it.
+    published: Option<(
+        std::path::PathBuf,
+        buck2_execute::materialize::materializer::MaterializerBackgroundCleanupGuard,
+    )>,
+}
+
 #[derive(Allocative)]
 pub(crate) struct BuckdServerData {
     /// The flag that is set to true when server is shutting down.
     stop_accepting_requests: AtomicBool,
-    /// The MANIFEST of an image `buck2 suspend` wrote, until the client's kill ends the daemon.
-    /// A command that starts in between could change what the image describes, so it deletes
-    /// the MANIFEST first; status and kill still answer.
+    /// The commands around a `buck2 suspend`; see [`SuspendLatch`].
     #[allocative(skip)]
-    suspended_image: parking_lot::Mutex<Option<std::path::PathBuf>>,
+    suspend_latch: parking_lot::Mutex<SuspendLatch>,
     #[allocative(skip)]
     process_info: DaemonProcessInfo,
     base_daemon_constraints: buck2_cli_proto::DaemonConstraints,
@@ -450,7 +472,7 @@ impl BuckdServer {
         let scribe_sink = daemon_state.data().scribe_sink.dupe();
         let api_server = BuckdServer(Arc::new(BuckdServerData {
             stop_accepting_requests: AtomicBool::new(false),
-            suspended_image: parking_lot::Mutex::new(None),
+            suspend_latch: parking_lot::Mutex::new(SuspendLatch::default()),
             process_info,
             base_daemon_constraints,
             start_time: prost_types::Timestamp {
@@ -601,12 +623,6 @@ impl BuckdServer {
             )?);
 
             command.pre_run(self)?;
-            if let Some(manifest) = self.0.suspended_image.lock().take() {
-                tracing::warn!(
-                    "A command started after `buck2 suspend`; its image is no longer valid"
-                );
-                drop(std::fs::remove_file(manifest));
-            }
 
             let daemon_state = self.0.daemon_state.dupe();
             let trace_id = client_ctx.trace_id.parse()?;
@@ -617,6 +633,17 @@ impl BuckdServer {
                 daemon_shutdown_channel,
                 state,
             } = ActiveCommand::new(&dispatch, client_ctx.sanitized_argv.clone());
+            // Counted only now that the command is active; see `SuspendLatch`.
+            {
+                let mut latch = self.0.suspend_latch.lock();
+                latch.started += 1;
+                if let Some((manifest, _cleanup_guard)) = latch.published.take() {
+                    tracing::warn!(
+                        "A command started after `buck2 suspend`; its image is no longer valid"
+                    );
+                    drop(std::fs::remove_file(manifest));
+                }
+            }
 
             // A command that contends for the DICE graph is starting; cancel any
             // in-progress idle page-out so it yields resources back. Read-only /
@@ -1445,20 +1472,41 @@ impl DaemonApi for BuckdServer {
             HydrationCommandOptions,
             move |context, partial_result_dispatcher, req| {
                 async move {
-                    let manifest = crate::suspend::manifest_path(
-                        context
-                            .base_context
-                            .tenant
-                            .repo
-                            .paths
-                            .cache_dir_path()
-                            .as_path(),
-                    );
+                    let repo = &context.base_context.tenant.repo;
+                    let manifest =
+                        crate::suspend::manifest_path(repo.paths.cache_dir_path().as_path());
+                    // Read before the suspend's DICE transaction exists and before it checks
+                    // that it runs alone; see `SuspendLatch`.
+                    let started = data.suspend_latch.lock().started;
+                    if suspend
+                        && !crate::active_commands::is_only_active_command(
+                            context.base_context.events.trace_id(),
+                        )
+                    {
+                        return Err(buck2_error::buck2_error!(
+                            ErrorTag::Input,
+                            "`buck2 suspend` cannot run beside another command"
+                        ));
+                    }
                     let result = hydration_command(context, partial_result_dispatcher, req).await;
                     if suspend && result.is_ok() {
+                        let cleanup_guard = repo.materializer.prevent_background_cleanup().await;
+                        let mut latch = data.suspend_latch.lock();
+                        if latch.started != started {
+                            drop(latch);
+                            if let Some(image_dir) = manifest.parent() {
+                                drop(std::fs::remove_dir_all(image_dir));
+                            }
+                            return Err(buck2_error::buck2_error!(
+                                ErrorTag::Input,
+                                "a command started while `buck2 suspend` ran, so the image \
+                                 might not describe the daemon; it was deleted and the daemon \
+                                 keeps running"
+                            ));
+                        }
                         // The image describes the daemon as it is now, until the client's kill
                         // ends it: a command that starts first invalidates it.
-                        *data.suspended_image.lock() = Some(manifest);
+                        latch.published = Some((manifest, cleanup_guard));
                     }
                     result
                 }
