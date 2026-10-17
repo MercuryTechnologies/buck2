@@ -8,8 +8,6 @@
  * above-listed licenses.
  */
 
-use std::iter;
-
 use buck2_core::soft_error;
 use buck2_data::VersionControlRevision;
 use buck2_error::ErrorTag;
@@ -22,6 +20,9 @@ use buck2_util::properly_reaped_child::reap_on_drop_command;
 use futures::future::BoxFuture;
 use futures::stream::FuturesUnordered;
 use tokio_stream::StreamExt;
+
+use crate::git::display_command;
+use crate::git::run_git;
 
 /// Spawn tasks to collect version control information
 /// and return a droppable handle that will cancel them on drop.
@@ -144,11 +145,6 @@ async fn get_hg_status(
     };
 }
 
-fn display_command(program: &str, args: &[&str]) -> String {
-    shlex::try_join(iter::once(program).chain(args.iter().copied()))
-        .unwrap_or_else(|_| format!("{program} <argument contains NUL>"))
-}
-
 async fn run_hg(repo_root: &AbsNormPathBuf, args: &[&str]) -> buck2_error::Result<String> {
     let Some(repo_root) = repo_root.as_path().to_str() else {
         return Err(buck2_error::buck2_error!(
@@ -241,73 +237,6 @@ async fn get_git_status(
     match run_git(repo_root, &["status", "--porcelain"]).await {
         Ok(stdout) => revision.has_local_changes = Some(!stdout.trim().is_empty()),
         Err(e) => revision.command_error = Some(format!("{e:#}")),
-    }
-}
-
-/// Run a `git` command rooted at `repo_root`, returning its stdout on success or
-/// an error message describing the failure.
-async fn run_git(repo_root: &AbsNormPathBuf, args: &[&str]) -> buck2_error::Result<String> {
-    let Some(repo_root) = repo_root.as_path().to_str() else {
-        return Err(buck2_error::buck2_error!(
-            ErrorTag::Input,
-            "Repository root is not valid utf8: {}",
-            repo_root.as_path().display()
-        ));
-    };
-
-    // `-C <repo_root>` makes git operate on the repository regardless of the
-    // daemon's current working directory.
-    let mut full_args = vec!["-C", repo_root];
-    full_args.extend_from_slice(args);
-    let command = display_command("git", &full_args);
-
-    // `GIT_OPTIONAL_LOCKS=0` prevents git from taking the index lock or
-    // refreshing the index on disk, so we don't contend with a concurrent user
-    // `git` invocation (e.g. for `git status`).
-    let output = match reap_on_drop_command("git", &full_args, Some(&[("GIT_OPTIONAL_LOCKS", "0")]))
-    {
-        Ok(command) => command.output().await,
-        Err(e) => {
-            return Err(buck2_error::buck2_error!(
-                ErrorTag::Tier0,
-                "reap_on_drop_command for `{command}` failed: {e}"
-            ));
-        }
-    };
-
-    let result = match output {
-        Ok(result) => result,
-        Err(e) => {
-            return Err(buck2_error::buck2_error!(
-                ErrorTag::Tier0,
-                "Command `{command}` failed with error: {e:?}"
-            ));
-        }
-    };
-
-    if !result.status.success() {
-        let stderr = match std::str::from_utf8(&result.stderr) {
-            Ok(s) => s,
-            Err(e) => {
-                return Err(buck2_error::buck2_error!(
-                    ErrorTag::Tier0,
-                    "`{command}` stderr is not utf8: {e}"
-                ));
-            }
-        };
-        return Err(buck2_error::buck2_error!(
-            ErrorTag::Tier0,
-            "Command `{command}` failed with error code {}; stderr: {stderr}",
-            result.status
-        ));
-    }
-
-    match std::str::from_utf8(&result.stdout) {
-        Ok(s) => Ok(s.to_owned()),
-        Err(e) => Err(buck2_error::buck2_error!(
-            ErrorTag::Tier0,
-            "`{command}` stdout is not utf8: {e}"
-        )),
     }
 }
 
