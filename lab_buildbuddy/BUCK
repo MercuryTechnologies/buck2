@@ -40,15 +40,19 @@ config_setting(
 # image, the one lab's :buildbuddy platform row sends to the usw2 pool,
 # pinned by digest. The build takes from it only what this contract names:
 #
-# - /bin: the shell, bash (`[prelude] bash` in .buckconfig.buildbuddy-lab),
-#   coreutils, curl, tar, xz, sed, grep and nix-store;
+# - /bin, the image's PATH, whose entries link into the executor's mounted
+#   nix store: the shell, bash (`[prelude] bash` in
+#   .buckconfig.buildbuddy-lab), coreutils, curl, tar with gzip and xz
+#   (http_archive and the rust install), unzip (the protoc archives), git
+#   (git_fetch), sed, grep and nix-store;
 # - /lib64/ld-linux-x86-64.so.2, the loader of every exec-side program
 #   (the host rustc, rust-lld, build scripts, proc macros, CPython), which
 #   finds glibc and libgcc_s in the executor's mounted nix store;
 # - SSL_CERT_FILE for downloads.
 #
-# Nothing comes from /usr. Every compiler, library and source is pinned by
-# sha256 in this tree, except the gnu link sysroot, which
+# Nothing comes from /usr. Every compiler, library and source is pinned in
+# this tree, by sha256, or by commit for the two git_fetch crates, except
+# the gnu link sysroot, which
 # :gnu-exec-sysroot-x86_64 builds from pinned store paths through the
 # executor's nix daemon (`nix_daemon` below) and checks against a manifest.
 # That action also checks that the image loader runs the pinned glibc, so
