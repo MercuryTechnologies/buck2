@@ -453,7 +453,8 @@ impl TenantState {
         let ignore_specs: BuckFixedSortedMap<CellName, IgnoreSet> =
             ignore_specs.into_iter().collect();
 
-        let disk_state_options = DiskStateOptions::new(root_config)?;
+        let disk_state_options =
+            DiskStateOptions::new(root_config, &init_ctx.daemon_startup_config)?;
         let blocking_executor = shared.blocking_executor_factory.for_project(fs.dupe());
 
         let cache_dir_path = paths.cache_dir_path();
@@ -616,6 +617,7 @@ impl TenantState {
                     shared.daemon_id,
                 ),
                 maybe_initialize_incremental_sqlite_db(
+                    &disk_state_options,
                     paths.clone(),
                     blocking_executor.dupe() as Arc<dyn BlockingExecutor>,
                     root_config,
