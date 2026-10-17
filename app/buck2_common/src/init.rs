@@ -574,11 +574,28 @@ pub struct SuspendConfig {
     /// (`buck2_hydration.suspend_max_db_gb`): the store only grows, and a cold start is how it
     /// is reclaimed.
     pub max_db_gb: u64,
-    /// Environment variables, beyond the built-in per-run ones, whose values may differ
-    /// between the suspended daemon and the resumed one (`buck2_hydration.suspend_env_ignore`,
-    /// comma-separated).
+    /// Environment variables, beyond the built-in per-run ones and credentials, whose values may
+    /// differ between the suspended daemon and the resumed one
+    /// (`buck2_hydration.suspend_env_ignore`, comma-separated; a name ending in `*` is a prefix
+    /// and one starting with `*` a suffix). Unset, it is [`DEFAULT_SUSPEND_ENV_IGNORE`]; set, it
+    /// replaces that list, and set empty it ignores nothing more.
     pub env_ignore: Vec<String>,
 }
+
+/// The variables a CI runner sets differently on every run of one job, beyond those the daemon
+/// always ignores (`GITHUB_*`, `RUNNER_*` and the like): the default of
+/// `buck2_hydration.suspend_env_ignore`. Leaving them out is sound only because the actions that
+/// inherit the daemon's environment, the local ones, are not trusted across a move between
+/// machines.
+pub const DEFAULT_SUSPEND_ENV_IGNORE: &[&str] = &[
+    "ACTIONS_*",
+    "GIT_BASE_BRANCH",
+    "GIT_BRANCH",
+    "GIT_COMMIT",
+    "GIT_PR_NUMBER",
+    "ImageOS",
+    "ImageVersion",
+];
 
 impl HydrationConfig {
     /// Returns `None` when neither the Buck settings nor their legacy fallbacks
@@ -642,17 +659,21 @@ impl HydrationConfig {
                         property: "suspend_max_db_gb",
                     })?
                     .unwrap_or(50),
-                env_ignore: config
-                    .get(BuckconfigKeyRef {
-                        section: "buck2_hydration",
-                        property: "suspend_env_ignore",
-                    })
-                    .unwrap_or("")
-                    .split(',')
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                    .map(ToOwned::to_owned)
-                    .collect(),
+                env_ignore: match config.get(BuckconfigKeyRef {
+                    section: "buck2_hydration",
+                    property: "suspend_env_ignore",
+                }) {
+                    Some(list) => list
+                        .split(',')
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map(ToOwned::to_owned)
+                        .collect(),
+                    None => DEFAULT_SUSPEND_ENV_IGNORE
+                        .iter()
+                        .map(|s| (*s).to_owned())
+                        .collect(),
+                },
             })
         } else {
             None
@@ -1098,7 +1119,7 @@ mod tests {
             .suspend
             .expect("suspend is on");
         assert_eq!(suspend.max_db_gb, 50);
-        assert!(suspend.env_ignore.is_empty());
+        assert_eq!(suspend.env_ignore, DEFAULT_SUSPEND_ENV_IGNORE);
         Ok(())
     }
 
