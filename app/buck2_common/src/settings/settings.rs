@@ -239,6 +239,19 @@ const HYDRATION_SUSPEND: SettingKey<bool> = SettingKey {
     oss_default: None,
 };
 
+const HYDRATION_HOST_IDENTITY: SettingKey<&'static str> = SettingKey {
+    metadata: SettingKeyMetadata {
+        key: SettingKeyRef {
+            section: "hydration",
+            name: "host_identity",
+        },
+        overridable_in: &[OverrideSource::CommandLine, OverrideSource::LocalSettings],
+    },
+    // Absence means the legacy buckconfig key, then the hostname.
+    internal_default: None,
+    oss_default: None,
+};
+
 const HYDRATION_PAGE_OUT_POLICY: SettingKey<PageOutPolicy> = SettingKey {
     metadata: SettingKeyMetadata {
         key: SettingKeyRef {
@@ -329,6 +342,7 @@ pub(crate) static ALL_SETTING_METADATA: &[SettingKeyMetadata] = &[
     HYDRATION_PAGE_OUT_POLICY.metadata,
     HYDRATION_EVICTION_POLICY.metadata,
     HYDRATION_SUSPEND.metadata,
+    HYDRATION_HOST_IDENTITY.metadata,
     LOG_USE_MANIFOLD.metadata,
     LOG_URL.metadata,
     PACKAGE_VISIBILITY_DEFAULT_INTERSECTION.metadata,
@@ -372,7 +386,16 @@ struct LogDownloadSectionData {
     log_url: Option<String>,
 }
 
-#[derive(Debug, Default, Deserialize, Serialize, PartialEq, Eq, Allocative)]
+#[derive(
+    Clone,
+    Debug,
+    Default,
+    Deserialize,
+    Serialize,
+    PartialEq,
+    Eq,
+    Allocative
+)]
 #[serde(deny_unknown_fields)]
 struct HydrationSectionData {
     enable_paging: Option<bool>,
@@ -382,6 +405,7 @@ struct HydrationSectionData {
     page_out_policy: Option<PageOutPolicy>,
     eviction_policy: Option<EvictionPolicy>,
     suspend: Option<bool>,
+    host_identity: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize, Serialize, PartialEq, Eq, Allocative)]
@@ -492,7 +516,7 @@ impl HydrationSection {
     /// copy of every key from the previous version's stanza.
     pub(crate) const METADATA: SectionMetadata = SectionMetadata {
         section_name: "hydration",
-        section_version: 4,
+        section_version: 5,
     };
 
     /// Returns `None` when legacy buckconfig should determine the behavior.
@@ -516,6 +540,24 @@ impl HydrationSection {
     /// from it. Returns `None` when legacy buckconfig should determine the behavior.
     pub fn suspend(&self) -> Option<bool> {
         HYDRATION_SUSPEND.resolve(self.0.suspend)
+    }
+
+    /// What stands for this machine where buck2 records which machine wrote its on-disk state
+    /// (the suspend MANIFEST and the materializer, dep-file and incremental databases). Returns
+    /// `None` when legacy buckconfig, then the hostname, should determine it.
+    pub fn host_identity(&self) -> Option<&str> {
+        self.0
+            .host_identity
+            .as_deref()
+            .or_else(|| HYDRATION_HOST_IDENTITY.default_value())
+    }
+
+    /// The same settings without `host_identity`, so that a digest of the rest can tell a
+    /// change of identity from any other change.
+    pub fn without_host_identity(&self) -> Self {
+        let mut data = (*self.0).clone();
+        data.host_identity = None;
+        Self(Arc::new(data))
     }
 
     /// Which values a page-out writes; see [`PageOutPolicy`].
@@ -764,6 +806,7 @@ Use test to execute tests.
         assert!(!hydration.defer_field_reads());
         assert_eq!(hydration.page_out_on_idle(), None);
         assert_eq!(hydration.suspend(), None);
+        assert_eq!(hydration.host_identity(), None);
         assert_eq!(hydration.page_out_policy(), PageOutPolicy::OncePerValue);
         assert_eq!(
             hydration.eviction_policy(),
