@@ -518,6 +518,11 @@ impl DiceStorage {
             if cancelled() {
                 break;
             }
+            // A value that must stay resident is written only by `buck2 suspend`.
+            if !key_dyn.value_pages_out() {
+                non_pageable.push((dice_key, value));
+                continue;
+            }
             if let Some((data_key, ticket)) = self.page_out_value(&key_dyn, &value, finished)? {
                 pending.push(
                     dice_key,

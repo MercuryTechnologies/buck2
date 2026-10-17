@@ -19,10 +19,12 @@ use dupe::Dupe;
 // Re-exported so existing `dice::*ValueSerialize` paths (and `crate::api::key::*`)
 // keep resolving after the definitions moved to the `pagable` crate.
 pub use pagable::NoValueSerialize;
+pub use pagable::NoneValueSerialize;
 pub use pagable::OkPagableValueSerialize;
 use pagable::Pagable;
 use pagable::PagableTagged;
 pub use pagable::PagableValueSerialize;
+pub use pagable::ResidentValueSerialize;
 pub use pagable::TodoValueSerialize;
 pub use pagable::ValueSerialize;
 
