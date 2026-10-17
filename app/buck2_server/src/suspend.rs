@@ -68,6 +68,8 @@ const FORMAT: u32 = 2;
 /// coincidence.
 const CLOCK_SKEW_MS: u64 = 5 * 60 * 1000;
 
+mod vcs;
+
 /// Environment variables that differ between two runs of the same job and that nothing a daemon
 /// computes depends on, left out of the environment digest. A name ending in `*` is a prefix and a
 /// name starting with `*` a suffix.
@@ -608,13 +610,17 @@ fn check_files(m: &Manifest, image_dir: &Path, cache_dir: &Path) -> Result<Image
 }
 
 impl LoadedImage {
-    /// What the resumed file watcher compares the files with.
+    /// What the resumed file watcher compares the files with. It asks git, if the suspend
+    /// recorded a commit, once it has statted the files.
     pub(crate) fn resume_input<'a>(&'a self, project_root: &'a ProjectRoot) -> ResumeInput<'a> {
-        let _unused = project_root;
+        let watcher = &self.image.watcher;
         ResumeInput {
-            image: &self.image.watcher,
+            image: watcher,
             cross_host: self.cross_host,
-            vcs: Box::new(|| None),
+            vcs: Box::new(move || {
+                let head = watcher.vcs.as_ref()?;
+                Some(vcs::resume_delta(project_root.root(), head))
+            }),
         }
     }
 
@@ -753,9 +759,13 @@ async fn suspend_inner(
 
     // The files first: an edit made after this snapshot statted a file differs from it at
     // resume, and one made before is in the graph or fails the suspend.
+    let project_root = inputs.project_root;
     let watcher = inputs
         .file_watcher
-        .suspend_image(inputs.project_root, Box::new(|| None))
+        .suspend_image(
+            project_root,
+            Box::new(move || vcs::suspend_tree(project_root.root())),
+        )
         .await?;
     lap("files", &mut timings);
 

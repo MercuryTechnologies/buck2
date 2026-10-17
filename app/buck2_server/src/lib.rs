@@ -19,6 +19,7 @@ mod ctx;
 pub mod daemon;
 mod dice_tracker;
 mod file_status;
+mod git;
 mod heartbeat_guard;
 mod host_info;
 mod hydration;
