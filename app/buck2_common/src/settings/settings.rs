@@ -226,6 +226,19 @@ const HYDRATION_PAGE_OUT_ON_IDLE_ISOLATION_DIR_SCOPE: SettingKey<PageOutOnIdleIs
         oss_default: Some(PageOutOnIdleIsolationDirScope::All),
     };
 
+const HYDRATION_SUSPEND: SettingKey<bool> = SettingKey {
+    metadata: SettingKeyMetadata {
+        key: SettingKeyRef {
+            section: "hydration",
+            name: "suspend",
+        },
+        overridable_in: &[OverrideSource::CommandLine, OverrideSource::LocalSettings],
+    },
+    // Absence must remain distinct from `false` while legacy buckconfig is the fallback.
+    internal_default: None,
+    oss_default: None,
+};
+
 const HYDRATION_PAGE_OUT_POLICY: SettingKey<PageOutPolicy> = SettingKey {
     metadata: SettingKeyMetadata {
         key: SettingKeyRef {
@@ -315,6 +328,7 @@ pub(crate) static ALL_SETTING_METADATA: &[SettingKeyMetadata] = &[
     HYDRATION_PAGE_OUT_ON_IDLE_ISOLATION_DIR_SCOPE.metadata,
     HYDRATION_PAGE_OUT_POLICY.metadata,
     HYDRATION_EVICTION_POLICY.metadata,
+    HYDRATION_SUSPEND.metadata,
     LOG_USE_MANIFOLD.metadata,
     LOG_URL.metadata,
     PACKAGE_VISIBILITY_DEFAULT_INTERSECTION.metadata,
@@ -367,6 +381,7 @@ struct HydrationSectionData {
     page_out_on_idle_isolation_dir_scope: Option<PageOutOnIdleIsolationDirScope>,
     page_out_policy: Option<PageOutPolicy>,
     eviction_policy: Option<EvictionPolicy>,
+    suspend: Option<bool>,
 }
 
 #[derive(Debug, Default, Deserialize, Serialize, PartialEq, Eq, Allocative)]
@@ -477,7 +492,7 @@ impl HydrationSection {
     /// copy of every key from the previous version's stanza.
     pub(crate) const METADATA: SectionMetadata = SectionMetadata {
         section_name: "hydration",
-        section_version: 3,
+        section_version: 4,
     };
 
     /// Returns `None` when legacy buckconfig should determine the behavior.
@@ -495,6 +510,12 @@ impl HydrationSection {
     /// Returns `None` when legacy buckconfig should determine the behavior.
     pub fn page_out_on_idle(&self) -> Option<bool> {
         HYDRATION_PAGE_OUT_ON_IDLE.resolve(self.0.page_out_on_idle)
+    }
+
+    /// Whether `buck2 suspend` may write the daemon's state to disk and a later daemon resume
+    /// from it. Returns `None` when legacy buckconfig should determine the behavior.
+    pub fn suspend(&self) -> Option<bool> {
+        HYDRATION_SUSPEND.resolve(self.0.suspend)
     }
 
     /// Which values a page-out writes; see [`PageOutPolicy`].
@@ -742,6 +763,7 @@ Use test to execute tests.
         assert_eq!(hydration.enable_paging(), None);
         assert!(!hydration.defer_field_reads());
         assert_eq!(hydration.page_out_on_idle(), None);
+        assert_eq!(hydration.suspend(), None);
         assert_eq!(hydration.page_out_policy(), PageOutPolicy::OncePerValue);
         assert_eq!(
             hydration.eviction_policy(),

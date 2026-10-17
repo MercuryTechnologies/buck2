@@ -561,6 +561,23 @@ pub struct HydrationConfig {
     pub page_out_policy: PageOutPolicy,
     /// When the values a page-out writes leave memory; see [`EvictionPolicy`].
     pub eviction_policy: EvictionPolicy,
+    /// `buck2 suspend` and resume, `Some` when `hydration.suspend` (legacy
+    /// `buck2_hydration.suspend`) is true. Part of the startup config, so turning it on or off
+    /// restarts the daemon.
+    pub suspend: Option<SuspendConfig>,
+}
+
+/// Settings for `buck2 suspend` and resuming from what it wrote.
+#[derive(Allocative, Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SuspendConfig {
+    /// A suspended daemon whose paging store is larger than this many GiB is not resumed
+    /// (`buck2_hydration.suspend_max_db_gb`): the store only grows, and a cold start is how it
+    /// is reclaimed.
+    pub max_db_gb: u64,
+    /// Environment variables, beyond the built-in per-run ones, whose values may differ
+    /// between the suspended daemon and the resumed one (`buck2_hydration.suspend_env_ignore`,
+    /// comma-separated).
+    pub env_ignore: Vec<String>,
 }
 
 impl HydrationConfig {
@@ -595,9 +612,51 @@ impl HydrationConfig {
         // `page_out_on_idle` implies pagable storage, so it enables it too.
         let enabled = page_out_on_idle
             || resolve_bool(settings.hydration.enable_paging(), config, "enable_paging")?;
+        let suspend = resolve_bool(settings.hydration.suspend(), config, "suspend")?;
+        let page_out_policy = settings.hydration.page_out_policy();
+        if suspend {
+            // A suspend writes what paging does not; it needs paging to have written the rest,
+            // and every value it reads back again to have a row.
+            if !enabled {
+                return Err(buck2_error::buck2_error!(
+                    buck2_error::ErrorTag::Input,
+                    "`hydration.suspend` needs `hydration.enable_paging = true`"
+                ));
+            }
+            if page_out_policy == PageOutPolicy::OncePerKey {
+                return Err(buck2_error::buck2_error!(
+                    buck2_error::ErrorTag::Input,
+                    "`hydration.suspend` needs `hydration.page_out_policy = once_per_value`: \
+                     under `once_per_key` a value recomputed after a page-out never gets a row"
+                ));
+            }
+        }
         if !enabled {
             return Ok(None);
         }
+        let suspend = if suspend {
+            Some(SuspendConfig {
+                max_db_gb: config
+                    .parse(BuckconfigKeyRef {
+                        section: "buck2_hydration",
+                        property: "suspend_max_db_gb",
+                    })?
+                    .unwrap_or(50),
+                env_ignore: config
+                    .get(BuckconfigKeyRef {
+                        section: "buck2_hydration",
+                        property: "suspend_env_ignore",
+                    })
+                    .unwrap_or("")
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(ToOwned::to_owned)
+                    .collect(),
+            })
+        } else {
+            None
+        };
         Ok(Some(Self {
             pagable_storage_backend: config
                 .parse::<PagableStorageBackend>(BuckconfigKeyRef {
@@ -612,8 +671,9 @@ impl HydrationConfig {
                     property: "page_out_min_free_disk_gb",
                 })?
                 .unwrap_or(100),
-            page_out_policy: settings.hydration.page_out_policy(),
+            page_out_policy,
             eviction_policy: settings.hydration.eviction_policy(),
+            suspend,
         }))
     }
 }
@@ -896,6 +956,93 @@ mod tests {
             .expect("enable_paging should enable pagable storage");
         assert_eq!(hydration.page_out_policy, PageOutPolicy::OncePerKey);
         assert_eq!(hydration.eviction_policy, EvictionPolicy::OnIdle);
+        Ok(())
+    }
+
+    #[test]
+    fn test_suspend_is_off_by_default() -> buck2_error::Result<()> {
+        let config = parse(
+            &[("config", "[buck2_hydration]\nenable_paging = true\n")],
+            "config",
+        )?;
+        let startup_config = DaemonStartupConfig::new(&config, &BuckSettings::empty(), false)?;
+        let hydration = startup_config.hydration.expect("paging is on");
+        assert_eq!(hydration.suspend, None);
+        Ok(())
+    }
+
+    #[test]
+    fn test_suspend_from_legacy_config_with_its_options() -> buck2_error::Result<()> {
+        let config = parse(
+            &[(
+                "config",
+                indoc!(
+                    r#"
+                    [buck2_hydration]
+                    enable_paging = true
+                    suspend = true
+                    suspend_max_db_gb = 7
+                    suspend_env_ignore = CI_JOB_ID, BUILD_NUMBER
+                    "#
+                ),
+            )],
+            "config",
+        )?;
+        let startup_config = DaemonStartupConfig::new(&config, &BuckSettings::empty(), false)?;
+        let suspend = startup_config
+            .hydration
+            .expect("paging is on")
+            .suspend
+            .expect("suspend is on");
+        assert_eq!(suspend.max_db_gb, 7);
+        assert_eq!(suspend.env_ignore, vec!["CI_JOB_ID", "BUILD_NUMBER"]);
+        Ok(())
+    }
+
+    #[test]
+    fn test_suspend_setting_defaults() -> buck2_error::Result<()> {
+        let config = parse(&[("config", "")], "config")?;
+        let settings = resolve_setting_flags(vec![table(
+            "[hydration]\nenable_paging = true\nsuspend = true",
+        )])?;
+        let startup_config = DaemonStartupConfig::new(&config, &settings, false)?;
+        let suspend = startup_config
+            .hydration
+            .expect("paging is on")
+            .suspend
+            .expect("suspend is on");
+        assert_eq!(suspend.max_db_gb, 50);
+        assert!(suspend.env_ignore.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn test_suspend_refuses_without_paging() -> buck2_error::Result<()> {
+        let config = parse(
+            &[("config", "[buck2_hydration]\nsuspend = true\n")],
+            "config",
+        )?;
+        let error = DaemonStartupConfig::new(&config, &BuckSettings::empty(), false)
+            .expect_err("suspend without paging is refused");
+        assert!(
+            error.to_string().contains("hydration.enable_paging"),
+            "the refusal names the key: {error}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_suspend_refuses_once_per_key() -> buck2_error::Result<()> {
+        let config = parse(&[("config", "")], "config")?;
+        let settings = resolve_setting_flags(vec![table(
+            "[hydration]\nenable_paging = true\nsuspend = true\npage_out_policy = \"once_per_key\"",
+        )])?;
+        let error = DaemonStartupConfig::new(&config, &settings, false)
+            .expect_err("suspend under once_per_key is refused");
+        assert!(
+            error.to_string().contains("hydration.page_out_policy"),
+            "the refusal names the key: {error}"
+        );
         Ok(())
     }
 
