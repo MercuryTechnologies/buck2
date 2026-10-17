@@ -620,12 +620,13 @@ impl DiceStorage {
     }
 
     /// Writes a key as a row: its type tag and its fields, the projection alone for a
-    /// projection key (its base is the image's business).
+    /// projection key (its base is the image's business). Returns the row as stored too, for
+    /// [`Self::decode_key_row`].
     pub(crate) fn write_key_row(
         &self,
         key: &DiceKeyErased,
         finished: &ArcSerCache,
-    ) -> anyhow::Result<DataKey> {
+    ) -> anyhow::Result<(DataKey, PagableData)> {
         use pagable::PagableSerialize;
         let storage_context = self.storage.storage_context();
         let mut serializer = SerializerForPaging::new(storage_context);
@@ -636,7 +637,7 @@ impl DiceStorage {
         let (data, arcs) = serializer.finish();
         Ok(self
             .storage
-            .page_out_item(data, arcs, finished, storage_context)?)
+            .page_out_item_with_data(data, arcs, finished, storage_context)?)
     }
 
     /// Writes any pagable value as a row.
@@ -672,10 +673,21 @@ impl DiceStorage {
         row: DataKey,
         base: Option<DiceKey>,
     ) -> anyhow::Result<DiceKeyErased> {
-        use pagable::PagableBoxDeserialize;
         let data = self.storage.fetch_data(&row).await?;
+        self.decode_key_row(row, &data, base)
+    }
+
+    /// Reads a key from its row's data, as [`Self::read_key_row`] does from the store. The
+    /// arcs the row names are read from the store.
+    pub(crate) fn decode_key_row(
+        &self,
+        row: DataKey,
+        data: &PagableData,
+        base: Option<DiceKey>,
+    ) -> anyhow::Result<DiceKeyErased> {
+        use pagable::PagableBoxDeserialize;
         let handle = self.storage_handle();
-        let mut deserializer = handle.root_deserializer(row, &data);
+        let mut deserializer = handle.root_deserializer(row, data);
         Ok(match base {
             None => DiceKeyErased::Key(Arc::from(
                 <dyn crate::key::DiceKeyDyn as PagableBoxDeserialize>::deserialize_box(
@@ -691,6 +703,11 @@ impl DiceStorage {
                 ),
             ),
         })
+    }
+
+    /// Commits every row written so far, without making the store durable.
+    pub(crate) fn flush(&self) -> anyhow::Result<()> {
+        self.storage.flush()
     }
 
     /// Commits every row written so far and makes the store durable: the sqlite writer runs
