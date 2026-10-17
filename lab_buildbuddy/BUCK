@@ -36,14 +36,23 @@ config_setting(
 # constraint sets and name no backend; both execute here, on x86_64 executors,
 # so aarch64 is a cross-compile as it was on Namespace.
 #
-# The executors run OCI containers. The image is BuildBuddy's own Ubuntu 24.04
-# RBE image, the one buildbuddy/defs.bzl names, pinned by digest: the build
-# scripts and proc macros are linked for the gnu execution platform with no
-# sysroot, so the link needs glibc's development files and libgcc in the
-# image, and the prelude's Rust toolchain install needs find. Lab's thin worker
-# image has neither (lab's infra/toolchains/BUCK: "the worker image, which has
-# no C compiler"), and Namespace's default image had both. The image is public,
-# so an executor pulls it without registry credentials.
+# The executors run OCI containers, and the image is lab's thin worker
+# image, the one lab's :buildbuddy platform row sends to the usw2 pool,
+# pinned by digest. The build takes from it only what this contract names:
+#
+# - /bin: the shell, bash (`[prelude] bash` in .buckconfig.buildbuddy-lab),
+#   coreutils, curl, tar, xz, sed, grep and nix-store;
+# - /lib64/ld-linux-x86-64.so.2, the loader of every exec-side program
+#   (the host rustc, rust-lld, build scripts, proc macros, CPython), which
+#   finds glibc and libgcc_s in the executor's mounted nix store;
+# - SSL_CERT_FILE for downloads.
+#
+# Nothing comes from /usr. Every compiler, library and source is pinned by
+# sha256 in this tree, except the gnu link sysroot, which
+# :gnu-exec-sysroot-x86_64 builds from pinned store paths through the
+# executor's nix daemon (`nix_daemon` below) and checks against a manifest.
+# That action also checks that the image loader runs the pinned glibc, so
+# bump this digest and those paths together, with lab's image.
 # BuildBuddy's scheduler matches an executor on OSFamily, Arch and Pool
 # (enterprise/server/scheduling, at v2.310.0); `usw2` is c1's amd64 pool.
 # There is no local executor, so --remote-only proves every action ran
@@ -52,7 +61,8 @@ config_setting(
 buildbuddy_remote_execution_platform(
     name = "usw2_c1",
     arch = "amd64",
-    container_image = "docker://gcr.io/flame-public/rbe-ubuntu24-04@sha256:f7db0d4791247f032fdb4451b7c3ba90e567923a341cc6dc43abfc283436791a",
+    constraints = ["lab_buildbuddy//:nix_daemon"],
+    container_image = "docker://nscr.io/gl3j69hgbu2d6/lab-re-worker-thin:latest@sha256:96eba587c2ac177eca8c93c6920d7a7b5fe8b5bbcf1fc4b6781a2f0521eb77f8",
     cpu_configuration = "prelude//cpu:x86_64",
     os_configuration = "prelude//os:linux",
     os_family = "Linux",
