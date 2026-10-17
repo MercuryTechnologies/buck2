@@ -44,6 +44,7 @@ download_llvm_distribution(
     sha256 = "3590e82cd56ff58cdf71732b0fbc3eb8f21d4fc00b8592d1329af522381f08cc",
     target = "linux-amd64-musl",
     url = "https://github.com/sluongng/buck2/releases/download/v0.202624.0/llvm-toolchain-minimal-22.1.7-linux-amd64-musl.tar.gz",
+    visibility = ["lab_buildbuddy//..."],
 )
 
 # A target configuration carrying prelude//abi/constraints:musl (the
@@ -78,7 +79,14 @@ cxx_llvm_toolchain(
     cxx_compiler_flags = ["-std=c++20"],
     distribution = ":llvm_dist",
     sysroot = select({
-        "DEFAULT": None,
+        # The gnu configuration is the execution platform's, which links the
+        # build scripts and proc macros. On an executor with a nix daemon the
+        # sysroot comes from its store (lab_buildbuddy/BUCK); elsewhere the
+        # image provides glibc and libgcc, as before.
+        "DEFAULT": select({
+            "DEFAULT": None,
+            "lab_buildbuddy//:nix_daemon": "lab_buildbuddy//:gnu-exec-sysroot-x86_64[sysroot]",
+        }),
         "prelude//abi:musl": select({
             "prelude//cpu:arm64": ":musl-sysroot-aarch64",
             "prelude//cpu:x86_64": ":musl-sysroot-x86_64",
@@ -265,6 +273,7 @@ downloaded_rust_toolchain(
         "nightly-2026-07-05": "08c0aba8c8f95055700f4d781b7669f8f6522822ce1c078c207e2df75740905c",
     },
     default_edition = "2024",
+    host_runtime_libs = "lab_buildbuddy//:rustc-runtime-libs",
     # Release builds pass e.g. -c rust.rustc_flags="-Copt-level=3 -Cstrip=debuginfo";
     # the default is a debug build, as for cargo.
     rustc_flags = read_root_config("rust", "rustc_flags", "").split(),
