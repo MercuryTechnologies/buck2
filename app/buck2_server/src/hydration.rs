@@ -55,6 +55,7 @@ pub(crate) async fn hydration_command(
             tenant: ctx.base_context.tenant.dupe(),
             subcommand,
             wait: req.wait,
+            portable: req.portable.unwrap_or(false),
         },
         ctx,
         partial_result_dispatcher,
@@ -68,6 +69,8 @@ struct HydrationServerCommand {
     subcommand: HydrationSubcommand,
     /// `status --wait`: block until any in-progress idle page-out finishes.
     wait: bool,
+    /// `suspend --portable`.
+    portable: bool,
 }
 
 #[async_trait]
@@ -122,6 +125,7 @@ impl ServerCommandTemplate for HydrationServerCommand {
                     project_root: server_ctx.project_root(),
                     cache_dir: repo.paths.cache_dir_path().into_path_buf(),
                     buck_out: repo.paths.buck_out_path().into_path_buf(),
+                    portable: self.portable,
                 })
                 .await?;
                 Ok(buck2_cli_proto::HydrationResponse {

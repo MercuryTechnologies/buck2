@@ -60,6 +60,13 @@ pub struct SuspendCommand {
     /// build events, as `buck2 kill --bes-drain-timeout` does.
     #[clap(long, value_name = "DURATION", default_value = "0s")]
     bes_drain_timeout: humantime::Duration,
+
+    /// Make the image resumable on another machine, which has none of this one's `buck-out`:
+    /// upload every built output the remote cache cannot already serve (outputs of local
+    /// actions), hashing each file again first, and have the resumed daemon run every action
+    /// that ran locally again. Needs a remote execution backend to upload to.
+    #[clap(long)]
+    portable: bool,
 }
 
 #[async_trait(?Send)]
@@ -86,6 +93,7 @@ impl StreamingCommand for SuspendCommand {
                     context: Some(context),
                     subcommand: HydrationSubcommand::Suspend.into(),
                     wait: false,
+                    portable: Some(self.portable),
                 },
                 events_ctx,
                 ctx.console_interaction_stream(self.console_opts()),
@@ -175,6 +183,7 @@ impl StreamingCommand for ResumeCommand {
                     context: Some(context),
                     subcommand: HydrationSubcommand::ResumeStatus.into(),
                     wait: false,
+                    portable: None,
                 },
                 events_ctx,
                 ctx.console_interaction_stream(self.console_opts()),

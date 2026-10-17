@@ -395,6 +395,8 @@ struct Manifest {
     image_len: u64,
     image: String,
     dice_state_bytes: u64,
+    /// Written by `buck2 suspend --portable`: every materialized artifact has a CAS recipe.
+    portable: bool,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -654,7 +656,7 @@ impl LoadedImage {
         if resumed.lost > 0 {
             return Err(format!(
                 "the image is not portable: {} materialized artifacts are not on this disk \
-                 and have no CAS recipe",
+                 and have no CAS recipe (suspend with `--portable` to upload them)",
                 resumed.lost
             ));
         }
@@ -738,6 +740,8 @@ pub(crate) struct SuspendInputs<'a> {
     pub(crate) project_root: &'a ProjectRoot,
     pub(crate) cache_dir: PathBuf,
     pub(crate) buck_out: PathBuf,
+    /// `buck2 suspend --portable`.
+    pub(crate) portable: bool,
 }
 
 /// Writes the image. Before the MANIFEST is written nothing is lost by failing: the partial image
@@ -777,7 +781,10 @@ async fn suspend_inner(
         .await?;
     lap("files", &mut timings);
 
-    let artifacts = inputs.materializer.suspend_artifacts().await?;
+    let artifacts = inputs
+        .materializer
+        .suspend_artifacts(inputs.portable)
+        .await?;
     let artifact_count = artifacts.len();
     let mut artifact_rows = Vec::new();
     for row in suspend_rows(artifacts) {
@@ -843,6 +850,7 @@ async fn suspend_inner(
         image_len: bytes.len() as u64,
         image: blake3_hex(&bytes),
         dice_state_bytes,
+        portable: inputs.portable,
     };
     let manifest_bytes = serde_json::to_vec_pretty(&manifest)
         .map_err(|e| buck2_error!(ErrorTag::Tier0, "encoding the MANIFEST: {e}"))?;
@@ -854,7 +862,8 @@ async fn suspend_inner(
     let stats = &image.stats;
     let mut out = String::new();
     out.push_str(&format!(
-        "suspended: image {} bytes, paging store {} bytes, {} artifacts in {} rows\n",
+        "suspended{}: image {} bytes, paging store {} bytes, {} artifacts in {} rows\n",
+        if inputs.portable { " (portable)" } else { "" },
         bytes.len(),
         dice_state_bytes,
         artifact_count,
@@ -956,6 +965,7 @@ mod tests {
                 image_len: 0,
                 image: String::new(),
                 dice_state_bytes: 1 << 20,
+                portable: false,
             }
         }
     }

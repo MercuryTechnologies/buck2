@@ -1044,6 +1044,9 @@ message HydrationRequest {
   HydrationSubcommand subcommand = 2;
   // `status --wait`: block until any in-progress idle page-out finishes.
   bool wait = 3;
+  // `suspend --portable`: upload every materialized artifact the CAS cannot already serve, so
+  // that a daemon on another machine can resume the image.
+  optional bool portable = 4;
 }
 
 message HydrationResponse {

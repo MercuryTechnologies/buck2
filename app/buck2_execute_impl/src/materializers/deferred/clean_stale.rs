@@ -1333,6 +1333,7 @@ fn create_clean_fut<T: IoHandler>(
                         path.clone(),
                         upload.entry.dupe(),
                         info.dupe(),
+                        false,
                     )
                     .await
                 {

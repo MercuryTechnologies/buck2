@@ -19,6 +19,7 @@ use allocative::Allocative;
 use allocative::FlameGraphBuilder;
 use allocative::Visitor;
 use allocative::ident_key;
+use buck2_core::execution_types::executor_config::RemoteExecutorUseCase;
 use buck2_core::fs::project_rel_path::ProjectRelativePathBuf;
 use buck2_directory::directory::immutable_directory::ImmutableDirectory;
 use buck2_error::BuckErrorContext;
@@ -42,6 +43,7 @@ use derivative::Derivative;
 use dupe::Dupe;
 use futures::stream::BoxStream;
 use futures::stream::StreamExt;
+use futures::stream::TryStreamExt;
 use jiff::SignedDuration;
 use jiff::Timestamp;
 use tokio::sync::mpsc;
@@ -581,15 +583,65 @@ fn resume_artifacts<T: IoHandler>(
 impl<T: IoHandler> DeferredMaterializerAccessor<T> {
     pub(super) async fn suspend_artifacts_impl(
         &self,
+        portable: bool,
     ) -> buck2_error::Result<Vec<SuspendedArtifact>> {
         let (sender, receiver) = oneshot::channel();
         self.command_sender.send(MaterializerCommand::Extension(
             Box::new(SuspendArtifacts { sender }) as _,
             get_dispatcher_opt(),
         ))?;
-        receiver
+        let mut artifacts = receiver
             .await
-            .buck_error_context("No response from materializer")?
+            .buck_error_context("No response from materializer")??;
+        if portable {
+            self.upload_for_portable_suspend(&mut artifacts).await?;
+        }
+        Ok(artifacts)
+    }
+
+    /// Uploads every materialized artifact that has no CAS recipe, verifying each file, and
+    /// records the upload as its recipe. Nothing runs while a suspend does, so the artifacts
+    /// stay as the materializer listed them.
+    async fn upload_for_portable_suspend(
+        &self,
+        artifacts: &mut [SuspendedArtifact],
+    ) -> buck2_error::Result<()> {
+        const CONCURRENT_UPLOADS: usize = 32;
+        let info = Arc::new(CasDownloadInfo::new_uploaded(
+            RemoteExecutorUseCase::buck2_default(),
+        ));
+        let uploads: Vec<_> = artifacts
+            .iter()
+            .enumerate()
+            .filter_map(|(i, a)| match &a.state {
+                SuspendedArtifactState::Materialized { entry, cas: None } => {
+                    Some((i, a.path.clone(), entry.dupe()))
+                }
+                _ => None,
+            })
+            .collect();
+        let uploaded: Vec<usize> =
+            futures::stream::iter(uploads.into_iter().map(|(i, path, entry)| {
+                let io = self.io.dupe();
+                let info = info.dupe();
+                async move {
+                    io.upload_materialized_artifact(path.clone(), entry, info, true)
+                        .await
+                        .with_buck_error_context(|| {
+                            format!("uploading `{path}` for `buck2 suspend --portable`")
+                        })?;
+                    buck2_error::Ok(i)
+                }
+            }))
+            .buffer_unordered(CONCURRENT_UPLOADS)
+            .try_collect()
+            .await?;
+        for i in uploaded {
+            if let SuspendedArtifactState::Materialized { cas, .. } = &mut artifacts[i].state {
+                *cas = Some(info.to_suspended());
+            }
+        }
+        Ok(())
     }
 
     pub(super) async fn resume_artifacts_impl(

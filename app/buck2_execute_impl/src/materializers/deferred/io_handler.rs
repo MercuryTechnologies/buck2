@@ -19,6 +19,7 @@ use buck2_common::file_ops::metadata::FileMetadata;
 use buck2_common::file_ops::metadata::TrackedFileDigest;
 use buck2_core::buck2_env;
 use buck2_core::fs::project::ProjectRoot;
+use buck2_core::fs::project_rel_path::ProjectRelativePath;
 use buck2_core::fs::project_rel_path::ProjectRelativePathBuf;
 use buck2_directory::directory::directory::Directory;
 use buck2_directory::directory::directory_iterator::DirectoryIterator;
@@ -59,6 +60,7 @@ use futures::future::Future;
 use futures::future::FutureExt;
 use jiff::SignedDuration;
 use jiff::Timestamp;
+use remote_execution::InlinedBlobWithDigest;
 use remote_execution::NamedDigest;
 use remote_execution::NamedDigestWithPermissions;
 use remote_execution::TCode;
@@ -151,11 +153,16 @@ pub trait IoHandler: Sized + Sync + Send + 'static {
         min_ttl: SignedDuration,
     ) -> Option<BoxFuture<'static, buck2_error::Result<()>>>;
 
+    /// Uploads the files of the materialized artifact at `path` to the CAS under the digests
+    /// `entry` records. With `verify`, each file is read and hashed again first, and the bytes
+    /// hashed are the bytes uploaded: a file that no longer matches `entry` fails the upload
+    /// and nothing is uploaded for it. Without, the files are trusted to match.
     async fn upload_materialized_artifact(
         self: &Arc<Self>,
         path: ProjectRelativePathBuf,
         entry: ActionDirectoryEntry<ActionSharedDirectory>,
         info: Arc<CasDownloadInfo>,
+        verify: bool,
     ) -> buck2_error::Result<()>;
 
     fn read_dir(&self, path: &AbsNormPathBuf) -> buck2_error::Result<ReadDir>;
@@ -416,7 +423,30 @@ impl IoHandler for DefaultIoHandler {
         path: ProjectRelativePathBuf,
         entry: ActionDirectoryEntry<ActionSharedDirectory>,
         info: Arc<CasDownloadInfo>,
+        verify: bool,
     ) -> buck2_error::Result<()> {
+        if verify {
+            let fs = self.fs.dupe();
+            let digest_config = self.digest_config;
+            let blobs = tokio::task::spawn_blocking(move || {
+                read_verified_files(&fs, &path, &entry, digest_config)
+            })
+            .await
+            .map_err(|e| buck2_error::buck2_error!(ErrorTag::Tier0, "{e}"))??
+            .into_iter()
+            .map(|(digest, blob)| InlinedBlobWithDigest {
+                digest: digest.to_re(),
+                blob,
+                ..Default::default()
+            })
+            .collect();
+            let connection = self.re_client_manager.get_re_connection();
+            let re_client = connection.get_client().with_use_case(info.re_use_case);
+            re_client
+                .upload_files_and_directories(vec![], vec![], blobs, None)
+                .await?;
+            return Ok(());
+        }
         let files = {
             let mut files = Vec::new();
             let mut walk = unordered_entry_walk(entry.as_ref().map_dir(Directory::as_ref));
@@ -536,6 +566,7 @@ impl IoHandler for NoDiskIoHandler {
         _path: ProjectRelativePathBuf,
         _entry: ActionDirectoryEntry<ActionSharedDirectory>,
         _info: Arc<CasDownloadInfo>,
+        _verify: bool,
     ) -> buck2_error::Result<()> {
         Err(buck2_error::buck2_error!(
             ErrorTag::Tier0,
@@ -562,6 +593,46 @@ impl IoHandler for NoDiskIoHandler {
     fn digest_config(&self) -> DigestConfig {
         self.digest_config
     }
+}
+
+/// Reads every file of the materialized artifact at `path` and checks it against the digest
+/// `entry` records, hashing with the algorithm of that digest's family as the digest config
+/// has it. Returns each file's digest with the bytes that were hashed, so that an upload of
+/// them cannot send content that changed after the check. A mismatch names the file.
+pub(crate) fn read_verified_files(
+    fs: &ProjectRoot,
+    path: &ProjectRelativePath,
+    entry: &ActionDirectoryEntry<ActionSharedDirectory>,
+    digest_config: DigestConfig,
+) -> buck2_error::Result<Vec<(FileDigest, Vec<u8>)>> {
+    let mut out = Vec::new();
+    let mut walk = unordered_entry_walk(entry.as_ref().map_dir(Directory::as_ref));
+    while let Some((entry_path, entry)) = walk.next() {
+        if let DirectoryEntry::Leaf(ActionDirectoryMember::File(file)) = entry {
+            let file_path = path.join(entry_path.get());
+            let bytes = fs_util::read(fs.resolve(&file_path)).categorize_internal()?;
+            let recorded = file.digest.data();
+            let algorithm = digest_config
+                .cas_digest_config()
+                .algorithm_for_family(recorded.raw_digest().algorithm())
+                .ok_or_else(|| {
+                    buck2_error::buck2_error!(
+                        ErrorTag::Input,
+                        "`{file_path}` has a digest this digest config does not hash"
+                    )
+                })?;
+            let actual = FileDigest::from_content_for_algorithm(&bytes, algorithm);
+            if actual != *recorded {
+                return Err(buck2_error::buck2_error!(
+                    ErrorTag::Input,
+                    "`{file_path}` changed on disk after it was built: it hashes to {actual}, \
+                     not {recorded}, so it was not uploaded"
+                ));
+            }
+            out.push((actual, bytes));
+        }
+    }
+    Ok(out)
 }
 
 /// This is used for testing to ingest digests (via BUCK2_TEST_TOMBSTONED_DIGESTS).

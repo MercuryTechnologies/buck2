@@ -625,7 +625,7 @@ impl<T: IoHandler> Cleaner<T> {
         };
         if let Err(error) = self
             .io
-            .upload_materialized_artifact(path.clone(), action_entry, info.dupe())
+            .upload_materialized_artifact(path.clone(), action_entry, info.dupe(), false)
             .await
         {
             tracing::warn!(path = %path, "Failed to upload artifact before unmaterialization: {error:#}");

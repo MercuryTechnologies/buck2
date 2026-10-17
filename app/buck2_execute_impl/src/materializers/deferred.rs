@@ -747,8 +747,11 @@ impl<T: IoHandler + Allocative> Materializer for DeferredMaterializerAccessor<T>
         self.iterate_impl()
     }
 
-    async fn suspend_artifacts(&self) -> buck2_error::Result<Vec<SuspendedArtifact>> {
-        self.suspend_artifacts_impl().await
+    async fn suspend_artifacts(
+        &self,
+        portable: bool,
+    ) -> buck2_error::Result<Vec<SuspendedArtifact>> {
+        self.suspend_artifacts_impl(portable).await
     }
 
     async fn resume_artifacts(

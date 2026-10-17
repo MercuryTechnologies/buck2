@@ -224,6 +224,8 @@ pub(crate) mod state_machine {
         Clean,
         Materialize,
         MaterializeError,
+        /// A verified upload, which the stub checks and records.
+        Upload,
     }
 
     #[derive(Allocative)]
@@ -442,13 +444,25 @@ pub(crate) mod state_machine {
             unimplemented!()
         }
 
-        /// The stub has no CAS to upload to; a caller sees the failure it would see offline.
+        /// The stub has no CAS to upload to. An unverified upload fails as it would offline; a
+        /// verified one runs the real check against the files and records the upload.
         async fn upload_materialized_artifact(
             self: &Arc<Self>,
             path: ProjectRelativePathBuf,
-            _entry: ActionDirectoryEntry<ActionSharedDirectory>,
+            entry: ActionDirectoryEntry<ActionSharedDirectory>,
             _info: Arc<CasDownloadInfo>,
+            verify: bool,
         ) -> buck2_error::Result<()> {
+            if verify {
+                crate::materializers::deferred::io_handler::read_verified_files(
+                    &self.fs,
+                    &path,
+                    &entry,
+                    self.digest_config,
+                )?;
+                self.log.lock().push((Op::Upload, path));
+                return Ok(());
+            }
             Err(buck2_error!(
                 buck2_error::ErrorTag::Tier0,
                 "The IO stub cannot upload `{path}`"
@@ -555,7 +569,41 @@ pub(crate) mod state_machine {
             .next()
             .await
             .unwrap()?;
+        wait_materialized(path, dm).await
+    }
 
+    /// Declares `path` as a CAS download of `contents` and materializes it, which the stub does
+    /// without writing a file: the artifact ends `Materialized` with the CAS as its recipe.
+    async fn materialize_cas(
+        path: &ProjectRelativePathBuf,
+        contents: &'static [u8],
+        dm: &DeferredMaterializerAccessor<StubIoHandler>,
+    ) -> buck2_error::Result<()> {
+        let expiry = Timestamp::now()
+            .checked_add(SignedDuration::from_hours(1))
+            .expect("one hour should fit in a timestamp");
+        dm.declare_cas_many_impl(
+            Arc::new(CasDownloadInfo::new_declared(
+                RemoteExecutorUseCase::buck2_default(),
+            )),
+            vec![DeclareArtifactPayload {
+                path: path.clone(),
+                artifact: cas_value(DigestConfig::testing_default(), contents, expiry),
+            }],
+        )
+        .await?;
+        dm.materialize_many(vec![path.clone()])
+            .await?
+            .next()
+            .await
+            .unwrap()?;
+        wait_materialized(path, dm).await
+    }
+
+    async fn wait_materialized(
+        path: &ProjectRelativePathBuf,
+        dm: &DeferredMaterializerAccessor<StubIoHandler>,
+    ) -> buck2_error::Result<()> {
         // Materialization resolves once the file is on disk, but callers need the state the
         // materializer records when it processes the completion (notably the sqlite entry).
         loop {
@@ -1765,7 +1813,7 @@ pub(crate) mod state_machine {
             )
             .await?;
 
-            let mut artifacts = dm.suspend_artifacts().await?;
+            let mut artifacts = dm.suspend_artifacts(false).await?;
             let mut states: Vec<(String, &'static str)> = artifacts
                 .iter()
                 .map(|a| {
@@ -1952,6 +2000,120 @@ pub(crate) mod state_machine {
             );
             // The changed artifact is on disk, so it is deleted before the download.
             assert_eq!(io.take_log(), vec![(Op::Clean, with_cas.clone())]);
+            dm.abort();
+            Ok(())
+        })
+        .await
+    }
+
+    fn suspended_states(
+        artifacts: &[buck2_execute::materialize::materializer::SuspendedArtifact],
+    ) -> Vec<(String, String)> {
+        use buck2_execute::materialize::materializer::SuspendedArtifactState;
+        use buck2_execute::materialize::materializer::SuspendedCasOrigin;
+        let mut out: Vec<(String, String)> = artifacts
+            .iter()
+            .map(|a| {
+                let state = match &a.state {
+                    SuspendedArtifactState::Materialized { cas: None, .. } => "materialized",
+                    SuspendedArtifactState::Materialized {
+                        cas: Some((SuspendedCasOrigin::Uploaded, _)),
+                        ..
+                    } => "materialized, uploaded",
+                    SuspendedArtifactState::Materialized { cas: Some(_), .. } => {
+                        "materialized, cas"
+                    }
+                    SuspendedArtifactState::CasDownload { .. } => "cas",
+                    SuspendedArtifactState::LocalCopy { .. } => "copy",
+                    SuspendedArtifactState::Write { .. } => "write",
+                };
+                (a.path.to_string(), state.to_owned())
+            })
+            .collect();
+        out.sort();
+        out
+    }
+
+    /// `suspend --portable` uploads exactly the materialized artifact that has no CAS recipe,
+    /// after hashing it again, and every artifact of the image then comes back on a fresh
+    /// machine. Without `--portable` that artifact is lost there.
+    #[tokio::test]
+    async fn portable_suspend_uploads_what_the_cas_cannot_serve() -> buck2_error::Result<()> {
+        use buck2_execute::materialize::materializer::ResumedArtifacts;
+
+        ignore_stack_overflow_checks_for_future(async {
+            let cas = make_path("buck-out/v2/art/foo/cas");
+            let local = make_path("buck-out/v2/art/foo/local");
+            let write = make_path("buck-out/v2/art/foo/write");
+            let io = Arc::new(StubIoHandler::new(temp_root()));
+            let (dm, _) = make_materializer(io.dupe(), None).await;
+            materialize_cas(&cas, b"cas", &dm).await?;
+            materialize_write(&local, b"local", &dm).await?;
+            io.take_log();
+            let write_path = write.clone();
+            dm.declare_write(Box::new(move || {
+                Ok(vec![WriteRequest {
+                    path: write_path,
+                    content: b"write".to_vec(),
+                    is_executable: false,
+                    path_kind: BuckOutPathKind::Configuration,
+                }])
+            }))
+            .await?;
+
+            // The declared write's clean is logged once the processor reaches it, which the
+            // suspend's own command waits for.
+            let plain = dm.suspend_artifacts(false).await?;
+            assert_eq!(io.take_log(), vec![(Op::Clean, write.clone())]);
+            let portable = dm.suspend_artifacts(true).await?;
+            assert_eq!(io.take_log(), vec![(Op::Upload, local.clone())]);
+            assert_eq!(
+                suspended_states(&portable),
+                vec![
+                    (cas.to_string(), "materialized, cas".to_owned()),
+                    (local.to_string(), "materialized, uploaded".to_owned()),
+                    (write.to_string(), "write".to_owned()),
+                ]
+            );
+
+            // An output changed on disk after it was built is not uploaded, and the suspend
+            // fails.
+            io.fs().write_file(&local, b"tampered", false)?;
+            let err = dm.suspend_artifacts(true).await.unwrap_err();
+            assert!(
+                format!("{err:#}").contains("changed on disk"),
+                "unexpected error: {err:#}"
+            );
+            assert_eq!(io.take_log(), vec![]);
+            dm.abort();
+
+            // A fresh machine: everything comes back from the CAS or is written again, and
+            // nothing is deleted first.
+            let fresh = Arc::new(StubIoHandler::new(temp_root()));
+            let (dm, _) = make_materializer(fresh.dupe(), None).await;
+            assert_eq!(
+                dm.resume_artifacts(portable).await?,
+                ResumedArtifacts {
+                    reactivated: 0,
+                    redeclared: 1,
+                    refetch: 2,
+                    lost: 0,
+                }
+            );
+            assert_eq!(fresh.take_log(), vec![]);
+            dm.abort();
+
+            let fresh = Arc::new(StubIoHandler::new(temp_root()));
+            let (dm, _) = make_materializer(fresh.dupe(), None).await;
+            assert_eq!(
+                dm.resume_artifacts(plain).await?,
+                ResumedArtifacts {
+                    reactivated: 0,
+                    redeclared: 1,
+                    refetch: 1,
+                    lost: 1,
+                }
+            );
             dm.abort();
             Ok(())
         })
