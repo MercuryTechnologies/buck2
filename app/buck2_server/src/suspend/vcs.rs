@@ -689,8 +689,9 @@ mod tests {
             let image = repo.suspend(&repo.crawler()).await;
             repo.reclone(&[]);
             repo.age_all();
-            // The index records the aged stat.
-            repo.git(&["status", "--porcelain"]);
+            // The index records the aged stat. `git status` would not write it here: these
+            // calls run with optional locks off.
+            repo.git(&["update-index", "-q", "--refresh"]);
             repo.git(&["config", setting.0, setting.1]);
             let f = repo.dir().join("f");
             let modified = std::fs::metadata(&f).unwrap().modified().unwrap();
