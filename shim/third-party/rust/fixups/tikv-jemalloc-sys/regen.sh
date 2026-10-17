@@ -8,10 +8,14 @@
 #
 #   shim/third-party/rust/fixups/tikv-jemalloc-sys/regen.sh
 #
-# Every input is a buck2 target built through .buckconfig.namespace, so this
-# needs the same remote execution credentials as any build with that config
-# and materialises the Rust toolchain of each target locally. BUCK2 names the
-# buck2 to run (default: buck2 on PATH); make, sed and sh must exist here.
+# Every input is a buck2 target built on remote execution, through
+# .buckconfig.namespace unless BUCK2_CONFIG gives other config arguments
+# (word-split: "--config-file <file> -c <section.key=value>"), and the Rust
+# toolchain of each target is materialised locally. BUCK2 names the buck2
+# to run (default: buck2 on PATH); make, sed and sh must exist here.
+#
+# The crate is the tikv-jemalloc-sys archive the shim's BUCK names, so a
+# version bump reaches the headers by rerunning this after regenerate.sh.
 #
 # Only jemalloc_internal_defs.h depends on the target (page size, spin-wait
 # instruction); the script checks that the other three headers came out the
@@ -20,7 +24,9 @@ set -eu
 
 here=$(cd "$(dirname "$0")" && pwd)
 root=$(cd "$here/../../../../.." && pwd)
-crate="tikv-jemalloc-sys-0.6.1+5.3.0-1-ge13ca993e8ccb9ba9847cc330696e02839f328f7"
+crate=$(grep -o -m1 '"tikv-jemalloc-sys-[^"]*\.crate"' "$here/../../BUCK" | tr -d '"')
+crate="${crate%.crate}"
+[ -n "$crate" ] || { echo "$0: no tikv-jemalloc-sys archive in the shim's BUCK" >&2; exit 1; }
 # The build script passes the part after `+` as --with-version.
 je_version="${crate#*+}"
 BUCK2="${BUCK2:-buck2}"
@@ -45,7 +51,7 @@ for arch in x86_64 aarch64; do
     esac
 
     outputs="$work/outputs-$arch"
-    (cd "$root" && $BUCK2 build --config-file .buckconfig.namespace \
+    (cd "$root" && $BUCK2 build ${BUCK2_CONFIG:---config-file .buckconfig.namespace} \
         --target-platforms "namespace//:linux-$arch-musl" \
         --show-full-output \
         toolchains//:llvm_dist \
