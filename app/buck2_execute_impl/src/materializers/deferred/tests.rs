@@ -1974,8 +1974,11 @@ pub(crate) mod state_machine {
             assert_eq!(io.take_log(), vec![(Op::Materialize, with_cas.clone())]);
             dm.abort();
 
-            // The same machine, where one artifact is on disk as suspended and the other changed.
+            // The same machine, where one artifact is on disk as suspended, one changed, and one
+            // is gone. The gone one comes first: its directory exists, so a probe that took the
+            // directory for missing would skip the delete of the changed one beside it.
             let same = make_path("buck-out/v2/art/foo/same");
+            let gone = make_path("buck-out/v2/art/foo/gone/out");
             let io = Arc::new(StubIoHandler::new(temp_root()));
             let (dm, _) = make_materializer(io.dupe(), None).await;
             materialize_write(&same, b"same", &dm).await?;
@@ -1986,6 +1989,7 @@ pub(crate) mod state_machine {
             let resumed = dm
                 .resume_artifacts(vec![
                     suspended_materialized(&same, b"same", false),
+                    suspended_materialized(&gone, b"gone", true),
                     suspended_materialized(&with_cas, b"new", true),
                 ])
                 .await?;
@@ -1994,11 +1998,12 @@ pub(crate) mod state_machine {
                 ResumedArtifacts {
                     reactivated: 1,
                     redeclared: 0,
-                    refetch: 1,
+                    refetch: 2,
                     lost: 0,
                 }
             );
-            // The changed artifact is on disk, so it is deleted before the download.
+            // The changed artifact is on disk, so it is deleted before the download; the gone
+            // one is not.
             assert_eq!(io.take_log(), vec![(Op::Clean, with_cas.clone())]);
             dm.abort();
             Ok(())
