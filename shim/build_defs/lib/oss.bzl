@@ -24,25 +24,30 @@ def _parse_prefix_mappings(raw_rules):
 
     return rules
 
-# Cell the BUCK file being processed belongs to
-ACTIVE_CELL = native.get_cell_name()
+# These settings describe the project, so they are read from the project root
+# .buckconfig whichever cell loads this file. A buck2 that loads a .bzl once
+# for every cell (facebook/buck2#1100, carried by lab's fork) evaluates it in
+# the shim cell, where read_config would see the shim's .buckconfig; and
+# starlark folds read_config with constant arguments at compile time, so even
+# a call inside a function would. The loading cell itself is asked for in
+# translate_target, at call time.
 
 # The root cell of this project, extracted from the "root" alias.
 # Targets that explicitly reference this cell will not be rewritten, and
 # targets that do not end up referencing a cell will be replaced with targets
 # that reference this cell
-ROOT_CELL = read_config("cell_aliases", "root", "root")
+ROOT_CELL = read_root_config("cell_aliases", "root", "root")
 
 # The cell this file and the rest of the shim directory belong to, generally
 # "shim" and does not need to be set.
-SHIM_CELL = read_config("oss", "shim_cell", "shim")
+SHIM_CELL = read_root_config("oss", "shim_cell", "shim")
 
 # The internal cell this project originally belonged to.
 #
 # When applying rewrites, the cell of the target is often considered. Targets
 # that do not explicitly specify a cell (eg: "//foo:bar") will be considered
 # to belong to INTERNAL_CELL.
-INTERNAL_CELL = read_config("oss", "internal_cell", "fbcode")
+INTERNAL_CELL = read_root_config("oss", "internal_cell", "fbcode")
 
 # There can be situations where a target specifies a cell explicitly and the
 # path is part of the local checkout, rather than potentially needing to be
@@ -57,7 +62,7 @@ INTERNAL_CELL = read_config("oss", "internal_cell", "fbcode")
 #
 # Examples:
 #     internal_cell//oss_project/foo:bar -> root//oss_project/foo:bar
-PROJECT_DIRS = _filter_empty_strings(read_config("oss", "project_dirs", "").split(" "))
+PROJECT_DIRS = _filter_empty_strings(read_root_config("oss", "project_dirs", "").split(" "))
 
 # There are some situations where prefix of the internal directory structure is
 # removed from the public filepaths, such as rewriting "internal/foo/bar/baz"
@@ -76,7 +81,7 @@ PROJECT_DIRS = _filter_empty_strings(read_config("oss", "project_dirs", "").spli
 # Examples:
 #     //oss_project/foo:bar -> root//foo:bar
 #     internal_cell//oss_project/foo:bar -> root//foo:bar
-STRIPPED_ROOT_DIRS = _filter_empty_strings(read_config("oss", "stripped_root_dirs", "").split(" "))
+STRIPPED_ROOT_DIRS = _filter_empty_strings(read_root_config("oss", "stripped_root_dirs", "").split(" "))
 
 # Internally, most code shares the same cell in a monorepo, but public projects
 # only contain a subset, importing dependencies via git submodules or other
@@ -99,7 +104,7 @@ STRIPPED_ROOT_DIRS = _filter_empty_strings(read_config("oss", "stripped_root_dir
 # Examples:
 #     internal//foo->foo//foo; internal//foo/bar:baz -> foo//foo/bar:baz
 PREFIX_MAPPINGS = _parse_prefix_mappings(
-    _filter_empty_strings(read_config("oss", "prefix_mappings", "").split(" ")),
+    _filter_empty_strings(read_root_config("oss", "prefix_mappings", "").split(" ")),
 )
 
 # Hardcoded rewrite rules that apply to many projects and only produce targets
@@ -131,7 +136,7 @@ IMPLICIT_REWRITE_RULES = {
 
 DEFAULT_REWRITE_CTX = struct(
     cells = struct(
-        active = ACTIVE_CELL,
+        active = None,
         root = ROOT_CELL,
         shim = SHIM_CELL,
         internal = INTERNAL_CELL,
@@ -167,7 +172,9 @@ def translate_target(target: str, ctx = DEFAULT_REWRITE_CTX) -> str:
         # This cell is explicitly root. Don't touch
         return target
 
-    resolved_cell = ctx.cells.active if cell == "" else cell
+    # The cell of the BUCK file being processed, asked for at call time.
+    active_cell = ctx.cells.active or native.get_cell_name()
+    resolved_cell = active_cell if cell == "" else cell
     internal_cell = ctx.cells.internal if resolved_cell == ctx.cells.root else resolved_cell
 
     if internal_cell == ctx.cells.internal:

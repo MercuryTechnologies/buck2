@@ -1,0 +1,25 @@
+# Build buck2 with buck2 on lab's BuildBuddy remote execution (c1, usw2):
+#
+#   ./bootstrap/buck2 build //app/buck2:buck2-bin --config-file .buckconfig.buildbuddy-lab \
+#       --remote-only --target-platforms namespace//:linux-x86_64-musl
+#
+# The same as .buckconfig.namespace with lab's executors instead of
+# Namespace's. [buck2_re_client] (lab's endpoint, its CA and the
+# x-buildbuddy-api-key header) must sit in a file the daemon reads with no
+# arguments, such as an untracked .buckconfig.local: the daemon builds its
+# remote-execution client from the config files alone.
+
+[cell_aliases]
+toolchains = buildbuddy_toolchains
+
+[build]
+execution_platforms = lab_buildbuddy//:usw2_c1
+
+[http_archive]
+remote_download = true
+
+[buck2]
+digest_algorithms = BLAKE3
+materializations = deferred_skip_final_artifacts
+sqlite_materializer_state = true
+defer_write_actions = true

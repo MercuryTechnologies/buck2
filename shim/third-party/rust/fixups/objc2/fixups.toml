@@ -7,3 +7,8 @@
 # above-listed licenses.
 
 buildscript.run = false
+
+# objc2 0.6.4 reads env!("CARGO_PKG_VERSION") in two crate-level #![doc]
+# attributes, so rustc fails on macOS without it. Cargo always sets it;
+# reindeer sets it only when a fixup asks.
+cargo_env = ["CARGO_PKG_VERSION"]
