@@ -128,8 +128,8 @@ check "the local action is dirtied" grep -q '; 1 locally executed actions to run
 
 step build-pr "$B" build //:after //:r9 --show-full-output
 ran build-pr
-after=$(grep -E '//:after ' "$R/build-pr.log" | awk '{print $2}')
-r9=$(grep -E '//:r9 ' "$R/build-pr.log" | awk '{print $2}')
+after=$(grep -E '^root//:after ' "$R/build-pr.log" | awk '{print $2}')
+r9=$(grep -E '^root//:r9 ' "$R/build-pr.log" | awk '{print $2}')
 check "the local action ran again with the PR's environment" grep -q '^sha-pr$' "$after"
 check "what-ran lists the local action, run locally" test "$(ran_where "$R/build-pr.what-ran" root//:sha)" = local
 check "the chain was not run again" test -z "$(for i in $(seq 0 9); do ran_where "$R/build-pr.what-ran" root//:r$i; done)"
@@ -139,8 +139,8 @@ check "a chain output fetched from the CAS has its content" grep -q "^r9 $SALT$"
 # The same targets cold, in another checkout, with the PR's environment: equal outputs.
 cd "$C"
 step build-cold "$B" build //:after //:r9 --show-full-output
-cafter=$(grep -E '//:after ' "$R/build-cold.log" | awk '{print $2}')
-cr9=$(grep -E '//:r9 ' "$R/build-cold.log" | awk '{print $2}')
+cafter=$(grep -E '^root//:after ' "$R/build-cold.log" | awk '{print $2}')
+cr9=$(grep -E '^root//:r9 ' "$R/build-cold.log" | awk '{print $2}')
 check "after equals a cold build's" cmp -s "$after" "$cafter"
 check "r9 equals a cold build's" cmp -s "$r9" "$cr9"
 "$B" kill > /dev/null 2>&1
