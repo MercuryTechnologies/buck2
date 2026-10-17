@@ -198,9 +198,10 @@ mod tests {
     fn accepts_valid_hydration_settings() -> buck2_error::Result<()> {
         let selected = select_rollout_table(table(
             r#"
-                [hydration.4]
+                [hydration.5]
                 enable_paging = true
                 suspend = true
+                host_identity = "img=sha256:abc;arch=x86_64"
                 defer_field_reads = true
                 page_out_on_idle = true
                 page_out_on_idle_isolation_dir_scope = "non_default"
@@ -217,6 +218,7 @@ mod tests {
                     [hydration]
                     enable_paging = true
                     suspend = true
+                    host_identity = "img=sha256:abc;arch=x86_64"
                     defer_field_reads = true
                     page_out_on_idle = true
                     page_out_on_idle_isolation_dir_scope = "non_default"
@@ -233,7 +235,7 @@ mod tests {
         assert_eq!(
             select_rollout_table(table(
                 r#"
-                    [hydration.3]
+                    [hydration.4]
                     enable_paging = true
                     page_out_on_idle = true
                 "#,

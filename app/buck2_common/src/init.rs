@@ -677,6 +677,11 @@ impl HydrationConfig {
     }
 }
 
+/// The legacy buckconfig key for the host identity, in `buck2_hydration`. A digest of the root
+/// buckconfig leaves it out, as [`DaemonStartupConfig::without_host_identity`] does for the
+/// startup config.
+pub const HOST_IDENTITY_PROPERTY: &str = "host_identity";
+
 /// Startup options and Buck Settings read by the client and passed to the daemon.
 /// Reusing a daemon requires equal startup options and daemon-compatible Buck Settings.
 ///
@@ -717,6 +722,14 @@ pub struct DaemonStartupOptions {
     pub daemon_idle_timeout_s: Option<u64>,
     /// Pagable DICE storage settings, or `None` when paging is disabled.
     pub hydration: Option<HydrationConfig>,
+    /// What stands for this machine in the on-disk state buck2 keeps across daemons (the suspend
+    /// MANIFEST and the materializer, dep-file and incremental databases): `hydration.host_identity`,
+    /// legacy `buck2_hydration.host_identity`. `None` means the hostname. Two machines with the same
+    /// identity are trusted to run local actions the same way, so CI derives it from what those
+    /// actions depend on (the runner image, the toolchain closure, the architecture) rather than
+    /// from the machine's name. Part of the startup config because the databases are opened once,
+    /// at startup.
+    pub host_identity: Option<String>,
 }
 
 impl DaemonStartupConfig {
@@ -845,11 +858,30 @@ impl DaemonStartupConfig {
                 property: "daemon_idle_timeout_s",
             })?,
             hydration: HydrationConfig::from_config(config, settings)?,
+            host_identity: match settings.hydration.host_identity() {
+                Some(identity) => Some(identity.to_owned()),
+                None => config
+                    .get(BuckconfigKeyRef {
+                        section: "buck2_hydration",
+                        property: HOST_IDENTITY_PROPERTY,
+                    })
+                    .map(ToOwned::to_owned),
+            }
+            .filter(|identity| !identity.is_empty()),
         };
         Ok(Self {
             buck_settings: settings.dupe(),
             startup_options,
         })
+    }
+
+    /// This config with the host identity cleared wherever it can be set, so that a digest of it
+    /// changes with every startup setting except the identity, which is checked on its own.
+    pub fn without_host_identity(&self) -> Self {
+        let mut config = self.clone();
+        config.startup_options.host_identity = None;
+        config.buck_settings.hydration = config.buck_settings.hydration.without_host_identity();
+        config
     }
 
     /// Returns the automatic idle page-out configuration for this daemon.
@@ -897,6 +929,7 @@ impl DaemonStartupConfig {
             macos_qos_class: None,
             daemon_idle_timeout_s: None,
             hydration: None,
+            host_identity: None,
         };
         Self {
             buck_settings: DaemonBuckSettings::default(),
@@ -1001,6 +1034,59 @@ mod tests {
             .expect("enable_paging should enable pagable storage");
         assert_eq!(hydration.page_out_policy, PageOutPolicy::OncePerKey);
         assert_eq!(hydration.eviction_policy, EvictionPolicy::OnIdle);
+        Ok(())
+    }
+
+    #[test]
+    fn test_host_identity_defaults_to_none() -> buck2_error::Result<()> {
+        let config = parse(&[("config", "")], "config")?;
+        let startup_config = DaemonStartupConfig::new(&config, &DaemonBuckSettings::default(), false)?;
+        assert_eq!(startup_config.startup_options.host_identity, None);
+        Ok(())
+    }
+
+    #[test]
+    fn test_host_identity_from_legacy_config_and_settings() -> buck2_error::Result<()> {
+        let config = parse(
+            &[("config", "[buck2_hydration]\nhost_identity = legacy\n")],
+            "config",
+        )?;
+        let startup_config = DaemonStartupConfig::new(&config, &DaemonBuckSettings::default(), false)?;
+        assert_eq!(startup_config.startup_options.host_identity.as_deref(), Some("legacy"));
+
+        let settings = resolve_setting_flags(vec![table(
+            "[hydration]\nhost_identity = \"img=sha256:abc;arch=x86_64\"",
+        )])?;
+        let startup_config = DaemonStartupConfig::new(&config, &settings.daemon, false)?;
+        assert_eq!(
+            startup_config.startup_options.host_identity.as_deref(),
+            Some("img=sha256:abc;arch=x86_64")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_empty_host_identity_means_the_hostname() -> buck2_error::Result<()> {
+        let config = parse(
+            &[("config", "[buck2_hydration]\nhost_identity =\n")],
+            "config",
+        )?;
+        let startup_config = DaemonStartupConfig::new(&config, &DaemonBuckSettings::default(), false)?;
+        assert_eq!(startup_config.startup_options.host_identity, None);
+        Ok(())
+    }
+
+    #[test]
+    fn test_without_host_identity_clears_every_source() -> buck2_error::Result<()> {
+        let config = parse(&[("config", "")], "config")?;
+        let plain = DaemonStartupConfig::new(&config, &DaemonBuckSettings::default(), false)?;
+        let settings = resolve_setting_flags(vec![table("[hydration]\nhost_identity = \"a\"")])?;
+        let with = DaemonStartupConfig::new(&config, &settings.daemon, false)?;
+        assert_ne!(plain.serialize()?, with.serialize()?);
+        assert_eq!(
+            plain.without_host_identity().serialize()?,
+            with.without_host_identity().serialize()?
+        );
         Ok(())
     }
 
