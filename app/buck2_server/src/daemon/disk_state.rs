@@ -11,6 +11,7 @@
 use std::sync::Arc;
 
 use allocative::Allocative;
+use buck2_common::init::DaemonStartupConfig;
 use buck2_common::invocation_paths::TenantPaths;
 use buck2_common::legacy_configs::configs::LegacyBuckConfig;
 use buck2_common::legacy_configs::key::BuckconfigKeyRef;
@@ -43,10 +44,25 @@ use crate::daemon::server::TenantStateInitPreferences;
 #[derive(Allocative)]
 pub struct DiskStateOptions {
     pub sqlite_materializer_state: bool,
+    /// The machine the databases belong to (see [`host_identity`]). A database another identity
+    /// wrote is not loaded.
+    pub host_identity: String,
+}
+
+/// What stands for this machine in the on-disk state: `hydration.host_identity` when it is set,
+/// the hostname otherwise, and empty when neither is known.
+pub(crate) fn host_identity(startup_config: &DaemonStartupConfig) -> String {
+    match &startup_config.host_identity {
+        Some(identity) => identity.clone(),
+        None => buck2_events::metadata::hostname().unwrap_or_default(),
+    }
 }
 
 impl DiskStateOptions {
-    pub fn new(root_config: &LegacyBuckConfig) -> buck2_error::Result<Self> {
+    pub fn new(
+        root_config: &LegacyBuckConfig,
+        startup_config: &DaemonStartupConfig,
+    ) -> buck2_error::Result<Self> {
         let sqlite_materializer_state = root_config
             .parse::<RolloutPercentage>(BuckconfigKeyRef {
                 section: "buck2",
@@ -56,11 +72,13 @@ impl DiskStateOptions {
             .roll();
         Ok(Self {
             sqlite_materializer_state,
+            host_identity: host_identity(startup_config),
         })
     }
 }
 
 fn sqlite_db_setup_metadata_and_versions(
+    options: &DiskStateOptions,
     root_config: &LegacyBuckConfig,
     schema_version: String,
     version_config: &str,
@@ -88,8 +106,10 @@ fn sqlite_db_setup_metadata_and_versions(
     })? {
         versions.insert("buckconfig_version".to_owned(), buckconfig_version);
     }
-    if let Some(hostname) = metadata.get("hostname") {
-        versions.insert("hostname".to_owned(), hostname.to_owned());
+    // The key keeps its name, so that a machine on the default identity, its hostname, keeps the
+    // databases it wrote before the identity was configurable.
+    if !options.host_identity.is_empty() {
+        versions.insert("hostname".to_owned(), options.host_identity.clone());
     }
 
     Ok((metadata, versions))
@@ -119,6 +139,7 @@ pub(crate) async fn maybe_initialize_materializer_sqlite_db(
     }
 
     let (metadata, versions) = sqlite_db_setup_metadata_and_versions(
+        options,
         root_config,
         MATERIALIZER_DB_SCHEMA_VERSION.to_string(),
         "sqlite_materializer_state_version",
@@ -147,6 +168,7 @@ pub(crate) async fn maybe_initialize_materializer_sqlite_db(
 }
 
 pub(crate) async fn maybe_initialize_incremental_sqlite_db(
+    options: &DiskStateOptions,
     paths: TenantPaths,
     io_executor: Arc<dyn BlockingExecutor>,
     root_config: &LegacyBuckConfig,
@@ -173,6 +195,7 @@ pub(crate) async fn maybe_initialize_incremental_sqlite_db(
     }
 
     let (metadata, versions) = sqlite_db_setup_metadata_and_versions(
+        options,
         root_config,
         INCREMENTAL_DB_SCHEMA_VERSION.to_string(),
         "sqlite_incremental_state_version",
@@ -246,6 +269,7 @@ pub(crate) async fn maybe_initialize_dep_file_sqlite_db(
     }
 
     let (metadata, versions) = sqlite_db_setup_metadata_and_versions(
+        options,
         root_config,
         DEP_FILE_DB_SCHEMA_VERSION.to_string(),
         "sqlite_dep_file_state_version",
@@ -365,6 +389,50 @@ mod tests {
     use buck2_fs::paths::forward_rel_path::ForwardRelativePath;
 
     use super::*;
+
+    fn versions_for(identity: &str) -> IntentionallyStdHashMap<String, String> {
+        let root_config =
+            buck2_common::legacy_configs::configs::testing::parse(&[("c", "")], "c").unwrap();
+        let options = DiskStateOptions {
+            sqlite_materializer_state: true,
+            host_identity: identity.to_owned(),
+        };
+        sqlite_db_setup_metadata_and_versions(
+            &options,
+            &root_config,
+            "1".to_owned(),
+            "sqlite_materializer_state_version",
+            None,
+            &DaemonId::null(),
+        )
+        .unwrap()
+        .1
+    }
+
+    #[test]
+    fn test_databases_are_keyed_to_the_host_identity() {
+        let a = versions_for("img=sha256:a;arch=x86_64");
+        assert_eq!(
+            a.get("hostname").map(String::as_str),
+            Some("img=sha256:a;arch=x86_64")
+        );
+        // A database records its versions and is discarded when they differ, so another identity
+        // must give another map.
+        assert_ne!(a, versions_for("img=sha256:b;arch=x86_64"));
+        assert_eq!(a, versions_for("img=sha256:a;arch=x86_64"));
+        assert_eq!(versions_for("").get("hostname"), None);
+    }
+
+    #[test]
+    fn test_host_identity_defaults_to_the_hostname() {
+        let mut config = DaemonStartupConfig::testing_empty();
+        assert_eq!(
+            host_identity(&config),
+            buck2_events::metadata::hostname().unwrap_or_default()
+        );
+        config.host_identity = Some("ci".to_owned());
+        assert_eq!(host_identity(&config), "ci");
+    }
 
     #[test]
     fn test_delete_all_from_cache_dir() {
