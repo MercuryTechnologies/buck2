@@ -206,6 +206,17 @@ impl FileChangeTracker {
         Ok(())
     }
 
+    /// Adds everything `other` recorded: what changed while no daemon ran, found by comparing
+    /// a resumed daemon's files with its suspended snapshot, and what its watcher reported since.
+    pub fn merge(&mut self, other: FileChangeTracker) {
+        self.files_to_dirty.extend(other.files_to_dirty);
+        self.dirs_to_dirty.extend(other.dirs_to_dirty);
+        self.paths_to_dirty.extend(other.paths_to_dirty);
+        self.exists_matching_exact_case_to_dirty
+            .extend(other.exists_matching_exact_case_to_dirty);
+        self.maybe_modified_dirs.extend(other.maybe_modified_dirs);
+    }
+
     fn entry_added_or_removed(&mut self, path: CellPath) {
         self.paths_to_dirty.insert(PathMetadataKey(path.clone()));
         self.exists_matching_exact_case_to_dirty

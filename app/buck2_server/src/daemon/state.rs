@@ -630,6 +630,7 @@ impl TenantState {
             cells.dupe(),
             ignore_specs,
             dep_file_cache.dupe(),
+            None,
         )
         .with_buck_error_context(|| {
             format!(

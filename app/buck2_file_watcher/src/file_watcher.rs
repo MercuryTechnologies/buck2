@@ -12,6 +12,7 @@ use std::sync::Arc;
 
 use allocative::Allocative;
 use async_trait::async_trait;
+use buck2_common::file_ops::baseline::FileSystemBaselineImage;
 use buck2_common::ignores::ignore_set::IgnoreSet;
 use buck2_common::legacy_configs::configs::LegacyBuckConfig;
 use buck2_common::legacy_configs::key::BuckconfigKeyRef;
@@ -32,6 +33,7 @@ use crate::dep_files::DepFileCache;
 #[cfg(fbcode_build)]
 use crate::edenfs::interface::EdenFsFileWatcher;
 use crate::fs_hash_crawler::FsHashCrawler;
+use crate::fs_hash_crawler::FsSnapshotImage;
 use crate::mergebase::Mergebase;
 use crate::notify::NotifyFileWatcher;
 use crate::watchman::interface::WatchmanFileWatcher;
@@ -43,6 +45,54 @@ pub trait FileWatcher: Allocative + Send + Sync + 'static {
         &self,
         dice: DiceTransactionUpdater,
     ) -> buck2_error::Result<(DiceTransactionUpdater, Mergebase, SyncOutcome)>;
+
+    /// What `buck2 suspend` records so that a resumed daemon's watcher can report every change
+    /// made while no daemon ran. Called after a sync whose changes are committed, with no
+    /// command running: the image must account for every change made since that sync, or fail.
+    async fn suspend_image(
+        &self,
+        _project_root: &ProjectRoot,
+    ) -> buck2_error::Result<FileWatcherImage> {
+        Err(buck2_error!(
+            ErrorTag::Input,
+            "`buck2 suspend` supports the `notify` and `fs_hash_crawler` file watchers only \
+             (`buck2.file_watcher`)"
+        ))
+    }
+}
+
+/// Which watcher wrote a [`FileWatcherImage`]; a resume with another refuses it.
+#[derive(
+    Copy,
+    Clone,
+    Debug,
+    PartialEq,
+    Eq,
+    serde::Serialize,
+    serde::Deserialize
+)]
+pub enum FileWatcherImageKind {
+    Notify,
+    FsHashCrawler,
+}
+
+impl FileWatcherImageKind {
+    /// The `buck2.file_watcher` value that makes this watcher.
+    pub fn config_value(self) -> &'static str {
+        match self {
+            FileWatcherImageKind::Notify => "notify",
+            FileWatcherImageKind::FsHashCrawler => "fs_hash_crawler",
+        }
+    }
+}
+
+/// A suspended daemon's file watcher: the files as its last accounted-for state found them,
+/// and the baseline its graph's file reads are relative to.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct FileWatcherImage {
+    pub kind: FileWatcherImageKind,
+    pub baseline: FileSystemBaselineImage,
+    pub snapshot: FsSnapshotImage,
 }
 
 /// Whether a sync accounted for everything that changed since the previous one.
@@ -97,6 +147,7 @@ impl dyn FileWatcher {
         cells: CellResolver,
         ignore_specs: StdBuckHashMap<CellName, IgnoreSet>,
         dep_file_cache: Arc<dyn DepFileCache>,
+        resume: Option<&FileWatcherImage>,
     ) -> buck2_error::Result<Arc<dyn FileWatcher>> {
         if !project_root.root().as_path().exists() {
             return Err(buck2_error!(
@@ -149,6 +200,27 @@ impl dyn FileWatcher {
         } else {
             watcher_conf
         };
+
+        if let Some(image) = resume {
+            if image.kind.config_value() != watcher_conf {
+                return Err(buck2_error!(
+                    ErrorTag::Input,
+                    "the suspended daemon used the `{}` file watcher, this one `{}`",
+                    image.kind.config_value(),
+                    watcher_conf
+                ));
+            }
+            return match image.kind {
+                FileWatcherImageKind::Notify => Ok(Arc::new(
+                    NotifyFileWatcher::resume(project_root, cells, ignore_specs, image)
+                        .buck_error_context("Resuming notify file watcher")?,
+                )),
+                FileWatcherImageKind::FsHashCrawler => Ok(Arc::new(
+                    FsHashCrawler::resume(project_root, cells, ignore_specs, image)
+                        .buck_error_context("Resuming fs_crawler file watcher")?,
+                )),
+            };
+        }
 
         match watcher_conf {
             "watchman" => Ok(Arc::new(

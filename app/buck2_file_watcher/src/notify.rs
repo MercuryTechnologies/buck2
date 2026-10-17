@@ -9,6 +9,7 @@
  */
 
 use std::mem;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
 
@@ -43,7 +44,10 @@ use tracing::debug;
 use tracing::info;
 
 use crate::file_watcher::FileWatcher;
+use crate::file_watcher::FileWatcherImage;
+use crate::file_watcher::FileWatcherImageKind;
 use crate::file_watcher::SyncOutcome;
+use crate::fs_hash_crawler::FsSnapshot;
 use crate::mergebase::Mergebase;
 use crate::stats::FileWatcherStats;
 
@@ -279,6 +283,17 @@ pub struct NotifyFileWatcher {
     data: Arc<Mutex<buck2_error::Result<NotifyFileData>>>,
     /// What the changes recorded on the updater are relative to.
     baseline: Mutex<FileSystemBaseline>,
+    root: ProjectRoot,
+    cells: CellResolver,
+    #[allocative(skip)]
+    ignore_specs: Arc<StdBuckHashMap<CellName, IgnoreSet>>,
+    /// For a resumed daemon, what changed while no daemon ran, until the first sync records it.
+    #[allocative(skip)]
+    pending: Mutex<Option<FileChangeTracker>>,
+    /// The cookie a suspend waits for: once its event arrives, every event the kernel queued
+    /// before it has been processed.
+    #[allocative(skip)]
+    cookie: Arc<Mutex<Option<(PathBuf, std::sync::mpsc::Sender<()>)>>>,
 }
 
 impl NotifyFileWatcher {
@@ -287,26 +302,78 @@ impl NotifyFileWatcher {
         cells: CellResolver,
         ignore_specs: StdBuckHashMap<CellName, IgnoreSet>,
     ) -> buck2_error::Result<Self> {
+        Self::with_baseline(root, cells, ignore_specs, FileSystemBaseline::unique())
+    }
+
+    fn with_baseline(
+        root: &ProjectRoot,
+        cells: CellResolver,
+        ignore_specs: StdBuckHashMap<CellName, IgnoreSet>,
+        baseline: FileSystemBaseline,
+    ) -> buck2_error::Result<Self> {
         let data = Arc::new(Mutex::new(Ok(NotifyFileData::new())));
         let data2 = data.dupe();
         let root2 = root.dupe();
-        let mut watcher = notify::recommended_watcher(move |event| {
-            let mut guard = data2.lock().unwrap();
-            if let Ok(state) = &mut *guard {
-                if let Err(e) = state.process(event, &root2, &cells, &ignore_specs) {
-                    *guard = Err(e);
+        let cells2 = cells.dupe();
+        let ignore_specs = Arc::new(ignore_specs);
+        let ignore_specs2 = ignore_specs.dupe();
+        let cookie: Arc<Mutex<Option<(PathBuf, std::sync::mpsc::Sender<()>)>>> =
+            Arc::new(Mutex::new(None));
+        let cookie2 = cookie.dupe();
+        let mut watcher =
+            notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
+                if let Ok(e) = &event {
+                    let mut cookie = cookie2.lock().unwrap();
+                    if let Some((path, _)) = &*cookie
+                        && e.paths.iter().any(|p| p == path)
+                    {
+                        let (_, sender) = cookie.take().expect("checked above");
+                        drop(sender.send(()));
+                    }
                 }
-            }
-        })
-        .map_err(|e| from_any_with_tag(e, buck2_error::ErrorTag::NotifyWatcher))?;
+                let mut guard = data2.lock().unwrap();
+                if let Ok(state) = &mut *guard {
+                    if let Err(e) = state.process(event, &root2, &cells2, &ignore_specs2) {
+                        *guard = Err(e);
+                    }
+                }
+            })
+            .map_err(|e| from_any_with_tag(e, buck2_error::ErrorTag::NotifyWatcher))?;
         watcher
             .watch(root.root().as_path(), notify::RecursiveMode::Recursive)
             .map_err(|e| from_any_with_tag(e, buck2_error::ErrorTag::NotifyWatcher))?;
         Ok(Self {
             watcher,
             data,
-            baseline: Mutex::new(FileSystemBaseline::unique()),
+            baseline: Mutex::new(baseline),
+            root: root.dupe(),
+            cells,
+            ignore_specs,
+            pending: Mutex::new(None),
+            cookie,
         })
+    }
+
+    /// A watcher for a resumed daemon. The watch is registered before the files are compared
+    /// with the suspended snapshot, so a change made during the comparison is reported by the
+    /// comparison, by an event, or by both, and never by neither. The first sync records both.
+    pub fn resume(
+        root: &ProjectRoot,
+        cells: CellResolver,
+        ignore_specs: StdBuckHashMap<CellName, IgnoreSet>,
+        image: &FileWatcherImage,
+    ) -> buck2_error::Result<Self> {
+        let watcher = Self::with_baseline(
+            root,
+            cells.dupe(),
+            ignore_specs,
+            FileSystemBaseline::from_image(&image.baseline),
+        )?;
+        let suspended = FsSnapshot::from_image(&image.snapshot, &cells)?;
+        let now = FsSnapshot::build(root, &cells, &watcher.ignore_specs)?;
+        let (_stats, changes) = suspended.get_updates_for_dice(&now, &watcher.ignore_specs)?;
+        *watcher.pending.lock().unwrap() = Some(changes);
+        Ok(watcher)
     }
 
     fn sync2(
@@ -318,8 +385,12 @@ impl NotifyFileWatcher {
             mem::replace(&mut *guard, Ok(NotifyFileData::new()))
         };
         let (stats, changes) = old?.sync();
+        let pending = self.pending.lock().unwrap().take();
         let mut baseline = self.baseline.lock().unwrap();
-        if let Some(changes) = changes {
+        if let Some(mut changes) = changes {
+            if let Some(pending) = pending {
+                changes.merge(pending);
+            }
             changes.write_to_dice(&mut dice)?;
         } else {
             // Events were missed; the fresh instance reported in `stats` has the daemon start
@@ -329,10 +400,89 @@ impl NotifyFileWatcher {
         dice.set_file_system_baseline(baseline.dupe())?;
         Ok((stats, dice))
     }
+
+    /// Waits until every event queued before now has been processed: writes a cookie file and
+    /// waits for its event, which inotify delivers after every earlier one on the same queue.
+    fn barrier(&self, project_root: &ProjectRoot) -> buck2_error::Result<()> {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let dir = project_root
+            .root()
+            .as_path()
+            .join(InvocationPaths::buck_out_dir_prefix().as_str());
+        let path = dir.join(format!(
+            ".suspend-cookie-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        let (sender, receiver) = std::sync::mpsc::channel();
+        *self.cookie.lock().unwrap() = Some((path.clone(), sender));
+        std::fs::write(&path, b"")
+            .map_err(|e| from_any_with_tag(e, buck2_error::ErrorTag::NotifyWatcher))?;
+        let arrived = receiver.recv_timeout(std::time::Duration::from_secs(30));
+        drop(std::fs::remove_file(&path));
+        *self.cookie.lock().unwrap() = None;
+        arrived.map_err(|_| {
+            buck2_error::buck2_error!(
+                buck2_error::ErrorTag::NotifyWatcher,
+                "the file watcher did not see its cookie `{}` within 30s",
+                path.display()
+            )
+        })
+    }
 }
 
 #[async_trait]
 impl FileWatcher for NotifyFileWatcher {
+    /// Takes the snapshot `S` first, then waits for every event queued so far. An edit made
+    /// before `S` statted a file produced such an event; since the last sync's changes are
+    /// committed, any event means `S` and the graph disagree, and the suspend fails rather than
+    /// lose it. An edit made after `S` statted a file differs from `S`, so the resumed watcher's
+    /// comparison reports it.
+    async fn suspend_image(
+        &self,
+        project_root: &ProjectRoot,
+    ) -> buck2_error::Result<FileWatcherImage> {
+        let snapshot = tokio::task::block_in_place(|| {
+            let snapshot = FsSnapshot::build(&self.root, &self.cells, &self.ignore_specs)?;
+            self.barrier(project_root)?;
+            buck2_error::Ok(snapshot)
+        })?;
+        {
+            let guard = self.data.lock().unwrap();
+            let data = match &*guard {
+                Ok(data) => data,
+                Err(e) => return Err(e.clone()),
+            };
+            if data.missed_events {
+                return Err(buck2_error::buck2_error!(
+                    buck2_error::ErrorTag::NotifyWatcher,
+                    "the file watcher missed events since the last command; run a build, then \
+                     `buck2 suspend` again"
+                ));
+            }
+            if !data.events.is_empty() {
+                let paths: Vec<String> = data
+                    .events
+                    .iter()
+                    .take(5)
+                    .map(|(p, _)| p.to_string())
+                    .collect();
+                return Err(buck2_error::buck2_error!(
+                    buck2_error::ErrorTag::Input,
+                    "{} file(s) changed since the last command ({}); run a build, then \
+                     `buck2 suspend` again",
+                    data.events.len(),
+                    paths.join(", ")
+                ));
+            }
+        }
+        Ok(FileWatcherImage {
+            kind: FileWatcherImageKind::Notify,
+            baseline: self.baseline.lock().unwrap().to_image(),
+            snapshot: snapshot.to_image(),
+        })
+    }
+
     async fn sync(
         &self,
         dice: DiceTransactionUpdater,
