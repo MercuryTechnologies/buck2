@@ -744,3 +744,435 @@ fn install(
     sync_dir(&image_dir)?;
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+    use std::path::PathBuf;
+
+    use super::*;
+
+    const EXE: &str = "e1e1";
+
+    /// A suspended image as the daemon leaves it, with `seed` in every file's bytes.
+    fn write_image(cache_dir: &Path, seed: u8) {
+        let image_dir = cache_dir.join(IMAGE_DIR);
+        let dice_state = cache_dir.join(DICE_STATE_DIR);
+        std::fs::create_dir_all(&image_dir).unwrap();
+        std::fs::create_dir_all(&dice_state).unwrap();
+        let bytes = |n: usize| -> Vec<u8> {
+            (0..n)
+                .map(|i| (i as u8).wrapping_mul(31).wrapping_add(seed))
+                .collect()
+        };
+        std::fs::write(image_dir.join(IMAGE), bytes(70_000)).unwrap();
+        std::fs::write(dice_state.join("pagable.0.db"), bytes(200_000)).unwrap();
+        std::fs::write(dice_state.join("pagable.1.db"), bytes(3)).unwrap();
+        std::fs::write(dice_state.join("pagable.2.db"), b"").unwrap();
+        // The daemon's MANIFEST has more fields than the client reads.
+        let manifest = serde_json::json!({
+            "magic": MAGIC,
+            "format": FORMAT,
+            "exe": EXE,
+            "created_at_ms": 1000 + seed as u64,
+            "hostname": "h",
+            "uid": 1,
+        });
+        std::fs::write(
+            image_dir.join(MANIFEST),
+            serde_json::to_vec_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+    }
+
+    /// Every file under the cache dir, by path.
+    fn snapshot(cache_dir: &Path) -> BTreeMap<String, Vec<u8>> {
+        let mut out = BTreeMap::new();
+        if !cache_dir.exists() {
+            return out;
+        }
+        for e in walkdir::WalkDir::new(cache_dir) {
+            let e = e.unwrap();
+            if e.file_type().is_file() {
+                let rel = e.path().strip_prefix(cache_dir).unwrap();
+                out.insert(
+                    rel.to_str().unwrap().to_owned(),
+                    std::fs::read(e.path()).unwrap(),
+                );
+            }
+        }
+        out
+    }
+
+    struct Fixture {
+        _dir: tempfile::TempDir,
+        /// The suspending machine's cache dir.
+        src: PathBuf,
+        /// The importing machine's cache dir, which already holds another image.
+        dst: PathBuf,
+        bundle: PathBuf,
+    }
+
+    fn fixture() -> Fixture {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("a/buck-out/v2/cache");
+        let dst = dir.path().join("b/buck-out/v2/cache");
+        write_image(&src, 1);
+        write_image(&dst, 2);
+        let bundle = dir.path().join("image.tar.zst");
+        export(&src, &bundle).unwrap();
+        Fixture {
+            _dir: dir,
+            src,
+            dst,
+            bundle,
+        }
+    }
+
+    /// The bundle's members, uncompressed: each tar header and its data.
+    fn members(bundle: &Path) -> Vec<(tar::Header, Vec<u8>)> {
+        let bytes = zstd::stream::decode_all(File::open(bundle).unwrap()).unwrap();
+        let mut archive = tar::Archive::new(bytes.as_slice());
+        archive
+            .entries()
+            .unwrap()
+            .map(|e| {
+                let mut e = e.unwrap();
+                let mut data = Vec::new();
+                e.read_to_end(&mut data).unwrap();
+                (e.header().clone(), data)
+            })
+            .collect()
+    }
+
+    fn write_members(bundle: &Path, members: &[(tar::Header, Vec<u8>)]) {
+        let mut tar = tar::Builder::new(Vec::new());
+        for (header, data) in members {
+            tar.append(header, data.as_slice()).unwrap();
+        }
+        let bytes = tar.into_inner().unwrap();
+        std::fs::write(
+            bundle,
+            zstd::stream::encode_all(bytes.as_slice(), 3).unwrap(),
+        )
+        .unwrap();
+    }
+
+    /// A regular-file header whose name is these raw bytes, which `tar::Header::set_path`
+    /// would refuse for `..` and absolute paths.
+    fn raw_header(name: &[u8], len: u64, kind: tar::EntryType) -> tar::Header {
+        let mut header = tar_header(len);
+        header.set_entry_type(kind);
+        header.as_old_mut().name[..name.len()].copy_from_slice(name);
+        header.set_cksum();
+        header
+    }
+
+    fn member_name(header: &tar::Header) -> String {
+        String::from_utf8(header.path_bytes().into_owned()).unwrap()
+    }
+
+    /// Imports `f.bundle` into `f.dst` and expects a refusal that leaves `f.dst` as it was.
+    fn refused(f: &Fixture, exe: &str) -> ImportError {
+        let before = snapshot(&f.dst);
+        let err = import(&f.bundle, &f.dst, exe, None).unwrap_err();
+        assert_eq!(
+            snapshot(&f.dst),
+            before,
+            "a refusal changed the cache dir: {err}"
+        );
+        err
+    }
+
+    #[test]
+    fn round_trip_is_byte_identical() {
+        let f = fixture();
+        let before = snapshot(&f.src);
+        let summary = import(&f.bundle, &f.dst, EXE, None).unwrap();
+        assert_eq!(snapshot(&f.dst), before);
+        // The export leaves the image where it was.
+        assert_eq!(snapshot(&f.src), before);
+        // BUNDLE, image.bin, three paging files, MANIFEST and BUNDLE.files.
+        assert_eq!(summary.members, 7);
+        assert_eq!(summary.created_at_ms, 1001);
+    }
+
+    #[test]
+    fn round_trip_into_a_fresh_checkout() {
+        let f = fixture();
+        let fresh = f.dst.parent().unwrap().join("other/buck-out/v2/cache");
+        import(&f.bundle, &fresh, EXE, None).unwrap();
+        assert_eq!(snapshot(&fresh), snapshot(&f.src));
+    }
+
+    #[test]
+    fn layout_is_header_image_store_manifest_listing() {
+        let f = fixture();
+        let names: Vec<String> = members(&f.bundle)
+            .iter()
+            .map(|(h, _)| member_name(h))
+            .collect();
+        assert_eq!(
+            names,
+            [
+                "BUNDLE",
+                "suspend/image.bin",
+                "dice_state/pagable.0.db",
+                "dice_state/pagable.1.db",
+                "dice_state/pagable.2.db",
+                "suspend/MANIFEST",
+                "BUNDLE.files",
+            ]
+        );
+    }
+
+    #[test]
+    fn flipped_byte_in_any_member_is_refused() {
+        let f = fixture();
+        let original = members(&f.bundle);
+        for i in 0..original.len() {
+            let mut changed = original.clone();
+            let data = &mut changed[i].1;
+            if data.is_empty() {
+                continue;
+            }
+            let at = data.len() / 2;
+            data[at] ^= 0x01;
+            write_members(&f.bundle, &changed);
+            refused(&f, EXE);
+        }
+    }
+
+    #[test]
+    fn flipped_byte_in_the_compressed_stream_is_refused() {
+        let f = fixture();
+        let mut bytes = std::fs::read(&f.bundle).unwrap();
+        let at = bytes.len() / 2;
+        bytes[at] ^= 0x10;
+        std::fs::write(&f.bundle, bytes).unwrap();
+        refused(&f, EXE);
+    }
+
+    #[test]
+    fn truncation_is_refused() {
+        let f = fixture();
+        let original = members(&f.bundle);
+        let bytes = std::fs::read(&f.bundle).unwrap();
+        for keep in [
+            0,
+            10,
+            bytes.len() / 3,
+            bytes.len() / 2,
+            bytes.len() - 4,
+            bytes.len() - 1,
+        ] {
+            std::fs::write(&f.bundle, &bytes[..keep]).unwrap();
+            let before = snapshot(&f.dst);
+            let result = import(&f.bundle, &f.dst, EXE, None);
+            assert!(result.is_err(), "kept {keep} of {} bytes", bytes.len());
+            assert_eq!(snapshot(&f.dst), before);
+        }
+        // A stream cut cleanly after a whole member, so only the listing tells.
+        for keep in 1..original.len() {
+            write_members(&f.bundle, &original[..keep]);
+            let err = refused(&f, EXE);
+            assert!(matches!(err, ImportError::NoTrailer), "kept {keep}: {err}");
+        }
+    }
+
+    fn with_header(f: &Fixture, edit: impl FnOnce(&mut BundleHeader)) {
+        let mut all = members(&f.bundle);
+        let mut header: BundleHeader = serde_json::from_slice(&all[0].1).unwrap();
+        edit(&mut header);
+        let data = serde_json::to_vec_pretty(&header).unwrap();
+        let mut h = all[0].0.clone();
+        h.set_size(data.len() as u64);
+        h.set_cksum();
+        all[0] = (h, data);
+        write_members(&f.bundle, &all);
+    }
+
+    #[test]
+    fn another_image_format_is_refused() {
+        let f = fixture();
+        with_header(&f, |h| h.image_format = FORMAT + 1);
+        assert!(matches!(refused(&f, EXE), ImportError::ImageFormat(v) if v == FORMAT + 1));
+    }
+
+    #[test]
+    fn another_bundle_format_is_refused() {
+        let f = fixture();
+        with_header(&f, |h| h.bundle_format = BUNDLE_FORMAT + 1);
+        assert!(matches!(refused(&f, EXE), ImportError::BundleFormat(_)));
+    }
+
+    #[test]
+    fn another_binary_is_refused() {
+        let f = fixture();
+        assert!(matches!(
+            refused(&f, "another"),
+            ImportError::OtherBinary { .. }
+        ));
+    }
+
+    #[test]
+    fn header_must_come_first() {
+        let f = fixture();
+        let mut all = members(&f.bundle);
+        all.swap(0, 1);
+        write_members(&f.bundle, &all);
+        assert!(matches!(refused(&f, EXE), ImportError::NotABundle(_)));
+    }
+
+    /// Inserts a member before `BUNDLE.files`, which does not list it.
+    fn insert_member(f: &Fixture, header: tar::Header, data: &[u8]) {
+        let mut all = members(&f.bundle);
+        let at = all.len() - 1;
+        all.insert(at, (header, data.to_vec()));
+        write_members(&f.bundle, &all);
+    }
+
+    #[test]
+    fn unlisted_member_is_refused() {
+        let f = fixture();
+        insert_member(
+            &f,
+            raw_header(b"dice_state/extra.db", 4, tar::EntryType::Regular),
+            b"evil",
+        );
+        assert!(matches!(
+            refused(&f, EXE),
+            ImportError::Mismatch(p) if p == "dice_state/extra.db"
+        ));
+    }
+
+    #[test]
+    fn member_outside_the_image_is_refused() {
+        for name in [
+            &b"../x"[..],
+            b"dice_state/../../x",
+            b"/etc/passwd",
+            b"suspend/other",
+            b"materializer_state/db.sqlite",
+            b"x",
+            b"dice_state//x",
+            b"./dice_state/x",
+        ] {
+            let f = fixture();
+            insert_member(&f, raw_header(name, 4, tar::EntryType::Regular), b"evil");
+            let err = refused(&f, EXE);
+            assert!(
+                matches!(err, ImportError::BadMember(_)),
+                "{}: {err}",
+                String::from_utf8_lossy(name)
+            );
+            // Nothing was written outside the cache dir either.
+            assert!(!f.dst.parent().unwrap().join("x").exists());
+        }
+    }
+
+    #[test]
+    fn links_and_devices_are_refused() {
+        for kind in [
+            tar::EntryType::Symlink,
+            tar::EntryType::Link,
+            tar::EntryType::Char,
+            tar::EntryType::Block,
+            tar::EntryType::Fifo,
+            tar::EntryType::Directory,
+        ] {
+            let f = fixture();
+            let mut header = raw_header(b"dice_state/link", 0, kind);
+            header.set_link_name("/etc/passwd").unwrap();
+            header.set_cksum();
+            insert_member(&f, header, b"");
+            assert!(
+                matches!(refused(&f, EXE), ImportError::BadMember(_)),
+                "{kind:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn duplicate_member_is_refused() {
+        let f = fixture();
+        let all = members(&f.bundle);
+        let image = all[1].clone();
+        insert_member(&f, image.0, &image.1);
+        assert!(matches!(refused(&f, EXE), ImportError::Duplicate(_)));
+    }
+
+    #[test]
+    fn member_after_the_listing_is_refused() {
+        let f = fixture();
+        let mut all = members(&f.bundle);
+        all.push((
+            raw_header(b"dice_state/late.db", 1, tar::EntryType::Regular),
+            b"x".to_vec(),
+        ));
+        write_members(&f.bundle, &all);
+        assert!(matches!(refused(&f, EXE), ImportError::AfterTrailer(_)));
+    }
+
+    #[test]
+    fn running_daemon_is_refused_before_anything_is_read() {
+        let f = fixture();
+        std::fs::write(&f.bundle, b"not even zstd").unwrap();
+        let before = snapshot(&f.dst);
+        let err = import(&f.bundle, &f.dst, EXE, Some(4242)).unwrap_err();
+        assert!(matches!(err, ImportError::DaemonRunning(4242)));
+        assert_eq!(snapshot(&f.dst), before);
+    }
+
+    #[test]
+    fn failure_after_the_paging_store_moves_leaves_no_manifest() {
+        for fail_at in [
+            InstallStep::OldRemoved,
+            InstallStep::DiceStateInstalled,
+            InstallStep::ImageInstalled,
+        ] {
+            let f = fixture();
+            let err = import_with(&f.bundle, &f.dst, EXE, None, &mut |s| {
+                if s == fail_at {
+                    Err(io::Error::other("injected"))
+                } else {
+                    Ok(())
+                }
+            })
+            .unwrap_err();
+            assert!(matches!(err, ImportError::Io { .. }), "{fail_at:?}: {err}");
+            assert!(
+                !f.dst.join(IMAGE_DIR).join(MANIFEST).exists(),
+                "{fail_at:?} left a MANIFEST"
+            );
+            // The unpacked copy is cleaned up; the next daemon start wipes the rest.
+            let left: Vec<_> = std::fs::read_dir(&f.dst)
+                .unwrap()
+                .map(|e| e.unwrap().file_name().into_string().unwrap())
+                .filter(|n| n.contains(".import."))
+                .collect();
+            assert!(left.is_empty(), "{fail_at:?}: {left:?}");
+        }
+    }
+
+    #[test]
+    fn export_without_an_image_fails_and_writes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = dir.path().join("cache");
+        std::fs::create_dir_all(cache.join(DICE_STATE_DIR)).unwrap();
+        let out = dir.path().join("out.tar.zst");
+        assert!(export(&cache, &out).is_err());
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn export_refuses_a_link_in_the_paging_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = dir.path().join("cache");
+        write_image(&cache, 1);
+        std::os::unix::fs::symlink("/etc/passwd", cache.join(DICE_STATE_DIR).join("l")).unwrap();
+        let out = dir.path().join("out.tar.zst");
+        assert!(export(&cache, &out).is_err());
+        assert!(!out.exists());
+    }
+}
