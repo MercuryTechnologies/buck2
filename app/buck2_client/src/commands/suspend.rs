@@ -199,6 +199,11 @@ pub struct ResumeCommand {
     import: Option<PathArg>,
 }
 
+/// How long `buck2 resume` waits for the daemon it starts, unless
+/// `buck2_hydration.resume_timeout_s` says otherwise. A daemon restores a suspended state before
+/// it answers, and a large graph takes far longer than the 90 s an ordinary start is given.
+const DEFAULT_RESUME_TIMEOUT_S: u64 = 600;
+
 /// The pid of a live daemon for this checkout, from `buckd.info`.
 fn running_daemon(daemon_dir: &DaemonDir) -> buck2_error::Result<Option<u32>> {
     let Some(info) = BuckdProcessInfo::load_if_exists(daemon_dir)? else {
@@ -255,6 +260,17 @@ impl StreamingCommand for ResumeCommand {
             t.elapsed().as_secs_f64()
         )?;
         Ok(())
+    }
+
+    fn daemon_startup_timeout_floor(
+        &self,
+        ctx: &ClientCommandContext<'_>,
+    ) -> buck2_error::Result<Option<Duration>> {
+        let secs = ctx
+            .immediate_config
+            .hydration_resume_timeout_s()?
+            .unwrap_or(DEFAULT_RESUME_TIMEOUT_S);
+        Ok(Some(Duration::from_secs(secs)))
     }
 
     async fn exec_impl(

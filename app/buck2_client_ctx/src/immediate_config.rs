@@ -18,7 +18,6 @@ use buck2_common::invocation_roots::InvocationRoots;
 use buck2_common::invocation_roots::find_invocation_roots;
 use buck2_common::legacy_configs::cells::BuckConfigBasedCells;
 use buck2_common::legacy_configs::configs::LegacyBuckConfig;
-#[cfg(fbcode_build)]
 use buck2_common::legacy_configs::key::BuckconfigKeyRef;
 use buck2_common::settings::parser::parse_settings;
 use buck2_core::buck2_env;
@@ -155,6 +154,16 @@ impl<'a> ImmediateConfigContext<'a> {
         self.setting_arg_layers
             .set(setting_arg_layers)
             .map_err(|_| internal_error!("Attempted to set setting argument layers more than once"))
+    }
+
+    /// `buck2_hydration.resume_timeout_s` from the root buckconfig: how long a client waits for
+    /// a daemon that resumes a suspended state. Read by the client only, so it is not part of
+    /// the daemon's startup config and changing it does not restart a daemon.
+    pub fn hydration_resume_timeout_s(&self) -> buck2_error::Result<Option<u64>> {
+        self.data()?.root_config.parse(BuckconfigKeyRef {
+            section: "buck2_hydration",
+            property: "resume_timeout_s",
+        })
     }
 
     pub fn allow_daemon_start_unsandboxed_via_wrapper(&self) -> buck2_error::Result<bool> {
