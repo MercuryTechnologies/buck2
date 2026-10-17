@@ -636,6 +636,7 @@ impl LoadedImage {
             .await
             .map_err(|e| format!("graph: {e:#}"))?;
         timings.push(("graph", t.elapsed()));
+        timings.extend(stats.timings.iter().map(|(step, d)| (*step, *d)));
         Ok((stats, resumed, timings))
     }
 

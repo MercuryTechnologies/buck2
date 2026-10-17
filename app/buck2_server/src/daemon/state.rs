@@ -720,6 +720,7 @@ impl TenantState {
         // A resumed graph's file reads are relative to the suspended watcher's baseline and
         // snapshot. Should the watcher fail to resume, a fresh one has a new baseline, which
         // invalidates every file read the image carried: correct, if no faster than cold.
+        let watcher_start = std::time::Instant::now();
         let resumed_watcher = match &resumed_image {
             Some(image) => <dyn FileWatcher>::new(
                 fb,
@@ -731,6 +732,12 @@ impl TenantState {
                 Some(image.watcher()),
             )
             .inspect_err(|e| tracing::warn!("Resuming the file watcher failed: {e:#}"))
+            .inspect(|_| {
+                tracing::info!(
+                    "Resumed the file watcher in {:.3}s",
+                    watcher_start.elapsed().as_secs_f64()
+                )
+            })
             .ok(),
             None => None,
         };
