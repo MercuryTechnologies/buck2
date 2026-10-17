@@ -25,12 +25,17 @@ use buck2_client_ctx::common::ui::CommonConsoleOptions;
 use buck2_client_ctx::daemon::client::BuckdClientConnector;
 use buck2_client_ctx::daemon::client::BuckdLifecycleLock;
 use buck2_client_ctx::daemon::client::NoPartialResultHandler;
+use buck2_client_ctx::daemon::client::connect::BuckdProcessInfo;
+use buck2_client_ctx::daemon::client::connect::get_daemon_exe;
 use buck2_client_ctx::events_ctx::EventsCtx;
 use buck2_client_ctx::exit_result::ExitResult;
 use buck2_client_ctx::path_arg::PathArg;
 use buck2_client_ctx::startup_deadline::StartupDeadline;
 use buck2_client_ctx::streaming::StreamingCommand;
+use buck2_common::daemon_dir::DaemonDir;
+use buck2_common::suspend_image::exe_digest;
 use buck2_error::ExitCode;
+use buck2_wrapper_common::kill::process_exists;
 
 /// Write the daemon's state to disk and stop the daemon, for a later daemon to resume.
 ///
@@ -168,6 +173,8 @@ impl StreamingCommand for SuspendCommand {
 ///
 /// Prints `resumed: ...` or `cold: <reason>`. Any command that starts a daemon resumes the same
 /// way; this one only makes the outcome visible, and with `--require` fails on a cold start.
+/// With `--import`, it first unpacks a bundle `buck2 suspend --export` wrote, replacing any
+/// suspended state under buck-out.
 #[derive(Debug, clap::Parser)]
 pub struct ResumeCommand {
     #[clap(flatten)]
@@ -185,11 +192,70 @@ pub struct ResumeCommand {
     /// a warm one.
     #[clap(long)]
     require: bool,
+
+    /// Before starting the daemon, unpack this bundle from `buck2 suspend --export`. Refused
+    /// while a daemon runs for this checkout, and for a bundle another buck2 binary wrote.
+    #[clap(long, value_name = "FILE")]
+    import: Option<PathArg>,
+}
+
+/// The pid of a live daemon for this checkout, from `buckd.info`.
+fn running_daemon(daemon_dir: &DaemonDir) -> buck2_error::Result<Option<u32>> {
+    let Some(info) = BuckdProcessInfo::load_if_exists(daemon_dir)? else {
+        return Ok(None);
+    };
+    let pid = info.pid()?;
+    Ok(process_exists(pid)?.then(|| pid.to_u32()))
 }
 
 #[async_trait(?Send)]
 impl StreamingCommand for ResumeCommand {
     const COMMAND_NAME: &'static str = "resume";
+
+    async fn before_connect(&self, ctx: &ClientCommandContext<'_>) -> buck2_error::Result<()> {
+        let Some(bundle) = &self.import else {
+            return Ok(());
+        };
+        let bundle = bundle.resolve(&ctx.working_dir);
+        let paths = ctx.paths()?;
+        let daemon_dir = paths.daemon_dir()?;
+        // Held until the bundle is in place, so no daemon starts on half an image.
+        let lifecycle_lock = BuckdLifecycleLock::lock_with_timeout(
+            daemon_dir.clone(),
+            StartupDeadline::duration_from_now(Duration::from_secs(10))?,
+        )
+        .await?;
+        let running = running_daemon(&daemon_dir)?;
+        let cache_dir = paths.cache_dir_path();
+        let t = Instant::now();
+        let summary = tokio::task::spawn_blocking({
+            let bundle = bundle.clone();
+            move || -> buck2_error::Result<bundle::ImportSummary> {
+                // Only the binary the daemon runs is hashed, and only when no daemon runs.
+                let exe = match running {
+                    Some(_) => String::new(),
+                    None => exe_digest(&get_daemon_exe()?)?,
+                };
+                Ok(bundle::import(
+                    bundle.as_path(),
+                    cache_dir.as_path(),
+                    &exe,
+                    running,
+                )?)
+            }
+        })
+        .await??;
+        drop(lifecycle_lock);
+        buck2_client_ctx::eprintln!(
+            "imported {}: {} files, {} bytes, suspended at {} ms, in {:.3}s",
+            bundle.display(),
+            summary.members,
+            summary.bytes,
+            summary.created_at_ms,
+            t.elapsed().as_secs_f64()
+        )?;
+        Ok(())
+    }
 
     async fn exec_impl(
         self,
