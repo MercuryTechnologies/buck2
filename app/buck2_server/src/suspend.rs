@@ -1055,6 +1055,11 @@ async fn suspend_inner(
         out.push_str(&format!(" {name} {:.3}s", d.as_secs_f64()));
     }
     out.push('\n');
+    out.push_str("graph times:");
+    for (name, d) in &stats.timings {
+        out.push_str(&format!(" {name} {:.3}s", d.as_secs_f64()));
+    }
+    out.push('\n');
     Ok(out)
 }
 
