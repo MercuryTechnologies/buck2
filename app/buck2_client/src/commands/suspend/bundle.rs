@@ -1043,6 +1043,46 @@ mod tests {
         write_members(&f.bundle, &all);
     }
 
+    /// A bundle without the image or without the MANIFEST is refused even when its listing
+    /// agrees, and the cache dir keeps the image it had.
+    #[test]
+    fn a_bundle_without_the_image_or_the_manifest_is_refused() {
+        for gone in [
+            format!("{IMAGE_DIR}/{IMAGE}"),
+            format!("{IMAGE_DIR}/{MANIFEST}"),
+        ] {
+            let f = fixture();
+            let mut all = members(&f.bundle);
+            all.retain(|(h, _)| member_name(h) != gone);
+            let last = all.len() - 1;
+            let mut listing: BundleFiles = serde_json::from_slice(&all[last].1).unwrap();
+            listing.files.retain(|m| m.path != gone);
+            let data = serde_json::to_vec_pretty(&listing).unwrap();
+            let mut header = all[last].0.clone();
+            header.set_size(data.len() as u64);
+            header.set_cksum();
+            all[last] = (header, data);
+            write_members(&f.bundle, &all);
+            let err = refused(&f, EXE);
+            assert!(
+                matches!(&err, ImportError::Missing(p) if *p == gone),
+                "{gone}: {err}"
+            );
+        }
+    }
+
+    /// A file that yields fewer bytes than its length said, as one cut short while it is
+    /// bundled, fails the export: tar would write a member shorter than its header.
+    #[test]
+    fn a_member_that_shrinks_while_it_is_bundled_fails_the_export() {
+        let mut tar = tar::Builder::new(Vec::new());
+        let err = append(&mut tar, "suspend/image.bin", 10, &b"abc"[..]).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("shrank from 10 to 3 bytes"),
+            "{err:#}"
+        );
+    }
+
     #[test]
     fn unlisted_member_is_refused() {
         let f = fixture();
