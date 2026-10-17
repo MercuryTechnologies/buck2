@@ -45,6 +45,7 @@ use buck2_error::buck2_error;
 use buck2_execute::materialize::materializer::Materializer;
 use buck2_execute::materialize::materializer::ResumedArtifacts;
 use buck2_execute::materialize::materializer::SuspendedArtifact;
+use buck2_execute::materialize::materializer::SuspendedArtifactCensus;
 use buck2_execute::materialize::materializer::suspend_rows;
 use buck2_file_watcher::file_watcher::FileWatcher;
 use buck2_file_watcher::file_watcher::FileWatcherImage;
@@ -851,6 +852,7 @@ async fn suspend_inner(
         .suspend_artifacts(inputs.portable)
         .await?;
     let artifact_count = artifacts.len();
+    let census = SuspendedArtifactCensus::of(&artifacts);
     let mut artifact_rows = Vec::new();
     for row in suspend_rows(artifacts) {
         artifact_rows.push(
@@ -946,6 +948,7 @@ async fn suspend_inner(
         file.artifact_rows.len(),
         local_action_count
     ));
+    out.push_str(&format!("artifacts: {census}\n"));
     out.push_str(&format!(
         "graph: {} keys, {} asserted, {} certificates ({} candidates), {} values written now, \
          {} keys left out\n",
