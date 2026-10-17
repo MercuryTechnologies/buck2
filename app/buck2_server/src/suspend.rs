@@ -451,6 +451,15 @@ impl Manifest {
     fn dirties_local_actions(&self, hostname_now: &str, run_env_now: &str) -> bool {
         self.portable || self.hostname != hostname_now || self.run_env != run_env_now
     }
+
+    /// Whether the resumed watcher must treat the files as another machine's: no stat the image
+    /// holds is compared, and a link that leaves the project is a change. A portable image is
+    /// made to move, and a hostname says nothing about the machine when runners share one (VMs
+    /// restored from one snapshot, containers given a fixed name), so only a non-portable image
+    /// resumed under the hostname that wrote it is taken to be on the same machine.
+    fn cross_host(&self, hostname_now: &str) -> bool {
+        self.portable || self.hostname != hostname_now
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -656,10 +665,9 @@ fn check(
     // The hostname is not checked, since the identity stands for it, but a stat taken on another
     // machine is never comparable with this one's.
     let hostname = buck2_events::metadata::hostname().unwrap_or_default();
-    let cross_host = m.hostname != hostname;
     Ok((
         image,
-        cross_host,
+        m.cross_host(&hostname),
         m.dirties_local_actions(&hostname, &observed.env.run),
     ))
 }
@@ -736,17 +744,25 @@ impl LoadedImage {
             .map_err(|e| format!("graph: {e:#}"))?;
         timings.push(("graph", t.elapsed()));
         timings.extend(stats.timings.iter().map(|(step, d)| (*step, *d)));
+        // The suspended daemon's local actions join this daemon's, whether or not they are
+        // dirtied: a value this daemon keeps from one of them is still that machine's, and a
+        // later suspend of this daemon must list it for the resume after that to run it again.
+        let t = Instant::now();
+        let actions: LocalActionList = dice
+            .read_suspend_row(self.image.local_actions)
+            .await
+            .map_err(|e| format!("unreadable list of local actions: {e:#}"))?;
+        let existing = dice.updater(root).existing_state().await;
+        if let Some(local) = LocalActions::of(existing.global_data()) {
+            local.extend(&actions);
+        }
+        drop(existing);
         let mut dirtied_local_actions = 0;
         if self.dirty_local_actions {
-            let t = Instant::now();
-            let actions: LocalActionList = dice
-                .read_suspend_row(self.image.local_actions)
-                .await
-                .map_err(|e| format!("unreadable list of local actions: {e:#}"))?;
             dirtied_local_actions = actions.len();
             dirty_keys(dice, root, build_keys(actions)).await?;
-            timings.push(("local actions", t.elapsed()));
         }
+        timings.push(("local actions", t.elapsed()));
         Ok(RestoredImage {
             stats,
             artifacts: resumed,
@@ -1522,6 +1538,22 @@ mod tests {
             ..back
         };
         assert!(portable.dirties_local_actions("suspend-host", &run));
+    }
+
+    /// Only a non-portable image under the hostname that wrote it compares stats; a portable
+    /// one is another machine's files even when the hostname matches.
+    #[test]
+    fn a_portable_image_is_always_another_machine() {
+        let project = ProjectRootTemp::new().unwrap();
+        let m = side(project.path()).manifest();
+        let host = m.hostname.clone();
+        assert!(!m.cross_host(&host));
+        assert!(m.cross_host("other"));
+        let portable = Manifest {
+            portable: true,
+            ..m
+        };
+        assert!(portable.cross_host(&host));
     }
 
     /// The environment check leaves the per-run variables out, which is sound only because a
