@@ -21,9 +21,14 @@ rustflags = ["--cfg", "tokio_unstable"]
 # @oss-disable: rev = "f73ddb1002d51ae74c1b41670fae56bd5896b7a3"
 # @oss-disable: replace-with = "vendored-sources"
 
-# @oss-disable: [source."git+https://github.com/grpc/grpc-rust?rev=de65d0a48783869d89b7d8d4a65ce703f1612249"]
-# @oss-disable: git = "https://github.com/grpc/grpc-rust"
-# @oss-disable: rev = "de65d0a48783869d89b7d8d4a65ce703f1612249"
+# @oss-disable: [source."git+https://github.com/MercuryTechnologies/grpc-rust.git?rev=07fd98f0b9c1b8d76bcf29f7c04527b26ee62bac"]
+# @oss-disable: git = "https://github.com/MercuryTechnologies/grpc-rust.git"
+# @oss-disable: rev = "07fd98f0b9c1b8d76bcf29f7c04527b26ee62bac"
+# @oss-disable: replace-with = "vendored-sources"
+
+# @oss-disable: [source."git+https://github.com/MercuryTechnologies/hyper.git?rev=c32cafeea14f28c8f760debb3c8e6b7735077794"]
+# @oss-disable: git = "https://github.com/MercuryTechnologies/hyper.git"
+# @oss-disable: rev = "c32cafeea14f28c8f760debb3c8e6b7735077794"
 # @oss-disable: replace-with = "vendored-sources"
 
 # @oss-disable: [source."git+https://github.com/jsgf/rust-bindgen?rev=4d385d21c160e6ee1f443aeb7e00528a1dc7fd44"]

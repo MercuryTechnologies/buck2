@@ -288,8 +288,10 @@ winver = "1"
 
 [patch.crates-io]
 darwin-libproc = { git = "https://github.com/fbsource/darwin-libproc", rev = "f73ddb1002d51ae74c1b41670fae56bd5896b7a3" }
+hyper = { git = "https://github.com/MercuryTechnologies/hyper.git", rev = "c32cafeea14f28c8f760debb3c8e6b7735077794" }
 perf-event = { version = "0.4", git = "https://github.com/Nero5023/perf-event.git", rev = "6dae86b6d4807acec081e6dc0a53167f57f8c0f4" }
 perf-event-open-sys = { version = "5.0", git = "https://github.com/Nero5023/perf-event.git", rev = "6dae86b6d4807acec081e6dc0a53167f57f8c0f4" }
+tonic = { git = "https://github.com/MercuryTechnologies/grpc-rust.git", rev = "07fd98f0b9c1b8d76bcf29f7c04527b26ee62bac" }
 
 [workspace]
 resolver = "3"
