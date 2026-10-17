@@ -13,7 +13,7 @@ use std::process::Command as StdCommand;
 use std::process::ExitStatus;
 use std::time::Duration;
 
-use buck2_common::kill_util::try_terminate_process_gracefully;
+use buck2_common::kill_util::try_terminate_process_group_gracefully;
 use buck2_error::BuckErrorContext;
 use buck2_error::BuckErrorOptionContext;
 use buck2_resource_control::ActionFreezeEvent;
@@ -150,9 +150,11 @@ impl ProcessGroupImpl {
             .and_then(|id| id.try_into().ok())
             .internal_error("PID does not fit a i32")?;
 
-        // Always use process-group-based signaling first.
+        // The command leads its own process group (`process_group(0)` above),
+        // and a wrapper that forks rather than execs leaves its real work in
+        // that group, so both legs signal the group, not the pid.
         if let Some(graceful_shutdown_timeout_s) = graceful_shutdown_timeout_s {
-            try_terminate_process_gracefully(
+            try_terminate_process_group_gracefully(
                 pid,
                 Duration::from_secs(graceful_shutdown_timeout_s as u64),
             )
