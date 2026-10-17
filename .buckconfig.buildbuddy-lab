@@ -15,6 +15,11 @@ toolchains = buildbuddy_toolchains
 [build]
 execution_platforms = lab_buildbuddy//:usw2_c1
 
+# Lab's thin worker image has bash at /bin/bash and is meant to give actions
+# nothing from /usr, so genrules and wrapper scripts name it directly.
+[prelude]
+bash = /bin/bash
+
 [http_archive]
 remote_download = true
 
