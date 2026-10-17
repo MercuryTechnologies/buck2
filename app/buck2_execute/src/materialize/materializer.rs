@@ -603,7 +603,15 @@ pub trait Materializer: Allocative + Send + Sync + 'static {
 
     /// The materializer's part of `buck2 suspend`: every artifact the running daemon declared,
     /// materialized or not. Called with no command running.
-    async fn suspend_artifacts(&self) -> buck2_error::Result<Vec<SuspendedArtifact>> {
+    ///
+    /// With `portable`, every materialized artifact without a CAS recipe is first uploaded to
+    /// the CAS, each file hashed again on the way, and recorded with the upload as its recipe,
+    /// so that a daemon resumed on another machine can fetch every artifact. A file that no
+    /// longer matches what was built fails the suspend.
+    async fn suspend_artifacts(
+        &self,
+        _portable: bool,
+    ) -> buck2_error::Result<Vec<SuspendedArtifact>> {
         Err(buck2_error::buck2_error!(
             ErrorTag::Input,
             "`buck2 suspend` supports the deferred materializer with \
