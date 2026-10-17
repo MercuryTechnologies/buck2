@@ -697,10 +697,11 @@ impl TenantState {
             ResumePrep::Refused(reason) => (ResumeOutcome::Cold { reason }, None),
             ResumePrep::Ready(image) => {
                 let outcome = match image.restore(&dice, root, &*materializer).await {
-                    Ok((stats, artifacts, timings)) => ResumeOutcome::Resumed {
-                        stats,
-                        artifacts,
-                        timings,
+                    Ok(restored) => ResumeOutcome::Resumed {
+                        stats: restored.stats,
+                        artifacts: restored.artifacts,
+                        timings: restored.timings,
+                        dirtied_local_actions: restored.dirtied_local_actions,
                     },
                     Err(reason) => {
                         buck2_build_api::configure_dice::initial_commit(&dice, root).await?;

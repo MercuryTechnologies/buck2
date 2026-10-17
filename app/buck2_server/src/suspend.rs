@@ -32,6 +32,9 @@ use std::time::SystemTime;
 use allocative::Allocative;
 use buck2_common::init::DaemonStartupConfig;
 use buck2_common::init::HOST_IDENTITY_PROPERTY;
+use buck2_build_api::actions::local_actions::LocalActionList;
+use buck2_build_api::actions::local_actions::LocalActions;
+use buck2_build_api::actions::local_actions::build_keys;
 use buck2_common::init::SuspendConfig;
 use buck2_common::legacy_configs::configs::LegacyBuckConfig;
 use buck2_common::legacy_configs::key::BuckconfigKeyRef;
@@ -399,12 +402,23 @@ struct Manifest {
     portable: bool,
 }
 
+impl Manifest {
+    /// Whether a daemon resuming this image runs again every action the suspended daemon ran
+    /// on its own machine: those read the daemon's environment and machine, which a portable
+    /// image or another host does not promise to match.
+    fn dirties_local_actions(&self, hostname_now: &str) -> bool {
+        self.portable || self.hostname != hostname_now
+    }
+}
+
 #[derive(Serialize, Deserialize)]
 struct ImageFile {
     dice: Vec<u8>,
     /// The materializer's artifacts, in rows of `suspend_rows`'s bounds.
     artifact_rows: Vec<SuspendRow>,
     artifact_count: usize,
+    /// The actions the suspended daemon ran on its own machine (`LocalActionList`).
+    local_actions: SuspendRow,
     watcher: FileWatcherImage,
 }
 
@@ -420,6 +434,8 @@ pub(crate) enum ResumeOutcome {
         artifacts: ResumedArtifacts,
         #[allocative(skip)]
         timings: Vec<(&'static str, Duration)>,
+        /// Locally executed actions dirtied so that they run again here.
+        dirtied_local_actions: usize,
     },
     /// An image was found and not used: the start is cold.
     Cold { reason: String },
@@ -434,6 +450,7 @@ impl ResumeOutcome {
                 stats,
                 artifacts,
                 timings,
+                dirtied_local_actions,
             } => {
                 let mut out = format!(
                     "resumed: {} keys, {} asserted, {} valid, {} candidates, {} not installed; \
@@ -447,6 +464,9 @@ impl ResumeOutcome {
                     artifacts.redeclared,
                     artifacts.refetch
                 );
+                out.push_str(&format!(
+                    "; {dirtied_local_actions} locally executed actions to run again"
+                ));
                 for (step, d) in timings {
                     out.push_str(&format!("; {step} {:.3}s", d.as_secs_f64()));
                 }
@@ -465,6 +485,8 @@ pub(crate) struct LoadedImage {
     image: ImageFile,
     /// The image was written on another machine, so no file stat it holds is comparable.
     cross_host: bool,
+    /// See [`Manifest::dirties_local_actions`].
+    dirty_local_actions: bool,
     image_dir: PathBuf,
     loaded_in: Duration,
 }
@@ -492,9 +514,10 @@ pub(crate) fn prepare_resume(cache_dir: &Path, identity: &SuspendIdentity) -> Re
         return ResumePrep::Refused("the MANIFEST could not be claimed".to_owned());
     }
     match check(&manifest_bytes, &image_dir, cache_dir, identity) {
-        Ok((image, cross_host)) => ResumePrep::Ready(LoadedImage {
+        Ok((image, cross_host, dirty_local_actions)) => ResumePrep::Ready(LoadedImage {
             image,
             cross_host,
+            dirty_local_actions,
             image_dir,
             loaded_in: start.elapsed(),
         }),
@@ -576,7 +599,7 @@ fn check(
     image_dir: &Path,
     cache_dir: &Path,
     identity: &SuspendIdentity,
-) -> Result<(ImageFile, bool), Refusal> {
+) -> Result<(ImageFile, bool, bool), Refusal> {
     let m = parse_manifest(manifest_bytes)?;
     let observed = Observed {
         identity,
@@ -590,8 +613,9 @@ fn check(
     let image = check_files(&m, image_dir, cache_dir)?;
     // The hostname is not checked, since the identity stands for it, but a stat taken on another
     // machine is never comparable with this one's.
-    let cross_host = m.hostname != buck2_events::metadata::hostname().unwrap_or_default();
-    Ok((image, cross_host))
+    let hostname = buck2_events::metadata::hostname().unwrap_or_default();
+    let cross_host = m.hostname != hostname;
+    Ok((image, cross_host, m.dirties_local_actions(&hostname)))
 }
 
 /// The checks that read the image's files.
@@ -638,7 +662,7 @@ impl LoadedImage {
         dice: &Arc<Dice>,
         root: dice::BranchId,
         materializer: &dyn Materializer,
-    ) -> Result<(ResumeStats, ResumedArtifacts, Vec<(&'static str, Duration)>), String> {
+    ) -> Result<RestoredImage, String> {
         let mut timings = vec![("load", self.loaded_in)];
         let t = Instant::now();
         let mut resumed = ResumedArtifacts::default();
@@ -667,13 +691,54 @@ impl LoadedImage {
             .map_err(|e| format!("graph: {e:#}"))?;
         timings.push(("graph", t.elapsed()));
         timings.extend(stats.timings.iter().map(|(step, d)| (*step, *d)));
-        Ok((stats, resumed, timings))
+        let mut dirtied_local_actions = 0;
+        if self.dirty_local_actions {
+            let t = Instant::now();
+            let actions: LocalActionList = dice
+                .read_suspend_row(self.image.local_actions)
+                .await
+                .map_err(|e| format!("unreadable list of local actions: {e:#}"))?;
+            dirtied_local_actions = actions.len();
+            dirty_keys(dice, root, build_keys(actions)).await?;
+            timings.push(("local actions", t.elapsed()));
+        }
+        Ok(RestoredImage {
+            stats,
+            artifacts: resumed,
+            timings,
+            dirtied_local_actions,
+        })
     }
 
     /// The image is single-use: once replayed, or refused, it goes.
     pub(crate) fn discard(&self) {
         drop(std::fs::remove_dir_all(&self.image_dir));
     }
+}
+
+/// What [`LoadedImage::restore`] did.
+pub(crate) struct RestoredImage {
+    pub(crate) stats: ResumeStats,
+    pub(crate) artifacts: ResumedArtifacts,
+    pub(crate) timings: Vec<(&'static str, Duration)>,
+    pub(crate) dirtied_local_actions: usize,
+}
+
+/// Dirties `keys` on `root`, as a rewind does, so that the next transaction computes each again.
+async fn dirty_keys<K: dice::Key>(
+    dice: &Arc<Dice>,
+    root: dice::BranchId,
+    keys: Vec<K>,
+) -> Result<(), String> {
+    if keys.is_empty() {
+        return Ok(());
+    }
+    let mut updater = dice.updater(root);
+    updater
+        .changed(keys)
+        .map_err(|e| format!("dirtying local actions: {e:#}"))?;
+    updater.commit().await;
+    Ok(())
 }
 
 fn write_durably(path: &Path, bytes: &[u8]) -> buck2_error::Result<()> {
@@ -794,6 +859,15 @@ async fn suspend_inner(
             })?,
         );
     }
+    let local_actions: LocalActionList = LocalActions::of(inputs.transaction.global_data())
+        .map(LocalActions::snapshot)
+        .unwrap_or_default();
+    let local_actions_row = inputs
+        .dice
+        .write_suspend_row(&local_actions)
+        .map_err(|e| buck2_error!(ErrorTag::Tier0, "writing the local actions: {e:#}"))?;
+    let local_action_count = local_actions.len();
+    drop(local_actions);
     lap("materializer", &mut timings);
 
     let dice_state = inputs.cache_dir.join(DICE_STATE_DIR);
@@ -819,6 +893,7 @@ async fn suspend_inner(
         dice: image.bytes,
         artifact_rows,
         artifact_count,
+        local_actions: local_actions_row,
         watcher,
     };
     let bytes = bincode::serde::encode_to_vec(&file, bincode::config::standard())
@@ -862,12 +937,14 @@ async fn suspend_inner(
     let stats = &image.stats;
     let mut out = String::new();
     out.push_str(&format!(
-        "suspended{}: image {} bytes, paging store {} bytes, {} artifacts in {} rows\n",
+        "suspended{}: image {} bytes, paging store {} bytes, {} artifacts in {} rows, {} \
+         locally executed actions\n",
         if inputs.portable { " (portable)" } else { "" },
         bytes.len(),
         dice_state_bytes,
         artifact_count,
-        file.artifact_rows.len()
+        file.artifact_rows.len(),
+        local_action_count
     ));
     out.push_str(&format!(
         "graph: {} keys, {} asserted, {} certificates ({} candidates), {} values written now, \
@@ -1387,5 +1464,77 @@ mod tests {
         assert_eq!(back.env_vars, m.env_vars);
         assert_eq!(back.host_identity, "A");
         assert_eq!(back.created_at_ms, m.created_at_ms);
+        assert!(!back.dirties_local_actions("suspend-host"));
+        assert!(back.dirties_local_actions("other"));
+        let portable = Manifest {
+            portable: true,
+            ..back
+        };
+        assert!(portable.dirties_local_actions("suspend-host"));
+    }
+
+    /// The dirtying a resume applies to locally executed actions: the dirtied key computes
+    /// again in the next transaction, and a key that was not dirtied keeps its value.
+    #[tokio::test]
+    async fn dirtied_keys_compute_again() {
+        use std::sync::atomic::AtomicUsize;
+        use std::sync::atomic::Ordering;
+
+        use allocative::Allocative;
+        use async_trait::async_trait;
+        use dice::DetectCycles;
+        use dice::DiceComputations;
+        use dice::DiceKeyDyn;
+        use dice::EqualityBehavior;
+        use dice::Key;
+        use dice_futures::cancellation::CancellationContext;
+        use pagable::Pagable;
+        use pagable::pagable_typetag;
+
+        static COMPUTES: [AtomicUsize; 2] = [AtomicUsize::new(0), AtomicUsize::new(0)];
+
+        #[derive(Allocative, Clone, Copy, Debug, Eq, PartialEq, Hash, Pagable)]
+        #[pagable_typetag(DiceKeyDyn)]
+        struct Counted(usize);
+
+        impl std::fmt::Display for Counted {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "Counted({})", self.0)
+            }
+        }
+
+        #[async_trait]
+        impl Key for Counted {
+            type Value = usize;
+
+            async fn compute(
+                &self,
+                _ctx: &mut DiceComputations,
+                _cancellations: &CancellationContext,
+            ) -> Self::Value {
+                COMPUTES[self.0].fetch_add(1, Ordering::SeqCst) + 1
+            }
+
+            fn value_serialize() -> impl dice::ValueSerialize<Value = Self::Value> {
+                dice::NoValueSerialize::<Self::Value>::new()
+            }
+
+            fn equality_behavior() -> EqualityBehavior<Self::Value> {
+                EqualityBehavior::Compare(|x, y| x == y)
+            }
+        }
+
+        let dice = Dice::builder().build(DetectCycles::Enabled);
+        let root = dice.new_root().await;
+        let ctx = dice.updater(root).commit().await;
+        assert_eq!(*ctx.compute(&Counted(0)).await.unwrap(), 1);
+        assert_eq!(*ctx.compute(&Counted(1)).await.unwrap(), 1);
+        drop(ctx);
+
+        dirty_keys(&dice, root, vec![Counted(0)]).await.unwrap();
+        let ctx = dice.updater(root).commit().await;
+        assert_eq!(*ctx.compute(&Counted(0)).await.unwrap(), 2);
+        assert_eq!(*ctx.compute(&Counted(1)).await.unwrap(), 1);
+        assert_eq!(COMPUTES[1].load(Ordering::SeqCst), 1);
     }
 }

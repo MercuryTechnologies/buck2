@@ -37,6 +37,7 @@ use dice::PageOutPolicy;
 use starlark::pagable::DeferredFieldReadsEnabled;
 
 use crate::actions::execute::dice_data::SetInvalidationTrackingConfig;
+use crate::actions::local_actions::SetLocalActions;
 use crate::build::detailed_aggregated_metrics::dice::SetDetailedAggregatedMetricsHandle;
 use crate::build::detailed_aggregated_metrics::events::DetailedAggregatedMetricsHandle;
 
@@ -78,6 +79,7 @@ pub fn configure_dice_data_for_buck(
 
     // Empty handle; a command enables the tracker lazily if it needs one.
     data.set_detailed_aggregated_metrics_handle(DetailedAggregatedMetricsHandle::new());
+    data.set_local_actions();
     Ok(data)
 }
 

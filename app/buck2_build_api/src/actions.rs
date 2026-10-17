@@ -99,6 +99,7 @@ pub mod calculation;
 pub mod errors;
 pub mod execute;
 pub mod impls;
+pub mod local_actions;
 pub mod query;
 pub mod registry;
 pub mod rewind;
