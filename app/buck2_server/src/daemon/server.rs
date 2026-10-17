@@ -282,6 +282,7 @@ impl TenantStateInitPreferences {
         root_config: &LegacyBuckConfig,
         tenting_acl_provider: Option<Arc<dyn TentingAclProvider>>,
         dice_state_path: &Path,
+        resuming: bool,
     ) -> buck2_error::Result<(Arc<Dice>, BranchId)> {
         // `hydration` is `Some` when paging is enabled (via `enable_paging` or
         // `page_out_on_idle`), which is what gates setting up on-disk storage.
@@ -300,6 +301,7 @@ impl TenantStateInitPreferences {
                 .buck_settings
                 .hydration
                 .defer_field_reads(),
+            resuming,
         )
         .await
     }
@@ -332,6 +334,11 @@ impl Interceptor for BuckCheckAuthTokenInterceptor {
 pub(crate) struct BuckdServerData {
     /// The flag that is set to true when server is shutting down.
     stop_accepting_requests: AtomicBool,
+    /// The MANIFEST of an image `buck2 suspend` wrote, until the client's kill ends the daemon.
+    /// A command that starts in between could change what the image describes, so it deletes
+    /// the MANIFEST first; status and kill still answer.
+    #[allocative(skip)]
+    suspended_image: parking_lot::Mutex<Option<std::path::PathBuf>>,
     #[allocative(skip)]
     process_info: DaemonProcessInfo,
     base_daemon_constraints: buck2_cli_proto::DaemonConstraints,
@@ -443,6 +450,7 @@ impl BuckdServer {
         let scribe_sink = daemon_state.data().scribe_sink.dupe();
         let api_server = BuckdServer(Arc::new(BuckdServerData {
             stop_accepting_requests: AtomicBool::new(false),
+            suspended_image: parking_lot::Mutex::new(None),
             process_info,
             base_daemon_constraints,
             start_time: prost_types::Timestamp {
@@ -593,6 +601,12 @@ impl BuckdServer {
             )?);
 
             command.pre_run(self)?;
+            if let Some(manifest) = self.0.suspended_image.lock().take() {
+                tracing::warn!(
+                    "A command started after `buck2 suspend`; its image is no longer valid"
+                );
+                drop(std::fs::remove_file(manifest));
+            }
 
             let daemon_state = self.0.daemon_state.dupe();
             let trace_id = client_ctx.trace_id.parse()?;
@@ -1423,11 +1437,32 @@ impl DaemonApi for BuckdServer {
         &self,
         req: Request<HydrationRequest>,
     ) -> Result<Response<ResponseStream>, Status> {
+        let suspend =
+            req.get_ref().subcommand == buck2_cli_proto::HydrationSubcommand::Suspend as i32;
+        let data = self.0.dupe();
         self.run_streaming(
             req,
             HydrationCommandOptions,
-            |context, partial_result_dispatcher, req| {
-                hydration_command(context, partial_result_dispatcher, req).boxed()
+            move |context, partial_result_dispatcher, req| {
+                async move {
+                    let manifest = crate::suspend::manifest_path(
+                        context
+                            .base_context
+                            .tenant
+                            .repo
+                            .paths
+                            .cache_dir_path()
+                            .as_path(),
+                    );
+                    let result = hydration_command(context, partial_result_dispatcher, req).await;
+                    if suspend && result.is_ok() {
+                        // The image describes the daemon as it is now, until the client's kill
+                        // ends it: a command that starts first invalidates it.
+                        *data.suspended_image.lock() = Some(manifest);
+                    }
+                    result
+                }
+                .boxed()
             },
         )
         .await

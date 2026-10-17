@@ -1033,6 +1033,10 @@ enum HydrationSubcommand {
   STATUS = 2;
   // Drop the resident values a row already holds, as memory pressure would.
   EVICT = 3;
+  // `buck2 suspend`: write the daemon's state to disk for a later daemon to resume.
+  SUSPEND = 4;
+  // `buck2 resume`: report what this daemon's start did about a suspended image.
+  RESUME_STATUS = 5;
 }
 
 message HydrationRequest {
@@ -1049,6 +1053,8 @@ message HydrationResponse {
   // What the page-out moved. Set only for `page-out`, and only on success —
   // failures surface as a command error.
   optional buck.data.PageOutSummary page_out_summary = 2;
+  // `resume`: whether this daemon resumed a suspended image.
+  optional bool resumed = 3;
 }
 
 message SetLogFilterRequest {

@@ -34,6 +34,8 @@ use buck2_client::commands::run::RunCommand;
 use buck2_client::commands::server::ServerCommand;
 use buck2_client::commands::status::StatusCommand;
 use buck2_client::commands::subscribe::SubscribeCommand;
+use buck2_client::commands::suspend::ResumeCommand;
+use buck2_client::commands::suspend::SuspendCommand;
 use buck2_client::commands::targets::TargetsCommand;
 use buck2_client::commands::test::TestCommand;
 use buck2_client_ctx::agent_context::AgentContext;
@@ -436,6 +438,7 @@ pub(crate) enum CommandKind {
     Install(InstallCommand),
     Kill(KillCommand),
     Killall(KillallCommand),
+    Resume(ResumeCommand),
     Root(RootCommand),
     /// Alias for `uquery`.
     Query(UqueryCommand),
@@ -444,6 +447,7 @@ pub(crate) enum CommandKind {
     Status(StatusCommand),
     #[clap(subcommand)]
     Starlark(StarlarkCommand),
+    Suspend(SuspendCommand),
     /// Alias for `utargets`.
     Targets(TargetsCommand),
     Utargets(TargetsCommand),
@@ -620,6 +624,8 @@ impl CommandKind {
             CommandKind::HelpEnv(cmd) => cmd.exec(matches, command_ctx),
             CommandKind::Kill(cmd) => command_ctx.exec(cmd, matches, events_ctx),
             CommandKind::Killall(cmd) => command_ctx.exec(cmd, matches, events_ctx),
+            CommandKind::Resume(cmd) => command_ctx.exec(cmd, matches, events_ctx),
+            CommandKind::Suspend(cmd) => command_ctx.exec(cmd, matches, events_ctx),
             CommandKind::Clean(cmd) => cmd.exec(matches, command_ctx, events_ctx),
             CommandKind::Cleanall(cmd) => command_ctx.exec(cmd, matches, events_ctx),
             CommandKind::Root(cmd) => cmd.exec(matches, command_ctx).into(),
@@ -672,6 +678,8 @@ impl CommandKind {
             CommandKind::HelpEnv(_) => "help-env",
             CommandKind::Kill(cmd) => cmd.logging_name(),
             CommandKind::Killall(cmd) => cmd.logging_name(),
+            CommandKind::Resume(cmd) => cmd.logging_name(),
+            CommandKind::Suspend(cmd) => cmd.logging_name(),
             CommandKind::Clean(cmd) => cmd.command_name(),
             CommandKind::Cleanall(cmd) => cmd.logging_name(),
             CommandKind::Root(_) => "root",

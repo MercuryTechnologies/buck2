@@ -97,6 +97,9 @@ pub async fn configure_dice_for_buck(
     // When the values a page-out writes leave memory (`hydration.eviction_policy`).
     eviction_policy: EvictionPolicy,
     defer_field_reads: bool,
+    // The daemon will replay a suspended image onto the root before anything else is committed
+    // to it, and then commit what [`initial_commit`] commits only if the replay fails.
+    resuming: bool,
 ) -> buck2_error::Result<(Arc<Dice>, BranchId)> {
     let data = configure_dice_data_for_buck(DiceRootConfiguration {
         io,
@@ -136,10 +139,18 @@ pub async fn configure_dice_for_buck(
 
     let dice = dice.build(DetectCycles::Enabled);
     let root = dice.new_root().await;
+    if !resuming {
+        initial_commit(&dice, root).await?;
+    }
+
+    Ok((dice, root))
+}
+
+/// What a new root starts with before the first command injects anything.
+pub async fn initial_commit(dice: &Arc<Dice>, root: BranchId) -> buck2_error::Result<()> {
     let mut dice_ctx = dice.updater(root);
     dice_ctx.set_none_cell_resolver()?;
     dice_ctx.set_none_legacy_config_external_data()?;
     dice_ctx.commit().await;
-
-    Ok((dice, root))
+    Ok(())
 }
