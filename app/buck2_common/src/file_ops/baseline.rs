@@ -9,6 +9,7 @@
  */
 
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 
@@ -38,15 +39,53 @@ pub enum FileSystemBaseline {
     /// it recorded as a change.
     Revision(Arc<str>),
     /// A state equal to no other. Only [`FileSystemBaseline::unique`] produces these.
-    Unique(u64),
+    ///
+    /// `process` is drawn at random once per process, so a baseline a suspended daemon recorded
+    /// in its graph never equals one a later process makes: that equality would let the later
+    /// process reuse every file read the suspended one made, changed files included.
+    Unique { process: u64, n: u64 },
 }
 
 impl FileSystemBaseline {
-    /// A baseline equal to no other.
+    /// A baseline equal to no other, in this process or any other.
     pub fn unique() -> Self {
+        static PROCESS: OnceLock<u64> = OnceLock::new();
         static NEXT: AtomicU64 = AtomicU64::new(0);
-        Self::Unique(NEXT.fetch_add(1, Ordering::Relaxed))
+        Self::Unique {
+            process: *PROCESS.get_or_init(rand::random),
+            n: NEXT.fetch_add(1, Ordering::Relaxed),
+        }
     }
+
+    /// The baseline as `buck2 suspend` records it beside the file watcher's state.
+    pub fn to_image(&self) -> FileSystemBaselineImage {
+        match self {
+            FileSystemBaseline::Revision(r) => FileSystemBaselineImage::Revision(r.to_string()),
+            FileSystemBaseline::Unique { process, n } => FileSystemBaselineImage::Unique {
+                process: *process,
+                n: *n,
+            },
+        }
+    }
+
+    /// The baseline a suspended daemon recorded: a resumed file watcher keeps reporting changes
+    /// relative to it, so the file reads the image carries stay valid.
+    pub fn from_image(image: &FileSystemBaselineImage) -> Self {
+        match image {
+            FileSystemBaselineImage::Revision(r) => FileSystemBaseline::Revision(Arc::from(&**r)),
+            FileSystemBaselineImage::Unique { process, n } => FileSystemBaseline::Unique {
+                process: *process,
+                n: *n,
+            },
+        }
+    }
+}
+
+/// [`FileSystemBaseline`] in a form `buck2 suspend` writes to disk.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum FileSystemBaselineImage {
+    Revision(String),
+    Unique { process: u64, n: u64 },
 }
 
 #[derive(Clone, Dupe, Display, Debug, Eq, Hash, PartialEq, Allocative, Pagable)]
@@ -96,6 +135,35 @@ impl SetFileSystemBaseline for DiceTransactionUpdater {
         baseline: FileSystemBaseline,
     ) -> buck2_error::Result<()> {
         Ok(self.changed_to(vec![(FileSystemBaselineKey, baseline)])?)
+    }
+}
+
+#[cfg(test)]
+mod unique_tests {
+    use super::*;
+
+    #[test]
+    fn unique_baselines_differ_and_round_trip() {
+        let a = FileSystemBaseline::unique();
+        let b = FileSystemBaseline::unique();
+        assert_ne!(a, b);
+        assert_eq!(FileSystemBaseline::from_image(&a.to_image()), a);
+        let rev = FileSystemBaseline::Revision(Arc::from("abc"));
+        assert_eq!(FileSystemBaseline::from_image(&rev.to_image()), rev);
+    }
+
+    /// A baseline another process made with the same counter value is not equal to ours.
+    #[test]
+    fn unique_baseline_of_another_process_differs() {
+        let ours = FileSystemBaseline::unique();
+        let FileSystemBaseline::Unique { process, n } = ours.clone() else {
+            unreachable!()
+        };
+        let theirs = FileSystemBaseline::from_image(&FileSystemBaselineImage::Unique {
+            process: process.wrapping_add(1),
+            n,
+        });
+        assert_ne!(ours, theirs);
     }
 }
 
