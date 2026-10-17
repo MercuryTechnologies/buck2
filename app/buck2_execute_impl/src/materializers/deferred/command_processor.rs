@@ -958,7 +958,7 @@ impl<T: IoHandler> DeferredMaterializerCommandProcessor<T> {
             .add_materialized(classification, logical_size_bytes);
     }
 
-    fn declare(
+    pub(super) fn declare(
         &mut self,
         path: &ProjectRelativePath,
         value: ArtifactValue,

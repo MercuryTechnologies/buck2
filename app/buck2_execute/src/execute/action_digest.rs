@@ -10,7 +10,11 @@
 
 use buck2_common::cas_digest::CasDigest;
 use buck2_common::cas_digest::CasDigestKind;
+use pagable::Pagable;
 
+/// Pagable so that an action digest can be written by `buck2 suspend` (the CAS origin of a
+/// declared artifact), as file digests already are.
+#[derive(Pagable)]
 pub struct ActionDigestKind {
     _private: (),
 }

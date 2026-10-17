@@ -1714,6 +1714,124 @@ pub(crate) mod state_machine {
         .await
     }
 
+    /// What `buck2 suspend` records survives a restart over the same sqlite state: the
+    /// materialized artifact is active again, so `clean --stale` keeps it, and the declared ones
+    /// are declared again, so asking for them materializes them.
+    #[tokio::test]
+    async fn suspended_artifacts_are_tracked_again_after_resume() -> buck2_error::Result<()> {
+        use buck2_execute::materialize::materializer::ResumedArtifacts;
+        use buck2_execute::materialize::materializer::SuspendedArtifact;
+        use buck2_execute::materialize::materializer::SuspendedArtifactState;
+
+        ignore_stack_overflow_checks_for_future(async {
+            let materialized = make_path(SAMPLE_BUCK_OUT_PATH);
+            let declared_write = make_path("buck-out/v2/art/foo/declared");
+            let declared_cas = make_path("buck-out/v2/art/foo/cas");
+            let project_root = temp_root();
+            let io = Arc::new(StubIoHandler::new(project_root.clone()));
+            let (dm, _) = make_materializer(io.dupe(), None).await;
+            materialize_write(&materialized, b"contents", &dm).await?;
+            let write_path = declared_write.clone();
+            dm.declare_write(Box::new(move || {
+                Ok(vec![WriteRequest {
+                    path: write_path,
+                    content: b"later".to_vec(),
+                    is_executable: false,
+                    path_kind: BuckOutPathKind::Configuration,
+                }])
+            }))
+            .await?;
+            let expiry = Timestamp::now()
+                .checked_add(SignedDuration::from_hours(1))
+                .expect("one hour should fit in a timestamp");
+            dm.declare_cas_many_impl(
+                Arc::new(CasDownloadInfo::new_declared(
+                    RemoteExecutorUseCase::buck2_default(),
+                )),
+                vec![DeclareArtifactPayload {
+                    path: declared_cas.clone(),
+                    artifact: cas_value(io.digest_config(), b"cas", expiry),
+                }],
+            )
+            .await?;
+
+            let mut artifacts = dm.suspend_artifacts().await?;
+            let mut states: Vec<(String, &'static str)> = artifacts
+                .iter()
+                .map(|a| {
+                    (
+                        a.path.to_string(),
+                        match a.state {
+                            SuspendedArtifactState::Materialized => "materialized",
+                            SuspendedArtifactState::CasDownload { .. } => "cas",
+                            SuspendedArtifactState::LocalCopy { .. } => "copy",
+                            SuspendedArtifactState::Write { .. } => "write",
+                        },
+                    )
+                })
+                .collect();
+            states.sort();
+            assert_eq!(
+                states,
+                vec![
+                    (materialized.to_string(), "materialized"),
+                    (declared_cas.to_string(), "cas"),
+                    (declared_write.to_string(), "write"),
+                ]
+            );
+            dm.abort();
+
+            // A materialized artifact the sqlite state no longer has is lost: the resume of a
+            // daemon whose state was not kept with its image is refused.
+            artifacts.push(SuspendedArtifact {
+                path: make_path("buck-out/v2/art/foo/missing"),
+                deps: None,
+                state: SuspendedArtifactState::Materialized,
+            });
+            let (dm, _) = make_materializer(io, None).await;
+            let resumed = dm.resume_artifacts(artifacts).await?;
+            assert_eq!(
+                resumed,
+                ResumedArtifacts {
+                    reactivated: 1,
+                    redeclared: 2,
+                    lost: 1,
+                }
+            );
+
+            // Active again, so a clean that would delete every inactive artifact keeps it.
+            let (res, _events) = clean_stale_with_events(
+                &dm,
+                CleanStaleArtifactsArgs {
+                    policy: CleanStaleArtifactsPolicy::Explicit {
+                        keep_since_time: jiff::Timestamp::MAX,
+                        adaptive_low_disk_threshold: None,
+                        adaptive_min_ttl: None,
+                        adaptive_unmaterialize_active: false,
+                    },
+                    dry_run: false,
+                    tracked_only: false,
+                },
+            )
+            .await;
+            let res = res?;
+            let stats = res
+                .stats
+                .as_ref()
+                .unwrap_or_else(|| panic!("{}", res.message.unwrap()));
+            assert_eq!(stats.cleaned_artifact_count, 0);
+
+            // The declared write is known again: asking for it writes it.
+            dm.materialize_many(vec![declared_write.clone()])
+                .await?
+                .next()
+                .await
+                .unwrap()?;
+            Ok(())
+        })
+        .await
+    }
+
     #[tokio::test]
     async fn test_clean_stale_records_sizes_after_cleanup_finishes() -> buck2_error::Result<()> {
         ignore_stack_overflow_checks_for_future(async {
