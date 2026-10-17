@@ -89,6 +89,12 @@ def _requires_no_srcs_environment(ctx: AnalysisContext) -> bool:
 # We don't want to use cache mode in open source because the config keys that drive it aren't wired up
 _USE_CACHE_MODE = is_full_meta_repo()
 
+# The bash that runs a genrule's script, as an argv. The default
+# finds bash on PATH through /usr/bin/env, as upstream does; an execution
+# platform that should take nothing from /usr sets `[prelude] bash`, such as
+# `/bin/bash`. Read here, not in a shared .bzl, so this file gains no load.
+_BASH = read_root_config("prelude", "bash", "/usr/bin/env bash").split(" ")
+
 # Extra attributes required by every genrule based on genrule_impl
 def genrule_attributes() -> dict[str, Attr]:
     attributes = {
@@ -434,7 +440,7 @@ def process_genrule(
     if is_windows:
         script_args = ["cmd.exe", "/v:off", "/c", sh_script]
     else:
-        script_args = ["/usr/bin/env", "bash", "-e", sh_script]
+        script_args = _BASH + ["-e", sh_script]
 
     # Only set metadata arguments when they are non-null
     metadata_args = {}
