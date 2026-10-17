@@ -46,6 +46,8 @@ use dice::DiceTransactionUpdater;
 use dupe::Dupe;
 
 use crate::file_watcher::FileWatcher;
+use crate::file_watcher::FileWatcherImage;
+use crate::file_watcher::FileWatcherImageKind;
 use crate::file_watcher::SyncOutcome;
 use crate::mergebase::Mergebase;
 use crate::stats::FileWatcherStats;
@@ -86,6 +88,26 @@ impl FsHashCrawler {
         })
     }
 
+    /// A crawler for a resumed daemon: its first sync reports every path whose stat differs
+    /// from `image`'s snapshot, the one the suspended daemon's last sync took, so what changed
+    /// while no daemon ran is recorded like any other change. It keeps the suspended daemon's
+    /// baseline, which the restored file reads are relative to.
+    pub fn resume(
+        root: &ProjectRoot,
+        cells: CellResolver,
+        ignore_specs: StdBuckHashMap<CellName, IgnoreSet>,
+        image: &FileWatcherImage,
+    ) -> buck2_error::Result<Self> {
+        let snapshot = FsSnapshot::from_image(&image.snapshot, &cells)?;
+        Ok(Self {
+            root: root.dupe(),
+            cells,
+            ignore_specs: Arc::new(ignore_specs),
+            snapshot: Arc::new(Mutex::new(snapshot)),
+            baseline: FileSystemBaseline::from_image(&image.baseline),
+        })
+    }
+
     async fn update(
         &self,
         mut dice: DiceTransactionUpdater,
@@ -106,6 +128,20 @@ impl FsHashCrawler {
 
 #[async_trait]
 impl FileWatcher for FsHashCrawler {
+    /// The snapshot of the last sync is `S`: an edit made before it statted a file was
+    /// recorded by that sync, and one made after differs from `S`, so the resumed crawler
+    /// reports it.
+    async fn suspend_image(
+        &self,
+        _project_root: &ProjectRoot,
+    ) -> buck2_error::Result<FileWatcherImage> {
+        Ok(FileWatcherImage {
+            kind: FileWatcherImageKind::FsHashCrawler,
+            baseline: self.baseline.to_image(),
+            snapshot: self.snapshot.lock().unwrap().to_image(),
+        })
+    }
+
     async fn sync(
         &self,
         dice: DiceTransactionUpdater,
@@ -173,7 +209,8 @@ enum EntryInfo {
     #[allocative(skip)]
     File(FileStat),
     Directory,
-    Symlink,
+    /// The link's target, or `None` if it could not be read.
+    Symlink(Option<String>),
 }
 
 impl EntryInfo {
@@ -181,17 +218,38 @@ impl EntryInfo {
         match self {
             EntryInfo::File(_) => FileWatcherKind::File,
             EntryInfo::Directory => FileWatcherKind::Directory,
-            EntryInfo::Symlink => FileWatcherKind::Symlink,
+            EntryInfo::Symlink(_) => FileWatcherKind::Symlink,
         }
     }
 }
 
 #[derive(Allocative)]
-struct FsSnapshot {
+pub(crate) struct FsSnapshot {
     entries: BuckMutMap<CellPath, EntryInfo>,
     /// When the walk that took this snapshot began.
     #[allocative(skip)]
     started: SystemTime,
+}
+
+/// [`FsSnapshot`] as `buck2 suspend` writes it: every path by cell and cell-relative path.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct FsSnapshotImage {
+    /// When the walk began, as seconds and nanoseconds since the epoch.
+    started: (u64, u32),
+    entries: Vec<(String, String, EntryImage)>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+enum EntryImage {
+    File {
+        modified: Option<(u64, u32)>,
+        len: u64,
+        changed: (i64, i64),
+        ino: u64,
+        dev: u64,
+    },
+    Directory,
+    Symlink(Option<String>),
 }
 
 /// What the walk needs besides the directory it is in.
@@ -226,7 +284,106 @@ impl Walk<'_> {
 }
 
 impl FsSnapshot {
-    fn build(
+    pub(crate) fn to_image(&self) -> FsSnapshotImage {
+        let started = self
+            .started
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default();
+        let mut entries: Vec<(String, String, EntryImage)> = self
+            .entries
+            .iter()
+            .map(|(cell_path, info)| {
+                (
+                    cell_path.cell().as_str().to_owned(),
+                    cell_path.path().as_str().to_owned(),
+                    match info {
+                        EntryInfo::File(stat) => EntryImage::File {
+                            modified: stat.modified.and_then(|m| {
+                                m.duration_since(SystemTime::UNIX_EPOCH)
+                                    .ok()
+                                    .map(|d| (d.as_secs(), d.subsec_nanos()))
+                            }),
+                            len: stat.len,
+                            #[cfg(unix)]
+                            changed: stat.changed,
+                            #[cfg(not(unix))]
+                            changed: (0, 0),
+                            #[cfg(unix)]
+                            ino: stat.ino,
+                            #[cfg(not(unix))]
+                            ino: 0,
+                            #[cfg(unix)]
+                            dev: stat.dev,
+                            #[cfg(not(unix))]
+                            dev: 0,
+                        },
+                        EntryInfo::Directory => EntryImage::Directory,
+                        EntryInfo::Symlink(target) => EntryImage::Symlink(target.clone()),
+                    },
+                )
+            })
+            .collect();
+        entries.sort_by(|a, b| (&a.0, &a.1).cmp(&(&b.0, &b.1)));
+        FsSnapshotImage {
+            started: (started.as_secs(), started.subsec_nanos()),
+            entries,
+        }
+    }
+
+    pub(crate) fn from_image(
+        image: &FsSnapshotImage,
+        cells: &CellResolver,
+    ) -> buck2_error::Result<Self> {
+        let mut entries = BuckMutMap::default();
+        for (cell, path, entry) in &image.entries {
+            let cell = cells
+                .cells()
+                .map(|(name, _)| name)
+                .find(|name| name.as_str() == cell)
+                .ok_or_else(|| {
+                    buck2_error::buck2_error!(
+                        buck2_error::ErrorTag::Input,
+                        "the suspended snapshot names cell `{cell}`, which no longer exists"
+                    )
+                })?;
+            let cell_path = CellPath::new(
+                cell,
+                &buck2_core::cells::paths::CellRelativePathBuf::try_from(path.clone())?,
+            );
+            let info = match entry {
+                EntryImage::File {
+                    modified,
+                    len,
+                    changed,
+                    ino,
+                    dev,
+                } => {
+                    let _unused = (changed, ino, dev);
+                    EntryInfo::File(FileStat {
+                        modified: modified.map(|(secs, nanos)| {
+                            SystemTime::UNIX_EPOCH + Duration::new(secs, nanos)
+                        }),
+                        len: *len,
+                        #[cfg(unix)]
+                        changed: *changed,
+                        #[cfg(unix)]
+                        ino: *ino,
+                        #[cfg(unix)]
+                        dev: *dev,
+                    })
+                }
+                EntryImage::Directory => EntryInfo::Directory,
+                EntryImage::Symlink(target) => EntryInfo::Symlink(target.clone()),
+            };
+            entries.insert(cell_path, info);
+        }
+        Ok(FsSnapshot {
+            entries,
+            started: SystemTime::UNIX_EPOCH + Duration::new(image.started.0, image.started.1),
+        })
+    }
+
+    pub(crate) fn build(
         root: &ProjectRoot,
         cells: &CellResolver,
         ignore_specs: &StdBuckHashMap<CellName, IgnoreSet>,
@@ -276,8 +433,16 @@ impl FsSnapshot {
                         }
                     }
                     (EntryInfo::Directory, EntryInfo::Directory) => (),
-                    // FIXME(JakobDegen): Track symlink targets
-                    (EntryInfo::Symlink, EntryInfo::Symlink) => (),
+                    (EntryInfo::Symlink(cur), EntryInfo::Symlink(prev)) => {
+                        // A retargeted link reads as different contents.
+                        if cur != prev || cur.is_none() {
+                            events.push(FsEvent {
+                                cell_path: cell_path.to_owned(),
+                                event: FileWatcherEventType::Modify,
+                                kind: prev_info.to_file_watcher_kind(),
+                            });
+                        }
+                    }
                     (current_info, prev_info) => {
                         events.push(FsEvent {
                             cell_path: cell_path.to_owned(),
@@ -313,7 +478,7 @@ impl FsSnapshot {
         Ok(events)
     }
 
-    fn get_updates_for_dice(
+    pub(crate) fn get_updates_for_dice(
         &self,
         new_snapshot: &FsSnapshot,
         ignore_specs: &StdBuckHashMap<CellName, IgnoreSet>,
@@ -410,7 +575,10 @@ impl FsSnapshot {
                     self.add_entry(cell_path, EntryInfo::Directory);
                 }
                 FileType::Symlink => {
-                    self.add_entry(cell_path, EntryInfo::Symlink);
+                    let target = std::fs::read_link(disk_path.as_path())
+                        .ok()
+                        .and_then(|t| t.to_str().map(ToOwned::to_owned));
+                    self.add_entry(cell_path, EntryInfo::Symlink(target));
                 }
                 FileType::Unknown => (),
             }
