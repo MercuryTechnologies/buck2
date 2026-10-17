@@ -143,8 +143,13 @@ fn resume_delta_inner(root: &AbsNormPath, image: &VcsImage) -> buck2_error::Resu
         }
     }
 
-    for source in ["HEAD", image.head.as_str()] {
-        let mut args = vec!["check-attr", "-z", "--stdin", "--source", source];
+    // `git status` converts a file it rehashes by the attributes of the working tree, which an
+    // uncommitted `.gitattributes` changes; the commits' attributes are checked as well.
+    for source in [None, Some("HEAD"), Some(image.head.as_str())] {
+        let mut args = vec!["check-attr", "-z", "--stdin"];
+        if let Some(source) = source {
+            args.extend_from_slice(&["--source", source]);
+        }
         args.extend_from_slice(CONVERSION_ATTRIBUTES);
         let attributes = run_git_blocking(root, &args, Some(paths_input.clone()))?;
         let fields: Vec<&str> = records(&attributes).collect();
@@ -155,7 +160,8 @@ fn resume_delta_inner(root: &AbsNormPath, image: &VcsImage) -> buck2_error::Resu
             {
                 return Err(buck2_error!(
                     ErrorTag::Input,
-                    "`{path}` has `{attribute}: {value}` at {source}"
+                    "`{path}` has `{attribute}: {value}` at {}",
+                    source.unwrap_or("the working tree")
                 ));
             }
         }
@@ -180,6 +186,8 @@ fn resume_delta_inner(root: &AbsNormPath, image: &VcsImage) -> buck2_error::Resu
     )?;
     changed.extend(records(&diff).filter_map(|path| project_path(&prefix, path)));
     // A file system monitor or untracked cache answers from its own state; read the files.
+    // `core.trustctime=false` or `core.checkStat=minimal` lets a same-size rewrite that puts
+    // the modification time back pass as clean, since only the change time moved.
     let status = run_git_blocking(
         root,
         &[
@@ -187,6 +195,10 @@ fn resume_delta_inner(root: &AbsNormPath, image: &VcsImage) -> buck2_error::Resu
             "core.fsmonitor=false",
             "-c",
             "core.untrackedCache=false",
+            "-c",
+            "core.trustctime=true",
+            "-c",
+            "core.checkStat=default",
             "status",
             "--porcelain=v1",
             "-z",
@@ -656,8 +668,43 @@ mod tests {
         repo.git(&["update-index", "--no-skip-worktree", "b"]);
         assert!(repo.delta(&image).usable);
 
+        // Uncommitted, in the working tree only: `git status` applies it all the same.
         repo.write(".gitattributes", "*.txt filter=fake\n");
+        assert!(!repo.delta(&image).usable);
         repo.commit("attributes");
         assert!(!repo.delta(&image).usable);
+    }
+
+    /// A same-size rewrite in place that puts the modification time back leaves only the change
+    /// time moved. A repository that tells git not to trust it (`core.trustctime=false`, or
+    /// `core.checkStat=minimal`) would call the file clean; the resume reports it all the same.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_rewrite_with_the_old_mtime_is_a_change_whatever_git_trusts() {
+        for setting in [("core.trustctime", "false"), ("core.checkStat", "minimal")] {
+            let repo = Repo::new();
+            repo.write("f", "aaaa");
+            repo.write("g", "gggg");
+            repo.commit("A");
+            repo.age_all();
+            let image = repo.suspend(&repo.crawler()).await;
+            repo.reclone(&[]);
+            repo.age_all();
+            // The index records the aged stat.
+            repo.git(&["status", "--porcelain"]);
+            repo.git(&["config", setting.0, setting.1]);
+            let f = repo.dir().join("f");
+            let modified = std::fs::metadata(&f).unwrap().modified().unwrap();
+            // git compares whole seconds of the change time.
+            std::thread::sleep(Duration::from_millis(1100));
+            std::fs::write(&f, "bbbb").unwrap();
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(&f)
+                .unwrap()
+                .set_modified(modified)
+                .unwrap();
+            let scan = repo.scan_git(&image);
+            assert_eq!(events(&scan), set(&[("f", M)]), "{setting:?}");
+        }
     }
 }
