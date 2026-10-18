@@ -286,6 +286,8 @@ pub(crate) fn new_executor_preference(
 pub(crate) struct UnregisteredRunAction {
     pub(crate) executor_preference: ExecutorPreference,
     pub(crate) always_print_stderr: bool,
+    /// `store_path_outputs`: see `Action::store_path_outputs`.
+    pub(crate) store_path_outputs: bool,
     pub(crate) weight: WeightClass,
     pub(crate) low_pass_filter: bool,
     pub(crate) dep_files: RunActionDepFiles,
@@ -1630,6 +1632,10 @@ impl Action for RunAction {
 
     fn always_print_stderr(&self) -> bool {
         self.inner.always_print_stderr
+    }
+
+    fn store_path_outputs(&self) -> bool {
+        self.inner.store_path_outputs
     }
 
     fn is_expected_eligible_for_dedupe(&self) -> Option<bool> {

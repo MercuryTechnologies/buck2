@@ -218,7 +218,12 @@ async fn build_action_no_redirect_impl(
     if action_execution_data.ran_here
         && let Some(local) = LocalActions::of(ctx.global_data())
     {
-        local.record(action.key());
+        let store_paths = action_execution_data
+            .action_result
+            .as_ref()
+            .ok()
+            .and_then(|outputs| LocalActions::store_paths(action.store_path_outputs(), outputs));
+        local.record(action.key(), store_paths);
     }
 
     ctx.action_executed(execution_metrics)?;

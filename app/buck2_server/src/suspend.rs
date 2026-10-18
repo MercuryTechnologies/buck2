@@ -35,6 +35,7 @@ use buck2_common::init::HOST_IDENTITY_PROPERTY;
 use buck2_build_api::actions::local_actions::LocalActionList;
 use buck2_build_api::actions::local_actions::LocalActions;
 use buck2_build_api::actions::local_actions::build_keys;
+use buck2_build_api::actions::local_actions::partition_by_store_validity;
 use buck2_common::init::SuspendConfig;
 use buck2_common::legacy_configs::configs::LegacyBuckConfig;
 use buck2_common::legacy_configs::key::BuckconfigKeyRef;
@@ -487,6 +488,9 @@ pub(crate) enum ResumeOutcome {
         timings: Vec<(&'static str, Duration)>,
         /// Locally executed actions dirtied so that they run again here.
         dirtied_local_actions: usize,
+        /// Locally executed actions not dirtied, though the image asked for it, because every
+        /// store path they declare is valid here.
+        kept_store_actions: usize,
     },
     /// An image was found and not used: the start is cold.
     Cold { reason: String },
@@ -502,6 +506,7 @@ impl ResumeOutcome {
                 artifacts,
                 timings,
                 dirtied_local_actions,
+                kept_store_actions,
             } => {
                 let mut out = format!(
                     "resumed: {} keys, {} asserted, {} valid, {} candidates, {} not installed; \
@@ -516,7 +521,8 @@ impl ResumeOutcome {
                     artifacts.refetch
                 );
                 out.push_str(&format!(
-                    "; {dirtied_local_actions} locally executed actions to run again"
+                    "; {dirtied_local_actions} locally executed actions to run again; \
+                     {kept_store_actions} kept, their store paths valid here"
                 ));
                 for (step, d) in timings {
                     out.push_str(&format!("; {step} {:.3}s", d.as_secs_f64()));
@@ -538,6 +544,8 @@ pub(crate) struct LoadedImage {
     cross_host: bool,
     /// See [`Manifest::dirties_local_actions`].
     dirty_local_actions: bool,
+    /// `buck2_hydration.suspend_store_check`.
+    store_check: Vec<String>,
     image_dir: PathBuf,
     loaded_in: Duration,
 }
@@ -569,6 +577,7 @@ pub(crate) fn prepare_resume(cache_dir: &Path, identity: &SuspendIdentity) -> Re
             image,
             cross_host,
             dirty_local_actions,
+            store_check: identity.config.store_check.clone(),
             image_dir,
             loaded_in: start.elapsed(),
         }),
@@ -761,12 +770,19 @@ impl LoadedImage {
             local.extend(&actions);
         }
         drop(existing);
-        let dirtied_local_actions = if self.dirty_local_actions {
-            dirty_keys(dice, root, build_keys(actions))
+        let (dirtied_local_actions, kept_store_actions) = if self.dirty_local_actions {
+            let check = self.store_check.clone();
+            let (dirty, kept) = tokio::task::spawn_blocking(move || {
+                partition_by_store_validity(actions, |path| store_path_valid(path, &check))
+            })
+            .await
+            .map_err(|e| RestoreError::Fatal(format!("checking store paths: {e}")))?;
+            let dirtied = dirty_keys(dice, root, build_keys(dirty))
                 .await
-                .map_err(RestoreError::Fatal)?
+                .map_err(RestoreError::Fatal)?;
+            (dirtied, kept)
         } else {
-            0
+            (0, 0)
         };
         timings.push(("local actions", t.elapsed()));
         Ok(RestoredImage {
@@ -774,6 +790,7 @@ impl LoadedImage {
             artifacts: resumed,
             timings,
             dirtied_local_actions,
+            kept_store_actions,
         })
     }
 
@@ -789,6 +806,7 @@ pub(crate) struct RestoredImage {
     pub(crate) artifacts: ResumedArtifacts,
     pub(crate) timings: Vec<(&'static str, Duration)>,
     pub(crate) dirtied_local_actions: usize,
+    pub(crate) kept_store_actions: usize,
 }
 
 /// Why [`LoadedImage::restore`] did not resume.
@@ -798,6 +816,26 @@ pub(crate) enum RestoreError {
     /// The graph holds the image but not everything the image needs on top of it, such as its
     /// local actions dirtied: this daemon must not run anything.
     Fatal(String),
+}
+
+/// Whether a store path a local action's output links to is valid on this machine: it exists,
+/// and `check` (`buck2_hydration.suspend_store_check`), when set, exits 0 with the path appended.
+/// A check that cannot run counts as invalid, which costs only a rerun.
+fn store_path_valid(path: &str, check: &[String]) -> bool {
+    if std::fs::symlink_metadata(path).is_err() {
+        return false;
+    }
+    let Some((program, args)) = check.split_first() else {
+        return true;
+    };
+    std::process::Command::new(program)
+        .args(args)
+        .arg(path)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
 }
 
 /// Dirties `keys` on `root`, as a rewind does, so that the next transaction computes each again.
@@ -1702,6 +1740,28 @@ mod tests {
             text.starts_with("the image is not portable: 2 materialized artifacts"),
             "{text}"
         );
+    }
+
+    /// A store path is valid only if it exists here and the configured check accepts it; a
+    /// check that cannot run rejects it.
+    #[test]
+    fn a_store_path_is_valid_only_if_it_exists_and_passes_the_check() {
+        let dir = tempfile::tempdir().unwrap();
+        let present = dir.path().join("abc-tool");
+        std::fs::write(&present, "tool").unwrap();
+        let present = present.to_str().unwrap();
+        let missing = dir.path().join("abd-gone");
+        let missing = missing.to_str().unwrap();
+        let words = |c: &str| c.split_whitespace().map(ToOwned::to_owned).collect::<Vec<_>>();
+        assert!(store_path_valid(present, &[]));
+        assert!(!store_path_valid(missing, &[]));
+        assert!(store_path_valid(present, &words("true")));
+        assert!(!store_path_valid(present, &words("false")));
+        assert!(!store_path_valid(missing, &words("true")));
+        // The path is the check's last argument.
+        assert!(store_path_valid(present, &words("test -f")));
+        assert!(!store_path_valid(present, &words("test -d")));
+        assert!(!store_path_valid(present, &words("/nonexistent/check")));
     }
 
     /// The dirtying a resume applies to locally executed actions: the dirtied key computes

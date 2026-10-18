@@ -703,6 +703,7 @@ impl TenantState {
                         artifacts: restored.artifacts,
                         timings: restored.timings,
                         dirtied_local_actions: restored.dirtied_local_actions,
+                        kept_store_actions: restored.kept_store_actions,
                     },
                     Err(RestoreError::Cold(reason)) => {
                         buck2_build_api::configure_dice::initial_commit(&dice, root).await?;

@@ -169,6 +169,13 @@ pub trait Action: PagableTagged + Allocative + Debug + Send + Sync + 'static {
         false
     }
 
+    /// Whether the action declares each of its outputs a symlink to a path of an immutable
+    /// store whose name is a function of the action's inputs (`store_path_outputs`); see
+    /// `local_actions`.
+    fn store_path_outputs(&self) -> bool {
+        false
+    }
+
     /// Provides a string name for this action, obtained by combining the provided category and identifier.
     fn name(&self) -> String {
         if let Some(identifier) = self.identifier() {
