@@ -20,6 +20,8 @@ use buck2_build_signals::env::NodeDuration;
 use buck2_build_signals::env::WaitingData;
 use buck2_common::events::HasEvents;
 use buck2_common::file_ops::metadata::FileDigest;
+use buck2_directory::directory::directory::Directory;
+use buck2_directory::directory::directory_iterator::DirectoryIterator;
 use buck2_core::fs::project_rel_path::ProjectRelativePathBuf;
 use buck2_core::deferred::base_deferred_key::BaseDeferredKey;
 use buck2_core::fs::artifact_path_resolver::ArtifactFs;
@@ -34,6 +36,7 @@ use buck2_events::dispatch::async_record_root_spans;
 use buck2_events::dispatch::get_dispatcher;
 use buck2_events::dispatch::span_async;
 use buck2_events::span::SpanId;
+use buck2_execute::directory::ActionDirectoryMember;
 use buck2_execute::execute::result::CommandExecutionReport;
 use buck2_execute::execute::result::CommandExecutionStatus;
 use buck2_execute::materialize::materializer::ReLostInput;
@@ -547,7 +550,7 @@ struct LostCasInput {
 }
 
 async fn execute_with_lost_input_rewind_request(
-    _ctx: &mut DiceComputations<'_>,
+    ctx: &mut DiceComputations<'_>,
     cancellation: &CancellationContext,
     executor: &BuckActionExecutor<'_>,
     waiting_data: WaitingData,
@@ -571,16 +574,19 @@ async fn execute_with_lost_input_rewind_request(
     let execute_result = match execute_result {
         Ok(result) => Ok(result),
         Err(error) => Err(add_lost_input_rewind_request(
+            ctx,
             action.key(),
             &ensured_inputs,
             error,
-        )),
+        )
+        .await),
     };
 
     (execute_result, command_reports)
 }
 
-fn add_lost_input_rewind_request(
+async fn add_lost_input_rewind_request(
+    ctx: &mut DiceComputations<'_>,
     consumer_key: &ActionKey,
     ensured_inputs: &BuckIndexMap<ArtifactGroup, ArtifactGroupValues>,
     error: ExecuteError,
@@ -589,7 +595,8 @@ fn add_lost_input_rewind_request(
         return error;
     };
 
-    let Some(producer_key) = lost_input_producer(consumer_key, ensured_inputs, &lost_input.digest)
+    let Some(producer_key) =
+        find_lost_input_producer(ctx, consumer_key, ensured_inputs, &lost_input.digest).await
     else {
         return error;
     };
@@ -630,6 +637,61 @@ fn lost_cas_input(error: &ExecuteError) -> Option<LostCasInput> {
     Some(LostCasInput {
         digest: lost_input.digest,
         path: lost_input.path.clone(),
+    })
+}
+
+/// How many symlinking actions the search for a lost input's producer looks through.
+const MAX_LOST_INPUT_INDIRECTIONS: usize = 4;
+
+/// The action that produced a lost input. The input may be a symlink to it rather than the file
+/// itself, as a genrule's `srcs` directory is, made by an action of its own; the search then
+/// goes on in that action's inputs, a few levels deep.
+async fn find_lost_input_producer(
+    ctx: &mut DiceComputations<'_>,
+    consumer_key: &ActionKey,
+    ensured_inputs: &BuckIndexMap<ArtifactGroup, ArtifactGroupValues>,
+    lost_digest: &FileDigest,
+) -> Option<ActionKey> {
+    if let Some(producer) = lost_input_producer(consumer_key, ensured_inputs, lost_digest) {
+        return Some(producer);
+    }
+    let mut via = symlinking_input_producer(consumer_key, ensured_inputs, lost_digest)?;
+    for _ in 0..MAX_LOST_INPUT_INDIRECTIONS {
+        let action = ActionCalculation::get_action(ctx, &via).await.ok()?;
+        let mut inputs = BuckIndexMap::default();
+        for input in action.inputs().ok()?.iter() {
+            let resolved = input.resolved_artifact(ctx).await.ok()?;
+            let values = ensure_artifact_group_staged(ctx, resolved)
+                .await
+                .ok()?
+                .into_group_values(resolved)
+                .ok()?;
+            inputs.insert(input.clone(), values);
+        }
+        if let Some(producer) = lost_input_producer(&via, &inputs, lost_digest) {
+            return Some(producer);
+        }
+        via = symlinking_input_producer(&via, &inputs, lost_digest)?;
+    }
+    None
+}
+
+/// The producer of an input whose symlinks lead to a file of `lost_digest`: the file is among
+/// the input value's dependencies, not in the value itself.
+fn symlinking_input_producer(
+    consumer_key: &ActionKey,
+    ensured_inputs: &BuckIndexMap<ArtifactGroup, ArtifactGroupValues>,
+    lost_digest: &FileDigest,
+) -> Option<ActionKey> {
+    ensured_inputs.values().find_map(|values| {
+        values.iter().find_map(|(artifact, value)| {
+            let deps = value.deps()?;
+            let holds = deps.unordered_walk_leaves().without_paths().any(|leaf| {
+                matches!(leaf, ActionDirectoryMember::File(f) if f.digest.data() == lost_digest)
+            });
+            let key = artifact.action_key()?;
+            (holds && key != consumer_key).then(|| key.dupe())
+        })
     })
 }
 
