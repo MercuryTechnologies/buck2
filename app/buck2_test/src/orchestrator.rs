@@ -33,6 +33,7 @@ use buck2_build_api::actions::execute::dice_data::GetReClient;
 use buck2_build_api::actions::impls::run_action_knobs::HasRunActionKnobs;
 use buck2_build_api::actions::rewind::ActionRewindRequest;
 use buck2_build_api::actions::rewind::HasActionRewindTracker;
+use buck2_build_api::actions::rewind::value_holds_digest;
 use buck2_build_api::analysis::calculation::RuleAnalysisCalculation;
 use buck2_build_api::artifact_groups::ArtifactGroup;
 use buck2_build_api::artifact_groups::ArtifactGroupValues;
@@ -60,7 +61,6 @@ use buck2_build_signals::env::NodeDuration;
 use buck2_build_signals::env::WaitingData;
 use buck2_common::dice::cells::HasCellResolver;
 use buck2_common::events::HasEvents;
-use buck2_common::file_ops::metadata::FileDigest;
 use buck2_common::file_ops::metadata::TrackedFileDigest;
 use buck2_common::legacy_configs::dice::HasLegacyConfigs;
 use buck2_common::legacy_configs::key::BuckconfigKeyRef;
@@ -662,12 +662,12 @@ impl<'a> BuckTestOrchestrator<'a> {
             .into_iter()
             .collect();
 
-        // The producer of each input, by the input's digest, for a test whose input left the CAS.
-        let lost_input_producers: Vec<(FileDigest, ActionKey)> = ensured_inputs
+        // Each input built by an action, with its producer, for a test whose input left the CAS.
+        let lost_input_producers: Vec<(ArtifactValue, ActionKey)> = ensured_inputs
             .iter()
             .flat_map(|(_, agv)| {
                 agv.iter().filter_map(|(artifact, value)| {
-                    Some((value.digest()?.dupe(), artifact.action_key()?.dupe()))
+                    Some((value.dupe(), artifact.action_key()?.dupe()))
                 })
             })
             .collect();
@@ -855,12 +855,12 @@ impl Key for TestExecutionKey {
 /// materialization attach it) and the test has an input of that digest.
 fn lost_input_producer(
     error: &buck2_error::Error,
-    lost_input_producers: &[(FileDigest, ActionKey)],
+    lost_input_producers: &[(ArtifactValue, ActionKey)],
 ) -> Option<ActionKey> {
     let lost = error.find_typed_context::<ReLostInput>()?;
     lost_input_producers
         .iter()
-        .find(|(digest, _)| *digest == lost.digest)
+        .find(|(value, _)| value_holds_digest(value, &lost.digest))
         .map(|(_, producer)| producer.dupe())
 }
 
@@ -1371,7 +1371,7 @@ impl BuckTestOrchestrator<'_> {
         liveliness_observer: Arc<dyn LivelinessObserver>,
         re_cache_enabled: bool,
         supports_test_execution_caching: bool,
-        lost_input_producers: &[(FileDigest, ActionKey)],
+        lost_input_producers: &[(ArtifactValue, ActionKey)],
     ) -> Result<ExecuteData, ExecuteError> {
         let events = dice.per_transaction_data().get_dispatcher().dupe();
         let manager = CommandExecutionManager::new(
