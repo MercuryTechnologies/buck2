@@ -20,8 +20,12 @@
 //! The exception is an action that declares `store_path_outputs = True`: each of its outputs is a
 //! symlink to a path of an immutable store, such as `/nix/store`, whose name is a function of the
 //! action's inputs. Running it again on another machine names the same path, and makes it exist
-//! there if it does not. So a resume keeps such an action's value when every path it names is
-//! valid on the new machine, and dirties it, as any other, when one is not.
+//! there if it does not. So a resume keeps such an action's value when every path it names lies
+//! under a configured store prefix (`buck2_hydration.suspend_store_prefixes`, `/nix/store/` by
+//! default) and the store's own check (`buck2_hydration.suspend_store_check`) calls it valid on
+//! the new machine, and dirties it, as any other, when one is not. The declaration is an
+//! unchecked promise of the rule, so with no check configured every such action is dirtied:
+//! that a path exists says nothing of whether it is complete, or the store's.
 
 use buck2_artifact::actions::key::ActionKey;
 use buck2_execute::directory::ActionDirectoryEntry;
