@@ -11,7 +11,7 @@
 set -uo pipefail
 B=$1; W=$2; RE_CONFIG=$3
 RE_PROPERTIES=${RE_PROPERTIES:-'{"OSFamily": "Linux", "Arch": "amd64", "Pool": "usw2", "container-image": "docker://gcr.io/flame-public/rbe-ubuntu24-04@sha256:f7db0d4791247f032fdb4451b7c3ba90e567923a341cc6dc43abfc283436791a"}'}
-R=$W/results; F=$W/fixture; C=$W/cold; N=$W/not-portable; L=$W/chain
+R=$W/results; F=$W/fixture; C=$W/cold; N=$W/not-portable; L=$W/chain; G=$W/graph-error
 rm -rf "$W"; mkdir -p "$R"
 
 make_fixture() { # dir
@@ -83,6 +83,7 @@ make_fixture "$F"
 make_fixture "$C"
 make_fixture "$N"
 make_fixture "$L"
+make_fixture "$G"
 fail=0
 step() { # label, cmd...
   local l=$1; shift; local t0=$(date +%s.%N); "$@" > "$R/$l.log" 2>&1; local rc=$?; local t1=$(date +%s.%N)
@@ -154,6 +155,14 @@ fresh_runner
 export GITHUB_SHA=sha-pr
 step np-resume "$B" resume
 check "a non-portable image is refused on a fresh runner" grep -qE '^cold: the image is not portable: [1-9][0-9]* materialized artifacts' "$R/np-resume.log"
+# The graph was read beside the materializer's replay, which found the artifact lost: the refused
+# daemon must be cold, with nothing of the image installed, so the local action runs again here
+# with the PR's environment rather than handing back main's value.
+step np-build-pr "$B" build //:after --show-full-output
+ran np-build-pr
+npafter=$(grep -E '^root//:after ' "$R/np-build-pr.log" | awk '{print $2}')
+check "the refused daemon builds as a cold one: the local action ran here" test "$(ran_where "$R/np-build-pr.what-ran" root//:sha)" = local
+check "the refused daemon's output has the PR's environment" grep -q '^sha-pr$' "$npafter"
 "$B" kill > /dev/null 2>&1
 
 # A chain: the main daemon resumes its own image on the same machine with the same environment,
@@ -175,6 +184,24 @@ check "chain: the fresh runner dirties the local action" grep -q '; 1 locally ex
 step ch-build-pr "$B" build //:after --show-full-output
 chafter=$(grep -E '^root//:after ' "$R/ch-build-pr.log" | awk '{print $2}')
 check "chain: the local action ran again with the PR's environment" grep -q '^sha-pr$' "$chafter"
+"$B" kill > /dev/null 2>&1
+
+# A graph that fails its read after the materializer replayed every artifact, which the resume
+# reads at the same time: refused as the graph's, with nothing installed, so the daemon is cold
+# and runs the local action here.
+cd "$G"
+export GITHUB_SHA=sha-main
+step ge-build-main "$B" build //:after
+step ge-suspend "$B" suspend --portable
+fresh_runner
+export GITHUB_SHA=sha-pr
+BUCK2_TEST_RESUME_GRAPH_ERROR=true step ge-resume "$B" resume
+check "a graph error is refused as the graph's" grep -q '^cold: graph: injected by BUCK2_TEST_RESUME_GRAPH_ERROR' "$R/ge-resume.log"
+step ge-build-pr "$B" build //:after --show-full-output
+ran ge-build-pr
+geafter=$(grep -E '^root//:after ' "$R/ge-build-pr.log" | awk '{print $2}')
+check "after a graph error the local action ran here" test "$(ran_where "$R/ge-build-pr.what-ran" root//:sha)" = local
+check "after a graph error the output has the PR's environment" grep -q '^sha-pr$' "$geafter"
 "$B" kill > /dev/null 2>&1
 
 echo "result fail=$fail" | tee -a $R/summary.tsv
