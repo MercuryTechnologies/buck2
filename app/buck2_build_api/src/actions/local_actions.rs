@@ -24,6 +24,7 @@ use dice::DiceDataBuilder;
 use dupe::Dupe;
 
 use crate::actions::calculation::BuildKey;
+use crate::actions::execute::action_executor::ActionExecutionKind;
 
 /// Every action this daemon ran on its own machine, held in a DICE root's data.
 #[derive(Default)]
@@ -49,6 +50,19 @@ impl LocalActions {
                 | K::RemoteServedFromCache
                 | K::RemoteDeduplicated,
             ) => false,
+        }
+    }
+
+    /// Whether an action that finished with `kind` produced its result on this machine. A hit of
+    /// the identical-action cache counts only when the action it reuses ran here: outputs that
+    /// came from remote execution or the remote action cache are no more this machine's when
+    /// another configuration's action served them. A go stdlib built in several configurations
+    /// is served this way, and recording those hits made a resume run them again with every
+    /// action that depends on them.
+    pub fn executed_here(kind: &ActionExecutionKind) -> bool {
+        match kind {
+            ActionExecutionKind::LocalActionCache { produced_locally } => *produced_locally,
+            kind => Self::ran_here(Some(kind.as_enum())),
         }
     }
 
@@ -132,6 +146,23 @@ mod tests {
         ] {
             assert!(!LocalActions::ran_here(Some(kind)), "{kind:?}");
         }
+    }
+
+    /// An identical-action cache hit is this machine's only when the action it reuses ran here.
+    #[test]
+    fn a_cache_hit_is_local_only_when_its_source_ran_here() {
+        assert!(LocalActions::executed_here(
+            &ActionExecutionKind::LocalActionCache {
+                produced_locally: true
+            }
+        ));
+        assert!(!LocalActions::executed_here(
+            &ActionExecutionKind::LocalActionCache {
+                produced_locally: false
+            }
+        ));
+        assert!(!LocalActions::executed_here(&ActionExecutionKind::Simple));
+        assert!(LocalActions::executed_here(&ActionExecutionKind::LocalDepFile));
     }
 
     /// A resumed daemon's set holds the suspended daemon's actions beside its own, so that its
