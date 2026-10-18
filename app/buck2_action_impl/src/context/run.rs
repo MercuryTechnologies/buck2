@@ -181,7 +181,9 @@ pub(crate) fn analysis_actions_methods_run(methods: &mut MethodsBuilder) {
     ///   content-addressed store (a nix realisation's `/nix/store` path) whose name is a function
     ///   of the action's inputs. A daemon resumed from a portable suspend on another machine runs
     ///   a local action again, since its outputs may depend on the machine, unless the action
-    ///   declares this and every path it names is valid there; see `buck2_hydration.suspend_store_check`.
+    ///   declares this and every path it names lies under `buck2_hydration.suspend_store_prefixes`
+    ///   and passes `buck2_hydration.suspend_store_check` there. With no check configured, the
+    ///   declaration keeps nothing.
     /// * The `prefer_local`, `prefer_remote` and `local_only` options allow selecting where the
     /// action should run if the executor selected for this target is a hybrid executor.
     ///     * All those options disable concurrent execution: the action will run on the preferred

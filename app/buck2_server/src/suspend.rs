@@ -546,6 +546,8 @@ pub(crate) struct LoadedImage {
     dirty_local_actions: bool,
     /// `buck2_hydration.suspend_store_check`.
     store_check: Vec<String>,
+    /// `buck2_hydration.suspend_store_prefixes`.
+    store_prefixes: Vec<String>,
     image_dir: PathBuf,
     loaded_in: Duration,
 }
@@ -578,6 +580,7 @@ pub(crate) fn prepare_resume(cache_dir: &Path, identity: &SuspendIdentity) -> Re
             cross_host,
             dirty_local_actions,
             store_check: identity.config.store_check.clone(),
+            store_prefixes: identity.config.store_prefixes.clone(),
             image_dir,
             loaded_in: start.elapsed(),
         }),
@@ -772,8 +775,11 @@ impl LoadedImage {
         drop(existing);
         let (dirtied_local_actions, kept_store_actions) = if self.dirty_local_actions {
             let check = self.store_check.clone();
+            let prefixes = self.store_prefixes.clone();
             let (dirty, kept) = tokio::task::spawn_blocking(move || {
-                partition_by_store_validity(actions, |path| store_path_valid(path, &check))
+                partition_by_store_validity(actions, |path| {
+                    store_path_valid(path, &prefixes, &check)
+                })
             })
             .await
             .map_err(|e| RestoreError::Fatal(format!("checking store paths: {e}")))?;
@@ -818,16 +824,22 @@ pub(crate) enum RestoreError {
     Fatal(String),
 }
 
-/// Whether a store path a local action's output links to is valid on this machine: it exists,
-/// and `check` (`buck2_hydration.suspend_store_check`), when set, exits 0 with the path appended.
-/// A check that cannot run counts as invalid, which costs only a rerun.
-fn store_path_valid(path: &str, check: &[String]) -> bool {
+/// Whether a store path a local action's output links to is valid on this machine: it lies
+/// under one of `prefixes` (`buck2_hydration.suspend_store_prefixes`), it exists, and `check`
+/// (`buck2_hydration.suspend_store_check`) exits 0 with the path appended. With no check, no
+/// path is valid: `store_path_outputs` is the rule's promise, and a path that exists may still
+/// be half written, or not the store's at all, which only the store can tell. A check that
+/// cannot run counts as invalid too. Every refusal costs only a rerun.
+fn store_path_valid(path: &str, prefixes: &[String], check: &[String]) -> bool {
+    let Some((program, args)) = check.split_first() else {
+        return false;
+    };
+    if !under_store_prefix(path, prefixes) {
+        return false;
+    }
     if std::fs::symlink_metadata(path).is_err() {
         return false;
     }
-    let Some((program, args)) = check.split_first() else {
-        return true;
-    };
     std::process::Command::new(program)
         .args(args)
         .arg(path)
@@ -836,6 +848,23 @@ fn store_path_valid(path: &str, check: &[String]) -> bool {
         .stderr(std::process::Stdio::null())
         .status()
         .is_ok_and(|s| s.success())
+}
+
+/// Whether `path` names something inside one of `prefixes`, compared by component, so that
+/// `/nix/storefoo` is not under `/nix/store` and `/nix/store/../etc` is under nothing.
+fn under_store_prefix(path: &str, prefixes: &[String]) -> bool {
+    let path = Path::new(path);
+    if !path.is_absolute()
+        || path
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        return false;
+    }
+    prefixes.iter().any(|prefix| {
+        let prefix = Path::new(prefix);
+        prefix.is_absolute() && path.starts_with(prefix) && path != prefix
+    })
 }
 
 /// Dirties `keys` on `root`, as a rewind does, so that the next transaction computes each again.
@@ -1747,26 +1776,85 @@ mod tests {
         );
     }
 
-    /// A store path is valid only if it exists here and the configured check accepts it; a
-    /// check that cannot run rejects it.
+    /// A store path is valid only if it lies under a store prefix, exists here and the
+    /// configured check accepts it; a check that cannot run rejects it.
     #[test]
     fn a_store_path_is_valid_only_if_it_exists_and_passes_the_check() {
         let dir = tempfile::tempdir().unwrap();
+        let store = vec![dir.path().to_str().unwrap().to_owned()];
         let present = dir.path().join("abc-tool");
         std::fs::write(&present, "tool").unwrap();
         let present = present.to_str().unwrap();
         let missing = dir.path().join("abd-gone");
         let missing = missing.to_str().unwrap();
         let words = |c: &str| c.split_whitespace().map(ToOwned::to_owned).collect::<Vec<_>>();
-        assert!(store_path_valid(present, &[]));
-        assert!(!store_path_valid(missing, &[]));
-        assert!(store_path_valid(present, &words("true")));
-        assert!(!store_path_valid(present, &words("false")));
-        assert!(!store_path_valid(missing, &words("true")));
+        assert!(store_path_valid(present, &store, &words("true")));
+        assert!(!store_path_valid(present, &store, &words("false")));
+        assert!(!store_path_valid(missing, &store, &words("true")));
         // The path is the check's last argument.
-        assert!(store_path_valid(present, &words("test -f")));
-        assert!(!store_path_valid(present, &words("test -d")));
-        assert!(!store_path_valid(present, &words("/nonexistent/check")));
+        assert!(store_path_valid(present, &store, &words("test -f")));
+        assert!(!store_path_valid(present, &store, &words("test -d")));
+        assert!(!store_path_valid(present, &store, &words("/nonexistent/check")));
+    }
+
+    /// `store_path_outputs` is an unchecked promise of the rule, so existence alone never keeps
+    /// a value: with no check configured every path is invalid, even one that exists in the
+    /// store.
+    #[test]
+    fn without_a_check_no_store_path_is_valid() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = vec![dir.path().to_str().unwrap().to_owned()];
+        let present = dir.path().join("abc-tool");
+        std::fs::write(&present, "tool").unwrap();
+        assert!(!store_path_valid(present.to_str().unwrap(), &store, &[]));
+    }
+
+    /// A path outside every configured store prefix is invalid whatever the check says: an
+    /// action that declared `store_path_outputs` but links into a mutable directory such as
+    /// `/tmp` or the home directory runs again.
+    #[test]
+    fn a_path_outside_the_store_prefixes_is_invalid() {
+        let store = tempfile::tempdir().unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        let prefixes = vec![store.path().to_str().unwrap().to_owned()];
+        let outside = elsewhere.path().join("abc-tool");
+        std::fs::write(&outside, "tool").unwrap();
+        let inside = store.path().join("abc-tool");
+        std::fs::write(&inside, "tool").unwrap();
+        let yes = vec!["true".to_owned()];
+        assert!(store_path_valid(inside.to_str().unwrap(), &prefixes, &yes));
+        assert!(!store_path_valid(outside.to_str().unwrap(), &prefixes, &yes));
+        // Escaping the store through `..` does not count as inside it.
+        let escape = format!(
+            "{}/../{}/abc-tool",
+            store.path().display(),
+            elsewhere.path().file_name().unwrap().to_str().unwrap()
+        );
+        assert!(std::fs::symlink_metadata(&escape).is_ok());
+        assert!(!store_path_valid(&escape, &prefixes, &yes));
+        assert!(!store_path_valid(
+            inside.to_str().unwrap(),
+            &[],
+            &yes
+        ));
+    }
+
+    #[test]
+    fn store_prefixes_compare_by_component() {
+        let nix = vec!["/nix/store/".to_owned()];
+        assert!(under_store_prefix("/nix/store/abc-hello", &nix));
+        assert!(under_store_prefix("/nix/store/abc-hello/bin/hello", &nix));
+        assert!(!under_store_prefix("/nix/store", &nix));
+        assert!(!under_store_prefix("/nix/store/", &nix));
+        assert!(!under_store_prefix("/nix/storefoo/abc", &nix));
+        assert!(!under_store_prefix("/nix/store/../../etc/passwd", &nix));
+        assert!(!under_store_prefix("nix/store/abc", &nix));
+        assert!(!under_store_prefix("/tmp/abc", &nix));
+        let no_slash = vec!["/nix/store".to_owned()];
+        assert!(under_store_prefix("/nix/store/abc", &no_slash));
+        assert!(!under_store_prefix("/nix/storefoo/abc", &no_slash));
+        // A relative prefix is never a store.
+        assert!(!under_store_prefix("/nix/store/abc", &["nix/store".to_owned()]));
     }
 
     /// The dirtying a resume applies to locally executed actions: the dirtied key computes

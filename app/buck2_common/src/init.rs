@@ -584,9 +584,18 @@ pub struct SuspendConfig {
     /// valid on this machine (`buck2_hydration.suspend_store_check`, split on whitespace, such as
     /// `nix-store --check-validity`); exit status 0 means valid. A locally executed action that
     /// declared `store_path_outputs` keeps its value across a resume on another machine only
-    /// when each of its paths exists and, if this is set, passes it. Unset, existence is enough.
+    /// when each of its paths lies under one of `store_prefixes`, exists, and passes it. Unset,
+    /// no such action keeps its value: the declaration is the rule's promise, and only the
+    /// store itself can say that a path it names is complete here.
     pub store_check: Vec<String>,
+    /// The directories a path a `store_path_outputs` action names must lie under for a resume
+    /// to keep its value (`buck2_hydration.suspend_store_prefixes`, comma-separated). Unset, it
+    /// is [`DEFAULT_SUSPEND_STORE_PREFIXES`].
+    pub store_prefixes: Vec<String>,
 }
+
+/// The default of `buck2_hydration.suspend_store_prefixes`: nix's store.
+pub const DEFAULT_SUSPEND_STORE_PREFIXES: &[&str] = &["/nix/store/"];
 
 /// The variables a CI runner sets differently on every run of one job, beyond those the daemon
 /// always ignores (`GITHUB_*`, `RUNNER_*` and the like): the default of
@@ -687,6 +696,21 @@ impl HydrationConfig {
                     })
                     .map(|c| c.split_whitespace().map(ToOwned::to_owned).collect())
                     .unwrap_or_default(),
+                store_prefixes: match config.get(BuckconfigKeyRef {
+                    section: "buck2_hydration",
+                    property: "suspend_store_prefixes",
+                }) {
+                    Some(list) => list
+                        .split(',')
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map(ToOwned::to_owned)
+                        .collect(),
+                    None => DEFAULT_SUSPEND_STORE_PREFIXES
+                        .iter()
+                        .map(|s| (*s).to_owned())
+                        .collect(),
+                },
             })
         } else {
             None
@@ -1104,6 +1128,7 @@ mod tests {
                     suspend_max_db_gb = 7
                     suspend_env_ignore = CI_JOB_ID, BUILD_NUMBER
                     suspend_store_check = nix-store --check-validity
+                    suspend_store_prefixes = /nix/store/, /gnu/store/
                     "#
                 ),
             )],
@@ -1118,6 +1143,7 @@ mod tests {
         assert_eq!(suspend.max_db_gb, 7);
         assert_eq!(suspend.env_ignore, vec!["CI_JOB_ID", "BUILD_NUMBER"]);
         assert_eq!(suspend.store_check, vec!["nix-store", "--check-validity"]);
+        assert_eq!(suspend.store_prefixes, vec!["/nix/store/", "/gnu/store/"]);
         Ok(())
     }
 
@@ -1136,6 +1162,7 @@ mod tests {
         assert_eq!(suspend.max_db_gb, 50);
         assert_eq!(suspend.env_ignore, DEFAULT_SUSPEND_ENV_IGNORE);
         assert!(suspend.store_check.is_empty());
+        assert_eq!(suspend.store_prefixes, DEFAULT_SUSPEND_STORE_PREFIXES);
         Ok(())
     }
 

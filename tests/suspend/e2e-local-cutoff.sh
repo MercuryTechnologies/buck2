@@ -8,8 +8,10 @@
 # file; `stable`, a local_only action whose output never changes; `sha`, a local_only action that
 # writes $GITHUB_SHA. A remote chain c0..c9 reads read_link and stable; `after` reads sha.
 # STORE_KWARG=1 marks `realise` with `store_path_outputs = True` (needs a buck2 that has it);
-# STORE_CHECK sets `buck2_hydration.suspend_store_check`; EXPECT_KEPT=1 says cycle 1 must keep
-# realise's value (its store path is present and passes the check) rather than run it again.
+# STORE_CHECK sets `buck2_hydration.suspend_store_check`; STORE_PREFIXES sets
+# `buck2_hydration.suspend_store_prefixes` (default: the fake store, <workdir>/store/); EXPECT_KEPT=1
+# says cycle 1 must keep realise's value (its store path is under a prefix, present and passes the
+# check) rather than run it again. With no STORE_CHECK nothing may be kept.
 # Writes <workdir>/results/summary.tsv: one line per step, then the actions each resumed build
 # ran, and `ok`/`FAIL` per check. Exits non-zero if a check failed.
 set -uo pipefail
@@ -52,6 +54,7 @@ suspend = true
 host_identity = e2e-local-cutoff
 CFG
 if [ -n "${STORE_CHECK:-}" ]; then printf 'suspend_store_check = %s\n' "$STORE_CHECK" >> "$F/.buckconfig"; fi
+printf 'suspend_store_prefixes = %s\n' "${STORE_PREFIXES:-$S/}" >> "$F/.buckconfig"
 cat > "$F/platforms/defs.bzl" <<BZL
 def _impl(ctx):
     p = ExecutionPlatformInfo(label = ctx.label.raw_target(), configuration = ConfigurationInfo(constraints = {}, values = {}),
