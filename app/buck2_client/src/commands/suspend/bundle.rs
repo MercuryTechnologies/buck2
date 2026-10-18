@@ -1708,6 +1708,23 @@ mod tests {
         }
     }
 
+    /// A worker that cannot decode its chunk fails the import with what went wrong.
+    #[test]
+    fn a_frame_that_fails_its_checksum_is_refused_as_damaged() {
+        let f = fixture();
+        let mut bytes = std::fs::read(&f.bundle).unwrap();
+        let (at, _) = records_at(&f.bundle)
+            .into_iter()
+            .find(|(_, r)| (r.kind, r.member, r.chunk) == (Kind::Data, 2, 1))
+            .unwrap();
+        let head = RecordHead::decode(bytes[at..at + RECORD_HEAD_LEN].try_into().unwrap()).unwrap();
+        // The frame's last byte is part of its content checksum.
+        bytes[at + RECORD_HEAD_LEN + head.zlen as usize - 1] ^= 0x01;
+        std::fs::write(&f.bundle, &bytes).unwrap();
+        let err = refused(&f, EXE);
+        assert!(matches!(err, ImportError::Damaged(_)), "{err}");
+    }
+
     #[test]
     fn flipped_byte_in_the_compressed_stream_is_refused() {
         let f = fixture();
@@ -1886,7 +1903,11 @@ mod tests {
         let last = recs.len() - 1;
         recs.insert(last, manifest);
         write_records(&f.bundle, &recs);
-        assert!(matches!(refused(&f, EXE), ImportError::NotABundle(_)));
+        let err = refused(&f, EXE);
+        assert!(
+            matches!(&err, ImportError::NotABundle(why) if why.contains("are not")),
+            "{err}"
+        );
     }
 
     #[test]
