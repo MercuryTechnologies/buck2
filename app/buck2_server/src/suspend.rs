@@ -15,7 +15,10 @@
 //! snapshot of the files, beside the paging store (`cache/dice_state`) that holds the values. The
 //! `MANIFEST`, written last, records everything a later daemon must match for the image to mean
 //! what it meant: the binary, the startup config, the environment, the root buckconfig, the
-//! project, the host identity (`hydration.host_identity`, by default the hostname) and the user. A daemon that starts with the setting on and finds a matching
+//! project, the host identity (`hydration.host_identity`, by default the hostname), the system
+//! (`/run/current-system/sw`) and the user; `buck2_common::suspend_image` says what the identity
+//! and the system must be derived from for a resume on another machine to be sound. A daemon
+//! that starts with the setting on and finds a matching
 //! image resumes from it; every other start deletes it, so an image is used at most once and never
 //! over state another daemon changed.
 
@@ -46,6 +49,8 @@ pub(crate) use buck2_common::suspend_image::IMAGE_DIR;
 use buck2_common::suspend_image::MAGIC;
 use buck2_common::suspend_image::MANIFEST;
 use buck2_common::suspend_image::MANIFEST_CONSUMED;
+use buck2_common::suspend_image::reason;
+use buck2_common::suspend_image::system_fingerprint;
 use buck2_core::fs::project::ProjectRoot;
 use buck2_error::BuckErrorContext;
 use buck2_error::ErrorTag;
@@ -290,6 +295,8 @@ pub(crate) struct SuspendIdentity {
     pub(crate) watcher: String,
     /// `hydration.host_identity`, or the hostname.
     host_identity: String,
+    /// `system_fingerprint` when the daemon started: what it ran local actions under.
+    system: String,
 }
 
 impl SuspendIdentity {
@@ -326,6 +333,7 @@ impl SuspendIdentity {
                 .unwrap_or("notify")
                 .to_owned(),
             host_identity: crate::daemon::disk_state::host_identity(startup_config),
+            system: system_fingerprint(),
         })
     }
 }
@@ -344,6 +352,8 @@ pub(crate) enum Refusal {
     Project,
     HostIdentity,
     User,
+    /// See `buck2_common::suspend_image::system_fingerprint`.
+    System,
     Watcher,
     Clock,
     TooLarge {
@@ -365,7 +375,7 @@ impl fmt::Display for Refusal {
         };
         match self {
             Refusal::Format(detail) => write!(f, "image format: {detail}"),
-            Refusal::Binary => differs(f, "the buck2 binary"),
+            Refusal::Binary => f.write_str(reason::BINARY),
             Refusal::StartupConfig => differs(f, "the daemon startup config"),
             Refusal::Env(names) => write!(
                 f,
@@ -374,8 +384,9 @@ impl fmt::Display for Refusal {
             ),
             Refusal::RootConfig => differs(f, "the root buckconfig"),
             Refusal::Project => differs(f, "the project root or isolation dir"),
-            Refusal::HostIdentity => differs(f, "the host identity"),
-            Refusal::User => differs(f, "the user"),
+            Refusal::HostIdentity => f.write_str(reason::HOST_IDENTITY),
+            Refusal::User => f.write_str(reason::USER),
+            Refusal::System => f.write_str(reason::SYSTEM),
             Refusal::Watcher => differs(f, "the file watcher"),
             Refusal::Clock => write!(
                 f,
@@ -432,6 +443,8 @@ struct Manifest {
     /// from one on another machine of the same identity.
     hostname: String,
     uid: u32,
+    /// `system_fingerprint` of the suspending daemon: checked.
+    system: String,
     watcher: String,
     created_at_ms: u64,
     image_len: u64,
@@ -638,6 +651,9 @@ fn compare(m: &Manifest, o: &Observed<'_>) -> Result<(), Refusal> {
     }
     if m.uid != o.uid {
         return Err(Refusal::User);
+    }
+    if m.system != o.identity.system {
+        return Err(Refusal::System);
     }
     if m.watcher != o.identity.watcher {
         return Err(Refusal::Watcher);
@@ -917,6 +933,19 @@ fn sync_filesystem(path: &Path) -> buck2_error::Result<()> {
     Ok(())
 }
 
+/// A daemon that saw the system switch under it ran local actions under two systems, and an image
+/// of its graph matches neither: refuse to write one.
+fn system_unchanged(at_start: &str, now: &str) -> buck2_error::Result<()> {
+    if at_start != now {
+        return Err(buck2_error!(
+            ErrorTag::Input,
+            "Not suspending: the system changed while the daemon ran (`{at_start}` at its start, \
+             `{now}` now), so its local actions ran under both; `buck2 kill` and build again"
+        ));
+    }
+    Ok(())
+}
+
 /// Everything `buck2 suspend` needs from the daemon.
 pub(crate) struct SuspendInputs<'a> {
     pub(crate) identity: &'a SuspendIdentity,
@@ -955,6 +984,7 @@ async fn suspend_inner(
 
     drop(std::fs::remove_dir_all(image_dir));
     std::fs::create_dir_all(image_dir)?;
+    system_unchanged(&inputs.identity.system, &system_fingerprint())?;
 
     // The files first: an edit made after this snapshot statted a file differs from it at
     // resume, and one made before is in the graph or fails the suspend.
@@ -1044,6 +1074,7 @@ async fn suspend_inner(
         host_identity: inputs.identity.host_identity.clone(),
         hostname: buck2_events::metadata::hostname().unwrap_or_default(),
         uid: uid(),
+        system: inputs.identity.system.clone(),
         watcher: inputs.identity.watcher.clone(),
         created_at_ms: now_ms(),
         image_len: bytes.len() as u64,
@@ -1169,6 +1200,7 @@ mod tests {
                 host_identity: self.identity.host_identity.clone(),
                 hostname: "suspend-host".to_owned(),
                 uid: self.uid,
+                system: self.identity.system.clone(),
                 watcher: self.identity.watcher.clone(),
                 created_at_ms: self.now_ms,
                 image_len: 0,
@@ -1429,6 +1461,54 @@ mod tests {
     #[test]
     fn another_user_refuses() {
         assert_eq!(resume_after(|s, _| s.uid = 1001), Err(Refusal::User));
+    }
+
+    #[test]
+    fn a_configured_identity_resumes_under_another_hostname() {
+        let project = ProjectRootTemp::new().unwrap();
+        let suspended = side(project.path());
+        let manifest = suspended.manifest();
+        let resuming = side(project.path());
+        assert_ne!(
+            Some(manifest.hostname.clone()),
+            buck2_events::metadata::hostname()
+        );
+        assert_eq!(resuming.identity.host_identity, "A");
+        assert_eq!(compare(&manifest, &resuming.observed()), Ok(()));
+    }
+
+    #[test]
+    fn another_system_refuses_under_the_same_identity() {
+        // A toolchain change (another `/run/current-system/sw`) under an identity that does not
+        // name the toolchain, or under the hostname default on the machine that suspended.
+        assert_eq!(
+            resume_after(|s, _| {
+                s.identity.system = format!("{};sw=/nix/store/9zzz-system-path", s.identity.system)
+            }),
+            Err(Refusal::System)
+        );
+    }
+
+    #[test]
+    fn a_system_switch_while_the_daemon_ran_refuses_the_suspend() {
+        assert!(system_unchanged("arch=x;os=y;sw=/a", "arch=x;os=y;sw=/a").is_ok());
+        let e = system_unchanged("arch=x;os=y;sw=/a", "arch=x;os=y;sw=/b")
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("sw=/a") && e.contains("sw=/b"), "{e}");
+    }
+
+    #[test]
+    fn the_daemon_and_the_import_give_one_reason_text() {
+        use buck2_common::suspend_image::HeadMismatch;
+        for (refusal, mismatch) in [
+            (Refusal::Binary, HeadMismatch::Binary),
+            (Refusal::HostIdentity, HeadMismatch::HostIdentity),
+            (Refusal::User, HeadMismatch::User),
+            (Refusal::System, HeadMismatch::System),
+        ] {
+            assert_eq!(refusal.to_string(), mismatch.to_string());
+        }
     }
 
     #[test]
@@ -1703,6 +1783,7 @@ mod tests {
                 host_identity: identity.host_identity.clone(),
                 hostname: hostname.to_owned(),
                 uid: uid(),
+                system: identity.system.clone(),
                 watcher: identity.watcher.clone(),
                 created_at_ms: now_ms(),
                 image_len: bytes.len() as u64,

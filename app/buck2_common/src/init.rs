@@ -752,9 +752,11 @@ pub struct DaemonStartupConfig {
     /// MANIFEST and the materializer, dep-file and incremental databases): `hydration.host_identity`,
     /// legacy `buck2_hydration.host_identity`. `None` means the hostname. Two machines with the same
     /// identity are trusted to run local actions the same way, so CI derives it from what those
-    /// actions depend on (the runner image, the toolchain closure, the architecture) rather than
-    /// from the machine's name. Part of the startup config because the databases are opened once,
-    /// at startup.
+    /// actions depend on (the runner image's digest or a declared toolchain digest, and the
+    /// architecture) rather than from the machine's name, and never from the whole NixOS system,
+    /// which embeds the hostname; `crate::suspend_image` gives the rule, and the system check
+    /// a resume makes beside it. Part of the startup config because the databases are opened
+    /// once, at startup.
     pub host_identity: Option<String>,
 }
 
