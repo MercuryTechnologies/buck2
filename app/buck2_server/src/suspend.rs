@@ -21,6 +21,7 @@
 
 use std::collections::BTreeMap;
 use std::fmt;
+use std::future::Future;
 use std::io::Write;
 use std::path::Path;
 use std::path::PathBuf;
@@ -46,6 +47,7 @@ pub(crate) use buck2_common::suspend_image::IMAGE_DIR;
 use buck2_common::suspend_image::MAGIC;
 use buck2_common::suspend_image::MANIFEST;
 use buck2_common::suspend_image::MANIFEST_CONSUMED;
+use buck2_core::buck2_env;
 use buck2_core::fs::project::ProjectRoot;
 use buck2_error::BuckErrorContext;
 use buck2_error::ErrorTag;
@@ -62,6 +64,8 @@ use dice::Dice;
 use dice::DiceTransaction;
 use dice::ResumeStats;
 use dice::SuspendRow;
+use dupe::Dupe;
+use futures::StreamExt;
 use serde::Deserialize;
 use serde::Serialize;
 
@@ -539,7 +543,10 @@ impl ResumeOutcome {
 
 /// An image that passed every check, ready to replay.
 pub(crate) struct LoadedImage {
+    /// The image, its graph moved to `dice_bytes`.
     image: ImageFile,
+    /// [`ImageFile::dice`], shared with the task that reads the graph's rows.
+    dice_bytes: Arc<Vec<u8>>,
     /// The image was written on another machine, so no file stat it holds is comparable.
     cross_host: bool,
     /// See [`Manifest::dirties_local_actions`].
@@ -573,7 +580,8 @@ pub(crate) fn prepare_resume(cache_dir: &Path, identity: &SuspendIdentity) -> Re
         return ResumePrep::Refused("the MANIFEST could not be claimed".to_owned());
     }
     match check(&manifest_bytes, &image_dir, cache_dir, identity) {
-        Ok((image, cross_host, dirty_local_actions)) => ResumePrep::Ready(LoadedImage {
+        Ok((mut image, cross_host, dirty_local_actions)) => ResumePrep::Ready(LoadedImage {
+            dice_bytes: Arc::new(std::mem::take(&mut image.dice)),
             image,
             cross_host,
             dirty_local_actions,
@@ -717,11 +725,12 @@ impl LoadedImage {
         }
     }
 
-    /// Replays the image: the materializer's artifacts first, so that every output the graph
-    /// names is known before anything asks for it, then the graph onto `root`, then the list
-    /// of local actions. Everything that can fail on a damaged image is read before the graph
-    /// is restored, so a [`RestoreError::Cold`] leaves the graph untouched, for the caller to
-    /// start cold. Once the graph holds the image, a failure is [`RestoreError::Fatal`].
+    /// Replays the image. The materializer's artifacts and the graph's rows are read at the same
+    /// time, and the graph is installed onto `root` only once both are done, the materializer
+    /// lost nothing and the graph's rows all read, so that every output the graph names is known
+    /// before anything asks for it and a [`RestoreError::Cold`] leaves the graph untouched, for
+    /// the caller to start cold. Then the list of local actions. Once the graph holds the image,
+    /// a failure is [`RestoreError::Fatal`].
     pub(crate) async fn restore(
         &self,
         dice: &Arc<Dice>,
@@ -737,29 +746,57 @@ impl LoadedImage {
             .await
             .map_err(|e| RestoreError::Cold(format!("unreadable list of local actions: {e:#}")))?;
         let t = Instant::now();
-        let mut resumed = ResumedArtifacts::default();
-        for row in &self.image.artifact_rows {
-            let artifacts: Vec<SuspendedArtifact> = dice
-                .read_suspend_row(*row)
-                .await
-                .map_err(|e| RestoreError::Cold(format!("unreadable materializer state: {e:#}")))?;
-            resumed += materializer
-                .resume_artifacts(artifacts)
-                .await
-                .map_err(|e| RestoreError::Cold(format!("materializer: {e:#}")))?;
-        }
-        timings.push(("materializer", t.elapsed()));
-        if resumed.lost > 0 {
-            return Err(RestoreError::Cold(
-                Refusal::NotPortable { lost: resumed.lost }.to_string(),
-            ));
-        }
-        let t = Instant::now();
-        let stats = dice
-            .restore_image(root, &self.image.dice)
-            .await
-            .map_err(|e| RestoreError::Cold(format!("graph: {e:#}")))?;
-        timings.push(("graph", t.elapsed()));
+        // The graph's rows are read on a task of their own: both reads block their thread in
+        // sqlite, so on one task they would take turns.
+        // `BUCK2_TEST_RESUME_GRAPH_ERROR` fails the read once it has read everything, as a
+        // damaged row the last read finds would, for a test to check that the refusal comes
+        // before anything is installed.
+        let inject_graph_error = buck2_env!(
+            "BUCK2_TEST_RESUME_GRAPH_ERROR",
+            bool,
+            applicability = testing
+        )
+        .unwrap_or(false);
+        let graph_read = {
+            let dice = dice.dupe();
+            let bytes = self.dice_bytes.dupe();
+            tokio::spawn(async move {
+                let t = Instant::now();
+                let prepared = match dice.prepare_restore(root, &bytes).await {
+                    Ok(_) if inject_graph_error => {
+                        Err("graph: injected by BUCK2_TEST_RESUME_GRAPH_ERROR".to_owned())
+                    }
+                    Ok(prepared) => Ok(prepared),
+                    Err(e) => Err(format!("graph: {e:#}")),
+                };
+                (prepared, t.elapsed())
+            })
+        };
+        let mut replay_took = Duration::ZERO;
+        let mut read_took = Duration::ZERO;
+        let replay = async {
+            let t = Instant::now();
+            let resumed = replay_artifacts(dice, &self.image.artifact_rows, materializer).await;
+            replay_took = t.elapsed();
+            resumed
+        };
+        let graph_read = async {
+            match graph_read.await {
+                Ok((prepared, took)) => {
+                    read_took = took;
+                    prepared
+                }
+                Err(e) => Err(format!("graph: {e}")),
+            }
+        };
+        let overlapped = overlap_then_install(replay, graph_read, |prepared| {
+            dice.install_restore(prepared)
+        })
+        .await;
+        timings.push(("materializer", replay_took));
+        timings.push(("graph read", read_took));
+        timings.push(("materializer and graph", t.elapsed()));
+        let (resumed, stats) = overlapped.map_err(RestoreError::Cold)?;
         timings.extend(stats.timings.iter().map(|(step, d)| (*step, *d)));
         // The suspended daemon's local actions join this daemon's, whether or not they are
         // dirtied: a value this daemon keeps from one of them is still that machine's, and a
@@ -798,6 +835,47 @@ impl LoadedImage {
     pub(crate) fn discard(&self) {
         drop(std::fs::remove_dir_all(&self.image_dir));
     }
+}
+
+/// Replays the materializer's artifacts, one row after another in the order the suspend wrote
+/// them, reading the next row while the materializer declares the last.
+async fn replay_artifacts(
+    dice: &Arc<Dice>,
+    rows: &[SuspendRow],
+    materializer: &dyn Materializer,
+) -> Result<ResumedArtifacts, String> {
+    let mut resumed = ResumedArtifacts::default();
+    let mut reads = futures::stream::iter(rows.iter().copied())
+        .map(|row| dice.read_suspend_row::<Vec<SuspendedArtifact>>(row))
+        .buffered(2);
+    while let Some(artifacts) = reads.next().await {
+        let artifacts = artifacts.map_err(|e| format!("unreadable materializer state: {e:#}"))?;
+        resumed += materializer
+            .resume_artifacts(artifacts)
+            .await
+            .map_err(|e| format!("materializer: {e:#}"))?;
+    }
+    Ok(resumed)
+}
+
+/// Runs the materializer's replay and the graph's read together, and installs what the read
+/// returned only if the replay lost nothing and both succeeded. Both are awaited to the end
+/// whatever either returns: no replay command is then still on its way to the materializer when
+/// the daemon starts cold, nor a read still running. The refusals come in the order the replay
+/// and the read used to run one after the other: the materializer's, an artifact lost, the
+/// graph's.
+async fn overlap_then_install<P, S, I: Future<Output = S>>(
+    replay: impl Future<Output = Result<ResumedArtifacts, String>>,
+    read: impl Future<Output = Result<P, String>>,
+    install: impl FnOnce(P) -> I,
+) -> Result<(ResumedArtifacts, S), String> {
+    let (replayed, prepared) = futures::future::join(replay, read).await;
+    let resumed = replayed?;
+    if resumed.lost > 0 {
+        return Err(Refusal::NotPortable { lost: resumed.lost }.to_string());
+    }
+    let prepared = prepared?;
+    Ok((resumed, install(prepared).await))
 }
 
 /// What [`LoadedImage::restore`] did.
@@ -1745,6 +1823,130 @@ mod tests {
             text.starts_with("the image is not portable: 2 materialized artifacts"),
             "{text}"
         );
+    }
+
+    /// The replay and the graph read of [`overlap_then_install`], as fakes: each records that it
+    /// ran to its end, and `install` records what it was handed.
+    mod overlap {
+        use std::sync::atomic::AtomicBool;
+        use std::sync::atomic::Ordering;
+
+        use buck2_execute::materialize::materializer::ResumedArtifacts;
+
+        use super::super::overlap_then_install;
+
+        fn artifacts(lost: usize) -> ResumedArtifacts {
+            ResumedArtifacts {
+                reactivated: 3,
+                lost,
+                ..Default::default()
+            }
+        }
+
+        async fn slow<T>(done: &AtomicBool, value: T) -> T {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            done.store(true, Ordering::SeqCst);
+            value
+        }
+
+        /// Runs [`overlap_then_install`] and returns its result and whether `install` ran.
+        async fn run(
+            replay: impl Future<Output = Result<ResumedArtifacts, String>>,
+            read: impl Future<Output = Result<u32, String>>,
+        ) -> (Result<(ResumedArtifacts, u32), String>, bool) {
+            let installed = AtomicBool::new(false);
+            let result = overlap_then_install(replay, read, |p| {
+                installed.store(true, Ordering::SeqCst);
+                async move { p * 2 }
+            })
+            .await;
+            (result, installed.load(Ordering::SeqCst))
+        }
+
+        #[tokio::test]
+        async fn both_succeed_and_the_read_is_installed() {
+            let (result, installed) = run(async { Ok(artifacts(0)) }, async { Ok(21) }).await;
+            assert_eq!(result, Ok((artifacts(0), 42)));
+            assert!(installed);
+        }
+
+        #[tokio::test]
+        async fn a_lost_artifact_refuses_before_the_graph_is_installed() {
+            let read_done = AtomicBool::new(false);
+            let (result, installed) =
+                run(async { Ok(artifacts(1)) }, slow(&read_done, Ok(21))).await;
+            let err = result.unwrap_err();
+            assert!(
+                err.starts_with("the image is not portable: 1 materialized artifacts"),
+                "{err}"
+            );
+            assert!(!installed, "a refused graph must not be installed");
+            assert!(
+                read_done.load(Ordering::SeqCst),
+                "the read is awaited to its end"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_graph_error_refuses_after_the_replay_has_finished() {
+            let replay_done = AtomicBool::new(false);
+            let (result, installed) = run(slow(&replay_done, Ok(artifacts(0))), async {
+                Err("graph: unreadable row".to_owned())
+            })
+            .await;
+            assert_eq!(result, Err("graph: unreadable row".to_owned()));
+            assert!(!installed);
+            assert!(
+                replay_done.load(Ordering::SeqCst),
+                "no replay command may still be on its way when the daemon starts cold"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_materializer_error_is_reported_first() {
+            let (result, installed) =
+                run(async { Err("materializer: closed".to_owned()) }, async {
+                    Err("graph: unreadable row".to_owned())
+                })
+                .await;
+            assert_eq!(result, Err("materializer: closed".to_owned()));
+            assert!(!installed);
+        }
+
+        #[tokio::test]
+        async fn a_lost_artifact_is_reported_before_a_graph_error() {
+            let (result, installed) = run(async { Ok(artifacts(2)) }, async {
+                Err("graph: unreadable row".to_owned())
+            })
+            .await;
+            assert!(
+                result
+                    .unwrap_err()
+                    .starts_with("the image is not portable: 2")
+            );
+            assert!(!installed);
+        }
+
+        /// The two run at once: a replay that waits for the read to start would hang if they
+        /// ran one after the other.
+        #[tokio::test]
+        async fn the_replay_and_the_read_overlap() {
+            let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+            let replay = async move {
+                rx.await.map_err(|e| e.to_string())?;
+                Ok(artifacts(0))
+            };
+            let read = async move {
+                drop(tx.send(()));
+                Ok(21)
+            };
+            let (result, installed) =
+                tokio::time::timeout(std::time::Duration::from_secs(10), run(replay, read))
+                    .await
+                    .expect("the replay waited for a read that never started");
+            assert_eq!(result, Ok((artifacts(0), 42)));
+            assert!(installed);
+        }
     }
 
     /// A store path is valid only if it exists here and the configured check accepts it; a
