@@ -546,19 +546,37 @@ mod tests {
 
         use super::super::*;
 
+        /// A `sleep` binary to copy: NixOS has no /bin/sleep, so look on PATH first.
+        fn sleep_binary() -> std::path::PathBuf {
+            std::env::var_os("PATH")
+                .and_then(|path| {
+                    std::env::split_paths(&path)
+                        .map(|dir| dir.join("sleep"))
+                        .find(|candidate| candidate.is_file())
+                })
+                .unwrap_or_else(|| std::path::PathBuf::from("/bin/sleep"))
+        }
+
         #[tokio::test]
         async fn test_copy_file() -> buck2_error::Result<()> {
             let dir = tempfile::tempdir()?;
             let out = dir.path().join("sleep");
+            let sleep = sleep_binary();
 
             let res = buck2_util::process::async_background_command("cp")
-                .arg(Path::new("/bin/sleep"))
+                .arg(&sleep)
                 .arg(&out)
                 .spawn()?
                 .wait()
                 .await?;
 
             assert!(res.success());
+            // A nix store sleep is mode 555 and cp keeps that; the test is about
+            // overwriting a running binary, not a read-only one.
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&out, std::fs::Permissions::from_mode(0o755))?;
+            }
 
             let mut proc = buck2_util::process::async_background_command(&out)
                 .arg("10000")
@@ -567,7 +585,7 @@ mod tests {
                 .buck_error_context("Error spawning")?;
 
             // This will fail if we don't handle ETXTBSY.
-            copy_file(Path::new("/bin/sleep"), &out).await?;
+            copy_file(&sleep, &out).await?;
 
             // Check that our sleep didn't end
             assert_matches!(proc.try_wait(), Ok(None));
