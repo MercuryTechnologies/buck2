@@ -76,7 +76,7 @@ pub struct SuspendCommand {
     #[clap(long)]
     portable: bool,
 
-    /// After the daemon exits, also write its state to this file, one zstd-compressed tar, for
+    /// After the daemon exits, also write its state to this file, a sequence of zstd frames, for
     /// `buck2 resume --import` to unpack on another checkout at the same path. The state stays
     /// under buck-out as well. Implies `--portable`, since the importing machine has none of
     /// this one's `buck-out`.
@@ -202,7 +202,8 @@ pub struct ResumeCommand {
     #[clap(long)]
     require: bool,
 
-    /// Before starting the daemon, unpack this bundle from `buck2 suspend --export`. Refused
+    /// Before starting the daemon, unpack this bundle from `buck2 suspend --export`, or read it
+    /// from standard input when FILE is `-`, so a download can stream into the import. Refused
     /// while a daemon runs for this checkout, and for a bundle another buck2 binary wrote.
     #[clap(long, value_name = "FILE")]
     import: Option<PathArg>,
@@ -230,7 +231,11 @@ impl StreamingCommand for ResumeCommand {
         let Some(bundle) = &self.import else {
             return Ok(());
         };
-        let bundle = bundle.resolve(&ctx.working_dir);
+        let source = if bundle.path() == std::path::Path::new("-") {
+            bundle::BundleSource::Stdin
+        } else {
+            bundle::BundleSource::File(bundle.resolve(&ctx.working_dir).into_path_buf())
+        };
         let paths = ctx.paths()?;
         let daemon_dir = paths.daemon_dir()?;
         // Held until the bundle is in place, so no daemon starts on half an image.
@@ -243,30 +248,26 @@ impl StreamingCommand for ResumeCommand {
         let cache_dir = paths.cache_dir_path();
         let t = Instant::now();
         let summary = tokio::task::spawn_blocking({
-            let bundle = bundle.clone();
+            let source = source.clone();
             move || -> buck2_error::Result<bundle::ImportSummary> {
                 // Only the binary the daemon runs is hashed, and only when no daemon runs.
                 let exe = match running {
                     Some(_) => String::new(),
                     None => exe_digest(&get_daemon_exe()?)?,
                 };
-                Ok(bundle::import(
-                    bundle.as_path(),
-                    cache_dir.as_path(),
-                    &exe,
-                    running,
-                )?)
+                Ok(bundle::import(&source, cache_dir.as_path(), &exe, running)?)
             }
         })
         .await??;
         drop(lifecycle_lock);
         buck2_client_ctx::eprintln!(
-            "imported {}: {} files, {} bytes, suspended at {} ms, in {:.3}s",
-            bundle.display(),
+            "imported {}: {} files, {} bytes, suspended at {} ms, in {:.3}s on {} threads",
+            source,
             summary.members,
             summary.bytes,
             summary.created_at_ms,
-            t.elapsed().as_secs_f64()
+            t.elapsed().as_secs_f64(),
+            summary.threads
         )?;
         Ok(())
     }
