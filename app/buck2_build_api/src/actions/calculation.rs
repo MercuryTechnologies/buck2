@@ -78,6 +78,7 @@ use crate::actions::execute::action_executor::HasActionExecutor;
 use crate::actions::local_actions::LocalActions;
 use crate::actions::rewind::ActionRewindRequest;
 use crate::actions::rewind::HasActionRewindTracker;
+use crate::actions::rewind::value_holds_digest;
 use crate::artifact_groups::ArtifactGroup;
 use crate::artifact_groups::ArtifactGroupValues;
 use crate::artifact_groups::calculation::ensure_artifact_group_staged;
@@ -639,12 +640,9 @@ fn lost_input_producer(
 ) -> Option<ActionKey> {
     for values in ensured_inputs.values() {
         for (artifact, value) in values.iter() {
-            let Some(value_digest) = value.digest() else {
+            if !value_holds_digest(value, lost_digest) {
                 continue;
-            };
-            if value_digest != lost_digest {
-                continue;
-            };
+            }
             let Some(action_key) = artifact.action_key() else {
                 continue;
             };
