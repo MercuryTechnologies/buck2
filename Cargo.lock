@@ -1606,7 +1606,6 @@ dependencies = [
  "serde_json",
  "shlex",
  "superconsole",
- "tar",
  "tempfile",
  "threadpool",
  "tokio",
