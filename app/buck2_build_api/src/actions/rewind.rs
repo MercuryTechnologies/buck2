@@ -13,7 +13,13 @@ use std::sync::Mutex;
 
 use allocative::Allocative;
 use buck2_artifact::actions::key::ActionKey;
+use buck2_common::file_ops::metadata::FileDigest;
+use buck2_directory::directory::directory::Directory;
+use buck2_directory::directory::directory_iterator::DirectoryIterator;
+use buck2_directory::directory::entry::DirectoryEntry;
 use buck2_error::TypedContext;
+use buck2_execute::artifact_value::ArtifactValue;
+use buck2_execute::directory::ActionDirectoryMember;
 use buck2_hash::BuckDashSet;
 use dice::DiceTransaction;
 use dice::UserComputationData;
@@ -180,4 +186,19 @@ pub async fn apply_action_rewind(
         .await?;
     ctx.per_transaction_data().set_rewound_actions(&action_keys);
     Ok(ctx)
+}
+
+/// Whether an input's value is, or holds, a file of `digest`. The lost input is named by the
+/// file that could not be fetched, while the input may be the directory around it, as a
+/// genrule's `out` directory is.
+pub fn value_holds_digest(value: &ArtifactValue, digest: &FileDigest) -> bool {
+    if value.digest() == Some(digest) {
+        return true;
+    }
+    match value.entry() {
+        DirectoryEntry::Dir(d) => d.unordered_walk_leaves().without_paths().any(|leaf| {
+            matches!(leaf, ActionDirectoryMember::File(f) if f.digest.data() == digest)
+        }),
+        DirectoryEntry::Leaf(_) => false,
+    }
 }
