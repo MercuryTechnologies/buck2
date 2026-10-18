@@ -26,7 +26,6 @@ rust_library(
         "fbsource//third-party/rust:serde",
         "fbsource//third-party/rust:serde_json",
         "fbsource//third-party/rust:shlex",
-        "fbsource//third-party/rust:tar",
         "fbsource//third-party/rust:threadpool",
         "fbsource//third-party/rust:tokio",
         "fbsource//third-party/rust:tokio-stream",
