@@ -840,35 +840,55 @@ impl LoadedImage {
     }
 }
 
+/// How many of the materializer's rows a resume reads at once, ahead of the replay.
+const ARTIFACT_ROW_READERS: usize = 8;
+
 /// Replays the materializer's artifacts, one row after another in the order the suspend wrote
-/// them. The rows are read on a task of their own, a few ahead, while the materializer declares
-/// the last: a row read blocks its thread in sqlite.
+/// them. The rows are read ahead of the replay on tasks of their own, several at once, since
+/// reading a row, which reads every directory it names from the paging store, takes longer
+/// than declaring its artifacts, and a row read blocks its thread in sqlite.
 ///
-/// Returns too how long reading the rows took, apart from declaring them.
+/// Returns too how long the reads took to deliver the last row.
 async fn replay_artifacts(
     dice: &Arc<Dice>,
     rows: &[SuspendRow],
     materializer: &dyn Materializer,
 ) -> (Result<ResumedArtifacts, String>, Duration) {
-    let (tx, mut rx) = tokio::sync::mpsc::channel(2);
+    let (tx, mut rx) = tokio::sync::mpsc::channel(ARTIFACT_ROW_READERS);
     let reader = {
         let dice = dice.dupe();
         let rows = rows.to_vec();
         tokio::spawn(async move {
-            let mut reading = Duration::ZERO;
-            for row in rows {
-                let t = Instant::now();
-                let read = dice
-                    .read_suspend_row::<Vec<SuspendedArtifact>>(row)
-                    .await
-                    .map_err(|e| format!("unreadable materializer state: {e:#}"));
-                reading += t.elapsed();
+            let t = Instant::now();
+            let mut rows = rows.into_iter();
+            let mut in_flight = std::collections::VecDeque::with_capacity(ARTIFACT_ROW_READERS);
+            loop {
+                while in_flight.len() < ARTIFACT_ROW_READERS
+                    && let Some(row) = rows.next()
+                {
+                    let dice = dice.dupe();
+                    in_flight.push_back(tokio::spawn(async move {
+                        dice.read_suspend_row::<Vec<SuspendedArtifact>>(row).await
+                    }));
+                }
+                // Taken in the order of the rows, whichever read finishes first.
+                let Some(next) = in_flight.pop_front() else {
+                    break;
+                };
+                let read = match next.await {
+                    Ok(read) => read.map_err(|e| format!("unreadable materializer state: {e:#}")),
+                    Err(e) => Err(format!("unreadable materializer state: {e}")),
+                };
                 let failed = read.is_err();
                 if tx.send(read).await.is_err() || failed {
+                    // No read outlives the replay.
+                    for read in in_flight {
+                        drop(read.await);
+                    }
                     break;
                 }
             }
-            reading
+            t.elapsed()
         })
     };
     let mut resumed = ResumedArtifacts::default();
@@ -889,8 +909,8 @@ async fn replay_artifacts(
             }
         }
     }
-    // The reader stops at its next send once nothing receives; it is awaited so that no read
-    // outlives the replay.
+    // The reader stops at its next send once nothing receives, after the reads it started; it
+    // is awaited so that no read outlives the replay.
     drop(rx);
     match reader.await {
         Ok(reading) => (replayed.map(|()| resumed), reading),
