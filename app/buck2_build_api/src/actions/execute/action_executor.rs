@@ -199,10 +199,14 @@ impl ActionOutputsMap {
 /// re-bound through a `dynamic_output` gets an action key whose dice value is
 /// the producing action's entire `ActionOutputs`.
 ///
-/// The fingerprint hashes entries in iteration order, so two maps that are
-/// equal as unordered maps may compare unequal here. `Key::equality` permits
-/// that direction (it only costs extra invalidation); the opposite direction
-/// rests on blake3 collision resistance.
+/// The fingerprint does not depend on the order of the entries, so two maps
+/// that are equal as unordered maps compare equal. The order does differ
+/// between producers of one action's value: an executed action lists its
+/// outputs as the command result has them (sorted by path), while a hit of
+/// the identical-action cache lists them in the order the action declares
+/// them. Were the order hashed, an action whose value moved between the two
+/// would never cut off its dependents, and a resumed daemon reruns such an
+/// action. Unequal maps comparing equal rests on blake3 collision resistance.
 impl PartialEq for ActionOutputsData {
     fn eq(&self, other: &Self) -> bool {
         self.fingerprint == other.fingerprint
@@ -330,11 +334,22 @@ impl ActionExecutionKind {
 
 impl ActionOutputs {
     pub fn new(outputs: BuckIndexMap<BuildArtifactPath, ArtifactValue>) -> Self {
+        // Each entry is hashed on its own and the entry hashes are sorted, so that the
+        // fingerprint is that of the map, whatever order the entries came in.
+        let mut entries: Vec<[u8; 32]> = outputs
+            .iter()
+            .map(|(path, value)| {
+                let mut entry = Blake3StrongHasher::new();
+                path.strong_hash(&mut entry);
+                value.strong_hash(&mut entry);
+                *entry.finalize().as_bytes()
+            })
+            .collect();
+        entries.sort_unstable();
         let mut hasher = Blake3StrongHasher::new();
         outputs.len().strong_hash(&mut hasher);
-        for (path, value) in &outputs {
-            path.strong_hash(&mut hasher);
-            value.strong_hash(&mut hasher);
+        for entry in &entries {
+            std::hash::Hasher::write(&mut hasher, entry);
         }
         let fingerprint = hasher.finalize();
         Self(Arc::new(ActionOutputsData {
@@ -1055,6 +1070,59 @@ mod tests {
                 restored.iter().collect::<Vec<_>>(),
                 map.iter().collect::<Vec<_>>()
             );
+        }
+    }
+
+    /// One action's value, as an executed action lists its outputs and as the identical-action
+    /// cache lists them, must compare equal, or DICE cannot cut off the action's dependents when
+    /// its value moves from one producer to the other. A different value must not.
+    #[test]
+    fn action_outputs_equality_ignores_the_order_of_the_outputs() {
+        use buck2_common::cas_digest::CasDigestConfig;
+        use buck2_common::file_ops::metadata::FileMetadata;
+        use buck2_common::file_ops::metadata::TrackedFileDigest;
+        use buck2_core::configuration::data::ConfigurationData;
+        use buck2_core::deferred::base_deferred_key::BaseDeferredKey;
+        use buck2_core::fs::buck_out_path::BuckOutPathKind;
+        use buck2_core::fs::buck_out_path::BuildArtifactPath;
+        use buck2_core::target::configured_target_label::ConfiguredTargetLabel;
+        use buck2_execute::artifact_value::ArtifactValue;
+        use buck2_fs::paths::forward_rel_path::ForwardRelativePathBuf;
+
+        let owner = BaseDeferredKey::TargetLabel(ConfiguredTargetLabel::testing_parse(
+            "cell//pkg:target",
+            ConfigurationData::testing_new(),
+        ));
+        let config = CasDigestConfig::testing_default();
+        let entry = |name: &str, content: &str| {
+            let path = BuildArtifactPath::new(
+                owner.dupe(),
+                ForwardRelativePathBuf::unchecked_new(name.to_owned()),
+                BuckOutPathKind::Configuration,
+            );
+            let value = ArtifactValue::file(FileMetadata {
+                digest: TrackedFileDigest::from_content(content.as_bytes(), config),
+                is_executable: false,
+            });
+            (path, value)
+        };
+        // Both sides of the small/large boundary.
+        for n in [2, SMALL_OUTPUTS_MAX + 3] {
+            let names: Vec<String> = (0..n).map(|i| format!("out/{i}")).collect();
+            let declared: BuckIndexMap<_, _> = names.iter().map(|n| entry(n, n)).collect();
+            let executed: BuckIndexMap<_, _> = names.iter().rev().map(|n| entry(n, n)).collect();
+            assert_eq!(
+                ActionOutputs::new(declared.clone()),
+                ActionOutputs::new(executed),
+                "n = {n}"
+            );
+            let mut changed = declared.clone();
+            let (path, value) = entry(&names[0], "other");
+            changed.insert(path, value);
+            assert_ne!(ActionOutputs::new(declared.clone()), ActionOutputs::new(changed));
+            let mut fewer = declared.clone();
+            fewer.pop();
+            assert_ne!(ActionOutputs::new(declared), ActionOutputs::new(fewer));
         }
     }
 
