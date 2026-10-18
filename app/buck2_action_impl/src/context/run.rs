@@ -177,6 +177,11 @@ pub(crate) fn analysis_actions_methods_run(methods: &mut MethodsBuilder) {
     ///       running the action; otherwise the action executes normally (graceful fallback)
     ///     * Requires `buck2.use_network_action_output_cache=true` config to take effect
     ///     * Example use case: caching network downloads in containerized offline build environments
+    /// * `store_path_outputs` declares that each output is a symlink to a path of an immutable,
+    ///   content-addressed store (a nix realisation's `/nix/store` path) whose name is a function
+    ///   of the action's inputs. A daemon resumed from a portable suspend on another machine runs
+    ///   a local action again, since its outputs may depend on the machine, unless the action
+    ///   declares this and every path it names is valid there; see `buck2_hydration.suspend_store_check`.
     /// * The `prefer_local`, `prefer_remote` and `local_only` options allow selecting where the
     /// action should run if the executor selected for this target is a hybrid executor.
     ///     * All those options disable concurrent execution: the action will run on the preferred
@@ -272,6 +277,7 @@ pub(crate) fn analysis_actions_methods_run(methods: &mut MethodsBuilder) {
         #[starlark(require = named, default = false)] prefer_remote: bool,
         #[starlark(require = named, default = true)] low_pass_filter: bool,
         #[starlark(require = named, default = false)] always_print_stderr: bool,
+        #[starlark(require = named, default = false)] store_path_outputs: bool,
         #[starlark(require = named)] weight: Option<u32>,
         #[starlark(require = named)] weight_percentage: Option<u32>,
         #[starlark(require = named)] dep_files: Option<SmallMap<&'v str, &'v ArtifactTag>>,
@@ -647,6 +653,7 @@ pub(crate) fn analysis_actions_methods_run(methods: &mut MethodsBuilder) {
         let action = UnregisteredRunAction {
             executor_preference,
             always_print_stderr,
+            store_path_outputs,
             weight,
             low_pass_filter,
             dep_files: dep_files_configuration,

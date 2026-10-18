@@ -580,6 +580,12 @@ pub struct SuspendConfig {
     /// and one starting with `*` a suffix). Unset, it is [`DEFAULT_SUSPEND_ENV_IGNORE`]; set, it
     /// replaces that list, and set empty it ignores nothing more.
     pub env_ignore: Vec<String>,
+    /// The command a resume runs, with one store path appended, to ask whether that path is
+    /// valid on this machine (`buck2_hydration.suspend_store_check`, split on whitespace, such as
+    /// `nix-store --check-validity`); exit status 0 means valid. A locally executed action that
+    /// declared `store_path_outputs` keeps its value across a resume on another machine only
+    /// when each of its paths exists and, if this is set, passes it. Unset, existence is enough.
+    pub store_check: Vec<String>,
 }
 
 /// The variables a CI runner sets differently on every run of one job, beyond those the daemon
@@ -674,6 +680,13 @@ impl HydrationConfig {
                         .map(|s| (*s).to_owned())
                         .collect(),
                 },
+                store_check: config
+                    .get(BuckconfigKeyRef {
+                        section: "buck2_hydration",
+                        property: "suspend_store_check",
+                    })
+                    .map(|c| c.split_whitespace().map(ToOwned::to_owned).collect())
+                    .unwrap_or_default(),
             })
         } else {
             None
@@ -1090,6 +1103,7 @@ mod tests {
                     suspend = true
                     suspend_max_db_gb = 7
                     suspend_env_ignore = CI_JOB_ID, BUILD_NUMBER
+                    suspend_store_check = nix-store --check-validity
                     "#
                 ),
             )],
@@ -1103,6 +1117,7 @@ mod tests {
             .expect("suspend is on");
         assert_eq!(suspend.max_db_gb, 7);
         assert_eq!(suspend.env_ignore, vec!["CI_JOB_ID", "BUILD_NUMBER"]);
+        assert_eq!(suspend.store_check, vec!["nix-store", "--check-validity"]);
         Ok(())
     }
 
@@ -1120,6 +1135,7 @@ mod tests {
             .expect("suspend is on");
         assert_eq!(suspend.max_db_gb, 50);
         assert_eq!(suspend.env_ignore, DEFAULT_SUSPEND_ENV_IGNORE);
+        assert!(suspend.store_check.is_empty());
         Ok(())
     }
 
