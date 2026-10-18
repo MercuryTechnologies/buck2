@@ -13,7 +13,6 @@ use std::sync::LazyLock;
 use std::path::Path;
 use std::str::FromStr;
 
-use buck2_common::file_ops::metadata::FileDigest;
 use buck2_common::file_ops::metadata::TrackedFileDigest;
 use buck2_core::buck2_env;
 use buck2_core::execution_types::executor_config::RemoteExecutorUseCase;
@@ -41,9 +40,7 @@ use remote_execution::TDigest;
 use remote_execution::UploadRequest;
 
 use crate::artifact_value::ArtifactValue;
-use crate::digest::CasDigestFromReExt;
 use crate::digest::CasDigestToReExt;
-use crate::digest_config::DigestConfig;
 use crate::directory::ActionDirectoryMember;
 use crate::directory::ActionFingerprintedDirectoryRef;
 use crate::directory::ActionImmutableDirectory;
@@ -598,37 +595,44 @@ fn error_for_missing_file(
 
 /// This is used for tests. We allow an environment variable to be set to report that some digests
 /// are _always_ missing if they are required. This lets us test our upload paths more easily.
+/// Digests are matched as RE digests, hash and size, so the hooks work whatever algorithm the
+/// daemon hashes with, as `BUCK2_TEST_FAIL_RE_DOWNLOAD_DIGESTS_ONCE` already does.
 fn add_injected_missing_digests<'a>(
     input_digests: &BuckMutSet<&'a TrackedFileDigest>,
     missing_digests: &mut BuckMutSet<&'a TrackedFileDigest>,
 ) -> buck2_error::Result<()> {
-    fn convert_digests(val: &str) -> buck2_error::Result<Vec<FileDigest>> {
+    fn convert_digests(val: &str) -> buck2_error::Result<Vec<TDigest>> {
         val.split_whitespace()
             .map(|digest| {
-                let digest = TDigest::from_str(digest)
+                TDigest::from_str(digest)
                     .map_err(|e| from_any_with_tag(e, buck2_error::ErrorTag::InvalidDigest))
-                    .with_buck_error_context(|| format!("Invalid digest: `{digest}`"))?;
-                // This code does not run in a test but it is only used for testing.
-                let digest = FileDigest::from_re(&digest, DigestConfig::testing_default())?;
-                buck2_error::Ok(digest)
+                    .with_buck_error_context(|| format!("Invalid digest: `{digest}`"))
             })
             .collect()
+    }
+
+    fn input<'a>(
+        input_digests: &BuckMutSet<&'a TrackedFileDigest>,
+        digest: &TDigest,
+    ) -> Option<&'a TrackedFileDigest> {
+        input_digests
+            .iter()
+            .find(|i| i.to_re() == *digest)
+            .copied()
     }
 
     fn add_digests_once<'a>(
         input_digests: &BuckMutSet<&'a TrackedFileDigest>,
         missing_digests: &mut BuckMutSet<&'a TrackedFileDigest>,
-        digests: Vec<FileDigest>,
+        digests: &[TDigest],
     ) {
-        static INJECTED_ONCE: LazyLock<Mutex<BuckMutSet<FileDigest>>> =
-            LazyLock::new(|| Mutex::new(BuckMutSet::default()));
+        static INJECTED_ONCE: LazyLock<Mutex<std::collections::HashSet<TDigest>>> =
+            LazyLock::new(|| Mutex::new(std::collections::HashSet::new()));
 
         for d in digests {
-            let matched = input_digests.get(&d);
-            if let Some(i) = matched {
+            if let Some(i) = input(input_digests, d) {
                 let mut injected_once = INJECTED_ONCE.lock().expect("Poisoned lock");
-                if !injected_once.contains(&d) {
-                    injected_once.insert(d);
+                if injected_once.insert(d.clone()) {
                     missing_digests.insert(i);
                 }
             }
@@ -637,13 +641,13 @@ fn add_injected_missing_digests<'a>(
 
     let ingested_digests = buck2_env!(
         "BUCK2_TEST_INJECTED_MISSING_DIGESTS",
-        type=Vec<FileDigest>,
+        type=Vec<TDigest>,
         converter=convert_digests,
         applicability=testing
     )?;
     if let Some(digests) = ingested_digests {
         for d in digests {
-            if let Some(i) = input_digests.get(d) {
+            if let Some(i) = input(input_digests, d) {
                 missing_digests.insert(i);
             }
         }
@@ -659,18 +663,18 @@ fn add_injected_missing_digests<'a>(
         add_digests_once(
             input_digests,
             missing_digests,
-            convert_digests(&injected_digests)?,
+            &convert_digests(&injected_digests)?,
         );
     }
 
     let ingested_digests_once = buck2_env!(
         "BUCK2_TEST_INJECTED_MISSING_DIGESTS_ONCE",
-        type=Vec<FileDigest>,
+        type=Vec<TDigest>,
         converter=convert_digests,
         applicability=testing
     )?;
     if let Some(digests) = ingested_digests_once {
-        add_digests_once(input_digests, missing_digests, digests.to_vec());
+        add_digests_once(input_digests, missing_digests, digests);
     }
 
     Ok(())
