@@ -20,6 +20,7 @@ use std::time::SystemTime;
 use allocative::Allocative;
 use async_trait::async_trait;
 use buck2_build_signals::env::WaitingCategory;
+use buck2_common::file_ops::metadata::FileDigest;
 use buck2_common::file_ops::metadata::FileDigestConfig;
 use buck2_common::file_ops::metadata::FileMetadata;
 use buck2_common::liveliness_observer::LivelinessObserver;
@@ -74,6 +75,7 @@ use buck2_execute::materialize::materializer::MaterializationError;
 use buck2_execute::materialize::materializer::MaterializationPurpose;
 use buck2_execute::materialize::materializer::MaterializeRequest;
 use buck2_execute::materialize::materializer::Materializer;
+use buck2_execute::materialize::materializer::ReLostInput;
 use buck2_execute::materialize::materializer::ReadLease;
 use buck2_execute::materialize::materializer::WriteLease;
 use buck2_execute_local::CommandResult;
@@ -1409,6 +1411,12 @@ pub async fn materialize_inputs(
     .await?;
 
     let paths = artifacts.iter().map(|(path, _)| path.clone()).collect();
+    // What each input's value is, by path, so that a blob that left the CAS can be named as the
+    // input the action lost; see below.
+    let requested: Vec<(ProjectRelativePathBuf, Option<FileDigest>)> = artifacts
+        .iter()
+        .map(|(path, value)| (path.clone(), value.digest().cloned()))
+        .collect();
     let response = materializer
         .materialize(MaterializeRequest {
             artifacts,
@@ -1421,15 +1429,32 @@ pub async fn materialize_inputs(
         Ok(leases) => leases,
         Err(MaterializationError::NotFound { source }) => {
             let corrupted = source.info.origin.guaranteed_by_action_cache();
+            // The input under the missing entry, named as remote execution names an input it
+            // could not upload, so that the action's computation asks for its producer to be
+            // rewound and run again instead of failing the build: a daemon resumed from an image
+            // declares every input from the CAS, and some may have expired since.
+            let lost = requested.iter().find_map(|(path, digest)| {
+                Some(ReLostInput {
+                    path: path.clone(),
+                    digest: digest.clone()?,
+                })
+                .filter(|_| path.starts_with(&*source.path) || source.path.starts_with(path))
+            });
 
-            return Err(tag_error!(
-                "cas_missing_fatal",
-                MaterializationError::NotFound { source }.into(),
-                quiet: true,
-                task: false,
-                daemon_in_memory_state_is_corrupted: true,
-                action_cache_is_corrupted: corrupted
-            ));
+            // A blob no input can be named for is still taken for corrupted daemon state, which
+            // makes a client with the restarter on start a new daemon.
+            let error: buck2_error::Error = MaterializationError::NotFound { source }.into();
+            return Err(match lost {
+                Some(lost) => error.context(lost),
+                None => tag_error!(
+                    "cas_missing_fatal",
+                    error,
+                    quiet: true,
+                    task: false,
+                    daemon_in_memory_state_is_corrupted: true,
+                    action_cache_is_corrupted: corrupted
+                ),
+            });
         }
         Err(e) => return Err(e.into()),
     };
