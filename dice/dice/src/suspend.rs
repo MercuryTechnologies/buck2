@@ -334,6 +334,9 @@ impl Dice {
         lap("key rows written", &mut timings);
         drop(tried);
         storage.flush()?;
+        // Bound once here rather than after each row: a bind scans every arc written and not
+        // yet committed, so binding per row was quadratic in the rows written between flushes.
+        storage.bind_written(&finished);
         lap("key rows flushed", &mut timings);
         let mut round_tripped: HashMap<DiceKey, DataKey> = HashMap::default();
         for (key, row, data) in checks {

@@ -559,8 +559,11 @@ pub trait PagableStorage: Send + Sync + 'static {
         resolve_and_store(self, item_data, &item_slots)
     }
 
-    /// [`page_out_item`](Self::page_out_item), also returning the row as stored, so a caller
-    /// can read it back without a read of the store.
+    /// [`page_out_item_ticketed`](Self::page_out_item_ticketed), returning the row as stored
+    /// instead of a ticket, so a caller can read it back without a read of the store. As there,
+    /// the arcs it writes wait in `finished` for the caller to bind them with
+    /// [`ArcSerCache::bind_covered`] once their rows have committed: binding after every item
+    /// scans every arc still waiting, so a caller writing many items before a flush binds once.
     fn page_out_item_with_data(
         &self,
         item_data: Vec<u8>,
@@ -580,7 +583,6 @@ pub trait PagableStorage: Send + Sync + 'static {
             data: item_data,
             arcs,
         };
-        finished.bind_covered(self, &self.commit_frontier());
         Ok((key, data))
     }
 }
