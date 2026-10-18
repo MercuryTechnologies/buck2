@@ -15,6 +15,10 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use buck2_build_api::actions::artifact::get_artifact_fs::GetArtifactFs;
+use buck2_build_api::actions::rewind::HasActionRewindTracker;
+use buck2_build_api::actions::rewind::MAX_REPEATED_ACTION_REWINDS;
+use buck2_build_api::actions::rewind::apply_action_rewind;
+use buck2_build_api::actions::rewind::find_action_rewind_request;
 use buck2_build_api::analysis::calculation::RuleAnalysisCalculation;
 use buck2_build_api::build::AsyncBuildTargetResultBuilder;
 use buck2_build_api::build::BuildConfiguredLabelOptions;
@@ -495,12 +499,6 @@ async fn test(
         .as_ref()
         .internal_error("Missing `options`")?;
 
-    let session = TestSession::new(TestSessionOptions {
-        allow_re: options.allow_re,
-        force_use_project_relative_paths: options.force_use_project_relative_paths,
-        force_run_from_project_root: options.force_run_from_project_root,
-    });
-
     let build_opts = request
         .build_opts
         .as_ref()
@@ -530,45 +528,88 @@ async fn test(
         test_executor_args.insert(0, "--undeclared-outputs-dir".to_owned());
     }
 
-    let (streaming_build_result_tx, streaming_build_result_rx) =
-        streaming_build_result_channel(build_opts);
+    // A test or a build action whose input left the remote CAS asks for the input's producer to be
+    // rewound; the tests then run again on the rewound graph, as `buck2 build` runs again. A test
+    // that lost an input was reported cancelled, so it is not counted twice.
+    let mut rewinds = 0;
+    let mut ctx = ctx.dupe();
+    let test_outcome = loop {
+        let session = TestSession::new(TestSessionOptions {
+            allow_re: options.allow_re,
+            force_use_project_relative_paths: options.force_use_project_relative_paths,
+            force_run_from_project_root: options.force_run_from_project_root,
+        });
 
-    let test_future = test_targets(
-        ctx.dupe(),
-        resolved_pattern,
-        global_cfg_options,
-        test_executor_args,
-        Arc::new(TestLabelFiltering::new(
-            request.included_labels.clone(),
-            request.excluded_labels.clone(),
-            request.always_exclude,
-            request.build_filtered_targets,
-        )),
-        &*launcher,
-        session,
-        cell_resolver.dupe(),
-        working_dir_cell,
-        build_opts.skip_incompatible_targets,
-        MissingTargetBehavior::from_skip(build_opts.skip_missing_targets),
-        timeout,
-        request.ignore_tests_attribute,
-        build_default_info,
-        build_run_info,
-        tpx_experiments,
-        streaming_build_result_tx,
-    );
+        let (streaming_build_result_tx, streaming_build_result_rx) =
+            streaming_build_result_channel(build_opts);
 
-    let test_outcome = maybe_stream_build_reports(
-        test_future,
-        build_opts,
-        ctx.dupe(),
-        server_ctx.project_root(),
-        server_ctx.working_dir(),
-        server_ctx.events().trace_id().dupe(),
-        Default::default(),
-        streaming_build_result_rx,
-    )
-    .await?;
+        let test_future = test_targets(
+            ctx.dupe(),
+            resolved_pattern.clone(),
+            global_cfg_options.clone(),
+            test_executor_args.clone(),
+            Arc::new(TestLabelFiltering::new(
+                request.included_labels.clone(),
+                request.excluded_labels.clone(),
+                request.always_exclude,
+                request.build_filtered_targets,
+            )),
+            &*launcher,
+            session,
+            cell_resolver.dupe(),
+            working_dir_cell,
+            build_opts.skip_incompatible_targets,
+            MissingTargetBehavior::from_skip(build_opts.skip_missing_targets),
+            timeout,
+            request.ignore_tests_attribute,
+            build_default_info,
+            build_run_info,
+            tpx_experiments.clone(),
+            streaming_build_result_tx,
+        );
+
+        let test_outcome = maybe_stream_build_reports(
+            test_future,
+            build_opts,
+            ctx.dupe(),
+            server_ctx.project_root(),
+            server_ctx.working_dir(),
+            server_ctx.events().trace_id().dupe(),
+            Default::default(),
+            streaming_build_result_rx,
+        )
+        .await?;
+
+        let requested = ctx.per_transaction_data().take_requested_action_rewind();
+        let built = find_action_rewind_request(&test_outcome.build_target_result);
+        if rewinds >= MAX_REPEATED_ACTION_REWINDS {
+            // A build error still says what it is. A test cancelled for a lost input has no
+            // verdict, and must not pass as omitted.
+            if requested.is_some() {
+                return Err(buck2_error::buck2_error!(
+                    buck2_error::ErrorTag::ReCasArtifactExpired,
+                    "Tests lost inputs from the remote CAS again after {rewinds} rewinds"
+                ));
+            }
+            break test_outcome;
+        }
+        let rewind = match (built, requested) {
+            (Some(mut build), Some(test)) => {
+                build.merge(&test);
+                build
+            }
+            (Some(build), None) => build,
+            (None, Some(test)) => test,
+            (None, None) => break test_outcome,
+        };
+        rewinds += 1;
+        tracing::info!(
+            rewind_count = rewinds,
+            rewind_actions = rewind.action_keys().len(),
+            "Rewinding DICE action graph after lost remote CAS input, then testing again"
+        );
+        ctx = apply_action_rewind(ctx, rewind).await?;
+    };
 
     send_target_cfg_event(
         server_ctx.events(),

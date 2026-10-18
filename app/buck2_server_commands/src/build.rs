@@ -14,9 +14,9 @@ use std::time::Instant;
 
 use async_trait::async_trait;
 use buck2_build_api::actions::artifact::get_artifact_fs::GetArtifactFs;
-use buck2_build_api::actions::calculation::BuildKey;
-use buck2_build_api::actions::rewind::ActionRewindRequest;
-use buck2_build_api::actions::rewind::HasActionRewindTracker;
+use buck2_build_api::actions::rewind::MAX_REPEATED_ACTION_REWINDS;
+use buck2_build_api::actions::rewind::apply_action_rewind;
+use buck2_build_api::actions::rewind::find_action_rewind_request;
 use buck2_build_api::build;
 use buck2_build_api::build::AsyncBuildTargetResultBuilder;
 use buck2_build_api::build::BuildEvent;
@@ -152,8 +152,6 @@ impl ServerCommandTemplate for BuildServerCommand {
 fn expect_build_opts(req: &buck2_cli_proto::BuildRequest) -> &CommonBuildOptions {
     req.build_opts.as_ref().expect("should have build options")
 }
-
-const MAX_REPEATED_ACTION_REWINDS: usize = 20;
 
 #[derive(buck2_error::Error, Debug)]
 #[buck2(tag = Input)]
@@ -571,57 +569,6 @@ async fn build(
         graph_properties,
     )
     .await
-}
-
-fn find_action_rewind_request(build_result: &BuildTargetResult) -> Option<ActionRewindRequest> {
-    fn merge_rewind(request: &mut Option<ActionRewindRequest>, error: &buck2_error::Error) {
-        let Some(found) = error.find_typed_context::<ActionRewindRequest>() else {
-            return;
-        };
-
-        match request {
-            Some(request) => request.merge(&found),
-            None => *request = Some((*found).clone()),
-        }
-    }
-
-    let mut request = None;
-    for errors in build_result.other_errors.values() {
-        for error in errors {
-            merge_rewind(&mut request, error);
-        }
-    }
-
-    for configured in build_result.configured.values().flatten() {
-        for error in &configured.errors {
-            merge_rewind(&mut request, &error.inner);
-        }
-        for output in &configured.outputs {
-            if let Err(error) = &output.inner {
-                merge_rewind(&mut request, error);
-            }
-        }
-    }
-
-    request
-}
-
-async fn apply_action_rewind(
-    ctx: DiceTransaction,
-    rewind: ActionRewindRequest,
-) -> buck2_error::Result<DiceTransaction> {
-    let action_keys = rewind.into_action_keys();
-    let ctx = ctx
-        .update_to_latest(
-            action_keys
-                .iter()
-                .cloned()
-                .map(BuildKey)
-                .collect::<Vec<_>>(),
-        )
-        .await?;
-    ctx.per_transaction_data().set_rewound_actions(&action_keys);
-    Ok(ctx)
 }
 
 async fn process_build_result(

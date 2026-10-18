@@ -25,11 +25,14 @@ use std::time::Duration;
 
 use allocative::Allocative;
 use async_trait::async_trait;
+use buck2_artifact::actions::key::ActionKey;
 use buck2_build_api::actions::artifact::get_artifact_fs::GetArtifactFs;
 use buck2_build_api::actions::execute::dice_data::CommandExecutorResponse;
 use buck2_build_api::actions::execute::dice_data::DiceHasCommandExecutor;
 use buck2_build_api::actions::execute::dice_data::GetReClient;
 use buck2_build_api::actions::impls::run_action_knobs::HasRunActionKnobs;
+use buck2_build_api::actions::rewind::ActionRewindRequest;
+use buck2_build_api::actions::rewind::HasActionRewindTracker;
 use buck2_build_api::analysis::calculation::RuleAnalysisCalculation;
 use buck2_build_api::artifact_groups::ArtifactGroup;
 use buck2_build_api::artifact_groups::ArtifactGroupValues;
@@ -57,6 +60,7 @@ use buck2_build_signals::env::NodeDuration;
 use buck2_build_signals::env::WaitingData;
 use buck2_common::dice::cells::HasCellResolver;
 use buck2_common::events::HasEvents;
+use buck2_common::file_ops::metadata::FileDigest;
 use buck2_common::file_ops::metadata::TrackedFileDigest;
 use buck2_common::legacy_configs::dice::HasLegacyConfigs;
 use buck2_common::legacy_configs::key::BuckconfigKeyRef;
@@ -133,6 +137,7 @@ use buck2_execute::execute::target::request_metadata_target_id;
 use buck2_execute::materialize::materializer::HasMaterializer;
 use buck2_execute::materialize::materializer::MaterializationPurpose;
 use buck2_execute::materialize::materializer::MaterializeRequest;
+use buck2_execute::materialize::materializer::ReLostInput;
 use buck2_execute::materialize::materializer::WriteRequest;
 use buck2_execute_impl::executors::local::EnvironmentBuilder;
 use buck2_execute_impl::executors::local::apply_local_execution_environment;
@@ -657,6 +662,16 @@ impl<'a> BuckTestOrchestrator<'a> {
             .into_iter()
             .collect();
 
+        // The producer of each input, by the input's digest, for a test whose input left the CAS.
+        let lost_input_producers: Vec<(FileDigest, ActionKey)> = ensured_inputs
+            .iter()
+            .flat_map(|(_, agv)| {
+                agv.iter().filter_map(|(artifact, value)| {
+                    Some((value.digest()?.dupe(), artifact.action_key()?.dupe()))
+                })
+            })
+            .collect();
+
         let executor_preference = Self::executor_preference(options, supports_re)?;
         let required_resources = if test_executor
             .executor()
@@ -722,6 +737,7 @@ impl<'a> BuckTestOrchestrator<'a> {
             liveliness_observer.dupe(),
             test_executor.re_cache_enabled(),
             effective_test_execution_caching,
+            &lost_input_producers,
         )
         .boxed()
         .await?;
@@ -832,6 +848,20 @@ impl Key for TestExecutionKey {
     fn value_serialize() -> impl ValueSerialize<Value = Self::Value> {
         NoValueSerialize::<Self::Value>::new()
     }
+}
+
+/// The action that produced the input a failed test execution lost from the remote CAS, if its
+/// error names one (`ReLostInput`, as remote execution's upload and the local executor's
+/// materialization attach it) and the test has an input of that digest.
+fn lost_input_producer(
+    error: &buck2_error::Error,
+    lost_input_producers: &[(FileDigest, ActionKey)],
+) -> Option<ActionKey> {
+    let lost = error.find_typed_context::<ReLostInput>()?;
+    lost_input_producers
+        .iter()
+        .find(|(digest, _)| *digest == lost.digest)
+        .map(|(_, producer)| producer.dupe())
 }
 
 async fn prepare_and_execute(
@@ -1341,6 +1371,7 @@ impl BuckTestOrchestrator<'_> {
         liveliness_observer: Arc<dyn LivelinessObserver>,
         re_cache_enabled: bool,
         supports_test_execution_caching: bool,
+        lost_input_producers: &[(FileDigest, ActionKey)],
     ) -> Result<ExecuteData, ExecuteError> {
         let events = dice.per_transaction_data().get_dispatcher().dupe();
         let manager = CommandExecutionManager::new(
@@ -1565,17 +1596,32 @@ impl BuckTestOrchestrator<'_> {
                 error,
                 execution_kind,
                 ..
-            } => ExecuteData {
-                stdout: ExecutionStream::Inline(Default::default()),
-                stderr: ExecutionStream::Inline(format!("{error:?}").into_bytes()),
-                status: ExecutionStatus::Finished {
-                    exitcode: failure_exit_code(exit_code),
-                },
-                timing,
-                execution_kind,
-                outputs,
-                command_execution,
-            },
+            } => {
+                // An input that left the remote CAS is no verdict on the test. The test is
+                // reported cancelled (omitted) rather than failed, and the command rewinds the
+                // input's producer and runs the tests again; see `HasActionRewindTracker`.
+                if let Some(producer) = lost_input_producer(&error, lost_input_producers) {
+                    tracing::info!(
+                        test = %test_target_label,
+                        producer_action = %producer,
+                        "Requesting DICE graph rewind after a test input disappeared from remote CAS"
+                    );
+                    dice.per_transaction_data()
+                        .request_action_rewind(&ActionRewindRequest::new(vec![producer]));
+                    return Err(ExecuteError::Cancelled(Cancelled { reason: None }));
+                }
+                ExecuteData {
+                    stdout: ExecutionStream::Inline(Default::default()),
+                    stderr: ExecutionStream::Inline(format!("{error:?}").into_bytes()),
+                    status: ExecutionStatus::Finished {
+                        exitcode: failure_exit_code(exit_code),
+                    },
+                    timing,
+                    execution_kind,
+                    outputs,
+                    command_execution,
+                }
+            }
             CommandExecutionStatus::Cancelled {
                 execution_kind: _,
                 reason,
@@ -3209,6 +3255,7 @@ mod tests {
                 NoopLivelinessObserver::create(),
                 false,
                 false,
+                &[],
             ),
         )
         .await
