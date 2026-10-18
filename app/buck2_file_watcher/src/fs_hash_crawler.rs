@@ -52,6 +52,7 @@ use dupe::Dupe;
 use crate::file_watcher::FileWatcher;
 use crate::file_watcher::FileWatcherImage;
 use crate::file_watcher::FileWatcherImageKind;
+use crate::file_watcher::IndexStat;
 use crate::file_watcher::ResumeInput;
 use crate::file_watcher::SuspendVcs;
 use crate::file_watcher::SyncOutcome;
@@ -254,6 +255,38 @@ impl FileStat {
     fn executable(&self) -> bool {
         self.mode & 0o111 != 0
     }
+
+    /// Whether this stat is the one git's index recorded: git's own test with
+    /// `core.checkStat=default` and `core.trustctime=true`, and the device as well, whatever
+    /// the repository configures. Seconds alone are compared when the index holds no
+    /// nanoseconds, as git does then.
+    #[cfg(unix)]
+    fn matches_index(&self, index: &IndexStat) -> bool {
+        let Some(modified) = self
+            .modified
+            .and_then(|m| m.duration_since(SystemTime::UNIX_EPOCH).ok())
+        else {
+            return false;
+        };
+        let mtime = (modified.as_secs() as u32, modified.subsec_nanos());
+        let ctime = (self.changed.0 as u32, self.changed.1 as u32);
+        let (mtime, ctime) = if index.mtime.1 == 0 && index.ctime.1 == 0 {
+            ((mtime.0, 0), (ctime.0, 0))
+        } else {
+            (mtime, ctime)
+        };
+        mtime == index.mtime
+            && ctime == index.ctime
+            && self.dev as u32 == index.dev
+            && self.ino as u32 == index.ino
+            && self.len as u32 == index.size
+            && self.executable() == index.executable
+    }
+
+    #[cfg(not(unix))]
+    fn matches_index(&self, _index: &IndexStat) -> bool {
+        false
+    }
 }
 
 /// A file's contents as a suspend read them.
@@ -410,8 +443,12 @@ impl ResumeScan {
 /// 2. On the machine that took the snapshot, an equal full stat (times, inode, device, mode)
 ///    of a file not racily clean is no change. Across machines no stat is comparable.
 /// 3. Git vouches for a file when the snapshot holds its git blob id (the suspend read exactly
-///    the commit's bytes), git tracks it now, neither `git diff` from that commit nor
-///    `git status` names it, and nothing makes a checkout differ from its blob.
+///    the commit's bytes), the index holds that blob at that path with the stat this scan
+///    took, the entry is not racily clean, and no setting or attribute lets its checkout differ
+///    from the blob. The stat is compared here rather than by `git status` or `git diff-files`,
+///    which hash every racily clean file one at a time: on a fresh clone of lab's tree, the
+///    19,335 files whose modification time fell in the second the index was written, which
+///    took git 217 to 325 s under I/O load.
 /// 4. A file whose contents, read after it was statted here and unmoved by the read, hash to
 ///    the snapshot's digest is no change.
 /// 5. Anything else is a change.
@@ -424,15 +461,18 @@ pub fn resume_scan(
     ignore_specs: &StdBuckHashMap<CellName, IgnoreSet>,
     input: ResumeInput<'_>,
 ) -> buck2_error::Result<ResumeScan> {
+    let started = std::time::Instant::now();
     let suspended = FsSnapshot::from_image(&input.image.snapshot, cells)?;
     let now = FsSnapshot::build(root, cells, ignore_specs)?;
+    let walked = started.elapsed();
     let vcs = (input.vcs)();
+    let asked = started.elapsed();
     let mut scan = suspended.resume_changes(now, root, cells, input.cross_host, vcs.as_ref())?;
     // Only the changes a sync would record count; ignored paths are dropped there.
     scan.events.sort();
     tracing::info!(
         "Resumed file watcher: {} paths changed; {} files by stat, {} vouched by git, {} hashed; \
-         git {}",
+         git {}; {:.2}s (stat walk {:.2}s, git {:.2}s, compare and hash {:.2}s)",
         scan.events.len(),
         scan.stat_equal,
         scan.vouched,
@@ -441,7 +481,11 @@ pub fn resume_scan(
             None => "not recorded",
             Some(v) if v.usable => "used",
             Some(_) => "unusable",
-        }
+        },
+        started.elapsed().as_secs_f64(),
+        walked.as_secs_f64(),
+        (asked - walked).as_secs_f64(),
+        (started.elapsed() - asked).as_secs_f64(),
     );
     Ok(scan)
 }
@@ -893,10 +937,10 @@ impl FsSnapshot {
                         continue;
                     };
                     let path = cells.resolve_path(*cell_path)?;
-                    if ids.git_blob.is_some()
-                        && let Some(vcs) = vcs
-                        && vcs.tracked.contains(&path)
-                        && !vcs.changed.contains(&path)
+                    if let (Some(blob), Some(vcs)) = (ids.git_blob, vcs)
+                        && vcs.clean.get(&path).is_some_and(|entry| {
+                            entry.blob == blob && cur.matches_index(&entry.stat)
+                        })
                     {
                         vouched += 1;
                         continue;
@@ -1296,7 +1340,6 @@ mod tests {
     mod resume {
         use std::collections::BTreeSet;
         use std::collections::HashMap;
-        use std::collections::HashSet;
         use std::os::unix::fs::PermissionsExt;
         use std::time::Duration;
         use std::time::SystemTime;
@@ -1316,11 +1359,14 @@ mod tests {
         use super::write_aged;
         use crate::file_watcher::FileWatcherImage;
         use crate::file_watcher::FileWatcherImageKind;
+        use crate::file_watcher::IndexEntry;
+        use crate::file_watcher::IndexStat;
         use crate::file_watcher::ResumeInput;
         use crate::file_watcher::VcsDelta;
         use crate::file_watcher::VcsImage;
         use crate::file_watcher::VcsTree;
         use crate::fs_hash_crawler::EntryImage;
+        use crate::fs_hash_crawler::FileStat;
         use crate::fs_hash_crawler::FsHashCrawler;
         use crate::fs_hash_crawler::FsSnapshot;
         use crate::fs_hash_crawler::ResumeScan;
@@ -1452,6 +1498,32 @@ mod tests {
 
         fn rel(path: &str) -> ProjectRelativePathBuf {
             ProjectRelativePath::new(path).unwrap().to_buf()
+        }
+
+        /// The index entry git would write for the file at `path` now, holding `blob`.
+        fn index_entry(fx: &Fixture, path: &str, blob: [u8; 20]) -> IndexEntry {
+            IndexEntry {
+                blob,
+                stat: index_stat(&FileStat::from_metadata(
+                    &std::fs::symlink_metadata(fx.path(path).as_path()).unwrap(),
+                )),
+            }
+        }
+
+        fn index_stat(stat: &FileStat) -> IndexStat {
+            let modified = stat
+                .modified
+                .unwrap()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap();
+            IndexStat {
+                ctime: (stat.changed.0 as u32, stat.changed.1 as u32),
+                mtime: (modified.as_secs() as u32, modified.subsec_nanos()),
+                dev: stat.dev as u32,
+                ino: stat.ino as u32,
+                size: stat.len as u32,
+                executable: stat.executable(),
+            }
         }
 
         /// Each file of `image`, and whether the suspend recorded a digest of its contents.
@@ -1678,8 +1750,8 @@ mod tests {
             Ok(())
         }
 
-        /// Git vouches for a file only when the suspend read exactly its commit's blob, git
-        /// tracks it now and calls it clean, and git is usable.
+        /// Git vouches for a file only when the suspend read exactly its commit's blob, the
+        /// index holds that same blob, git calls it clean, and git is usable.
         #[test]
         fn git_vouches_only_for_its_blob() -> buck2_error::Result<()> {
             let fx = Fixture::new()?;
@@ -1699,9 +1771,16 @@ mod tests {
                 ]),
             };
             let image = foreign(&fx.suspend(Some(tree()))?);
+            // `dirty` is one git does not vouch for; `other_blob`'s suspended bytes were not the
+            // commit's, so the snapshot holds no blob id to compare.
             let delta = |usable| VcsDelta {
-                tracked: HashSet::from([rel("clean"), rel("dirty"), rel("other_blob")]),
-                changed: HashSet::from([rel("dirty")]),
+                clean: HashMap::from([
+                    (rel("clean"), index_entry(&fx, "clean", git_blob("clean"))),
+                    (
+                        rel("other_blob"),
+                        index_entry(&fx, "other_blob", git_blob("not these bytes")),
+                    ),
+                ]),
                 usable,
             };
 
@@ -1710,6 +1789,29 @@ mod tests {
             assert_eq!((scan.vouched, scan.hashed), (1, 3));
 
             let scan = fx.scan(&image, true, || Some(delta(false)))?;
+            assert_eq!((scan.vouched, scan.hashed), (0, 4));
+
+            // The index holds another blob at `clean`: git vouches for the blob, not the path.
+            let scan = fx.scan(&image, true, || {
+                Some(VcsDelta {
+                    clean: HashMap::from([(
+                        rel("clean"),
+                        index_entry(&fx, "clean", git_blob("other")),
+                    )]),
+                    usable: true,
+                })
+            })?;
+            assert_eq!((scan.vouched, scan.hashed), (0, 4));
+
+            // The index recorded another stat: the file may have been rewritten since.
+            let mut stale = index_entry(&fx, "clean", git_blob("clean"));
+            stale.stat.mtime.1 ^= 1;
+            let scan = fx.scan(&image, true, || {
+                Some(VcsDelta {
+                    clean: HashMap::from([(rel("clean"), stale)]),
+                    usable: true,
+                })
+            })?;
             assert_eq!((scan.vouched, scan.hashed), (0, 4));
             Ok(())
         }
@@ -1732,8 +1834,10 @@ mod tests {
             let path = fx.path("file");
             let scan = fx.scan(&image, true, || {
                 let delta = VcsDelta {
-                    tracked: HashSet::from([rel("file")]),
-                    changed: HashSet::new(),
+                    clean: HashMap::from([(
+                        rel("file"),
+                        index_entry(&fx, "file", git_blob("aaaa")),
+                    )]),
                     usable: true,
                 };
                 // Step past a coarse change-time tick, then edit after git answered.
@@ -1749,6 +1853,63 @@ mod tests {
                 .map(|e| (e.cell_path.path().to_string(), e.event, e.kind))
                 .collect();
             assert_eq!(later, set(&[("file", M, F)]));
+            Ok(())
+        }
+
+        /// The index's stat matches only the same file unmoved: every field git compares, the
+        /// nanoseconds too unless the index holds none, as a git built without `USE_NSEC`
+        /// writes it.
+        #[test]
+        fn index_stat_matches_only_an_unmoved_file() -> buck2_error::Result<()> {
+            let fx = Fixture::new()?;
+            fx.aged("file", "aaaa")?;
+            let stat =
+                FileStat::from_metadata(&std::fs::symlink_metadata(fx.path("file").as_path())?);
+            let index = index_stat(&stat);
+            assert!(stat.matches_index(&index));
+            let moved = [
+                IndexStat {
+                    mtime: (index.mtime.0 + 1, index.mtime.1),
+                    ..index
+                },
+                IndexStat {
+                    mtime: (index.mtime.0, index.mtime.1 ^ 1),
+                    ..index
+                },
+                IndexStat {
+                    ctime: (index.ctime.0, index.ctime.1 ^ 1),
+                    ..index
+                },
+                IndexStat {
+                    ino: index.ino ^ 1,
+                    ..index
+                },
+                IndexStat {
+                    dev: index.dev ^ 1,
+                    ..index
+                },
+                IndexStat {
+                    size: index.size + 1,
+                    ..index
+                },
+                IndexStat {
+                    executable: !index.executable,
+                    ..index
+                },
+            ];
+            for other in moved {
+                assert!(!stat.matches_index(&other), "{other:?}");
+            }
+            let whole_seconds = IndexStat {
+                mtime: (index.mtime.0, 0),
+                ctime: (index.ctime.0, 0),
+                ..index
+            };
+            assert!(stat.matches_index(&whole_seconds));
+            assert!(!stat.matches_index(&IndexStat {
+                mtime: (index.mtime.0 - 1, 0),
+                ..whole_seconds
+            }));
             Ok(())
         }
 

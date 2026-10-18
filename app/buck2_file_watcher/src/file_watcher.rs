@@ -9,7 +9,6 @@
  */
 
 use std::collections::HashMap;
-use std::collections::HashSet;
 use std::sync::Arc;
 
 use allocative::Allocative;
@@ -128,17 +127,39 @@ pub struct VcsTree {
 /// not in a git repository git can read.
 pub type SuspendVcs<'a> = Box<dyn FnOnce() -> Option<VcsTree> + Send + 'a>;
 
-/// What git says changed between the suspend image's commit and the files now. A path git may
-/// vouch for is in `tracked` and not in `changed`, and only while `usable`.
+/// What git vouches for at resume: the regular files whose bytes on disk are a blob git names,
+/// read after the watcher has statted the files. A file the suspend read is unchanged when the
+/// blob id here is the one it read and the file's stat is the one the index recorded, so the
+/// suspended commit need not be in the clone.
 #[derive(Clone, Debug, Default)]
 pub struct VcsDelta {
-    /// `git ls-files`: what the index tracks now.
-    pub tracked: HashSet<ProjectRelativePathBuf>,
-    /// `git diff --name-only <suspended head> HEAD`, and every path `git status` reports.
-    pub changed: HashSet<ProjectRelativePathBuf>,
-    /// False when any git call failed, or when a setting or attribute lets a checkout's bytes
-    /// differ from its blob's; then git vouches for nothing.
+    /// The index entry of every tracked regular file, minus each one git does not look at
+    /// (assume-unchanged, skip-worktree), whose checkout an attribute may convert, or that is
+    /// racily clean (modified no earlier than the index was written).
+    pub clean: HashMap<ProjectRelativePathBuf, IndexEntry>,
+    /// False when any git call failed, or a setting converts every checkout; then git vouches
+    /// for nothing.
     pub usable: bool,
+}
+
+/// A file as git's index records it: the blob, and the stat git took when it last found the
+/// file's bytes to be that blob.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct IndexEntry {
+    pub blob: [u8; 20],
+    pub stat: IndexStat,
+}
+
+/// The stat fields git's index keeps, each truncated to 32 bits as the index stores them.
+/// A git built without `USE_NSEC` stores zero nanoseconds, and then compares whole seconds.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct IndexStat {
+    pub ctime: (u32, u32),
+    pub mtime: (u32, u32),
+    pub dev: u32,
+    pub ino: u32,
+    pub size: u32,
+    pub executable: bool,
 }
 
 /// What a resumed daemon's watcher compares its files with.

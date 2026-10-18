@@ -19,6 +19,8 @@ use buck2_core::fs::project_rel_path::ProjectRelativePath;
 use buck2_core::fs::project_rel_path::ProjectRelativePathBuf;
 use buck2_error::ErrorTag;
 use buck2_error::buck2_error;
+use buck2_file_watcher::file_watcher::IndexEntry;
+use buck2_file_watcher::file_watcher::IndexStat;
 use buck2_file_watcher::file_watcher::VcsDelta;
 use buck2_file_watcher::file_watcher::VcsImage;
 use buck2_file_watcher::file_watcher::VcsTree;
@@ -26,8 +28,17 @@ use buck2_fs::paths::abs_norm_path::AbsNormPath;
 
 use crate::git::run_git_blocking;
 
-/// The attributes that let a checked-out file's bytes differ from its blob's.
-const CONVERSION_ATTRIBUTES: &[&str] = &["filter", "eol", "ident", "working-tree-encoding"];
+/// The attributes that let a checked-out file's bytes differ from its blob's. `text` (and `crlf`,
+/// its old name) normalises line endings when git hashes a file, so a file with CRLF on disk
+/// and LF in its blob is clean to git.
+const CONVERSION_ATTRIBUTES: &[&str] = &[
+    "filter",
+    "eol",
+    "text",
+    "crlf",
+    "ident",
+    "working-tree-encoding",
+];
 
 /// The commit checked out now and the blob id of every regular file it holds under the project,
 /// read after a suspend has read the files. `None` when git cannot say, which leaves a resume
@@ -85,9 +96,15 @@ fn suspend_tree_inner(root: &AbsNormPath) -> buck2_error::Result<VcsTree> {
     })
 }
 
-/// What git says changed since `image`'s commit, called by a resuming watcher after it has
-/// statted the files. Not usable, so that git vouches for nothing, when any git call fails or
-/// when anything lets git call a file clean whose bytes are not its blob's.
+/// The files git vouches for now, called by a resuming watcher after it has statted the files.
+/// Not usable, so that git vouches for nothing, when any git call fails or a setting converts
+/// every checkout. A file git cannot vouch for on its own (one git does not look at, one an
+/// attribute may convert, or one racily clean) is left out, and the resume hashes it, as it
+/// hashes a file whose stat is not the one the index recorded.
+///
+/// The index's blob ids are compared with the ones the suspend read, so the suspended commit
+/// need not be in the clone: a shallow clone, or one fetched without the suspended commit,
+/// still has git's help. No git command here reads a file's contents.
 pub(crate) fn resume_delta(root: &AbsNormPath, image: &VcsImage) -> VcsDelta {
     match resume_delta_inner(root, image) {
         Ok(delta) => delta,
@@ -121,104 +138,164 @@ fn resume_delta_inner(root: &AbsNormPath, image: &VcsImage) -> buck2_error::Resu
         }
     }
 
-    let listing = run_git_blocking(root, &["ls-files", "-z", "-v", "--full-name"], None)?;
-    let mut tracked = HashSet::new();
-    let mut paths_input = Vec::new();
-    for record in records(&listing) {
-        // `<tag> SP <path>`; a lowercase tag is assume-unchanged and `S` skip-worktree, for
-        // both of which `git status` does not look at the file.
-        let (Some(tag), Some(path)) = (record.chars().next(), record.get(2..)) else {
+    // The index's modification time, read before the index itself: an entry the index got
+    // after this read has a modification time no earlier, so it counts as racily clean.
+    let index_path = text(run_git_blocking(
+        root,
+        &["rev-parse", "--path-format=absolute", "--git-path", "index"],
+        None,
+    )?)?;
+    let index_path = index_path.trim_end_matches('\n');
+    // A split index keeps most entries in a shared file written at another time than the
+    // index, so the index's modification time does not tell which of them are racily clean.
+    let index_dir = std::path::Path::new(index_path).parent().ok_or_else(|| {
+        buck2_error!(ErrorTag::Input, "the index `{index_path}` has no directory")
+    })?;
+    let split = std::fs::read_dir(index_dir)
+        .map_err(|e| {
+            buck2_error!(
+                ErrorTag::Input,
+                "`{}` cannot be listed: {e}",
+                index_dir.display()
+            )
+        })?
+        .filter_map(|entry| entry.ok())
+        .any(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with("sharedindex.")
+        });
+    if split {
+        return Err(buck2_error!(
+            ErrorTag::Input,
+            "the index is split (`core.splitIndex`)"
+        ));
+    }
+    let index_written = std::fs::metadata(index_path)
+        .and_then(|m| m.modified())
+        .map_err(|e| buck2_error!(ErrorTag::Input, "the index cannot be statted: {e}"))?
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|e| buck2_error!(ErrorTag::Input, "the index predates 1970: {e}"))?
+        .as_secs() as u32;
+
+    // The attributes are asked for beside the listing, of a listing of their own; an entry the
+    // attribute pass did not see, should the index change between the two, is not vouched for.
+    let (listing, attributes) = std::thread::scope(|scope| {
+        let attributes = scope.spawn(|| conversions(root));
+        let listing = run_git_blocking(
+            root,
+            &["ls-files", "-z", "-v", "-s", "--debug", "--full-name"],
+            None,
+        );
+        (listing, attributes.join())
+    });
+    let listing = listing?;
+    let (checked, converts) =
+        attributes.map_err(|_| buck2_error!(ErrorTag::Tier0, "the attribute check panicked"))??;
+    let mut clean = HashMap::new();
+    let mut hidden = 0;
+    let mut racy = 0;
+    let mut converted = 0;
+    for (record, stat) in index_records(&listing)? {
+        // `<tag> SP <mode> SP <object> SP <stage> TAB <path>`; a lowercase tag is
+        // assume-unchanged and `S` skip-worktree, for both of which git stops keeping the
+        // entry in step with the file. A file system monitor's marks do not matter: the stat is
+        // compared here, not by git.
+        let Some((meta, path)) = record.split_once('\t') else {
             continue;
         };
-        if tag.is_ascii_lowercase() || tag == 'S' {
-            return Err(buck2_error!(
-                ErrorTag::Input,
-                "`{path}` is marked assume-unchanged or skip-worktree"
-            ));
+        let mut meta = meta.split(' ');
+        let (Some(tag), Some(mode), Some(object), Some(stage)) =
+            (meta.next(), meta.next(), meta.next(), meta.next())
+        else {
+            continue;
+        };
+        if tag.chars().any(|c| c.is_ascii_lowercase()) || tag == "S" {
+            hidden += 1;
+            continue;
         }
-        if let Some(path) = project_path(&prefix, path) {
-            paths_input.extend_from_slice(path.as_str().as_bytes());
-            paths_input.push(0);
-            tracked.insert(path);
+        if stage != "0" || !(mode == "100644" || mode == "100755") {
+            continue;
         }
-    }
-
-    // `git status` converts a file it rehashes by the attributes of the working tree, which an
-    // uncommitted `.gitattributes` changes; the commits' attributes are checked as well.
-    for source in [None, Some("HEAD"), Some(image.head.as_str())] {
-        let mut args = vec!["check-attr", "-z", "--stdin"];
-        if let Some(source) = source {
-            args.extend_from_slice(&["--source", source]);
+        // Racily clean: written in the second the index was, or later, so a rewrite of the same
+        // size in that second leaves the stat git recorded. git compares such a file's
+        // contents; the resume hashes it. Whole seconds, as a git built without `USE_NSEC`
+        // compares them.
+        if stat.mtime.0 >= index_written {
+            racy += 1;
+            continue;
         }
-        args.extend_from_slice(CONVERSION_ATTRIBUTES);
-        let attributes = run_git_blocking(root, &args, Some(paths_input.clone()))?;
-        let fields: Vec<&str> = records(&attributes).collect();
-        for triple in fields.chunks(3) {
-            if let [path, attribute, value] = triple
-                && *value != "unspecified"
-                && *value != "unset"
-            {
-                return Err(buck2_error!(
-                    ErrorTag::Input,
-                    "`{path}` has `{attribute}: {value}` at {}",
-                    source.unwrap_or("the working tree")
-                ));
+        if let (Some(path), Some(blob)) = (project_path(&prefix, path), sha1_id(object)) {
+            if !checked.contains(&path) || converts.contains(&path) {
+                converted += 1;
+                continue;
             }
+            clean.insert(
+                path,
+                IndexEntry {
+                    blob,
+                    stat: IndexStat {
+                        executable: mode == "100755",
+                        ..stat
+                    },
+                },
+            );
         }
     }
 
-    let mut changed = HashSet::new();
-    let diff = run_git_blocking(
-        root,
-        &[
-            "-c",
-            "diff.relative=false",
-            "diff",
-            "--name-only",
-            "-z",
-            "--no-renames",
-            "--no-ext-diff",
-            &image.head,
-            "HEAD",
-            "--",
-        ],
-        None,
-    )?;
-    changed.extend(records(&diff).filter_map(|path| project_path(&prefix, path)));
-    // A file system monitor or untracked cache answers from its own state; read the files.
-    // `core.trustctime=false` or `core.checkStat=minimal` lets a same-size rewrite that puts
-    // the modification time back pass as clean, since only the change time moved.
-    let status = run_git_blocking(
-        root,
-        &[
-            "-c",
-            "core.fsmonitor=false",
-            "-c",
-            "core.untrackedCache=false",
-            "-c",
-            "core.trustctime=true",
-            "-c",
-            "core.checkStat=default",
-            "status",
-            "--porcelain=v1",
-            "-z",
-            "--untracked-files=all",
-            "--no-renames",
-            "--ignore-submodules=none",
-        ],
-        None,
-    )?;
-    // `XY SP <path>`, the path relative to the repository's top level.
-    changed.extend(
-        records(&status)
-            .filter_map(|record| record.get(3..))
-            .filter_map(|path| project_path(&prefix, path)),
+    tracing::info!(
+        "Resume: git vouches for {} files whose stat is unchanged; hashes {} an attribute may \
+         convert ({}), {} racily clean and {} git does not look at",
+        clean.len(),
+        converted,
+        CONVERSION_ATTRIBUTES.join(", "),
+        racy,
+        hidden,
     );
     Ok(VcsDelta {
-        tracked,
-        changed,
+        clean,
         usable: true,
     })
+}
+
+/// The tracked files under the project, and those of them whose checkout an attribute may
+/// convert, as paths from the project.
+///
+/// A file whose stat moved since the index recorded it is hashed by the resume, so no git
+/// command rehashes it. A file whose stat did not move is clean to git; that leaves the
+/// conversions, which let git call a file clean whose bytes are not the blob's: git applies the
+/// attributes it checks files in with, the working tree's `.gitattributes` over the index's,
+/// which `check-attr` without `--source` reads. Attributes of the commits do not matter: the
+/// suspend kept a blob id only for bytes that hash to it, and the index's blob is compared with
+/// it directly.
+fn conversions(
+    root: &AbsNormPath,
+) -> buck2_error::Result<(
+    HashSet<ProjectRelativePathBuf>,
+    HashSet<ProjectRelativePathBuf>,
+)> {
+    // Without `--full-name`, paths are relative to the project, as `check-attr` reads them.
+    let paths = run_git_blocking(root, &["ls-files", "-z"], None)?;
+    let attributes = run_git_blocking(
+        root,
+        &[&["check-attr", "-z", "--stdin"][..], CONVERSION_ATTRIBUTES].concat(),
+        Some(paths.clone()),
+    )?;
+    let checked = records(&paths)
+        .filter_map(|path| project_path("", path))
+        .collect();
+    let fields: Vec<&str> = records(&attributes).collect();
+    let converts = fields
+        .chunks(3)
+        .filter_map(|triple| match triple {
+            [path, _attribute, value] if *value != "unspecified" && *value != "unset" => {
+                project_path("", path)
+            }
+            _ => None,
+        })
+        .collect();
+    Ok((checked, converts))
 }
 
 fn toplevel_to_project(root: &AbsNormPath) -> buck2_error::Result<String> {
@@ -243,6 +320,74 @@ fn records(output: &[u8]) -> impl Iterator<Item = &str> {
         .split(|b| *b == 0)
         .filter(|record| !record.is_empty())
         .filter_map(|record| std::str::from_utf8(record).ok())
+}
+
+/// The records of `git ls-files -z --debug`: each is a NUL-terminated `-s` record followed by
+/// five newline-terminated lines of the stat the index keeps,
+/// `  ctime: S:N`, `  mtime: S:N`, `  dev: D<TAB>ino: I`, `  uid: U<TAB>gid: G`,
+/// `  size: Z<TAB>flags: F`. A record whose path is not utf8 is skipped.
+fn index_records(output: &[u8]) -> buck2_error::Result<Vec<(&str, IndexStat)>> {
+    fn malformed() -> buck2_error::Error {
+        buck2_error!(
+            ErrorTag::Input,
+            "`git ls-files --debug` printed a malformed record"
+        )
+    }
+    /// `<key>: <number>` at the start of `field`, and what follows the number.
+    fn number<'a>(field: &'a [u8], key: &[u8]) -> Option<(u32, &'a [u8])> {
+        let rest = field.strip_prefix(key)?.strip_prefix(b": ")?;
+        let end = rest
+            .iter()
+            .position(|b| !b.is_ascii_digit())
+            .unwrap_or(rest.len());
+        let value = std::str::from_utf8(&rest[..end]).ok()?.parse().ok()?;
+        Some((value, &rest[end..]))
+    }
+    fn time(line: &[u8], key: &[u8]) -> Option<(u32, u32)> {
+        let (sec, rest) = number(line, key)?;
+        let rest = rest.strip_prefix(b":")?;
+        let nsec = std::str::from_utf8(rest).ok()?.parse().ok()?;
+        Some((sec, nsec))
+    }
+    fn pair(line: &[u8], first: &[u8], second: &[u8]) -> Option<(u32, u32)> {
+        let (a, rest) = number(line, first)?;
+        let (b, _) = number(rest.strip_prefix(b"\t")?, second)?;
+        Some((a, b))
+    }
+    let mut out = Vec::new();
+    let mut rest = output;
+    while !rest.is_empty() {
+        let end = rest.iter().position(|b| *b == 0).ok_or_else(malformed)?;
+        let record = std::str::from_utf8(&rest[..end]).ok();
+        rest = &rest[end + 1..];
+        let mut lines = [&b""[..]; 5];
+        for line in &mut lines {
+            let end = rest
+                .iter()
+                .position(|b| *b == b'\n')
+                .ok_or_else(malformed)?;
+            *line = rest[..end].trim_ascii_start();
+            rest = &rest[end + 1..];
+        }
+        let parsed = (|| {
+            let (dev, ino) = pair(lines[2], b"dev", b"ino")?;
+            // The flags that follow are hexadecimal, and not needed.
+            let (size, _) = number(lines[4], b"size")?;
+            Some(IndexStat {
+                ctime: time(lines[0], b"ctime")?,
+                mtime: time(lines[1], b"mtime")?,
+                dev,
+                ino,
+                size,
+                executable: false,
+            })
+        })();
+        let stat = parsed.ok_or_else(malformed)?;
+        if let Some(record) = record {
+            out.push((record, stat));
+        }
+    }
+    Ok(out)
 }
 
 /// A path relative to the repository's top level, relative to the project instead, or `None`
@@ -378,8 +523,16 @@ mod tests {
         }
 
         /// Moves the repository aside and clones it, `args` given, into the same path: a
-        /// fresh runner's checkout, where every file has a new inode.
+        /// fresh runner's checkout, where every file has a new inode. The checkout is aged and
+        /// the index refreshed, as one made long before the resume, so no entry is racily
+        /// clean; [`Self::reclone_raw`] leaves it as the clone wrote it.
         fn reclone(&self, args: &[&str]) {
+            self.reclone_raw(args);
+            self.age_all();
+            self.git(&["update-index", "-q", "--refresh"]);
+        }
+
+        fn reclone_raw(&self, args: &[&str]) {
             let aside = self.tempdir.path().join("aside");
             drop(std::fs::remove_dir_all(&aside));
             std::fs::rename(self.dir(), &aside).unwrap();
@@ -483,7 +636,9 @@ mod tests {
         assert_eq!(image.vcs.as_ref().unwrap().head, a);
 
         repo.reclone(&[]);
-        repo.write("edit", "after!");
+        // Not aged: written in the second the reclone refreshed the index, an aged rewrite of
+        // the same size would look unchanged to a git that compares whole seconds.
+        std::fs::write(repo.dir().join("edit"), "after!").unwrap();
         repo.write("added", "new");
         std::fs::remove_file(repo.dir().join("del")).unwrap();
         std::fs::rename(repo.dir().join("d/ren_old"), repo.dir().join("d/ren_new")).unwrap();
@@ -512,7 +667,8 @@ mod tests {
     }
 
     /// An edit written back to the suspended bytes, with a new modification time, is no change,
-    /// with git and without.
+    /// with git and without. Its stat no longer matches the index, so git names it and the hash
+    /// finds the suspended bytes.
     #[tokio::test(flavor = "multi_thread")]
     async fn aba_after_suspend_is_no_change() {
         let repo = Repo::new();
@@ -526,7 +682,7 @@ mod tests {
 
         let scan = repo.scan_git(&image);
         assert_eq!(events(&scan), Events::new());
-        assert_eq!((scan.stat_equal, scan.vouched, scan.hashed), (1, 1, 0));
+        assert_eq!((scan.stat_equal, scan.vouched, scan.hashed), (1, 0, 1));
         let scan = repo.scan(&image, || None);
         assert_eq!(events(&scan), Events::new());
         assert_eq!((scan.stat_equal, scan.hashed), (1, 1));
@@ -570,8 +726,8 @@ mod tests {
         assert_eq!(scan.vouched, 1);
     }
 
-    /// An edit after the files were statted and before `git status` is dirty to git; one after
-    /// `git status` moves the stat the watcher's next sync compares with.
+    /// An edit after the files were statted and before git compares them is dirty to git; one
+    /// after moves the stat the watcher's next sync compares with.
     #[tokio::test(flavor = "multi_thread")]
     async fn edits_racing_git() {
         let repo = Repo::new();
@@ -592,7 +748,16 @@ mod tests {
         });
         assert_eq!(events(&scan), set(&[("f", M)]));
 
-        repo.write("f", "aaaa");
+        // Two hours old, a time no earlier write gave it, so git sees the stat move and records
+        // the new one; the index is written now, so the entry is not racily clean.
+        std::fs::write(&f, "aaaa").unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&f)
+            .unwrap()
+            .set_modified(SystemTime::now() - Duration::from_secs(7200))
+            .unwrap();
+        repo.git(&["update-index", "-q", "--refresh"]);
         let scan = repo.scan(&image, || {
             let delta = resume_delta(repo.root.root(), &head);
             std::thread::sleep(Duration::from_millis(20));
@@ -625,64 +790,185 @@ mod tests {
         assert_eq!((scan.stat_equal, scan.vouched, scan.hashed), (0, 4, 0));
     }
 
-    /// A shallow clone that lacks the suspended commit: git is unusable, and the scan is the
-    /// one without git.
+    /// A shallow clone that lacks the suspended commit, as a CI checkout of the PR's commit at
+    /// depth 1: the index's blob ids are compared with the suspended ones, so git still vouches
+    /// for the unchanged file, and the changed one is hashed and reported.
     #[tokio::test(flavor = "multi_thread")]
-    async fn shallow_clone_without_the_suspended_commit_hashes() {
+    async fn shallow_clone_without_the_suspended_commit_still_uses_git() {
+        let repo = Repo::new();
+        repo.write("a", "a");
+        repo.write("b", "b");
+        let a = repo.commit("A");
+        repo.age_all();
+        let image = repo.suspend(&repo.crawler()).await;
+        repo.write("b", "B!");
+        repo.commit("B");
+        repo.reclone(&["--depth", "1"]);
+        let commit = format!("{a}^{{commit}}");
+        assert!(run_git_blocking(repo.root.root(), &["cat-file", "-e", &commit], None).is_err());
+
+        assert!(repo.delta(&image).usable);
+        let with_git = repo.scan_git(&image);
+        let without = repo.scan(&image, || None);
+        assert_eq!(events(&with_git), set(&[("b", M)]));
+        assert_eq!(events(&with_git), events(&without));
+        // `b`'s size moved, which is a change before any hash.
+        assert_eq!((with_git.vouched, with_git.hashed), (1, 0));
+        assert_eq!((without.vouched, without.hashed), (0, 1));
+    }
+
+    /// Settings that convert every checkout make git unusable. A file git does not look at, or
+    /// one an attribute may convert, is left to the hash, and git vouches for the rest.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn conversions_and_hidden_files_are_hashed() {
+        let repo = Repo::new();
+        repo.write("a.txt", "a");
+        repo.write("b", "b");
+        repo.commit("A");
+        let image = repo.suspend(&repo.crawler()).await;
+        let clean = |repo: &Repo| -> Option<BTreeSet<String>> {
+            let delta = repo.delta(&image);
+            delta
+                .usable
+                .then(|| delta.clean.keys().map(|p| p.to_string()).collect())
+        };
+        assert_eq!(clean(&repo), Some(lines("a.txt\nb")));
+
+        repo.git(&["config", "core.autocrlf", "true"]);
+        assert_eq!(clean(&repo), None);
+        repo.git(&["config", "core.autocrlf", "false"]);
+        assert_eq!(clean(&repo), Some(lines("a.txt\nb")));
+
+        repo.git(&["config", "core.eol", "crlf"]);
+        assert_eq!(clean(&repo), None);
+        repo.git(&["config", "--unset", "core.eol"]);
+
+        repo.git(&["update-index", "--skip-worktree", "b"]);
+        assert_eq!(clean(&repo), Some(lines("a.txt")));
+        repo.git(&["update-index", "--no-skip-worktree", "b"]);
+
+        repo.git(&["update-index", "--assume-unchanged", "b"]);
+        assert_eq!(clean(&repo), Some(lines("a.txt")));
+        repo.git(&["update-index", "--no-assume-unchanged", "b"]);
+        assert_eq!(clean(&repo), Some(lines("a.txt\nb")));
+
+        // Uncommitted, in the working tree only: git applies it all the same. The
+        // `.gitattributes` file itself is untracked, then committed and clean.
+        for attributes in [
+            "*.txt filter=fake",
+            "*.txt eol=lf",
+            "*.txt text=auto",
+            "*.txt ident",
+        ] {
+            repo.write(".gitattributes", &format!("{attributes}\n"));
+            assert_eq!(clean(&repo), Some(lines("b")), "{attributes}");
+        }
+        repo.commit("attributes");
+        assert_eq!(clean(&repo), Some(lines(".gitattributes\nb")));
+    }
+
+    /// Lab's tree: one vendored directory's `.gitattributes` sets `eol=lf`. Only the files it
+    /// matches are hashed; git vouches for every other file.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_vendored_gitattributes_hashes_only_its_own_files() {
+        let repo = Repo::new();
+        repo.write("vendor/winio/.gitattributes", "* text=auto eol=lf\n");
+        repo.write("vendor/winio/pipe.go", "package winio\n");
+        repo.write("vendor/winio/sub/file.go", "package sub\n");
+        repo.write("vendor/other/x.go", "package other\n");
+        repo.write("src/main.rs", "fn main() {}\n");
+        repo.write("README", "readme\n");
+        repo.commit("A");
+        repo.age_all();
+        let image = repo.suspend(&repo.crawler()).await;
+        repo.reclone(&[]);
+        let scan = repo.scan_git(&image);
+        assert_eq!(events(&scan), Events::new());
+        assert_eq!((scan.vouched, scan.hashed), (3, 3));
+    }
+
+    /// A clean filter that maps different bytes of the same size to the blob: once the index has
+    /// been refreshed, git calls the edited file clean, so git must not vouch for it, and the
+    /// hash reports it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_file_a_filter_makes_clean_to_git_is_reported() {
+        let repo = Repo::new();
+        repo.write(".gitattributes", "*.txt filter=lower\n");
+        repo.write("f.txt", "abc\n");
+        repo.write("g", "g");
+        repo.commit("A");
+        repo.age_all();
+        let image = repo.suspend(&repo.crawler()).await;
+        repo.reclone(&[]);
+        repo.git(&["config", "filter.lower.clean", "tr A-Z a-z"]);
+        let f = repo.dir().join("f.txt");
+        std::fs::write(&f, "ABC\n").unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&f)
+            .unwrap()
+            .set_modified(SystemTime::now() - Duration::from_secs(7200))
+            .unwrap();
+        // A refresh hashes the edit through the filter, finds the blob, and records the new stat.
+        repo.git(&["update-index", "-q", "--refresh"]);
+        assert_eq!(
+            repo.git(&["diff-files", "--name-only"]),
+            "",
+            "git calls the edit clean"
+        );
+        let scan = repo.scan_git(&image);
+        assert_eq!(events(&scan), set(&[("f.txt", M)]));
+        // `g` and `.gitattributes`.
+        assert_eq!((scan.vouched, scan.hashed), (2, 1));
+    }
+
+    /// The resume compares the index's blob with the suspended one: a commit that changes a file
+    /// to a blob of the same size is no file git vouches for.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_same_size_change_in_a_new_commit_is_reported() {
+        let repo = Repo::new();
+        repo.write("f", "aaaa");
+        repo.write("g", "gggg");
+        repo.commit("A");
+        repo.age_all();
+        let image = repo.suspend(&repo.crawler()).await;
+        // Not aged: the index's stat for `f` is an hour old, so `git add` sees the edit.
+        std::fs::write(repo.dir().join("f"), "bbbb").unwrap();
+        repo.commit("B");
+        repo.reclone(&[]);
+        let delta = repo.delta(&image);
+        assert!(delta.usable);
+        let f = ProjectRelativePath::new("f").unwrap().to_buf();
+        assert!(delta.clean.contains_key(&f), "the index tracks f at B");
+        let scan = repo.scan_git(&image);
+        assert_eq!(events(&scan), set(&[("f", M)]));
+        assert_eq!((scan.vouched, scan.hashed), (1, 1));
+    }
+
+    /// Outside a git repository, or with a broken index, git vouches for nothing and the scan is
+    /// the one without git.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn git_errors_make_git_unusable() {
         let repo = Repo::new();
         repo.write("a", "a");
         repo.write("b", "b");
         repo.commit("A");
         repo.age_all();
         let image = repo.suspend(&repo.crawler()).await;
-        repo.write("b", "B!");
-        repo.commit("B");
-        repo.reclone(&["--depth", "1"]);
+        repo.reclone(&[]);
+        repo.write("b", "B");
 
+        std::fs::write(repo.dir().join(".git/index"), "not an index").unwrap();
         assert!(!repo.delta(&image).usable);
-        let with_git = repo.scan_git(&image);
-        let without = repo.scan(&image, || None);
-        assert_eq!(events(&with_git), set(&[("b", M)]));
-        assert_eq!(events(&with_git), events(&without));
-        assert_eq!((with_git.vouched, with_git.hashed), (0, 1));
-    }
+        let broken = repo.scan_git(&image);
+        assert_eq!(events(&broken), set(&[("b", M)]));
+        assert_eq!((broken.vouched, broken.hashed), (0, 2));
 
-    /// Settings and attributes that let a checkout's bytes differ from its blob's, and a file
-    /// git does not look at, each make git unusable.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn conversions_and_hidden_files_make_git_unusable() {
-        let repo = Repo::new();
-        repo.write("a.txt", "a");
-        repo.write("b", "b");
-        repo.commit("A");
-        let image = repo.suspend(&repo.crawler()).await;
-        assert!(repo.delta(&image).usable);
-
-        repo.git(&["config", "core.autocrlf", "true"]);
+        std::fs::remove_dir_all(repo.dir().join(".git")).unwrap();
         assert!(!repo.delta(&image).usable);
-        repo.git(&["config", "core.autocrlf", "false"]);
-        assert!(repo.delta(&image).usable);
-
-        repo.git(&["config", "core.eol", "crlf"]);
-        assert!(!repo.delta(&image).usable);
-        repo.git(&["config", "--unset", "core.eol"]);
-        assert!(repo.delta(&image).usable);
-
-        repo.git(&["update-index", "--skip-worktree", "b"]);
-        assert!(!repo.delta(&image).usable);
-        repo.git(&["update-index", "--no-skip-worktree", "b"]);
-        assert!(repo.delta(&image).usable);
-
-        repo.git(&["update-index", "--assume-unchanged", "b"]);
-        assert!(!repo.delta(&image).usable);
-        repo.git(&["update-index", "--no-assume-unchanged", "b"]);
-        assert!(repo.delta(&image).usable);
-
-        // Uncommitted, in the working tree only: `git status` applies it all the same.
-        repo.write(".gitattributes", "*.txt filter=fake\n");
-        assert!(!repo.delta(&image).usable);
-        repo.commit("attributes");
-        assert!(!repo.delta(&image).usable);
+        let none = repo.scan_git(&image);
+        assert_eq!(events(&none), set(&[("b", M)]));
+        assert_eq!((none.vouched, none.hashed), (0, 2));
     }
 
     /// A same-size rewrite in place that puts the modification time back leaves only the change
@@ -699,8 +985,7 @@ mod tests {
             let image = repo.suspend(&repo.crawler()).await;
             repo.reclone(&[]);
             repo.age_all();
-            // The index records the aged stat. `git status` would not write it here: these
-            // calls run with optional locks off.
+            // The index records the aged stat, so only the rewrite below can move it.
             repo.git(&["update-index", "-q", "--refresh"]);
             repo.git(&["config", setting.0, setting.1]);
             let f = repo.dir().join("f");
@@ -719,17 +1004,68 @@ mod tests {
         }
     }
 
-    /// An attribute the suspended commit set and HEAD no longer does still makes git unusable:
-    /// the files the suspend read were checked out under it.
+    /// An attribute only the suspended commit set does not stop git: the suspend kept a blob id
+    /// only for bytes that hash to it, and the index's blob is compared with it directly.
     #[tokio::test(flavor = "multi_thread")]
-    async fn an_attribute_of_the_suspended_commit_makes_git_unusable() {
+    async fn an_attribute_of_the_suspended_commit_alone_does_not_stop_git() {
         let repo = Repo::new();
         repo.write("a.txt", "a");
         repo.write(".gitattributes", "*.txt filter=fake\n");
         repo.commit("A");
+        repo.age_all();
         let image = repo.suspend(&repo.crawler()).await;
         std::fs::remove_file(repo.dir().join(".gitattributes")).unwrap();
         repo.commit("B");
+        repo.reclone(&[]);
+        let scan = repo.scan_git(&image);
+        assert_eq!(events(&scan), set(&[(".gitattributes", D)]));
+        assert_eq!((scan.vouched, scan.hashed), (1, 0));
+    }
+
+    /// A fresh clone's files written no earlier than its index are racily clean: git vouches
+    /// for none of them, whatever their stat, and the resume hashes them.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn racily_clean_entries_are_hashed() {
+        let repo = Repo::new();
+        for name in ["a", "b", "c/d"] {
+            repo.write(name, name);
+        }
+        repo.commit("A");
+        repo.age_all();
+        let image = repo.suspend(&repo.crawler()).await;
+        repo.reclone_raw(&[]);
+        // The index's time put back past every file's: each entry is written no earlier.
+        let index = repo.dir().join(".git/index");
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&index)
+            .unwrap()
+            .set_modified(SystemTime::now() - Duration::from_secs(7200))
+            .unwrap();
+        let delta = repo.delta(&image);
+        assert!(delta.usable);
+        assert_eq!(delta.clean.len(), 0);
+        let scan = repo.scan_git(&image);
+        assert_eq!(events(&scan), Events::new());
+        assert_eq!((scan.vouched, scan.hashed), (0, 3));
+
+        // Files an hour old, recorded by an index written now: the same entries are clean.
+        repo.age_all();
+        repo.git(&["update-index", "-q", "--refresh"]);
+        let scan = repo.scan_git(&image);
+        assert_eq!((scan.vouched, scan.hashed), (3, 0));
+    }
+
+    /// A split index keeps entries in a file written at another time than the index, so git
+    /// vouches for nothing.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_split_index_makes_git_unusable() {
+        let repo = Repo::new();
+        repo.write("a", "a");
+        repo.commit("A");
+        let image = repo.suspend(&repo.crawler()).await;
+        assert!(repo.delta(&image).usable);
+        repo.git(&["update-index", "--split-index"]);
         assert!(!repo.delta(&image).usable);
     }
 
@@ -754,10 +1090,9 @@ mod tests {
         repo.write("outside", "edited");
         let delta = resume_delta(sub.root(), &tree.image);
         assert!(delta.usable);
-        let tracked: BTreeSet<String> = delta.tracked.iter().map(|p| p.to_string()).collect();
-        assert_eq!(tracked, lines("inside\nd/f"));
-        let changed: BTreeSet<String> = delta.changed.iter().map(|p| p.to_string()).collect();
-        assert_eq!(changed, lines("inside"));
+        // `inside`'s new stat is the scan's to compare; git holds the entry, not the edit.
+        let clean: BTreeSet<String> = delta.clean.keys().map(|p| p.to_string()).collect();
+        assert_eq!(clean, lines("inside\nd/f"));
 
         let at_top = VcsImage {
             toplevel_to_project: String::new(),
