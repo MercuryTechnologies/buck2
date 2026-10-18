@@ -11,6 +11,19 @@
 //! What git tells a suspend and a resume about the checkout, so that a resume on a fresh clone
 //! need not read every file. Git only ever narrows the files a resume reads: whenever its
 //! answer could be wrong, it vouches for nothing, and the resume compares contents instead.
+//!
+//! One known limit. A file's stat in the index was recorded when git last wrote the file, under
+//! the attributes of that checkout, and the resume sees only the attributes in HEAD, the index
+//! and the working tree. An attribute that applied at an earlier checkout and is gone from all
+//! three can let git vouch for converted bytes: check out C, whose `.gitattributes` gives
+//! `*.txt filter=upper`, so that `f.txt` is written upper-cased; then check out D, which has no
+//! `.gitattributes` and the same blob for `f.txt`, so git keeps the file and its stat. The index
+//! now says `f.txt` is its blob, unconverted, and the resume believes it, as `git status` does.
+//! A conversion that changes the size is still caught by the stat; a filter that keeps it is
+//! not. A fresh clone of a single commit, which is
+//! what a CI runner resuming an image checks out, has no earlier checkout and cannot reach this;
+//! a runner that reuses one checkout across commits whose attributes differ can, and should
+//! clone afresh.
 
 use std::collections::HashMap;
 use std::collections::HashSet;
