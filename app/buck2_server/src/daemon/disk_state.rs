@@ -51,14 +51,7 @@ pub struct DiskStateOptions {
     pub host_identity: Option<String>,
 }
 
-/// What stands for this machine in the on-disk state: `hydration.host_identity` when it is set,
-/// the hostname otherwise, and empty when neither is known.
-pub(crate) fn host_identity(startup_config: &DaemonStartupConfig) -> String {
-    match &startup_config.startup_options.host_identity {
-        Some(identity) => identity.clone(),
-        None => buck2_events::metadata::hostname().unwrap_or_default(),
-    }
-}
+pub(crate) use buck2_common::suspend_image::host_identity;
 
 impl DiskStateOptions {
     pub fn new(

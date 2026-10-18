@@ -23,8 +23,10 @@
 //!   before it reads anything else, and creates every member at its length before any data;
 //! - one `DATA` record per chunk of a member: `chunk_size` bytes at `chunk * chunk_size`, the last
 //!   chunk of a member shorter. An export writes them in member and chunk order. The MANIFEST's
-//!   come first, and an import reads and checks it before anything after it; the rest it takes in
-//!   any order;
+//!   come first, and an import reads it before anything after it and checks the binary, the host
+//!   identity, the user and the system (`buck2_common::suspend_image::check_head`) against what
+//!   the daemon it is about to start would see, so a bundle for another machine is refused having
+//!   read a few KB rather than gigabytes; the rest it takes in any order;
 //! - `END`, the [`BundleDigests`]: the blake3 of `HEAD`, and each member's digest over the blake3
 //!   of its chunks. Nothing may follow it.
 //!
@@ -55,11 +57,14 @@ use std::sync::mpsc;
 
 use buck2_common::suspend_image::DICE_STATE_DIR;
 use buck2_common::suspend_image::FORMAT;
+use buck2_common::suspend_image::HeadMismatch;
+use buck2_common::suspend_image::HeadObserved;
 use buck2_common::suspend_image::IMAGE;
 use buck2_common::suspend_image::IMAGE_DIR;
 use buck2_common::suspend_image::MAGIC;
 use buck2_common::suspend_image::MANIFEST;
 use buck2_common::suspend_image::ManifestHead;
+use buck2_common::suspend_image::check_head;
 use buck2_error::BuckErrorContext;
 use buck2_error::ErrorTag;
 use buck2_error::buck2_error;
@@ -637,6 +642,8 @@ pub(crate) enum ImportError {
         bundle: String,
         this: String,
     },
+    /// The MANIFEST names another binary, host identity, user or system than this machine's.
+    Refused(HeadMismatch),
     /// A member whose path no bundle has: absolute, `..`, or a name outside the image; or a
     /// record for a member `HEAD` does not list.
     BadMember(String),
@@ -671,8 +678,10 @@ impl std::fmt::Display for ImportError {
             }
             ImportError::OtherBinary { bundle, this } => write!(
                 f,
-                "the bundle was written by another buck2 binary (blake3 {bundle}, this one is {this})"
+                "{} (blake3 {bundle} wrote the bundle, this one is {this})",
+                HeadMismatch::Binary
             ),
+            ImportError::Refused(mismatch) => write!(f, "{mismatch}"),
             ImportError::BadMember(p) => write!(f, "member `{p}` has no place in a bundle"),
             ImportError::Duplicate(p) => write!(f, "`{p}` appears twice"),
             ImportError::AfterTrailer(p) => write!(f, "{p} follows `{END}`"),
@@ -889,8 +898,10 @@ fn read_json<R: Read, T: for<'de> Deserialize<'de>>(
 
 /// Unpacks a bundle into `cache_dir`, replacing any image there, and returns what it installed.
 ///
-/// `exe` is the blake3 of the binary the daemon will run, and `running_daemon` the pid of a
-/// daemon that is up for this checkout, if any: both are refused before anything is read.
+/// `here` is what the daemon about to start will check the MANIFEST against, and
+/// `running_daemon` the pid of a daemon that is up for this checkout, if any. A running daemon
+/// is refused before anything is read, and a MANIFEST that does not match `here` before
+/// anything after it is.
 /// Everything is unpacked into a directory of its own and checked against `END` first; only
 /// then does the old image go and the new one move in, the MANIFEST last, so an import that
 /// fails or is killed at any point leaves either the old image or no MANIFEST, and the next start
@@ -901,7 +912,7 @@ fn read_json<R: Read, T: for<'de> Deserialize<'de>>(
 pub(crate) fn import(
     source: &BundleSource,
     cache_dir: &Path,
-    exe: &str,
+    here: &HeadObserved,
     running_daemon: Option<u32>,
 ) -> Result<ImportSummary, ImportError> {
     if let Some(pid) = running_daemon {
@@ -915,7 +926,7 @@ pub(crate) fn import(
             import_from(
                 BufReader::with_capacity(1 << 20, file),
                 cache_dir,
-                exe,
+                here,
                 threads,
                 &mut |_| Ok(()),
             )
@@ -923,7 +934,7 @@ pub(crate) fn import(
         BundleSource::Stdin => import_from(
             BufReader::with_capacity(1 << 20, io::stdin().lock()),
             cache_dir,
-            exe,
+            here,
             threads,
             &mut |_| Ok(()),
         ),
@@ -943,7 +954,7 @@ type InstallHook<'a> = dyn FnMut(InstallStep) -> io::Result<()> + 'a;
 fn import_from<R: Read>(
     mut input: R,
     cache_dir: &Path,
-    exe: &str,
+    here: &HeadObserved,
     threads: usize,
     hook: &mut InstallHook<'_>,
 ) -> Result<ImportSummary, ImportError> {
@@ -958,9 +969,9 @@ fn import_from<R: Read>(
         None => return Err(ImportError::NotABundle("it holds no records".to_owned())),
     };
     let (head_json, header): (_, BundleHeader) = read_json(&mut input, &head, HEAD)?;
-    check_header(&header, exe)?;
+    check_header(&header, &here.exe)?;
     let head_digest = blake3::hash(&head_json).to_hex().to_string();
-    let manifest = read_manifest(&mut input, &header)?;
+    let manifest = read_manifest(&mut input, &header, here)?;
 
     std::fs::create_dir_all(cache_dir)
         .map_err(io_err(|| format!("Creating `{}`", cache_dir.display())))?;
@@ -997,11 +1008,14 @@ struct EarlyMember {
     chunks: Vec<[u8; 32]>,
 }
 
-/// Reads the MANIFEST's records, which follow `HEAD`, and checks the MANIFEST against `HEAD`:
-/// what an import can refuse having read a few KB rather than gigabytes.
+/// Reads the MANIFEST's records, which follow `HEAD`, and checks the MANIFEST against `HEAD` and
+/// against `here`, the daemon about to start: what an import can refuse having read a few KB
+/// rather than gigabytes. The daemon checks the MANIFEST again when it starts; this check only
+/// refuses earlier, with the daemon's reason.
 fn read_manifest<R: Read>(
     input: &mut R,
     header: &BundleHeader,
+    here: &HeadObserved,
 ) -> Result<EarlyMember, ImportError> {
     let manifest_rel = format!("{IMAGE_DIR}/{MANIFEST}");
     let not_first = || {
@@ -1048,6 +1062,7 @@ fn read_manifest<R: Read>(
             manifest.magic, manifest.format, manifest.exe, header.image_format, header.exe
         )));
     }
+    check_head(&manifest, here).map_err(ImportError::Refused)?;
     Ok(EarlyMember {
         member: i as u32,
         data,
@@ -1371,6 +1386,9 @@ mod tests {
     use super::*;
 
     const EXE: &str = "e1e1";
+    const IDENTITY: &str = "img-1";
+    const SYSTEM: &str = "arch=x86_64;os=linux;sw=/nix/store/7il4-system-path";
+    const UID: u32 = 1;
     /// Small enough that the fixture's members span several chunks, the last one short.
     const TEST_CHUNK: u64 = 64 << 10;
 
@@ -1396,8 +1414,10 @@ mod tests {
             "exe": EXE,
             "created_at_ms": 1000 + seed as u64,
             "portable": true,
+            "host_identity": IDENTITY,
+            "system": SYSTEM,
             "hostname": "h",
-            "uid": 1,
+            "uid": UID,
         });
         std::fs::write(
             image_dir.join(MANIFEST),
@@ -1450,12 +1470,34 @@ mod tests {
         }
     }
 
+    /// The machine the fixture's images were suspended on, as an importing machine sees itself.
+    fn here() -> HeadObserved {
+        HeadObserved {
+            exe: EXE.to_owned(),
+            host_identity: IDENTITY.to_owned(),
+            system: SYSTEM.to_owned(),
+            uid: UID,
+        }
+    }
+
+    fn running(exe: &str) -> HeadObserved {
+        HeadObserved {
+            exe: exe.to_owned(),
+            ..here()
+        }
+    }
+
     fn import_file(
         bundle: &Path,
         cache_dir: &Path,
         exe: &str,
     ) -> Result<ImportSummary, ImportError> {
-        import(&BundleSource::File(bundle.to_owned()), cache_dir, exe, None)
+        import(
+            &BundleSource::File(bundle.to_owned()),
+            cache_dir,
+            &running(exe),
+            None,
+        )
     }
 
     /// One record, its frame decoded.
@@ -1537,8 +1579,12 @@ mod tests {
 
     /// Imports `f.bundle` into `f.dst` and expects a refusal that leaves `f.dst` as it was.
     fn refused(f: &Fixture, exe: &str) -> ImportError {
+        refused_by(f, &running(exe))
+    }
+
+    fn refused_by(f: &Fixture, here: &HeadObserved) -> ImportError {
         let before = snapshot(&f.dst);
-        let err = import_file(&f.bundle, &f.dst, exe).unwrap_err();
+        let err = import(&BundleSource::File(f.bundle.clone()), &f.dst, here, None).unwrap_err();
         assert_eq!(
             snapshot(&f.dst),
             before,
@@ -1585,7 +1631,7 @@ mod tests {
         for threads in [1, 2, 16] {
             let dst = f.dst.parent().unwrap().join(format!("t{threads}/cache"));
             let input = Trickle(File::open(&f.bundle).unwrap(), 0);
-            let summary = import_from(input, &dst, EXE, threads, &mut |_| Ok(())).unwrap();
+            let summary = import_from(input, &dst, &here(), threads, &mut |_| Ok(())).unwrap();
             assert_eq!(summary.threads, threads);
             assert_eq!(snapshot(&dst), snapshot(&f.src), "{threads} threads");
         }
@@ -1796,7 +1842,7 @@ mod tests {
         for keep in [len / 4, len / 2, len - 30] {
             let before = snapshot(&f.dst);
             let input = Dies(File::open(&f.bundle).unwrap(), keep);
-            let err = import_from(input, &f.dst, EXE, 4, &mut |_| Ok(())).unwrap_err();
+            let err = import_from(input, &f.dst, &here(), 4, &mut |_| Ok(())).unwrap_err();
             assert!(matches!(err, ImportError::Io { .. }), "{keep}: {err}");
             assert_eq!(snapshot(&f.dst), before);
             let left: Vec<_> = std::fs::read_dir(&f.dst)
@@ -1893,6 +1939,52 @@ mod tests {
         let f = fixture();
         cut_after_the_manifest(&f);
         assert!(matches!(refused(&f, EXE), ImportError::Damaged(_)));
+    }
+
+    #[test]
+    fn another_identity_is_refused_reading_only_the_manifest() {
+        let f = fixture();
+        cut_after_the_manifest(&f);
+        // The same machine reads on and finds the damage...
+        let err = refused_by(&f, &here());
+        assert!(matches!(err, ImportError::Damaged(_)), "{err}");
+        // ...another refuses before it.
+        let other = HeadObserved {
+            host_identity: "img-2".to_owned(),
+            ..here()
+        };
+        let err = refused_by(&f, &other);
+        assert!(
+            matches!(err, ImportError::Refused(HeadMismatch::HostIdentity)),
+            "{err}"
+        );
+        // With the reason text the daemon gives.
+        assert_eq!(
+            buck2_error::Error::from(err).to_string(),
+            format!(
+                "Not importing the suspend bundle: {}",
+                buck2_common::suspend_image::reason::HOST_IDENTITY
+            )
+        );
+    }
+
+    #[test]
+    fn another_system_or_user_is_refused_reading_only_the_manifest() {
+        let f = fixture();
+        cut_after_the_manifest(&f);
+        let toolchain_changed = HeadObserved {
+            system: "arch=x86_64;os=linux;sw=/nix/store/9zzz-system-path".to_owned(),
+            ..here()
+        };
+        assert!(matches!(
+            refused_by(&f, &toolchain_changed),
+            ImportError::Refused(HeadMismatch::System)
+        ));
+        let other_user = HeadObserved { uid: 0, ..here() };
+        assert!(matches!(
+            refused_by(&f, &other_user),
+            ImportError::Refused(HeadMismatch::User)
+        ));
     }
 
     #[test]
@@ -2159,7 +2251,7 @@ mod tests {
         let err = import(
             &BundleSource::File(f.bundle.clone()),
             &f.dst,
-            EXE,
+            &here(),
             Some(4242),
         )
         .unwrap_err();
@@ -2176,7 +2268,7 @@ mod tests {
         ] {
             let f = fixture();
             let input = File::open(&f.bundle).unwrap();
-            let err = import_from(input, &f.dst, EXE, 4, &mut |s| {
+            let err = import_from(input, &f.dst, &here(), 4, &mut |s| {
                 if s == fail_at {
                     Err(io::Error::other("injected"))
                 } else {
