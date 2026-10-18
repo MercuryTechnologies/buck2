@@ -106,7 +106,13 @@ fn suspend_tree_inner(root: &AbsNormPath) -> buck2_error::Result<VcsTree> {
 /// need not be in the clone: a shallow clone, or one fetched without the suspended commit,
 /// still has git's help. No git command here reads a file's contents.
 pub(crate) fn resume_delta(root: &AbsNormPath, image: &VcsImage) -> VcsDelta {
-    match resume_delta_inner(root, image) {
+    resume_delta_racing(root, image, || {})
+}
+
+/// [`resume_delta`], with `during` run after the index is first statted and before git reads
+/// it, where a test puts a concurrent write of the index.
+fn resume_delta_racing(root: &AbsNormPath, image: &VcsImage, during: impl FnOnce()) -> VcsDelta {
+    match resume_delta_inner(root, image, during) {
         Ok(delta) => delta,
         Err(e) => {
             tracing::info!("Resume does not use git, and hashes instead: {e:#}");
@@ -115,7 +121,11 @@ pub(crate) fn resume_delta(root: &AbsNormPath, image: &VcsImage) -> VcsDelta {
     }
 }
 
-fn resume_delta_inner(root: &AbsNormPath, image: &VcsImage) -> buck2_error::Result<VcsDelta> {
+fn resume_delta_inner(
+    root: &AbsNormPath,
+    image: &VcsImage,
+    during: impl FnOnce(),
+) -> buck2_error::Result<VcsDelta> {
     let prefix = toplevel_to_project(root)?;
     if prefix != image.toplevel_to_project {
         return Err(buck2_error!(
@@ -172,12 +182,13 @@ fn resume_delta_inner(root: &AbsNormPath, image: &VcsImage) -> buck2_error::Resu
             "the index is split (`core.splitIndex`)"
         ));
     }
-    let index_written = std::fs::metadata(index_path)
-        .and_then(|m| m.modified())
-        .map_err(|e| buck2_error!(ErrorTag::Input, "the index cannot be statted: {e}"))?
+    let index_before = IndexStamp::of(std::path::Path::new(index_path))?;
+    let index_written = index_before
+        .modified
         .duration_since(std::time::UNIX_EPOCH)
         .map_err(|e| buck2_error!(ErrorTag::Input, "the index predates 1970: {e}"))?
         .as_secs() as u32;
+    during();
 
     // The index's `.gitattributes` must be HEAD's, the ones the checkout converted files with,
     // for `check-attr --cached` to stand for them: one staged since would hide a conversion the
@@ -215,6 +226,18 @@ fn resume_delta_inner(root: &AbsNormPath, image: &VcsImage) -> buck2_error::Resu
     let listing = listing?;
     let (checked, converts) =
         attributes.map_err(|_| buck2_error!(ErrorTag::Tier0, "the attribute check panicked"))??;
+    // The racy rule holds only for the index whose time was read above. A write of the index
+    // since, by a git command running beside the resume, would leave the listing describing an
+    // index of another time (one copied back with an older time makes entries look settled
+    // that are not), so git vouches for nothing. git writes an index to `index.lock` and
+    // renames it, so any write moves the inode as well as the time or size.
+    let index_after = IndexStamp::of(std::path::Path::new(index_path))?;
+    if index_after != index_before {
+        return Err(buck2_error!(
+            ErrorTag::Input,
+            "the index changed while git read it ({index_before:?} then {index_after:?})"
+        ));
+    }
     let mut clean = HashMap::new();
     let mut hidden = 0;
     let mut racy = 0;
@@ -279,6 +302,34 @@ fn resume_delta_inner(root: &AbsNormPath, image: &VcsImage) -> buck2_error::Resu
         clean,
         usable: true,
     })
+}
+
+/// What a write of the index changes, compared before and after git reads it.
+#[derive(Debug, PartialEq, Eq)]
+struct IndexStamp {
+    modified: std::time::SystemTime,
+    size: u64,
+    /// Device, inode and ctime, where the platform has them.
+    #[cfg(unix)]
+    identity: (u64, u64, i64, i64),
+}
+
+impl IndexStamp {
+    fn of(path: &std::path::Path) -> buck2_error::Result<Self> {
+        let meta = std::fs::metadata(path)
+            .map_err(|e| buck2_error!(ErrorTag::Input, "the index cannot be statted: {e}"))?;
+        Ok(Self {
+            modified: meta
+                .modified()
+                .map_err(|e| buck2_error!(ErrorTag::Input, "the index has no mtime: {e}"))?,
+            size: meta.len(),
+            #[cfg(unix)]
+            identity: {
+                use std::os::unix::fs::MetadataExt;
+                (meta.dev(), meta.ino(), meta.ctime(), meta.ctime_nsec())
+            },
+        })
+    }
 }
 
 /// The tracked files under the project, and those of them whose checkout an attribute may
@@ -1089,6 +1140,66 @@ mod tests {
         repo.git(&["update-index", "-q", "--refresh"]);
         let scan = repo.scan_git(&image);
         assert_eq!((scan.vouched, scan.hashed), (3, 0));
+    }
+
+    /// The racy rule reads the index's time before git lists the index; an index written in
+    /// between (a `git add` beside the resume, an index put back with an older time, or one
+    /// replaced by a copy of itself) leaves the listing describing another index than the one
+    /// statted, so git vouches for nothing and the resume hashes every file.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_index_written_while_git_reads_it_makes_git_unusable() {
+        let repo = Repo::new();
+        for name in ["a", "b", "c/d"] {
+            repo.write(name, name);
+        }
+        repo.commit("A");
+        repo.age_all();
+        let image = repo.suspend(&repo.crawler()).await;
+        repo.reclone(&[]);
+        let head = image.vcs.clone().unwrap();
+        let index = repo.dir().join(".git/index");
+
+        let untouched = resume_delta_racing(repo.root.root(), &head, || {});
+        assert!(untouched.usable);
+        assert_eq!(untouched.clean.len(), 3);
+
+        let added = resume_delta_racing(repo.root.root(), &head, || {
+            repo.write("e", "e");
+            repo.git(&["add", "e"]);
+        });
+        assert!(!added.usable, "an index written by `git add` was used");
+        assert!(added.clean.is_empty());
+
+        let older = resume_delta_racing(repo.root.root(), &head, || {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(&index)
+                .unwrap()
+                .set_modified(SystemTime::now() - Duration::from_secs(7200))
+                .unwrap();
+        });
+        assert!(!older.usable, "an index whose time went back was used");
+
+        let replaced = resume_delta_racing(repo.root.root(), &head, || {
+            let copy = repo.dir().join(".git/index.copy");
+            std::fs::copy(&index, &copy).unwrap();
+            let modified = std::fs::metadata(&index).unwrap().modified().unwrap();
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(&copy)
+                .unwrap()
+                .set_modified(modified)
+                .unwrap();
+            std::fs::rename(&copy, &index).unwrap();
+        });
+        assert!(
+            !replaced.usable,
+            "an index replaced by a copy with the same time and size was used"
+        );
+
+        // Nothing writing the index: git's help is back.
+        let settled = resume_delta_racing(repo.root.root(), &head, || {});
+        assert!(settled.usable);
     }
 
     /// A clone whose checkout a smudge filter converted (to upper case, the same size), its
