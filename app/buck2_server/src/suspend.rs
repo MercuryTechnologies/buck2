@@ -748,8 +748,6 @@ impl LoadedImage {
             .await
             .map_err(|e| RestoreError::Cold(format!("unreadable list of local actions: {e:#}")))?;
         let t = Instant::now();
-        // The graph's rows are read on a task of their own: both reads block their thread in
-        // sqlite, so on one task they would take turns.
         // `BUCK2_TEST_RESUME_GRAPH_ERROR` fails the read once it has read everything, as a
         // damaged row the last read finds would, for a test to check that the refusal comes
         // before anything is installed.
@@ -759,7 +757,9 @@ impl LoadedImage {
             applicability = testing
         )
         .unwrap_or(false);
-        let graph_read = {
+        // The graph's rows are read on a task of their own: both reads block their thread in
+        // sqlite, so on one task they would take turns.
+        let graph_task = {
             let dice = dice.dupe();
             let bytes = self.dice_bytes.dupe();
             tokio::spawn(async move {
@@ -786,7 +786,7 @@ impl LoadedImage {
             resumed
         };
         let graph_read = async {
-            match graph_read.await {
+            match graph_task.await {
                 Ok((prepared, took)) => {
                     read_took = took;
                     prepared
