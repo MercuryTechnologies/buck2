@@ -693,11 +693,58 @@ impl TenantState {
             )
             .await?;
 
-        let (resume_outcome, resumed_image) = match resume_prep {
+        let dep_file_cache = create_dep_file_cache();
+
+        // A resumed graph's file reads are relative to the suspended watcher's baseline and
+        // snapshot. The resumed watcher compares the files with the image's snapshot while the
+        // graph is restored, since neither reads what the other writes; it is used only if the
+        // graph resumes too. Should the watcher fail to resume, a fresh one has a new baseline,
+        // which invalidates every file read the image carried: correct, if no faster than cold.
+        let (resume_outcome, resumed_watcher) = match resume_prep {
             ResumePrep::None => (ResumeOutcome::NoImage, None),
             ResumePrep::Refused(reason) => (ResumeOutcome::Cold { reason }, None),
             ResumePrep::Ready(image) => {
-                let outcome = match image.restore(&dice, root, &*materializer).await {
+                let image = Arc::new(image);
+                tracing::info!("Resuming the file watcher...");
+                let watcher_scan = tokio::task::spawn_blocking({
+                    let image = image.dupe();
+                    let project_root = paths.project_root().dupe();
+                    let root_config = root_config.dupe();
+                    let cells = cells.dupe();
+                    let ignore_specs = ignore_specs.clone();
+                    let dep_file_cache = dep_file_cache.dupe();
+                    move || {
+                        let start = std::time::Instant::now();
+                        let watcher = <dyn FileWatcher>::new(
+                            fb,
+                            &project_root,
+                            &root_config,
+                            cells,
+                            ignore_specs,
+                            dep_file_cache,
+                            Some(image.resume_input(&project_root)),
+                        );
+                        (watcher, start.elapsed())
+                    }
+                });
+                let restored = image.restore(&dice, root, &*materializer).await;
+                // Joined before anything is decided, so that a refused resume leaves no scan
+                // running beside the cold daemon.
+                let watcher = match watcher_scan.await {
+                    Ok((Ok(watcher), took)) => {
+                        tracing::info!("Resumed the file watcher in {:.3}s", took.as_secs_f64());
+                        Some(watcher)
+                    }
+                    Ok((Err(e), _)) => {
+                        tracing::warn!("Resuming the file watcher failed: {e:#}");
+                        None
+                    }
+                    Err(e) => {
+                        tracing::warn!("Resuming the file watcher failed: {e}");
+                        None
+                    }
+                };
+                let outcome = match restored {
                     Ok(restored) => ResumeOutcome::Resumed {
                         stats: restored.stats,
                         artifacts: restored.artifacts,
@@ -722,38 +769,12 @@ impl TenantState {
                 };
                 image.discard();
                 let resumed = outcome.is_resumed();
-                (outcome, resumed.then_some(image))
+                (outcome, watcher.filter(|_| resumed))
             }
         };
         tracing::info!("Suspended state: {}", resume_outcome.describe());
 
-        let dep_file_cache = create_dep_file_cache();
-
         tracing::info!("Creating file watcher...");
-        // A resumed graph's file reads are relative to the suspended watcher's baseline and
-        // snapshot. Should the watcher fail to resume, a fresh one has a new baseline, which
-        // invalidates every file read the image carried: correct, if no faster than cold.
-        let watcher_start = std::time::Instant::now();
-        let resumed_watcher = match &resumed_image {
-            Some(image) => <dyn FileWatcher>::new(
-                fb,
-                paths.project_root(),
-                root_config,
-                cells.dupe(),
-                ignore_specs.clone(),
-                dep_file_cache.dupe(),
-                Some(image.resume_input(paths.project_root())),
-            )
-            .inspect_err(|e| tracing::warn!("Resuming the file watcher failed: {e:#}"))
-            .inspect(|_| {
-                tracing::info!(
-                    "Resumed the file watcher in {:.3}s",
-                    watcher_start.elapsed().as_secs_f64()
-                )
-            })
-            .ok(),
-            None => None,
-        };
         let file_watcher = match resumed_watcher {
             Some(watcher) => watcher,
             None => <dyn FileWatcher>::new(
