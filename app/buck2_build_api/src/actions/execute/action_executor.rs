@@ -255,7 +255,11 @@ pub enum ActionExecutionKind {
 
     /// This action was served by the local action cache and not executed.
     #[display("local_action_cache")]
-    LocalActionCache,
+    LocalActionCache {
+        /// Whether the identical action whose outputs were served ran on this machine, rather
+        /// than remotely or in the remote action cache.
+        produced_locally: bool,
+    },
 }
 
 pub struct CommandExecutionRef<'a> {
@@ -293,7 +297,7 @@ impl ActionExecutionKind {
             ActionExecutionKind::Simple => buck2_data::ActionExecutionKind::Simple,
             ActionExecutionKind::Deferred => buck2_data::ActionExecutionKind::Deferred,
             ActionExecutionKind::LocalDepFile => buck2_data::ActionExecutionKind::LocalDepFile,
-            ActionExecutionKind::LocalActionCache => {
+            ActionExecutionKind::LocalActionCache { .. } => {
                 buck2_data::ActionExecutionKind::LocalActionCache
             }
         }
@@ -327,7 +331,10 @@ impl ActionExecutionKind {
                 scheduling_mode: *scheduling_mode.dupe(),
                 incremental_kind: *incremental_kind,
             }),
-            Self::Simple | Self::Deferred | Self::LocalDepFile | Self::LocalActionCache => None,
+            Self::Simple
+            | Self::Deferred
+            | Self::LocalDepFile
+            | Self::LocalActionCache { .. } => None,
         }
     }
 }

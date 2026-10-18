@@ -973,12 +973,12 @@ impl DepFileBundle {
             },
         )
         .await?;
-        let outputs = outputs.map(|o| {
+        let outputs = outputs.map(|(o, produced_locally)| {
             (
                 o,
                 ActionExecutionMetadata {
                     dep_file_db_writes_queued: 0,
-                    execution_kind: ActionExecutionKind::LocalActionCache,
+                    execution_kind: ActionExecutionKind::LocalActionCache { produced_locally },
                     timing: Default::default(),
                     input_files_bytes: None,
                     waiting_data: WaitingData::new(),
@@ -1224,7 +1224,9 @@ pub(crate) async fn match_if_identical_action(
     declared_outputs: &[BuildArtifact],
     declared_dep_files: &DeclaredDepFiles,
     stats: &mut DepFileLookupStats,
-) -> buck2_error::Result<(Option<ActionOutputs>, bool)> {
+) -> buck2_error::Result<(Option<(ActionOutputs, bool)>, bool)> {
+    // A hit comes with whether the served outputs were produced on this machine, which the entry
+    // records; see `LocalActions::executed_here`.
     // Every exit below is a miss unless it says otherwise, so the hit paths are the only ones that
     // have to remember to record anything. A failure is not one of them: the caller overwrites this
     // with `error` when the lookup returns `Err`.
@@ -1252,7 +1254,7 @@ pub(crate) async fn match_if_identical_action(
             if outputs_are_still_present_in_materializer(ctx, live).await? {
                 tracing::trace!("Dep files are a hit");
                 stats.hit_live();
-                return Ok((Some(live.dupe()), false));
+                return Ok((Some((live.dupe(), previous_state.was_produced_locally)), false));
             }
             // Outputs no longer present; not a hit. Don't evict -- we didn't fully check dep files.
             return Ok((None, false));
@@ -1291,7 +1293,7 @@ pub(crate) async fn match_if_identical_action(
             CrossConfigProbe::Hit(outputs) => {
                 tracing::trace!("Cross-configuration local action cache hit");
                 stats.hit_live();
-                return Ok((Some(outputs), false));
+                return Ok((Some((outputs, candidate.was_produced_locally)), false));
             }
             CrossConfigProbe::OutputsGone => return Ok((None, false)),
         }
@@ -1378,6 +1380,7 @@ pub(crate) async fn match_if_identical_action(
             {
                 CrossConfigProbe::NotHit => {}
                 CrossConfigProbe::Hit(outputs) => {
+                    let produced_locally = loaded.was_produced_locally;
                     promote_reloaded_entry(
                         ctx.dep_file_cache(),
                         &logical,
@@ -1388,7 +1391,7 @@ pub(crate) async fn match_if_identical_action(
                     tracing::trace!("Persisted local action cache hit");
                     store.note_persisted_hit();
                     stats.hit_persisted();
-                    return Ok((Some(outputs), false));
+                    return Ok((Some((outputs, produced_locally)), false));
                 }
                 CrossConfigProbe::OutputsGone => return Ok((None, false)),
             }
