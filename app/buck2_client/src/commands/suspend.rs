@@ -33,7 +33,10 @@ use buck2_client_ctx::path_arg::PathArg;
 use buck2_client_ctx::startup_deadline::StartupDeadline;
 use buck2_client_ctx::streaming::StreamingCommand;
 use buck2_common::daemon_dir::DaemonDir;
+use buck2_common::suspend_image::HeadObserved;
 use buck2_common::suspend_image::exe_digest;
+use buck2_common::suspend_image::host_identity;
+use buck2_common::suspend_image::system_fingerprint;
 use buck2_error::ExitCode;
 use buck2_wrapper_common::kill::process_exists;
 
@@ -204,7 +207,10 @@ pub struct ResumeCommand {
 
     /// Before starting the daemon, unpack this bundle from `buck2 suspend --export`, or read it
     /// from standard input when FILE is `-`, so a download can stream into the import. Refused
-    /// while a daemon runs for this checkout, and for a bundle another buck2 binary wrote.
+    /// while a daemon runs for this checkout, and, having read only the bundle's MANIFEST and
+    /// starting no daemon, for a bundle another buck2 binary, host identity, user or system
+    /// wrote: the daemon would refuse it with the same reason. The daemon still checks
+    /// everything when it starts.
     #[clap(long, value_name = "FILE")]
     import: Option<PathArg>,
 }
@@ -246,6 +252,9 @@ impl StreamingCommand for ResumeCommand {
         .await?;
         let running = running_daemon(&daemon_dir)?;
         let cache_dir = paths.cache_dir_path();
+        // What the daemon this command starts will check the MANIFEST against: its identity
+        // comes from the startup config the client hands it.
+        let identity = host_identity(ctx.immediate_config.daemon_startup_config()?);
         let t = Instant::now();
         let summary = tokio::task::spawn_blocking({
             let source = source.clone();
@@ -255,7 +264,14 @@ impl StreamingCommand for ResumeCommand {
                     Some(_) => String::new(),
                     None => exe_digest(&get_daemon_exe()?)?,
                 };
-                Ok(bundle::import(&source, cache_dir.as_path(), &exe, running)?)
+                let here = HeadObserved {
+                    exe,
+                    host_identity: identity,
+                    system: system_fingerprint(),
+                    // SAFETY: getuid cannot fail.
+                    uid: unsafe { libc::getuid() },
+                };
+                Ok(bundle::import(&source, cache_dir.as_path(), &here, running)?)
             }
         })
         .await??;

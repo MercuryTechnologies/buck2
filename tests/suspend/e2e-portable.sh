@@ -9,7 +9,11 @@
 #    hostname (a UTS namespace) and the same identity, `buck2 resume --import --require` and a
 #    build. The targets that run must be exactly those whose inputs the range c0..c1 changes,
 #    plus the local action a portable resume dirties, and each output must equal a cold build's
-#    of c1 at the same path. The same bundle under another identity is refused.
+#    of c1 at the same path. The same bundle under another identity, under another system (a
+#    mount namespace whose /run/current-system/sw is another path: a toolchain change) and for
+#    another binary is refused by `resume --import` in under a second, having read only the
+#    MANIFEST, with no daemon started, even from a bundle padded to gigabytes; and a daemon given
+#    the image without the import's check (unpacked by hand) refuses it with the same reason.
 # 8. Crash points, each followed by a resume and a build whose outputs must equal the cold
 #    build's: kill -9 of the daemon at several points of a portable suspend (its CAS upload
 #    included); kill -9 of the client while it writes the bundle; kill -9 of the client while
@@ -20,13 +24,14 @@
 #
 # The RE buckconfig holds [buck2_re_client] (read only from config files) and is copied into
 # each checkout's untracked .buckconfig.d/. Every command runs under `timeout`, so a stuck daemon
-# shows as rc=124. Writes <workdir>/results/summary.tsv (one `ok` or `FAIL` line per check) and a
+# shows as rc=124. STOP_AFTER=t7 ends the run after test 7. Writes <workdir>/results/summary.tsv (one `ok` or `FAIL` line per check) and a
 # log per step, and exits non-zero if any check failed.
 set -uo pipefail
 B=$1; W=$2; RE_CONFIG=$3; WATCHER=${4:-fs_hash_crawler}
+RECORDS="python3 -I $(dirname "$(readlink -f "$0")")/bundle-records.py"
 RE_PROPERTIES=${RE_PROPERTIES:-'{"OSFamily": "Linux", "Arch": "amd64", "Pool": "usw2", "container-image": "docker://gcr.io/flame-public/rbe-ubuntu24-04@sha256:f7db0d4791247f032fdb4451b7c3ba90e567923a341cc6dc43abfc283436791a"}'}
 T=${TIMEOUT:-300}
-R=$W/results; P=$W/repo; SEED=$W/seed; BUNDLE=$W/image.tar.zst
+R=$W/results; P=$W/repo; SEED=$W/seed; BUNDLE=$W/image.bundle
 if mountpoint -q "$P/buck-out" 2>/dev/null; then sudo umount -l "$P/buck-out"; fi
 if mountpoint -q "$W/full" 2>/dev/null; then sudo umount -l "$W/full"; fi
 rm -rf "$W"; mkdir -p "$R" "$SEED"
@@ -233,14 +238,93 @@ outputs t7-cold-build "$W/out-cold"
 check "t7: the cold build wrote every output" test "$(ls "$W/out-cold" | wc -l)" -eq "$(echo $ALL | wc -w)"
 check "t7: every resumed output equals the cold build's" same_outputs "$W/out-t7-resumed-build"
 
-# The same bundle under another identity is refused.
+# The same bundle on a machine it is not for: refused at import, from the MANIFEST alone.
+# other_system cmd...: run with /run/current-system/sw resolving to another path, as after a
+# system switch, under hostname e2e-other-host.
+other_system=$W/other-system
+# A /run of its own, holding only current-system: its sw is another path, which keeps the real
+# system-path's bin so that PATH still finds every tool. Bind-mounted, so nothing need run between
+# the mount and the command, and nothing is added to the environment the daemon checks.
+rm -rf "$W/fake-run" "$W/fake-system" "$W/fake-system-path"
+mkdir -p "$W/fake-run" "$W/fake-system" "$W/fake-system-path"
+ln -s "$(readlink -f /run/current-system/sw)/bin" "$W/fake-system-path/bin"
+ln -s "$W/fake-system-path" "$W/fake-system/sw"
+ln -s "$W/fake-system" "$W/fake-run/current-system"
+cat > "$other_system" <<SH
+#!/usr/bin/env bash
+exec unshare --user --map-root-user --uts --mount sh -c \
+  'uid=\$0; gid=\$1; shift; hostname e2e-other-host && mount --bind "$W/fake-run" /run &&
+     exec unshare --user --map-user="\$uid" --map-group="\$gid" "\$@"' \
+  "\$(id -u)" "\$(id -g)" "\$@"
+SH
+chmod +x "$other_system"
+note "t7i: system here: $(readlink -f /run/current-system/sw 2>/dev/null || echo none); under other_system: $("$other_system" readlink -f /run/current-system/sw)"
+wall() { awk -F'\t' -v l="$1" '$1 == l { sub("wall=", "", $3); sub("s$", "", $3); print $3 }' "$R/summary.tsv" | tail -1; }
+under_a_second() { awk -v w="$(wall "$1")" 'BEGIN { exit !(w != "" && w < 1.0) }'; }
+no_daemon() { test -z "$(find_daemon)" && test ! -e "$DAEMON_DIR/buckd.info"; }
+refused_at_import() { # label, reason: the import refused for that reason, fast, leaving nothing
+  check "$1: refused at import: $2" grep -qF "Not importing the suspend bundle: $2" "$R/$1.log"
+  check "$1: in under a second ($(wall "$1")s)" under_a_second "$1"
+  check "$1: no daemon started" no_daemon
+  check "$1: no image installed" test ! -e "$P/buck-out/v2/cache/suspend/MANIFEST"
+}
+IDENTITY_REASON="the host identity differs from the suspended daemon's"
+SYSTEM_REASON="the system (architecture, OS, /run/current-system/sw) differs from the suspended daemon's"
 kill_daemon; rm -rf "$P/buck-out" "$DAEMON_DIR"
 sed -i 's/^host_identity = e2e-runner-image-1$/host_identity = e2e-runner-image-2/' .buckconfig
-step t7-other-identity "$other_host" "$B" resume --import "$BUNDLE"
-note "t7: other identity: $(resume_line t7-other-identity)"
-check "t7: another identity is refused, naming it" grep -q '^cold: the host identity differs' "$R/t7-other-identity.log"
-kill_daemon
+step t7i-other-identity "$other_host" "$B" resume --import "$BUNDLE"
+refused_at_import t7i-other-identity "$IDENTITY_REASON"
 git checkout -q .buckconfig
+rm -rf "$P/buck-out" "$DAEMON_DIR"
+step t7i-other-system "$other_system" "$B" resume --import "$BUNDLE"
+refused_at_import t7i-other-system "$SYSTEM_REASON"
+rm -rf "$P/buck-out" "$DAEMON_DIR"
+# The first command of a freshly written binary takes 1.7 to 3.5 s whatever it does (`--version`
+# included, 2026-10-18 on the workbox), so run one first: the step then times the refusal.
+cat "$B" > "$W/buck2-other"; printf 'x' >> "$W/buck2-other"; chmod +x "$W/buck2-other"
+t0=$(date +%s.%N); "$W/buck2-other" --version > /dev/null 2>&1
+note "t7i: the other binary's first command (--version) took $(echo "$(date +%s.%N) $t0" | awk '{printf "%.3f", $1-$2}')s"
+step t7i-other-binary "$other_host" "$W/buck2-other" resume --import "$BUNDLE"
+refused_at_import t7i-other-binary "the buck2 binary differs from the suspended daemon's"
+rm -f "$W/buck2-other"
+
+# The same refusal from a bundle of gigabytes: PAD_GB of random bytes right after the MANIFEST's
+# records, which a matching import reads past and refuses as damage.
+PAD=$W/padded.bundle
+if [ "${PAD_GB:-2}" -gt 0 ]; then
+  $RECORDS pad "$BUNDLE" "$PAD" "$(( ${PAD_GB:-2} << 30 ))"
+  note "t7i: padded bundle $(stat -c %s "$PAD") bytes"
+  kill_daemon; rm -rf "$P/buck-out" "$DAEMON_DIR"
+  sed -i 's/^host_identity = e2e-runner-image-1$/host_identity = e2e-runner-image-2/' .buckconfig
+  step t7i-padded-other-identity "$other_host" "$B" resume --import "$PAD"
+  refused_at_import t7i-padded-other-identity "$IDENTITY_REASON"
+  git checkout -q .buckconfig
+  rm -rf "$P/buck-out" "$DAEMON_DIR"
+  step t7i-padded-same-identity "$other_host" "$B" resume --import "$PAD"
+  note "t7i: the same padded bundle under the matching identity: rc=$? in $(wall t7i-padded-same-identity)s: $(grep -o 'Not importing[^"]*' "$R/t7i-padded-same-identity.log" | head -1)"
+  check "t7i: the matching import read past the MANIFEST and refused the bytes after it" grep -q 'Not importing the suspend bundle: the bundle is damaged' "$R/t7i-padded-same-identity.log"
+  kill_daemon; rm -f "$PAD"
+fi
+
+# The daemon's own check, for an image no import checked: unpacked by hand into the cache dir.
+unpack_by_hand() { rm -rf "$P/buck-out" "$DAEMON_DIR"; mkdir -p "$P/buck-out/v2/cache" && $RECORDS unpack "$BUNDLE" "$P/buck-out/v2/cache"; }
+unpack_by_hand
+sed -i 's/^host_identity = e2e-runner-image-1$/host_identity = e2e-runner-image-2/' .buckconfig
+step t7i-daemon-other-identity "$other_host" "$B" resume
+note "t7i: daemon, other identity: $(resume_line t7i-daemon-other-identity)"
+check "t7i: the daemon refuses another identity with the same reason" grep -q "^cold: $IDENTITY_REASON" "$R/t7i-daemon-other-identity.log"
+kill_daemon; git checkout -q .buckconfig
+unpack_by_hand
+step t7i-daemon-other-system "$other_system" "$B" resume
+note "t7i: daemon, other system: $(resume_line t7i-daemon-other-system)"
+check "t7i: the daemon refuses another system with the same reason" grep -qF "cold: $SYSTEM_REASON" "$R/t7i-daemon-other-system.log"
+kill_daemon
+unpack_by_hand
+step t7i-daemon-same "$other_host" "$B" resume --require
+note "t7i: daemon, same identity and system, another hostname: $(resume_line t7i-daemon-same)"
+check "t7i: the hand-unpacked image resumes under another hostname with the same identity" grep -q '^resumed:' "$R/t7i-daemon-same.log"
+kill_daemon
+if [ "${STOP_AFTER:-}" = t7 ]; then note "result fail=$fail $(date -u +%FT%TZ) (STOP_AFTER=t7)"; exit $fail; fi
 
 # ---- 8. crash points ---------------------------------------------------------------------------
 # Each starts from a warm daemon of c1 with GITHUB_SHA=sha-pr, so its outputs must equal the cold
