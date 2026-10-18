@@ -160,6 +160,39 @@ fn queue_depth() -> usize {
     static DEPTH: OnceLock<usize> = OnceLock::new();
     *DEPTH.get_or_init(|| parse_positive_env("BUCK2_PAGABLE_QUEUE_DEPTH", DEFAULT_QUEUE_DEPTH))
 }
+/// The bytes of its shard a reader maps rather than reading through sqlite's
+/// page cache; `BUCK2_PAGABLE_READER_MMAP_BYTES` overrides, 0 turns it off.
+///
+/// The bundled sqlite is built with `SQLITE_ENABLE_MEMORY_MANAGEMENT`, under
+/// which every connection's page cache is one group behind one mutex, so
+/// readers on separate connections still take turns: a bench resuming 1M key
+/// rows read them in 15.4 s with one reader, 14.2 s with four and 14.0 s with
+/// 32, and four connections per shard instead of two made it slower. A read
+/// from a mapped file takes no page from the cache: 9.4, 4.4 and 3.3 s. The
+/// default is sqlite's own cap, `SQLITE_MAX_MMAP_SIZE`, which it truncates
+/// larger values to; a shard past it reads its tail through the cache.
+/// <https://www.sqlite.org/mmap.html>
+const DEFAULT_READER_MMAP_BYTES: u64 = 0x7fff0000;
+
+fn reader_mmap_bytes() -> u64 {
+    static BYTES: OnceLock<u64> = OnceLock::new();
+    *BYTES.get_or_init(|| {
+        let var = "BUCK2_PAGABLE_READER_MMAP_BYTES";
+        let Some(raw) = env::var_os(var) else {
+            return DEFAULT_READER_MMAP_BYTES;
+        };
+        match raw.to_str().and_then(|v| v.parse::<u64>().ok()) {
+            Some(v) => v,
+            None => {
+                tracing::warn!(
+                    "ignoring {var}={raw:?}: not a non-negative integer; using default \
+                     {DEFAULT_READER_MMAP_BYTES}"
+                );
+                DEFAULT_READER_MMAP_BYTES
+            }
+        }
+    })
+}
 const INSERT_BATCH_ROWS: usize = 8;
 const INSERT_COLUMNS: usize = 3;
 const INSERT_SINGLE_SQL: &str =
@@ -328,6 +361,7 @@ impl ConnectionPool {
                     | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
             )?;
             Self::init_pragmas(&reader)?;
+            reader.execute_batch(&format!("PRAGMA mmap_size={};", reader_mmap_bytes()))?;
             reader.prepare_cached(FETCH_SQL)?;
             readers.push(Mutex::new(reader));
         }
@@ -1066,6 +1100,32 @@ mod tests {
             data: data.to_vec(),
             arcs,
         }
+    }
+
+    /// Every reader maps its shard, so that reads on separate connections do not
+    /// take turns on the page cache's mutex.
+    #[test]
+    fn readers_map_their_shard() -> anyhow::Result<()> {
+        let dir = TempStorageDir::new("reader_mmap")?;
+        let storage = SqliteBackedPagableStorage::try_new(&dir.path)?;
+        for shard in &storage.shards {
+            for reader in &shard.inner.conns.readers {
+                let mapped: i64 =
+                    reader
+                        .lock()
+                        .unwrap()
+                        .query_row("PRAGMA mmap_size", [], |row| row.get(0))?;
+                assert_eq!(mapped as u64, DEFAULT_READER_MMAP_BYTES);
+            }
+        }
+        // A row written and read back through a mapped reader is the row written.
+        let arcs = vec![DataKey::testing_new(3)];
+        let key = storage.store_data(pagable_data(b"mapped", arcs.clone()))?;
+        storage.flush()?;
+        let fetched = storage.fetch_data_read(&key)?;
+        assert_eq!(fetched.data, b"mapped");
+        assert_eq!(fetched.arcs, arcs);
+        Ok(())
     }
 
     #[test]
