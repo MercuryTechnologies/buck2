@@ -402,6 +402,27 @@ async fn an_image_cannot_be_restored_over_an_emptied_store() -> anyhow::Result<(
     Ok(())
 }
 
+/// A restore read in full and then dropped, as `buck2 resume` drops one when the materializer
+/// lost an artifact it read at the same time, installs nothing: the graph computes from scratch.
+#[tokio::test]
+async fn a_prepared_restore_installs_nothing_until_installed() -> anyhow::Result<()> {
+    let dir = tempdir()?;
+    let (dice, root) = open(&dir).await?;
+    inject(&dice, root, &initial_inputs()).await;
+    compute_all(&dice, root, &Computes::default()).await?;
+    let head = dice.head(root).await;
+    let image = dice.suspend_image(head).await?;
+    drop(dice);
+
+    let (resumed, root) = open(&dir).await?;
+    let prepared = resumed.prepare_restore(root, &image.bytes).await?;
+    drop(prepared);
+    inject(&resumed, root, &initial_inputs()).await;
+    let (_, ran) = compute_all(&resumed, root, &Computes::default()).await?;
+    assert!(ran.contains(&"Top".to_owned()), "ran: {ran:?}");
+    Ok(())
+}
+
 /// What a resumed graph computes survives the next suspend and resume, as what the first graph
 /// computed did.
 #[tokio::test]

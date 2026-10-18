@@ -546,15 +546,26 @@ impl Dice {
     }
 
     /// Replays an image [`Dice::suspend_image`] wrote onto `branch`, which must be a new root
-    /// nothing has been committed to, over the paging store the suspended process left.
-    ///
-    /// Everything is read before anything is installed, so an error leaves DICE as it was, and
-    /// the caller can start cold.
+    /// nothing has been committed to, over the paging store the suspended process left:
+    /// [`Dice::prepare_restore`], then [`Dice::install_restore`].
     pub async fn restore_image(
         self: &StdArc<Self>,
         branch: BranchId,
         bytes: &[u8],
     ) -> anyhow::Result<ResumeStats> {
+        let prepared = self.prepare_restore(branch, bytes).await?;
+        Ok(self.install_restore(prepared).await)
+    }
+
+    /// Reads everything an image names, its keys, asserted values and certificates, and
+    /// installs none of it, so an error, or a caller that drops the result, leaves DICE as it
+    /// was: the caller can start cold. Only interning the keys touches DICE, and an interned
+    /// key nothing refers to changes no computation.
+    pub async fn prepare_restore(
+        self: &StdArc<Self>,
+        branch: BranchId,
+        bytes: &[u8],
+    ) -> anyhow::Result<PreparedRestore> {
         let storage = self
             .pagable_storage
             .as_ref()
@@ -681,26 +692,45 @@ impl Dice {
                 mints.push((dice_keys[i], next));
             }
         }
-        let counts = self
-            .state_handle
-            .restore_head(RestoreHead {
+        Ok(PreparedRestore {
+            head: RestoreHead {
                 branch,
                 asserts,
                 certs,
                 dirtied,
                 mints,
-            })
-            .await;
-        lap("head", &mut timings);
-        Ok(ResumeStats {
+            },
             keys: image.keys.len(),
+            timings,
+        })
+    }
+
+    /// Installs what [`Dice::prepare_restore`] read as the head of its branch.
+    pub async fn install_restore(&self, prepared: PreparedRestore) -> ResumeStats {
+        let PreparedRestore {
+            head,
+            keys,
+            mut timings,
+        } = prepared;
+        let step = std::time::Instant::now();
+        let counts = self.state_handle.restore_head(head).await;
+        timings.push(("head", step.elapsed()));
+        ResumeStats {
+            keys,
             asserted: counts.asserted,
             certified: counts.certified,
             candidates: counts.candidates,
             dropped: counts.dropped,
             timings,
-        })
+        }
     }
+}
+
+/// An image [`Dice::prepare_restore`] read and checked against the store, not yet installed.
+pub struct PreparedRestore {
+    head: RestoreHead,
+    keys: usize,
+    timings: Vec<(&'static str, std::time::Duration)>,
 }
 
 impl Dice {
