@@ -192,9 +192,12 @@ async fn materialize_artifact_group(
 
         match buck2_util::future::try_join_all(materialize_futs).await {
             Ok(_) => {}
-            // A forced materialization whose blob the remote CAS no longer has asks for the actions
-            // that produced it to be rewound, and forgets that it queued these artifacts.
-            Err(error) if force && error.tags().contains(&ErrorTag::ReNotFound) => {
+            // A materialization whose blob the remote CAS no longer has asks for the actions that
+            // produced it to be rewound, and forgets that it queued these artifacts. This holds
+            // for the default materialization of requested outputs as for a forced one: a daemon
+            // resumed from an image hours old declares every output from the CAS, and without the
+            // rewind its first request for an expired one failed the build.
+            Err(error) if error.tags().contains(&ErrorTag::ReNotFound) => {
                 remove_materialization_queue_entries(&values, queue_tracker);
                 return Err(match materialization_rewind_request(&values) {
                     Some(request) => error.context(request),
