@@ -22,13 +22,15 @@
 //!   member's path and length. It comes first, so an import refuses a bundle from another binary
 //!   before it reads anything else, and creates every member at its length before any data;
 //! - one `DATA` record per chunk of a member: `chunk_size` bytes at `chunk * chunk_size`, the last
-//!   chunk of a member shorter. An export writes them in member and chunk order; an import takes
-//!   them in any order;
+//!   chunk of a member shorter. An export writes them in member and chunk order. The MANIFEST's
+//!   come first, and an import reads and checks it before anything after it; the rest it takes in
+//!   any order;
 //! - `END`, the [`BundleDigests`]: the blake3 of `HEAD`, and each member's digest over the blake3
 //!   of its chunks. Nothing may follow it.
 //!
-//! The members are `suspend/image.bin`, every file of `dice_state/`, then `suspend/MANIFEST`, and
-//! an import installs the MANIFEST only after every chunk has arrived and every digest matches.
+//! The members are `suspend/MANIFEST`, `suspend/image.bin`, then every file of `dice_state/`. An
+//! import installs the MANIFEST last, and only after every chunk has arrived and every digest
+//! matches, so its place in the bundle says nothing about what it vouches for.
 //!
 //! A bundle is not signed. The digests catch damage in transport; what keeps a deliberately
 //! poisoned bundle out is who may write to the store the bundles are kept in.
@@ -82,6 +84,8 @@ const MAX_CHUNK_SIZE: u64 = 64 << 20;
 const MAX_MEMBER_LEN: u64 = 1 << 40;
 /// The largest `HEAD` and `END` an import reads into memory: about 150 bytes per member.
 const MAX_JSON_BYTES: u32 = 64 << 20;
+/// The largest MANIFEST an import reads before the rest. A real one is a few KB.
+const MAX_MANIFEST_BYTES: u64 = 1 << 20;
 const HEAD: &str = "HEAD";
 const END: &str = "END";
 /// What a member's digest is derived under, so it cannot collide with a file's own blake3.
@@ -310,10 +314,9 @@ fn export_with(
              which writes a portable image"
         ));
     }
-    // The MANIFEST after what it vouches for, as the daemon writes it.
-    let mut paths = vec![format!("{IMAGE_DIR}/{IMAGE}")];
+    // The MANIFEST first, for an import to check before the gigabytes after it.
+    let mut paths = vec![manifest_rel, format!("{IMAGE_DIR}/{IMAGE}")];
     paths.extend(dice_state_files(cache_dir)?);
-    paths.push(manifest_rel);
     let mut members = Vec::with_capacity(paths.len());
     for path in paths {
         let src = cache_dir.join(&path);
@@ -406,6 +409,11 @@ fn write_json<W: Write, T: Serialize>(
     let frame = zstd::bulk::compress(&json, ZSTD_LEVEL).buck_error_context("Compressing")?;
     write_record(out, kind, 0, 0, json.len(), &frame)?;
     Ok(json)
+}
+
+/// The next item from a receiver the workers share, or `None` once every sender is gone.
+fn next_shared<T>(rx: &Mutex<mpsc::Receiver<T>>) -> Option<T> {
+    rx.lock().ok()?.recv().ok()
 }
 
 /// A chunk read from a member, on its way to be compressed.
@@ -516,14 +524,7 @@ fn encode<W: Write + Send>(
             let packed_tx = packed_tx.clone();
             s.spawn(move || {
                 let mut c = compressor();
-                loop {
-                    let Ok(raw) = raw_rx
-                        .lock()
-                        .map_err(drop)
-                        .and_then(|r| r.recv().map_err(drop))
-                    else {
-                        break;
-                    };
+                while let Some(raw) = next_shared(&raw_rx) {
                     let packed = match &mut c {
                         Ok(c) => pack(c, raw),
                         Err(e) => Err(e.clone()),
@@ -959,6 +960,7 @@ fn import_from<R: Read>(
     let (head_json, header): (_, BundleHeader) = read_json(&mut input, &head, HEAD)?;
     check_header(&header, exe)?;
     let head_digest = blake3::hash(&head_json).to_hex().to_string();
+    let manifest = read_manifest(&mut input, &header)?;
 
     std::fs::create_dir_all(cache_dir)
         .map_err(io_err(|| format!("Creating `{}`", cache_dir.display())))?;
@@ -967,7 +969,15 @@ fn import_from<R: Read>(
     std::fs::create_dir(&staging)
         .map_err(io_err(|| format!("Creating `{}`", staging.display())))?;
 
-    let result = unpack(input, &staging, &header, &head_digest, threads.max(1)).and_then(|bytes| {
+    let result = unpack(
+        input,
+        &staging,
+        &header,
+        &head_digest,
+        &manifest,
+        threads.max(1),
+    )
+    .and_then(|bytes| {
         install(&staging, cache_dir, hook)?;
         Ok(ImportSummary {
             members: header.members.len(),
@@ -978,6 +988,71 @@ fn import_from<R: Read>(
     });
     drop(std::fs::remove_dir_all(&staging));
     result
+}
+
+/// The MANIFEST, read whole before anything after it.
+struct EarlyMember {
+    member: u32,
+    data: Vec<u8>,
+    chunks: Vec<[u8; 32]>,
+}
+
+/// Reads the MANIFEST's records, which follow `HEAD`, and checks the MANIFEST against `HEAD`:
+/// what an import can refuse having read a few KB rather than gigabytes.
+fn read_manifest<R: Read>(
+    input: &mut R,
+    header: &BundleHeader,
+) -> Result<EarlyMember, ImportError> {
+    let manifest_rel = format!("{IMAGE_DIR}/{MANIFEST}");
+    let not_first = || {
+        ImportError::NotABundle(format!(
+            "the records after `{HEAD}` are not `{manifest_rel}`'s"
+        ))
+    };
+    let Some(i) = header.members.iter().position(|m| m.path == manifest_rel) else {
+        return Err(ImportError::Missing(manifest_rel));
+    };
+    let len = header.members[i].len;
+    if len == 0 || len > MAX_MANIFEST_BYTES {
+        return Err(ImportError::NotABundle(format!(
+            "`{manifest_rel}` is {len} bytes"
+        )));
+    }
+    let mut d = zstd::bulk::Decompressor::new()
+        .map_err(io_err(|| "Starting the zstd decoder".to_owned()))?;
+    let mut data = Vec::with_capacity(len as usize);
+    let mut chunks = Vec::new();
+    for chunk in 0..chunk_count(len, header.chunk_size) {
+        let Some(head) = next_head(input)? else {
+            return Err(ImportError::NoTrailer);
+        };
+        if head.kind != Kind::Data
+            || head.member as usize != i
+            || head.chunk != chunk
+            || u64::from(head.raw_len) != chunk_len(len, header.chunk_size, chunk)
+        {
+            return Err(not_first());
+        }
+        let bytes = decode_frame(&mut d, &read_frame(input, &head)?, head.raw_len)?;
+        chunks.push(*blake3::hash(&bytes).as_bytes());
+        data.extend_from_slice(&bytes);
+    }
+    let manifest: ManifestHead = serde_json::from_slice(&data)
+        .map_err(|e| ImportError::NotABundle(format!("`{manifest_rel}`: {e}")))?;
+    if manifest.magic != MAGIC
+        || manifest.format != header.image_format
+        || manifest.exe != header.exe
+    {
+        return Err(ImportError::NotABundle(format!(
+            "`{manifest_rel}` is image format {} {} by {}, and `{HEAD}` says {MAGIC} {} by {}",
+            manifest.magic, manifest.format, manifest.exe, header.image_format, header.exe
+        )));
+    }
+    Ok(EarlyMember {
+        member: i as u32,
+        data,
+        chunks,
+    })
 }
 
 /// A record on its way from the reader to a worker.
@@ -1019,6 +1094,7 @@ fn unpack<R: Read>(
     staging: &Path,
     header: &BundleHeader,
     head_digest: &str,
+    early: &EarlyMember,
     threads: usize,
 ) -> Result<u64, ImportError> {
     let chunk_size = header.chunk_size;
@@ -1044,9 +1120,17 @@ fn unpack<R: Read>(
         .map(|m| chunk_count(m.len, chunk_size))
         .collect();
 
+    write_at(&files[early.member as usize], &early.data, 0)
+        .map_err(io_err(|| format!("Writing `{IMAGE_DIR}/{MANIFEST}`")))?;
+    let early_chunks: Vec<((u32, u64), [u8; 32])> = (0u64..)
+        .zip(&early.chunks)
+        .map(|(c, d)| ((early.member, c), *d))
+        .collect();
+
     let failed = AtomicBool::new(false);
     let first_err: Mutex<Option<ImportError>> = Mutex::new(None);
-    let digests: Mutex<HashMap<(u32, u64), [u8; 32]>> = Mutex::new(HashMap::new());
+    let digests: Mutex<HashMap<(u32, u64), [u8; 32]>> =
+        Mutex::new(early_chunks.iter().copied().collect());
     let fail = |e: ImportError| {
         if let Ok(mut slot) = first_err.lock() {
             slot.get_or_insert(e);
@@ -1063,11 +1147,7 @@ fn unpack<R: Read>(
             s.spawn(move || {
                 let mut d = zstd::bulk::Decompressor::new()
                     .map_err(io_err(|| "Starting the zstd decoder".to_owned()));
-                loop {
-                    let Ok(job) = rx.lock().map_err(drop).and_then(|r| r.recv().map_err(drop))
-                    else {
-                        break;
-                    };
+                while let Some(job) = next_shared(&rx) {
                     // After a failure, drain without work, so the reader is never left blocked.
                     if failed.load(Ordering::Relaxed) {
                         continue;
@@ -1088,7 +1168,8 @@ fn unpack<R: Read>(
             });
         }
         drop(rx);
-        let read = read_records(&mut input, header, &counts, &failed, |job| {
+        let seen = early_chunks.iter().map(|(k, _)| *k).collect();
+        let read = read_records(&mut input, header, &counts, seen, &failed, |job| {
             tx.send(job).is_ok()
         });
         drop(tx);
@@ -1129,10 +1210,10 @@ fn read_records<R: Read>(
     input: &mut R,
     header: &BundleHeader,
     counts: &[u64],
+    mut seen: HashSet<(u32, u64)>,
     failed: &AtomicBool,
     mut dispatch: impl FnMut(Job) -> bool,
 ) -> Result<Option<BundleDigests>, ImportError> {
-    let mut seen = HashSet::new();
     let mut trailer = None;
     loop {
         if failed.load(Ordering::Relaxed) {
@@ -1519,11 +1600,11 @@ mod tests {
         assert_eq!(
             paths,
             [
+                "suspend/MANIFEST",
                 "suspend/image.bin",
                 "dice_state/pagable.0.db",
                 "dice_state/pagable.1.db",
                 "dice_state/pagable.2.db",
-                "suspend/MANIFEST",
             ]
         );
         assert_eq!(header.chunk_size, TEST_CHUNK);
@@ -1534,13 +1615,13 @@ mod tests {
             [
                 (Kind::Head, 0, 0),
                 (Kind::Data, 0, 0),
-                (Kind::Data, 0, 1),
                 (Kind::Data, 1, 0),
                 (Kind::Data, 1, 1),
-                (Kind::Data, 1, 2),
-                (Kind::Data, 1, 3),
                 (Kind::Data, 2, 0),
-                (Kind::Data, 4, 0),
+                (Kind::Data, 2, 1),
+                (Kind::Data, 2, 2),
+                (Kind::Data, 2, 3),
+                (Kind::Data, 3, 0),
                 (Kind::End, 0, 0),
             ]
         );
@@ -1580,11 +1661,12 @@ mod tests {
     }
 
     #[test]
+    /// After the MANIFEST, which an import reads first.
     fn chunks_in_any_order_are_accepted() {
         let f = fixture();
         let mut recs = records(&f.bundle);
         let last = recs.len() - 1;
-        recs[1..last].reverse();
+        recs[2..last].reverse();
         write_records(&f.bundle, &recs);
         import_file(&f.bundle, &f.dst, EXE).unwrap();
         assert_eq!(snapshot(&f.dst), snapshot(&f.src));
@@ -1597,11 +1679,11 @@ mod tests {
         // Two whole chunks of pagable.0.db trade places but keep their data.
         let a = recs
             .iter()
-            .position(|r| (r.member, r.chunk) == (1, 0))
+            .position(|r| (r.member, r.chunk) == (2, 0))
             .unwrap();
         let b = recs
             .iter()
-            .position(|r| (r.member, r.chunk) == (1, 1))
+            .position(|r| (r.member, r.chunk) == (2, 1))
             .unwrap();
         recs[a].chunk = 1;
         recs[b].chunk = 0;
@@ -1743,7 +1825,7 @@ mod tests {
     fn a_missing_chunk_is_refused() {
         let f = fixture();
         let mut recs = records(&f.bundle);
-        recs.retain(|r| (r.kind, r.member, r.chunk) != (Kind::Data, 1, 2));
+        recs.retain(|r| (r.kind, r.member, r.chunk) != (Kind::Data, 2, 2));
         write_records(&f.bundle, &recs);
         assert!(matches!(
             refused(&f, EXE),
@@ -1757,11 +1839,54 @@ mod tests {
         let mut recs = records(&f.bundle);
         let i = recs
             .iter()
-            .position(|r| (r.member, r.chunk) == (0, 1))
+            .position(|r| (r.member, r.chunk) == (1, 1))
             .unwrap();
         recs[i].raw.push(0);
         write_records(&f.bundle, &recs);
         assert!(matches!(refused(&f, EXE), ImportError::Mismatch(p) if p == "suspend/image.bin"));
+    }
+
+    /// Keeps the bundle up to the MANIFEST and makes everything after it bytes that are no
+    /// record: an import that reads past the MANIFEST fails on them, not on the MANIFEST.
+    fn cut_after_the_manifest(f: &Fixture) {
+        let starts: Vec<usize> = records_at(&f.bundle).iter().map(|(at, _)| *at).collect();
+        let mut bytes = std::fs::read(&f.bundle).unwrap();
+        bytes.truncate(starts[2]);
+        bytes.extend(vec![0xA5u8; 1 << 20]);
+        std::fs::write(&f.bundle, bytes).unwrap();
+    }
+
+    #[test]
+    fn a_manifest_at_odds_with_head_is_refused_before_the_rest_is_read() {
+        let f = fixture();
+        let mut recs = records(&f.bundle);
+        let mut manifest: serde_json::Value = serde_json::from_slice(&recs[1].raw).unwrap();
+        manifest["exe"] = serde_json::Value::String("another".to_owned());
+        recs[1].raw = serde_json::to_vec_pretty(&manifest).unwrap();
+        let len = recs[1].raw.len() as u64;
+        edit_header(&mut recs, |h| h.members[0].len = len);
+        write_records(&f.bundle, &recs);
+        cut_after_the_manifest(&f);
+        let err = refused(&f, EXE);
+        assert!(
+            matches!(&err, ImportError::NotABundle(why) if why.contains("by another")),
+            "{err}"
+        );
+        // The same cut bundle with a good MANIFEST fails only on what follows it.
+        let f = fixture();
+        cut_after_the_manifest(&f);
+        assert!(matches!(refused(&f, EXE), ImportError::Damaged(_)));
+    }
+
+    #[test]
+    fn a_manifest_that_does_not_follow_head_is_refused() {
+        let f = fixture();
+        let mut recs = records(&f.bundle);
+        let manifest = recs.remove(1);
+        let last = recs.len() - 1;
+        recs.insert(last, manifest);
+        write_records(&f.bundle, &recs);
+        assert!(matches!(refused(&f, EXE), ImportError::NotABundle(_)));
     }
 
     #[test]
