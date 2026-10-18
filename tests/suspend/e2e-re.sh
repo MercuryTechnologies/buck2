@@ -189,13 +189,16 @@ check "chain: the local action ran again with the PR's environment" grep -q '^sh
 # A graph that fails its read after the materializer replayed every artifact, which the resume
 # reads at the same time: refused as the graph's, with nothing installed, so the daemon is cold
 # and runs the local action here.
+# The variable is in the main daemon's environment too: the resume would refuse another one as
+# the environment's, before reading anything.
 cd "$G"
+export BUCK2_TEST_RESUME_GRAPH_ERROR=true
 export GITHUB_SHA=sha-main
 step ge-build-main "$B" build //:after
 step ge-suspend "$B" suspend --portable
 fresh_runner
 export GITHUB_SHA=sha-pr
-BUCK2_TEST_RESUME_GRAPH_ERROR=true step ge-resume "$B" resume
+step ge-resume "$B" resume
 check "a graph error is refused as the graph's" grep -q '^cold: graph: injected by BUCK2_TEST_RESUME_GRAPH_ERROR' "$R/ge-resume.log"
 step ge-build-pr "$B" build //:after --show-full-output
 ran ge-build-pr
@@ -203,6 +206,7 @@ geafter=$(grep -E '^root//:after ' "$R/ge-build-pr.log" | awk '{print $2}')
 check "after a graph error the local action ran here" test "$(ran_where "$R/ge-build-pr.what-ran" root//:sha)" = local
 check "after a graph error the output has the PR's environment" grep -q '^sha-pr$' "$geafter"
 "$B" kill > /dev/null 2>&1
+unset BUCK2_TEST_RESUME_GRAPH_ERROR
 
 echo "result fail=$fail" | tee -a $R/summary.tsv
 exit $fail
