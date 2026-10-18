@@ -270,6 +270,7 @@ pub use crate::storage::DiceStorage;
 pub use crate::storage::EvictionPolicy;
 pub use crate::storage::PagableStorageBackend;
 pub use crate::storage::PageOutPolicy;
+pub use crate::suspend::PreparedRestore;
 pub use crate::suspend::ResumeStats;
 pub use crate::suspend::Row as SuspendRow;
 pub use crate::suspend::SuspendDrop;
