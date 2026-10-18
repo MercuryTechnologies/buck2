@@ -215,12 +215,8 @@ async fn build_action_no_redirect_impl(
         waiting_data: action_execution_data.waiting_data,
     })?;
 
-    if LocalActions::ran_here(
-        action_execution_data
-            .action_result
-            .is_ok()
-            .then_some(execution_metrics.execution_kind),
-    ) && let Some(local) = LocalActions::of(ctx.global_data())
+    if action_execution_data.ran_here
+        && let Some(local) = LocalActions::of(ctx.global_data())
     {
         local.record(action.key());
     }
@@ -308,8 +304,11 @@ async fn build_action_inner(
     let mut incremental_kind = None;
     let mut waiting_data = None;
     let mut dep_file_db_writes_queued = 0;
+    // A failure counts, because its error is what the graph keeps.
+    let mut ran_here = true;
     let error_diagnostics = match execute_result {
         Ok((outputs, meta)) => {
+            ran_here = LocalActions::executed_here(&meta.execution_kind);
             output_size = outputs.calc_output_count_and_bytes(false).bytes;
             action_result = Ok(outputs);
             execution_kind = Some(meta.execution_kind.as_enum());
@@ -457,6 +456,7 @@ async fn build_action_inner(
     (
         ActionExecutionData {
             action_result,
+            ran_here,
             wall_time,
             queue_duration,
             memory_peak,
@@ -779,6 +779,8 @@ pub struct ActionExtraData {
 
 struct ActionExecutionData {
     action_result: buck2_error::Result<ActionOutputs>,
+    /// Whether the result may depend on this machine; see [`LocalActions::executed_here`].
+    ran_here: bool,
     wall_time: Option<std::time::Duration>,
     queue_duration: Option<std::time::Duration>,
     memory_peak: Option<u64>,
