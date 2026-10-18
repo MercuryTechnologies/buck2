@@ -65,7 +65,6 @@ use dice::DiceTransaction;
 use dice::ResumeStats;
 use dice::SuspendRow;
 use dupe::Dupe;
-use futures::StreamExt;
 use serde::Deserialize;
 use serde::Serialize;
 
@@ -776,11 +775,14 @@ impl LoadedImage {
             })
         };
         let mut replay_took = Duration::ZERO;
+        let mut rows_took = Duration::ZERO;
         let mut read_took = Duration::ZERO;
         let replay = async {
             let t = Instant::now();
-            let resumed = replay_artifacts(dice, &self.image.artifact_rows, materializer).await;
+            let (resumed, reading) =
+                replay_artifacts(dice, &self.image.artifact_rows, materializer).await;
             replay_took = t.elapsed();
+            rows_took = reading;
             resumed
         };
         let graph_read = async {
@@ -797,6 +799,7 @@ impl LoadedImage {
         })
         .await;
         timings.push(("materializer", replay_took));
+        timings.push(("materializer rows read", rows_took));
         timings.push(("graph read", read_took));
         timings.push(("materializer and graph", t.elapsed()));
         let (resumed, stats) = overlapped.map_err(RestoreError::Cold)?;
@@ -844,24 +847,64 @@ impl LoadedImage {
 }
 
 /// Replays the materializer's artifacts, one row after another in the order the suspend wrote
-/// them, reading the next row while the materializer declares the last.
+/// them. The rows are read on a task of their own, a few ahead, while the materializer declares
+/// the last: a row read blocks its thread in sqlite.
+///
+/// Returns too how long reading the rows took, apart from declaring them.
 async fn replay_artifacts(
     dice: &Arc<Dice>,
     rows: &[SuspendRow],
     materializer: &dyn Materializer,
-) -> Result<ResumedArtifacts, String> {
+) -> (Result<ResumedArtifacts, String>, Duration) {
+    let (tx, mut rx) = tokio::sync::mpsc::channel(2);
+    let reader = {
+        let dice = dice.dupe();
+        let rows = rows.to_vec();
+        tokio::spawn(async move {
+            let mut reading = Duration::ZERO;
+            for row in rows {
+                let t = Instant::now();
+                let read = dice
+                    .read_suspend_row::<Vec<SuspendedArtifact>>(row)
+                    .await
+                    .map_err(|e| format!("unreadable materializer state: {e:#}"));
+                reading += t.elapsed();
+                let failed = read.is_err();
+                if tx.send(read).await.is_err() || failed {
+                    break;
+                }
+            }
+            reading
+        })
+    };
     let mut resumed = ResumedArtifacts::default();
-    let mut reads = futures::stream::iter(rows.iter().copied())
-        .map(|row| dice.read_suspend_row::<Vec<SuspendedArtifact>>(row))
-        .buffered(2);
-    while let Some(artifacts) = reads.next().await {
-        let artifacts = artifacts.map_err(|e| format!("unreadable materializer state: {e:#}"))?;
-        resumed += materializer
-            .resume_artifacts(artifacts)
-            .await
-            .map_err(|e| format!("materializer: {e:#}"))?;
+    let mut replayed = Ok(());
+    while let Some(read) = rx.recv().await {
+        let declared = match read {
+            Ok(artifacts) => materializer
+                .resume_artifacts(artifacts)
+                .await
+                .map_err(|e| format!("materializer: {e:#}")),
+            Err(e) => Err(e),
+        };
+        match declared {
+            Ok(r) => resumed += r,
+            Err(e) => {
+                replayed = Err(e);
+                break;
+            }
+        }
     }
-    Ok(resumed)
+    // The reader stops at its next send once nothing receives; it is awaited so that no read
+    // outlives the replay.
+    drop(rx);
+    match reader.await {
+        Ok(reading) => (replayed.map(|()| resumed), reading),
+        Err(e) => (
+            replayed.and_then(|()| Err(format!("unreadable materializer state: {e}"))),
+            Duration::ZERO,
+        ),
+    }
 }
 
 /// Runs the materializer's replay and the graph's read together, and installs what the read
