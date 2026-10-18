@@ -179,6 +179,28 @@ fn resume_delta_inner(root: &AbsNormPath, image: &VcsImage) -> buck2_error::Resu
         .map_err(|e| buck2_error!(ErrorTag::Input, "the index predates 1970: {e}"))?
         .as_secs() as u32;
 
+    // The index's `.gitattributes` must be HEAD's, the ones the checkout converted files with,
+    // for `check-attr --cached` to stand for them: one staged since would hide a conversion the
+    // checkout applied. Cheap, as no file is read.
+    run_git_blocking(
+        root,
+        &[
+            "diff-index",
+            "--cached",
+            "--quiet",
+            "HEAD",
+            "--",
+            ":(top,glob)**/.gitattributes",
+        ],
+        None,
+    )
+    .map_err(|_| {
+        buck2_error!(
+            ErrorTag::Input,
+            "a `.gitattributes` is staged that HEAD does not hold, or HEAD cannot be read"
+        )
+    })?;
+
     // The attributes are asked for beside the listing, of a listing of their own; an entry the
     // attribute pass did not see, should the index change between the two, is not vouched for.
     let (listing, attributes) = std::thread::scope(|scope| {
@@ -264,11 +286,15 @@ fn resume_delta_inner(root: &AbsNormPath, image: &VcsImage) -> buck2_error::Resu
 ///
 /// A file whose stat moved since the index recorded it is hashed by the resume, so no git
 /// command rehashes it. A file whose stat did not move is clean to git; that leaves the
-/// conversions, which let git call a file clean whose bytes are not the blob's: git applies the
-/// attributes it checks files in with, the working tree's `.gitattributes` over the index's,
-/// which `check-attr` without `--source` reads. Attributes of the commits do not matter: the
-/// suspend kept a blob id only for bytes that hash to it, and the index's blob is compared with
-/// it directly.
+/// conversions, which let git call a file clean whose bytes are not the blob's. Two sets of
+/// attributes matter. git checks a file in with the working tree's `.gitattributes` over the
+/// index's, which `check-attr` reads by default. It checked the file out, when it recorded the
+/// stat, with the index's over the working tree's, which `check-attr --cached` reads; the index
+/// must hold HEAD's `.gitattributes` for that, see [`resume_delta`]. A `.gitattributes` edited,
+/// emptied or added in the working tree after the checkout changes only the first, so a file a
+/// smudge filter converted on checkout would otherwise pass as its blob. Attributes of the
+/// suspended commit do not matter: the suspend kept a blob id only for bytes that hash to it,
+/// and the index's blob is compared with it directly.
 fn conversions(
     root: &AbsNormPath,
 ) -> buck2_error::Result<(
@@ -277,24 +303,33 @@ fn conversions(
 )> {
     // Without `--full-name`, paths are relative to the project, as `check-attr` reads them.
     let paths = run_git_blocking(root, &["ls-files", "-z"], None)?;
-    let attributes = run_git_blocking(
-        root,
-        &[&["check-attr", "-z", "--stdin"][..], CONVERSION_ATTRIBUTES].concat(),
-        Some(paths.clone()),
-    )?;
+    let check = |cached: bool| {
+        let mut args = vec!["check-attr", "-z", "--stdin"];
+        if cached {
+            args.push("--cached");
+        }
+        args.extend_from_slice(CONVERSION_ATTRIBUTES);
+        run_git_blocking(root, &args, Some(paths.clone()))
+    };
+    let (working_tree, index) = std::thread::scope(|scope| {
+        let index = scope.spawn(|| check(true));
+        (check(false), index.join())
+    });
+    let index =
+        index.map_err(|_| buck2_error!(ErrorTag::Tier0, "the attribute check panicked"))?;
     let checked = records(&paths)
         .filter_map(|path| project_path("", path))
         .collect();
-    let fields: Vec<&str> = records(&attributes).collect();
-    let converts = fields
-        .chunks(3)
-        .filter_map(|triple| match triple {
+    let mut converts = HashSet::new();
+    for attributes in [working_tree?, index?] {
+        let fields: Vec<&str> = records(&attributes).collect();
+        converts.extend(fields.chunks(3).filter_map(|triple| match triple {
             [path, _attribute, value] if *value != "unspecified" && *value != "unset" => {
                 project_path("", path)
             }
             _ => None,
-        })
-        .collect();
+        }));
+    }
     Ok((checked, converts))
 }
 
@@ -1054,6 +1089,47 @@ mod tests {
         repo.git(&["update-index", "-q", "--refresh"]);
         let scan = repo.scan_git(&image);
         assert_eq!((scan.vouched, scan.hashed), (3, 0));
+    }
+
+    /// A clone whose checkout a smudge filter converted (to upper case, the same size), its
+    /// `.gitattributes` then emptied in the working tree or emptied and staged: the file's stat
+    /// is the index's and no attribute applies in the working tree, but its bytes are not the
+    /// blob's, so it must be hashed. Without the index's attributes git vouched for it; without
+    /// the staged check, for the staged case.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_conversion_the_checkout_applied_is_hashed_after_its_attribute_goes() {
+        for staged in [false, true] {
+            let repo = Repo::new();
+            repo.write("f.txt", "abc\ndef\n");
+            repo.write("g", "g");
+            repo.commit("A");
+            repo.age_all();
+            let image = repo.suspend(&repo.crawler()).await;
+            repo.write(".gitattributes", "*.txt filter=upper\n");
+            repo.commit("C");
+            repo.reclone(&[
+                "-c",
+                "filter.upper.smudge=tr a-z A-Z",
+                "-c",
+                "filter.upper.clean=tr A-Z a-z",
+            ]);
+            assert_eq!(
+                std::fs::read(repo.dir().join("f.txt")).unwrap(),
+                b"ABC\nDEF\n"
+            );
+            std::fs::write(repo.dir().join(".gitattributes"), "# none\n").unwrap();
+            if staged {
+                repo.git(&["add", ".gitattributes"]);
+                assert!(!repo.delta(&image).usable, "staged");
+            }
+            let without = repo.scan(&image, || None);
+            assert!(
+                events(&without).contains(&("f.txt".to_owned(), M)),
+                "staged {staged}"
+            );
+            let with_git = repo.scan_git(&image);
+            assert_eq!(events(&with_git), events(&without), "staged {staged}");
+        }
     }
 
     /// A split index keeps entries in a file written at another time than the index, so git
