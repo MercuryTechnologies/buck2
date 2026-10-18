@@ -528,11 +528,18 @@ async fn a_damaged_store_fails_the_reads_of_a_resume() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Node `i` of a binary tree of `Tree.0` nodes over [`Input`]s: the bench's graph.
+/// Node `i` of a binary tree of `n` nodes over [`Input`]s: the bench's graph. The third field
+/// is `i` again, behind an `Arc`, so each key's row names an arc row, as buck2's keys' rows do.
 #[derive(Allocative, Clone, Dupe, Debug, Display, PartialEq, Eq, Hash, Pagable)]
 #[display("Node({_0}/{_1})")]
 #[pagable_typetag(DiceKeyDyn)]
-struct Node(u32, u32);
+struct Node(u32, u32, Arc<u32>);
+
+impl Node {
+    fn new(i: u32, n: u32) -> Self {
+        Node(i, n, Arc::new(i))
+    }
+}
 
 #[async_trait]
 impl Key for Node {
@@ -544,11 +551,11 @@ impl Key for Node {
         _cancellations: &CancellationContext,
     ) -> Self::Value {
         Computes::record(ctx, self);
-        let Node(i, n) = *self;
+        let (i, n) = (self.0, self.1);
         let mut sum = *ctx.compute(&Input(i % LEAVES)).await.unwrap();
         for child in [2 * i + 1, 2 * i + 2] {
             if child < n {
-                sum += *ctx.compute(&Node(child, n)).await.unwrap();
+                sum += *ctx.compute(&Node::new(child, n)).await.unwrap();
             }
         }
         sum
@@ -581,7 +588,7 @@ async fn suspend_bench() -> anyhow::Result<()> {
     inject(&dice, root, &initial_inputs()).await;
     let t = std::time::Instant::now();
     let tx = dice.updater(root).commit().await;
-    let value = *tx.compute(&Node(0, n)).await?;
+    let value = *tx.compute(&Node::new(0, n)).await?;
     drop(tx);
     dice.wait_for_idle().await;
     eprintln!("compute {n} nodes: {:.3}s", t.elapsed().as_secs_f64());
@@ -635,7 +642,7 @@ async fn suspend_bench() -> anyhow::Result<()> {
     assert_eq!(stats.dropped, 0);
     inject(&resumed, root, &initial_inputs()).await;
     let tx = resumed.updater(root).commit().await;
-    assert_eq!(*tx.compute(&Node(0, n)).await?, value);
+    assert_eq!(*tx.compute(&Node::new(0, n)).await?, value);
     Ok(())
 }
 
@@ -645,6 +652,8 @@ struct CountingStore {
     inner: pagable_storage::storage::sqlite::SqliteBackedPagableStorage,
     unflushed: Mutex<std::collections::HashSet<pagable::DataKey>>,
     buffered_reads: Arc<std::sync::atomic::AtomicUsize>,
+    /// Reads of the commit frontier: one per bind of the arcs a page-out wrote.
+    frontier_reads: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl CountingStore {
@@ -696,6 +705,8 @@ impl pagable::storage::traits::PagableStorage for CountingStore {
     }
 
     fn commit_frontier(&self) -> pagable::storage::traits::CommitFrontier {
+        self.frontier_reads
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.inner.commit_frontier()
     }
 
@@ -715,19 +726,23 @@ impl pagable::storage::traits::PagableStorage for CountingStore {
 }
 
 /// A suspend writes every key's row before it reads any back, so it never reads a row its
-/// store still buffers. It used to read each key back as it wrote it, which over sqlite flushed
-/// a shard per key: 640 s for mwb's 1.3M keys.
+/// store still buffers; and it binds the arcs those rows name once, not after every row. It used
+/// to read each key back as it wrote it, which over sqlite flushed a shard per key (640 s for
+/// mwb's 1.3M keys), and with that gone, binding after every row scanned every arc not yet
+/// committed, quadratic in the rows written between flushes.
 #[tokio::test]
 async fn a_suspend_reads_no_key_row_its_store_still_buffers() -> anyhow::Result<()> {
     const NODES: u32 = 2_000;
     let dir = tempdir()?;
     let buffered_reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let frontier_reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let store = Arc::new(CountingStore {
         inner: pagable_storage::storage::sqlite::SqliteBackedPagableStorage::try_new(
             dir.path(),
         )?,
         unflushed: Mutex::new(Default::default()),
         buffered_reads: buffered_reads.dupe(),
+        frontier_reads: frontier_reads.dupe(),
     });
     let open_over = |store: Arc<CountingStore>| async move {
         let mut storage = DiceStorage::new(store);
@@ -743,11 +758,14 @@ async fn a_suspend_reads_no_key_row_its_store_still_buffers() -> anyhow::Result<
     let (dice, root) = open_over(store.dupe()).await;
     inject(&dice, root, &initial_inputs()).await;
     let tx = dice.updater(root).commit().await;
-    let value = *tx.compute(&Node(0, NODES)).await?;
+    let value = *tx.compute(&Node::new(0, NODES)).await?;
     drop(tx);
     dice.wait_for_idle().await;
     let head = dice.head(root).await;
     buffered_reads.store(0, std::sync::atomic::Ordering::Relaxed);
+    // The page-out at the start of the suspend reads the frontier a few times on its own.
+    dice.page_out().await?;
+    frontier_reads.store(0, std::sync::atomic::Ordering::Relaxed);
     let image = dice.suspend_image(head).await?;
     assert_eq!(image.stats.dropped_total(), 0);
     assert!(image.stats.keys > NODES as usize, "{:?}", image.stats);
@@ -755,6 +773,12 @@ async fn a_suspend_reads_no_key_row_its_store_still_buffers() -> anyhow::Result<
         buffered_reads.load(std::sync::atomic::Ordering::Relaxed),
         0,
         "every buffered row read is a commit of its shard"
+    );
+    let binds = frontier_reads.load(std::sync::atomic::Ordering::Relaxed);
+    assert!(
+        binds < 10,
+        "{binds} binds for {} keys: each scans every arc not yet committed",
+        image.stats.keys
     );
     drop(dice);
 
@@ -766,7 +790,7 @@ async fn a_suspend_reads_no_key_row_its_store_still_buffers() -> anyhow::Result<
     inject(&resumed, root, &initial_inputs()).await;
     let computes = Computes::default();
     let tx = resumed.updater_with_data(root, computes.data()).commit().await;
-    assert_eq!(*tx.compute(&Node(0, NODES)).await?, value);
+    assert_eq!(*tx.compute(&Node::new(0, NODES)).await?, value);
     assert_eq!(computes.take(), Vec::<String>::new());
     Ok(())
 }

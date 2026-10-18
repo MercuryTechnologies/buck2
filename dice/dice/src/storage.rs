@@ -589,7 +589,8 @@ impl DiceStorage {
 
     /// Writes `value` as a row, as a page-out would but leaving the value as it is: for
     /// `buck2 suspend`, which needs a row for every value its image names, those a page-out
-    /// keeps resident included. `None` if the key's serializer declines the value.
+    /// keeps resident included. `None` if the key's serializer declines the value. The arcs it
+    /// writes wait in `finished` for [`Self::bind_written`].
     pub(crate) fn write_value_row(
         &self,
         key_dyn: &DiceKeyErased,
@@ -609,19 +610,21 @@ impl DiceStorage {
             Some(Err(e)) => Err(e),
             Some(Ok(())) => {
                 let (data, arcs) = serializer.finish();
-                Ok(Some(self.storage.page_out_item(
+                let (row, _ticket) = self.storage.page_out_item_ticketed(
                     data,
                     arcs,
                     finished,
                     storage_context,
-                )?))
+                )?;
+                Ok(Some(row))
             }
         }
     }
 
     /// Writes a key as a row: its type tag and its fields, the projection alone for a
     /// projection key (its base is the image's business). Returns the row as stored too, for
-    /// [`Self::decode_key_row`].
+    /// [`Self::decode_key_row`]. The arcs it writes wait in `finished` for
+    /// [`Self::bind_written`].
     pub(crate) fn write_key_row(
         &self,
         key: &DiceKeyErased,
@@ -772,6 +775,12 @@ impl DiceStorage {
     /// Commits every row written so far, without making the store durable.
     pub(crate) fn flush(&self) -> anyhow::Result<()> {
         self.storage.flush()
+    }
+
+    /// Binds the arcs written through `finished` whose rows have committed to their rows, once
+    /// for a batch: binding after each row scans every arc still waiting.
+    pub(crate) fn bind_written(&self, finished: &ArcSerCache) {
+        finished.bind_covered(&*self.storage, &self.storage.commit_frontier());
     }
 
     /// Commits every row written so far and makes the store durable: the sqlite writer runs
