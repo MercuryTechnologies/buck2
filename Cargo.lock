@@ -3589,6 +3589,7 @@ version = "0.1.0"
 dependencies = [
  "allocative",
  "async-trait",
+ "buck2_artifact",
  "buck2_build_api",
  "buck2_build_signals",
  "buck2_cli_proto",
