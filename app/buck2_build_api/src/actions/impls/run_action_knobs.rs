@@ -47,6 +47,12 @@ pub struct RunActionKnobs {
     /// and the traffic to it grows, in steps that are the same on every host. A write within
     /// the share goes through the cache whatever `write_action_cache` says.
     pub write_action_cache_populate: RolloutFraction,
+    /// Skip the dep-file cache upload, and the action-cache lookup of the dep-file key that
+    /// precedes it, when the action's result came from the action cache. Upstream looks the
+    /// dep-file entry up after every hit, which a backend that bills per request counts as a
+    /// hit every warm build. The cost: an entry no execution ever seeded stays missing until
+    /// the action next executes. Set by `[buck2] dep_file_upload_after_cache_hit = false`.
+    pub skip_dep_file_upload_after_cache_hit: bool,
 }
 
 /// How write actions use the action cache; `buck2.write_action_cache`. Whether a miss is

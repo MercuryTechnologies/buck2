@@ -486,6 +486,7 @@ impl<'a> ServerCommandContext<'a> {
             write_cas_probe: false,
             write_action_cache: WriteActionCacheMode::Off,
             write_action_cache_populate: RolloutFraction::none(),
+            skip_dep_file_upload_after_cache_hit: false,
         };
 
         let concurrency = self
@@ -953,6 +954,15 @@ impl DiceCommandUpdater<'_, '_> {
                 property: "default_allow_cache_upload",
             })?
             .unwrap_or(false);
+
+        // `[buck2] dep_file_upload_after_cache_hit = false` skips the dep-file upload, and the
+        // dep-file key lookup it starts with, after an action-cache hit. Default true: upstream.
+        run_action_knobs.skip_dep_file_upload_after_cache_hit |= !root_config
+            .parse::<bool>(BuckconfigKeyRef {
+                section: "buck2",
+                property: "dep_file_upload_after_cache_hit",
+            })?
+            .unwrap_or(true);
 
         if root_config
             .parse::<bool>(BuckconfigKeyRef {
