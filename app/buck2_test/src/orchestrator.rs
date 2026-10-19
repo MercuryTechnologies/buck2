@@ -65,6 +65,7 @@ use buck2_common::local_resource_state::LocalResourceState;
 use buck2_core::cells::cell_root_path::CellRootPathBuf;
 use buck2_core::content_hash::ContentBasedPathHash;
 use buck2_core::deferred::base_deferred_key::BaseDeferredKey;
+use buck2_core::execution_types::executor_config::CacheUploadBehavior;
 use buck2_core::execution_types::executor_config::CommandExecutorConfig;
 use buck2_core::execution_types::executor_config::CommandGenerationOptions;
 use buck2_core::execution_types::executor_config::Executor;
@@ -721,6 +722,7 @@ impl<'a> BuckTestOrchestrator<'a> {
             execution_request,
             liveliness_observer.dupe(),
             test_executor.re_cache_enabled(),
+            test_executor.allow_cache_upload(),
             effective_test_execution_caching,
         )
         .boxed()
@@ -1340,6 +1342,7 @@ impl BuckTestOrchestrator<'_> {
         request: CommandExecutionRequest,
         liveliness_observer: Arc<dyn LivelinessObserver>,
         re_cache_enabled: bool,
+        allow_cache_upload: bool,
         _supports_test_execution_caching: bool,
     ) -> Result<ExecuteData, ExecuteError> {
         let events = dice.per_transaction_data().get_dispatcher().dupe();
@@ -1493,6 +1496,8 @@ impl BuckTestOrchestrator<'_> {
                         digest_config,
                         mergebase: &None,
                         re_platform: executor.re_platform(),
+                        allow_cache_upload,
+                        paths: request.paths(),
                     };
                     let _result = match executor
                         .cache_upload(
@@ -2801,6 +2806,17 @@ impl TestExecutor {
         self.executor_config.re_cache_enabled()
     }
 
+    /// Whether the test's executor config allows uploading locally produced results, as its
+    /// RE profile's `allow_cache_uploads` says. A test run locally is uploaded only then.
+    pub fn allow_cache_upload(&self) -> bool {
+        match &self.executor_config.executor {
+            Executor::RemoteEnabled(options) => {
+                matches!(options.cache_upload_behavior, CacheUploadBehavior::Enabled { .. })
+            }
+            Executor::Local(_) | Executor::None => false,
+        }
+    }
+
     pub fn executor(&self) -> &CommandExecutor {
         &self.test_executor
     }
@@ -3193,6 +3209,7 @@ mod tests {
                 &executor,
                 request,
                 NoopLivelinessObserver::create(),
+                false,
                 false,
                 false,
             ),
