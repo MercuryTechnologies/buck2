@@ -591,7 +591,7 @@ impl CasDownloader<'_> {
         info: &CasDownloadInfo,
         output_spec: &dyn RemoteActionResult,
     ) -> buck2_error::Result<Option<TDigest>> {
-        let digests = cache_hit_cas_digests(&artifacts.mapped_outputs, output_spec);
+        let digests = cache_hit_cas_digests(artifacts.mapped_outputs.values(), output_spec);
         if digests.is_empty() {
             return Ok(None);
         }
@@ -636,16 +636,17 @@ fn first_expired_digest(expirations: Vec<(TDigest, Timestamp)>, now: Timestamp) 
 /// stores by digest. A test reads its result from the action's stdout and stderr, so a hit whose
 /// streams the CAS has evicted fails the test as surely as a missing output fails a build.
 /// BuildBuddy checks a hit's outputs before serving it, but not its streams.
-fn cache_hit_cas_digests(
-    outputs: &BuckIndexMap<CommandExecutionOutput, ArtifactValue>,
+///
+/// An output's deps are left out. They are the inputs its symlinks reach into, which the cache
+/// entry never promised: an input built locally without an upload is absent from the CAS by
+/// design, and counting it rejected every hit on a directory of symlinks into such an input.
+fn cache_hit_cas_digests<'a>(
+    outputs: impl IntoIterator<Item = &'a ArtifactValue>,
     output_spec: &dyn RemoteActionResult,
 ) -> Vec<TDigest> {
     let mut digests = BuckMutSet::default();
-    for value in outputs.values() {
+    for value in outputs {
         collect_entry_file_digests(value.entry(), &mut digests);
-        if let Some(deps) = value.deps() {
-            collect_directory_file_digests(deps, &mut digests);
-        }
     }
     digests.extend(output_spec.std_stream_digests());
     digests.into_iter().collect()
@@ -797,7 +798,7 @@ mod tests {
 
         let expirations = expirations_from_cas(
             &[stdout],
-            cache_hit_cas_digests(&BuckIndexMap::default(), &hit),
+            cache_hit_cas_digests([], &hit),
             asked,
         );
 
@@ -817,7 +818,7 @@ mod tests {
 
         let expirations = expirations_from_cas(
             &[stdout, stderr],
-            cache_hit_cas_digests(&BuckIndexMap::default(), &hit),
+            cache_hit_cas_digests([], &hit),
             asked,
         );
 
@@ -837,7 +838,7 @@ mod tests {
         });
 
         assert_eq!(
-            cache_hit_cas_digests(&BuckIndexMap::default(), &hit),
+            cache_hit_cas_digests([], &hit),
             Vec::<TDigest>::new()
         );
     }
@@ -879,6 +880,41 @@ mod tests {
         collect_entry_file_digests(value.entry(), &mut digests);
 
         assert!(digests.contains(&digest));
+        Ok(())
+    }
+
+    #[test]
+    fn an_input_reached_through_an_output_symlink_is_not_checked() -> buck2_error::Result<()> {
+        let digest_config = DigestConfig::testing_default();
+        let pex = digest('c', 11743);
+        let mut tree = buck2_execute::directory::ActionDirectoryBuilder::empty_exhaustive();
+        tree.insert(
+            ForwardRelativePath::new("toolchains/forbid.pex")?,
+            DirectoryEntry::Leaf(ActionDirectoryMember::File(FileMetadata {
+                digest: TrackedFileDigest::new_expires(
+                    FileDigest::from_re(&pex, digest_config)?,
+                    Timestamp::now(),
+                    digest_config.cas_digest_config(),
+                ),
+                is_executable: true,
+            })),
+        )?;
+        tree.insert(
+            ForwardRelativePath::new("out/zip")?,
+            DirectoryEntry::Leaf(ActionDirectoryMember::Symlink(Arc::new(Symlink::new(
+                RelativePathBuf::from("../toolchains/forbid.pex"),
+            )))),
+        )?;
+        let value = extract_artifact_value(
+            &tree,
+            buck2_core::fs::project_rel_path::ProjectRelativePath::unchecked_new("out"),
+            digest_config,
+        )?
+        .expect("out is in the tree");
+        assert!(value.deps().is_some());
+
+        let hit = cache_hit(remote_execution::TActionResult2::default());
+        assert_eq!(cache_hit_cas_digests([&value], &hit), Vec::<TDigest>::new());
         Ok(())
     }
 }
