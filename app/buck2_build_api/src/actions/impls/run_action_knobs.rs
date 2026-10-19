@@ -34,6 +34,13 @@ pub struct RunActionKnobs {
     /// Whether write actions ask the CAS for their content first and declare a CAS download
     /// instead of a write when it is there.
     pub write_cas_probe: bool,
+
+    /// Skip the dep-file cache upload, and the action-cache lookup of the dep-file key that
+    /// precedes it, when the action's result came from the action cache. Upstream looks the
+    /// dep-file entry up after every hit, which a backend that bills per request counts as a
+    /// hit every warm build. The cost: an entry no execution ever seeded stays missing until
+    /// the action next executes. Set by `[buck2] dep_file_upload_after_cache_hit = false`.
+    pub skip_dep_file_upload_after_cache_hit: bool,
 }
 
 pub trait HasRunActionKnobs {

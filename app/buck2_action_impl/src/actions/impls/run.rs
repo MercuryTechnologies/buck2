@@ -1781,8 +1781,11 @@ impl Action for RunAction {
             .inner
             .allow_cache_upload
             .unwrap_or_else(|| ctx.run_action_knobs().default_allow_cache_upload);
-        let supports_remote_dep_files =
-            self.inner.allow_dep_file_cache_upload && dep_file_bundle.has_dep_files();
+        let supports_remote_dep_files = upload_dep_file(
+            self.inner.allow_dep_file_cache_upload && dep_file_bundle.has_dep_files(),
+            ctx.run_action_knobs().skip_dep_file_upload_after_cache_hit,
+            result.was_action_cache_hit(),
+        );
         let incremental_kind = match (
             self.inner.no_outputs_cleanup,
             self.inner.incremental_remote_outputs,
@@ -1881,6 +1884,37 @@ impl Action for RunAction {
         metadata.dep_file_db_writes_queued = u64::from(queued_write);
 
         Ok((outputs, metadata))
+    }
+}
+
+/// Whether an action's result goes through the dep-file cache upload. With
+/// `skip_after_cache_hit`, a result the action cache served does not: the executor that
+/// produced it seeded the entry when it ran, and the upload's existence check would
+/// otherwise cost one action-cache lookup per hit.
+fn upload_dep_file(supports_remote_dep_files: bool, skip_after_cache_hit: bool, action_cache_hit: bool) -> bool {
+    supports_remote_dep_files && !(skip_after_cache_hit && action_cache_hit)
+}
+
+#[cfg(test)]
+mod dep_file_upload_tests {
+    use super::upload_dep_file;
+
+    #[test]
+    fn uploads_as_upstream_without_the_knob() {
+        assert!(upload_dep_file(true, false, true));
+        assert!(upload_dep_file(true, false, false));
+    }
+
+    #[test]
+    fn skips_after_a_cache_hit_with_the_knob() {
+        assert!(!upload_dep_file(true, true, true));
+        assert!(upload_dep_file(true, true, false));
+    }
+
+    #[test]
+    fn never_uploads_without_dep_files() {
+        assert!(!upload_dep_file(false, false, false));
+        assert!(!upload_dep_file(false, true, true));
     }
 }
 
