@@ -503,10 +503,33 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "72b3254f16251a8381aa12e40e3c4d2f0199f8c6508fbecb9d91f575e0fbb8c6"
 
 [[package]]
+name = "bazel_bep_proto"
+version = "0.1.0"
+dependencies = [
+ "buck2_protoc_dev",
+ "prost",
+ "prost-types",
+ "tonic",
+ "tonic-prost",
+]
+
+[[package]]
 name = "beef"
 version = "0.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3a8241f3ebb85c056b509d4327ad0358fbbba6ffb340bf388f26350aeda225b1"
+
+[[package]]
+name = "bes_grpc_proto"
+version = "0.1.0"
+dependencies = [
+ "buck2_protoc_dev",
+ "google_grpc_proto",
+ "prost",
+ "prost-types",
+ "tonic",
+ "tonic-prost",
+]
 
 [[package]]
 name = "bincode"
@@ -1268,6 +1291,7 @@ dependencies = [
  "buck2_fs",
  "buck2_hash",
  "buck2_health_check",
+ "buck2_re_configuration",
  "buck2_resource_control",
  "buck2_util",
  "buck2_wrapper_common",
@@ -2047,6 +2071,8 @@ version = "0.1.0"
 dependencies = [
  "allocative",
  "async-trait",
+ "bazel_bep_proto",
+ "bes_grpc_proto",
  "buck2_build_info",
  "buck2_cli_proto",
  "buck2_core",
@@ -2055,13 +2081,16 @@ dependencies = [
  "buck2_hash",
  "buck2_util",
  "buck2_wrapper_common",
+ "chrono",
  "console",
  "crossbeam-channel",
  "derive_more 1.0.0",
  "dupe",
  "fbinit",
+ "flate2",
  "futures 0.3.32",
  "gazebo",
+ "google_grpc_proto",
  "hostname",
  "is_proc_translated",
  "opentelemetry",
@@ -2071,9 +2100,14 @@ dependencies = [
  "prost-types",
  "serde",
  "serde_json",
+ "sha2",
  "smallvec",
  "sys-info",
+ "tempfile",
  "tokio",
+ "tokio-stream",
+ "tonic",
+ "tracing",
  "uuid",
  "winver",
 ]
@@ -2241,6 +2275,7 @@ dependencies = [
  "buck2_build_api",
  "buck2_common",
  "buck2_core",
+ "buck2_data",
  "buck2_directory",
  "buck2_error",
  "buck2_execute",
@@ -3094,6 +3129,7 @@ dependencies = [
  "libc",
  "maplit",
  "pagable",
+ "prost-types",
  "remote_execution",
  "serde",
  "serde_json",
@@ -3418,6 +3454,7 @@ dependencies = [
  "iana-time-zone",
  "js-sys",
  "num-traits",
+ "serde",
  "wasm-bindgen",
  "windows-link",
 ]
@@ -4974,6 +5011,19 @@ dependencies = [
  "regex-automata",
  "regex-syntax",
  "serde",
+]
+
+[[package]]
+name = "google_grpc_proto"
+version = "0.1.0"
+dependencies = [
+ "buck2_data",
+ "buck2_protoc_dev",
+ "prost",
+ "prost-types",
+ "serde",
+ "tonic",
+ "tonic-prost",
 ]
 
 [[package]]
@@ -7512,6 +7562,7 @@ version = "0.1.0"
 dependencies = [
  "buck2_data",
  "buck2_protoc_dev",
+ "google_grpc_proto",
  "prost",
  "prost-types",
  "serde",
