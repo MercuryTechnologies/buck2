@@ -43,6 +43,7 @@ use buck2_execute::execute::manager::CommandExecutionManagerExt;
 use buck2_execute::execute::manager::CommandExecutionManagerWithClaim;
 use buck2_execute::execute::output::CommandStdStreams;
 use buck2_execute::execute::request::CommandExecutionOutput;
+use buck2_execute::knobs::CacheHitPresenceCheck;
 use buck2_execute::execute::request::CommandExecutionOutputRef;
 use buck2_execute::execute::request::CommandExecutionPaths;
 use buck2_execute::execute::request::CommandExecutionRequest;
@@ -102,6 +103,7 @@ pub async fn download_action_results<'a>(
     additional_message: Option<String>,
     output_trees_download_config: &OutputTreesDownloadConfig,
     missing_cas_as_cache_miss: bool,
+    presence_check: CacheHitPresenceCheck,
 ) -> DownloadResult {
     let std_streams = response.std_streams(re_client, digest_config);
     let std_streams = async {
@@ -137,6 +139,7 @@ pub async fn download_action_results<'a>(
         paranoid,
         output_trees_download_config,
         missing_cas_as_cache_miss,
+        presence_check,
     };
 
     let download = downloader.download(
@@ -311,6 +314,7 @@ pub struct CasDownloader<'a> {
     pub paranoid: Option<&'a ParanoidDownloader>,
     pub output_trees_download_config: &'a OutputTreesDownloadConfig,
     pub missing_cas_as_cache_miss: bool,
+    pub presence_check: CacheHitPresenceCheck,
 }
 
 impl CasDownloader<'_> {
@@ -591,7 +595,11 @@ impl CasDownloader<'_> {
         info: &CasDownloadInfo,
         output_spec: &dyn RemoteActionResult,
     ) -> buck2_error::Result<Option<TDigest>> {
-        let digests = cache_hit_cas_digests(artifacts.mapped_outputs.values(), output_spec);
+        let digests = cache_hit_cas_digests(
+            artifacts.mapped_outputs.values(),
+            output_spec,
+            self.presence_check,
+        );
         if digests.is_empty() {
             return Ok(None);
         }
@@ -643,10 +651,16 @@ fn first_expired_digest(expirations: Vec<(TDigest, Timestamp)>, now: Timestamp) 
 fn cache_hit_cas_digests<'a>(
     outputs: impl IntoIterator<Item = &'a ArtifactValue>,
     output_spec: &dyn RemoteActionResult,
+    presence_check: CacheHitPresenceCheck,
 ) -> Vec<TDigest> {
     let mut digests = BuckMutSet::default();
-    for value in outputs {
-        collect_entry_file_digests(value.entry(), &mut digests);
+    if presence_check == CacheHitPresenceCheck::Off {
+        return Vec::new();
+    }
+    if presence_check == CacheHitPresenceCheck::All {
+        for value in outputs {
+            collect_entry_file_digests(value.entry(), &mut digests);
+        }
     }
     digests.extend(output_spec.std_stream_digests());
     digests.into_iter().collect()
@@ -798,7 +812,7 @@ mod tests {
 
         let expirations = expirations_from_cas(
             &[stdout],
-            cache_hit_cas_digests([], &hit),
+            cache_hit_cas_digests([], &hit, CacheHitPresenceCheck::All),
             asked,
         );
 
@@ -818,7 +832,7 @@ mod tests {
 
         let expirations = expirations_from_cas(
             &[stdout, stderr],
-            cache_hit_cas_digests([], &hit),
+            cache_hit_cas_digests([], &hit, CacheHitPresenceCheck::All),
             asked,
         );
 
@@ -838,7 +852,7 @@ mod tests {
         });
 
         assert_eq!(
-            cache_hit_cas_digests([], &hit),
+            cache_hit_cas_digests([], &hit, CacheHitPresenceCheck::All),
             Vec::<TDigest>::new()
         );
     }
@@ -884,6 +898,37 @@ mod tests {
     }
 
     #[test]
+    fn the_presence_check_mode_picks_which_digests_a_hit_asks_about() -> buck2_error::Result<()> {
+        let digest_config = DigestConfig::testing_default();
+        let file = digest('d', 7);
+        let value = ArtifactValue::file(FileMetadata {
+            digest: TrackedFileDigest::new_expires(
+                FileDigest::from_re(&file, digest_config)?,
+                Timestamp::now(),
+                digest_config.cas_digest_config(),
+            ),
+            is_executable: false,
+        });
+        let stdout = digest('e', 10);
+        let hit = cache_hit(remote_execution::TActionResult2 {
+            stdout_digest: Some(stdout.clone()),
+            ..Default::default()
+        });
+        let mut all = cache_hit_cas_digests([&value], &hit, CacheHitPresenceCheck::All);
+        all.sort_by(|a, b| a.hash.cmp(&b.hash));
+        assert_eq!(all, vec![file.clone(), stdout.clone()]);
+        assert_eq!(
+            cache_hit_cas_digests([&value], &hit, CacheHitPresenceCheck::Streams),
+            vec![stdout]
+        );
+        assert_eq!(
+            cache_hit_cas_digests([&value], &hit, CacheHitPresenceCheck::Off),
+            Vec::<TDigest>::new()
+        );
+        Ok(())
+    }
+
+    #[test]
     fn an_input_reached_through_an_output_symlink_is_not_checked() -> buck2_error::Result<()> {
         let digest_config = DigestConfig::testing_default();
         let pex = digest('c', 11743);
@@ -914,7 +959,7 @@ mod tests {
         assert!(value.deps().is_some());
 
         let hit = cache_hit(remote_execution::TActionResult2::default());
-        assert_eq!(cache_hit_cas_digests([&value], &hit), Vec::<TDigest>::new());
+        assert_eq!(cache_hit_cas_digests([&value], &hit, CacheHitPresenceCheck::All), Vec::<TDigest>::new());
         Ok(())
     }
 }

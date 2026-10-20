@@ -29,6 +29,7 @@ use buck2_execute::execute::manager::CommandExecutionManagerExt;
 use buck2_execute::execute::prepared::PreparedCommand;
 use buck2_execute::execute::prepared::PreparedCommandOptionalExecutor;
 use buck2_execute::execute::result::CommandExecutionResult;
+use buck2_execute::knobs::CacheHitPresenceCheck;
 use buck2_execute::knobs::ExecutorGlobalKnobs;
 use buck2_execute::materialize::materializer::Materializer;
 use buck2_execute::re::action_identity::ReActionIdentity;
@@ -96,6 +97,7 @@ async fn query_action_cache_and_download_result(
     upload_all_actions: bool,
     remote_cache_unavailable_fallback: bool,
     log_action_keys: bool,
+    presence_check: CacheHitPresenceCheck,
     details: RemoteCommandExecutionDetails,
     output_trees_download_config: &OutputTreesDownloadConfig,
 ) -> ControlFlow<CommandExecutionResult, CommandExecutionManager> {
@@ -239,6 +241,7 @@ async fn query_action_cache_and_download_result(
         None,
         output_trees_download_config,
         true,
+        presence_check,
     )
     .await;
 
@@ -327,6 +330,7 @@ impl PreparedCommandOptionalExecutor for ActionCacheChecker {
             self.upload_all_actions,
             self.remote_cache_unavailable_fallback,
             self.knobs.log_action_keys,
+            self.knobs.cache_hit_presence_check,
             details,
             &self.output_trees_download_config,
         )
@@ -400,6 +404,7 @@ impl PreparedCommandOptionalExecutor for RemoteDepFileCacheChecker {
             self.upload_all_actions,
             self.remote_cache_unavailable_fallback,
             self.knobs.log_action_keys,
+            self.knobs.cache_hit_presence_check,
             details,
             &self.output_trees_download_config,
         )

@@ -568,6 +568,7 @@ impl PreparedCommandExecutor for ReExecutor {
                 additional_message,
                 &self.output_trees_download_config,
                 served_from_action_cache(&response, skip_cache_read),
+                self.knobs.cache_hit_presence_check,
             )
             .boxed()
             .await;
