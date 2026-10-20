@@ -74,6 +74,7 @@ use buck2_events::metadata;
 use buck2_events::schedule_type::SandcastleScheduleType;
 use buck2_execute::dep_file_state::SetDepFileStore;
 use buck2_execute::execute::blocking::SetBlockingExecutor;
+use buck2_execute::knobs::CacheHitPresenceCheck;
 use buck2_execute::knobs::ExecutorGlobalKnobs;
 use buck2_execute::materialize::materializer::Materializer;
 use buck2_execute::materialize::materializer::SetMaterializer;
@@ -890,11 +891,19 @@ impl DiceCommandUpdater<'_, '_> {
             })?
             .map(Duration::from_secs);
 
+        let cache_hit_presence_check = root_config
+            .parse::<CacheHitPresenceCheck>(BuckconfigKeyRef {
+                section: "buck2_re_client",
+                property: "cache_hit_presence_check",
+            })?
+            .unwrap_or_default();
+
         let executor_global_knobs = ExecutorGlobalKnobs {
             enable_miniperf,
             log_action_keys,
             re_cancel_on_estimated_queue_time_exceeds,
             re_fallback_on_estimated_queue_time_exceeds,
+            cache_hit_presence_check,
         };
 
         let host_sharing_broker = HostSharingBroker::new_with_named_semaphores(
