@@ -8,7 +8,6 @@
  * above-listed licenses.
  */
 
-use std::fmt::Write;
 use std::time::Duration;
 
 use buck2_event_observer::display;
@@ -25,6 +24,7 @@ use superconsole::components::DrawVertical;
 
 use self::table_builder::Table;
 use crate::subscribers::superconsole::SuperConsoleState;
+use crate::subscribers::superconsole::timed_list::table_builder::Aux;
 use crate::subscribers::superconsole::timed_list::table_builder::Row;
 use crate::subscribers::superconsole::timed_list::table_builder::SummaryRow;
 use crate::subscribers::superconsole::timed_list::table_builder::TimedRow;
@@ -78,14 +78,12 @@ impl TimedListBody<'_> {
         let info_elapsed = self.state.timekeeper.duration_since(info.start);
         let subaction_ratio = child_info_elapsed.as_secs_f64() / info_elapsed.as_secs_f64();
 
-        let mut aux = child_event.to_string();
-        if subaction_ratio < DISPLAY_SUBACTION_CUTOFF {
-            aux.push(' ');
-            aux.push_str(&fmt_duration::fmt_duration(child_info_elapsed));
-        }
-        if remaining_children > 0 {
-            write!(aux, " + {remaining_children}").expect("Write to String is not fallible");
-        }
+        let aux = Aux {
+            name: child_event.to_string(),
+            duration: (subaction_ratio < DISPLAY_SUBACTION_CUTOFF)
+                .then(|| fmt_duration::fmt_duration(child_info_elapsed)),
+            remaining_children,
+        };
 
         // Escalate the row color on time in the current stage, and only while
         // actively executing -- total elapsed is mostly queueing under contention.
