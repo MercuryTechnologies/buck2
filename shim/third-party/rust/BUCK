@@ -11228,18 +11228,18 @@ third_party_rust_library(
 )
 
 http_archive(
-    name = "inout-0.2.4.crate",
-    sha256 = "3ce983bb6fb399067d101fbfc9e74174e07e9f29a2bc679efefeb8c645819c3f",
-    strip_prefix = "inout-0.2.4",
-    urls = ["https://static.crates.io/crates/inout/0.2.4/download"],
+    name = "inout-0.2.5.crate",
+    sha256 = "3b5cf4372d022092674a83b8febf5865f7a573cc0c5baec5e49c879b6a20978f",
+    strip_prefix = "inout-0.2.5",
+    urls = ["https://static.crates.io/crates/inout/0.2.5/download"],
     visibility = [],
 )
 
 third_party_rust_library(
     name = "inout-0.2",
-    srcs = [":inout-0.2.4.crate"],
+    srcs = [":inout-0.2.5.crate"],
     crate = "inout",
-    crate_root = "inout-0.2.4.crate/src/lib.rs",
+    crate_root = "inout-0.2.5.crate/src/lib.rs",
     edition = "2024",
     platform = {
         "linux-arm64": dict(),
@@ -19605,18 +19605,18 @@ third_party_rust_alias(
 )
 
 http_archive(
-    name = "relative-path-2.0.2.crate",
-    sha256 = "f2a073568cd8b9c4825429d3e9fc5f52851b4f97cc1348800689408921e6b8f8",
-    strip_prefix = "relative-path-2.0.2",
-    urls = ["https://static.crates.io/crates/relative-path/2.0.2/download"],
+    name = "relative-path-2.0.3.crate",
+    sha256 = "38540a682c6e9bca04a8bca9e5ec5a6ba168dfbb04c9998fe517a9befb92eb68",
+    strip_prefix = "relative-path-2.0.3",
+    urls = ["https://static.crates.io/crates/relative-path/2.0.3/download"],
     visibility = [],
 )
 
 third_party_rust_library(
     name = "relative-path-2",
-    srcs = [":relative-path-2.0.2.crate"],
+    srcs = [":relative-path-2.0.3.crate"],
     crate = "relative_path",
-    crate_root = "relative-path-2.0.2.crate/src/lib.rs",
+    crate_root = "relative-path-2.0.3.crate/src/lib.rs",
     edition = "2021",
     features = [
         "alloc",
@@ -19633,7 +19633,7 @@ third_party_rust_library(
         "windows-msvc": dict(),
     },
     visibility = [],
-    deps = [":serde-1"],
+    deps = [":serde_core-1"],
 )
 
 third_party_rust_alias(
@@ -22031,18 +22031,18 @@ third_party_rust_library(
 )
 
 http_archive(
-    name = "rustls-webpki-0.103.15.crate",
-    sha256 = "f3c3cf1d8b1e7d4927e2d154c3fcb02979afb9939629c62cd9048d4f07b60ac2",
-    strip_prefix = "rustls-webpki-0.103.15",
-    urls = ["https://static.crates.io/crates/rustls-webpki/0.103.15/download"],
+    name = "rustls-webpki-0.103.16.crate",
+    sha256 = "4443b1b6d39d7c663139942cc4558262562d2c84123bb6282ef177009ca8b281",
+    strip_prefix = "rustls-webpki-0.103.16",
+    urls = ["https://static.crates.io/crates/rustls-webpki/0.103.16/download"],
     visibility = [],
 )
 
 third_party_rust_library(
     name = "rustls-webpki-0.103",
-    srcs = [":rustls-webpki-0.103.15.crate"],
+    srcs = [":rustls-webpki-0.103.16.crate"],
     crate = "webpki",
-    crate_root = "rustls-webpki-0.103.15.crate/src/lib.rs",
+    crate_root = "rustls-webpki-0.103.16.crate/src/lib.rs",
     edition = "2021",
     features = [
         "alloc",
@@ -29674,18 +29674,18 @@ third_party_rust_library(
 )
 
 http_archive(
-    name = "webpki-roots-1.0.9.crate",
-    sha256 = "7dcd9d09a39985f5344844e66b0c530a33843579125f23e21e9f0f220850f22a",
-    strip_prefix = "webpki-roots-1.0.9",
-    urls = ["https://static.crates.io/crates/webpki-roots/1.0.9/download"],
+    name = "webpki-roots-1.0.10.crate",
+    sha256 = "1c1c8e20c8a38fc7d65abfe74eb7280e4aa667e8eec8bc84996d2874810748d9",
+    strip_prefix = "webpki-roots-1.0.10",
+    urls = ["https://static.crates.io/crates/webpki-roots/1.0.10/download"],
     visibility = [],
 )
 
 third_party_rust_library(
     name = "webpki-roots-1",
-    srcs = [":webpki-roots-1.0.9.crate"],
+    srcs = [":webpki-roots-1.0.10.crate"],
     crate = "webpki_roots",
-    crate_root = "webpki-roots-1.0.9.crate/src/lib.rs",
+    crate_root = "webpki-roots-1.0.10.crate/src/lib.rs",
     edition = "2021",
     named_deps = {
         "pki_types": ":rustls-pki-types-1",
