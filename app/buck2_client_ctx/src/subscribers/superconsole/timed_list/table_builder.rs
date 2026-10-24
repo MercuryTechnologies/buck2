@@ -8,6 +8,7 @@
  * above-listed licenses.
  */
 
+use std::fmt::Write;
 use std::time::Duration;
 
 use buck2_event_observer::display;
@@ -192,7 +193,7 @@ impl TimedRow {
         label: Option<String>,
         detail: String,
         category: Option<String>,
-        aux: Option<String>,
+        aux: Option<Aux>,
         time: String,
         age: Duration,
         cutoffs: &Cutoffs,
@@ -228,7 +229,7 @@ impl TimedRow {
         };
 
         let aux = match aux {
-            Some(text) => Some(AuxCell { text, age }.line(cutoffs)?),
+            Some(aux) => Some(AuxCell { aux, age }.line(cutoffs)?),
             None => None,
         };
 
@@ -310,18 +311,41 @@ impl DetailCell {
     }
 }
 
+/// The first child shown beside a root row: `<name> [<duration>] [+ <remaining>]`.
+pub(crate) struct Aux {
+    pub(crate) name: String,
+    pub(crate) duration: Option<String>,
+    pub(crate) remaining_children: usize,
+}
+
 struct AuxCell {
-    text: String,
+    aux: Aux,
     age: Duration,
 }
 
 impl AuxCell {
     fn line(self, cutoffs: &Cutoffs) -> buck2_error::Result<Line> {
-        let Self { text, age } = self;
-        let text = match text.split_once(' ') {
-            Some((kind, rest)) => format!("{kind:<ACTION_KIND_WIDTH$}{rest}"),
-            None => text,
+        let Self {
+            aux:
+                Aux {
+                    name,
+                    duration,
+                    remaining_children,
+                },
+            age,
+        } = self;
+        // Pad the name to the stage column only when a duration follows, so
+        // durations align; the name itself may contain spaces and is kept as is.
+        let mut text = match duration {
+            Some(duration) => {
+                let width = ACTION_KIND_WIDTH.max(name.chars().count() + 1);
+                format!("{name:<width$}{duration}")
+            }
+            None => name,
         };
+        if remaining_children > 0 {
+            write!(text, " + {remaining_children}").expect("Write to String is not fallible");
+        }
         Ok(Line::from_iter([Span::new_styled(styled_for_delay(
             style(text),
             age,
@@ -369,9 +393,75 @@ mod tests {
     use superconsole::Component;
 
     use crate::subscribers::superconsole::timed_list::Cutoffs;
+    use crate::subscribers::superconsole::timed_list::table_builder::Aux;
+    use crate::subscribers::superconsole::timed_list::table_builder::AuxCell;
     use crate::subscribers::superconsole::timed_list::table_builder::Row;
     use crate::subscribers::superconsole::timed_list::table_builder::Table;
     use crate::subscribers::superconsole::timed_list::table_builder::TimedRow;
+
+    fn aux(name: &str, duration: Option<&str>, remaining_children: usize) -> Aux {
+        Aux {
+            name: name.to_owned(),
+            duration: duration.map(str::to_owned),
+            remaining_children,
+        }
+    }
+
+    fn aux_text(aux: Aux) -> buck2_error::Result<String> {
+        let line = AuxCell {
+            aux,
+            age: Duration::ZERO,
+        }
+        .line(&CUTOFFS)?;
+        Ok(line.fmt_for_test().to_string())
+    }
+
+    #[test]
+    fn aux_aligns_stage_durations() -> buck2_error::Result<()> {
+        assert_eq!(
+            aux_text(aux("local_execute", Some("5.4s"), 0))?,
+            "local_execute   5.4s"
+        );
+        assert_eq!(
+            aux_text(aux("prepare", Some("5.0s"), 1))?,
+            "prepare         5.0s + 1"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn aux_keeps_space_after_long_stage_name() -> buck2_error::Result<()> {
+        assert_eq!(
+            aux_text(aux("re_worker_upload", Some("5.4s"), 0))?,
+            "re_worker_upload 5.4s"
+        );
+        assert_eq!(
+            aux_text(aux("local_prepare_outputs", Some("5.4s"), 0))?,
+            "local_prepare_outputs 5.4s"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn aux_does_not_pad_inside_multi_word_name() -> buck2_error::Result<()> {
+        assert_eq!(
+            aux_text(aux("Waiting for graph computations", None, 0))?,
+            "Waiting for graph computations"
+        );
+        assert_eq!(
+            aux_text(aux("Waiting for graph computations", None, 2))?,
+            "Waiting for graph computations + 2"
+        );
+        assert_eq!(
+            aux_text(aux("Waiting for dice", Some("1.2s"), 0))?,
+            "Waiting for dice 1.2s"
+        );
+        assert_eq!(
+            aux_text(aux("upload (action)", Some("1.2s"), 3))?,
+            "upload (action) 1.2s + 3"
+        );
+        Ok(())
+    }
 
     const CUTOFFS: Cutoffs = Cutoffs {
         inform: Duration::from_secs(1000),
@@ -388,7 +478,7 @@ mod tests {
             None,
             label.to_owned(),
             None,
-            Some("local_execute 10.4s".to_owned()),
+            Some(aux("local_execute", Some("10.4s"), 0)),
             "1:47.6s".to_owned(),
             Duration::ZERO,
             &CUTOFFS,
@@ -421,7 +511,7 @@ mod tests {
             None,
             "root//third-party/rust:tikv-jemalloc-sys-0.6-buildscript".to_owned(),
             None,
-            Some("local_execute 10.4s".to_owned()),
+            Some(aux("local_execute", Some("10.4s"), 0)),
             "1:47.6s".to_owned(),
             Duration::ZERO,
             &CUTOFFS,
@@ -451,7 +541,7 @@ mod tests {
             None,
             label.to_owned(),
             None,
-            Some("local_execute 10.4s".to_owned()),
+            Some(aux("local_execute", Some("10.4s"), 0)),
             "1:47.6s".to_owned(),
             Duration::ZERO,
             &CUTOFFS,
@@ -518,7 +608,7 @@ mod tests {
             Some("root//third-party/rust:serde_bytes-0.11".to_owned()),
             "deps 0".to_owned(),
             Some("deps".to_owned()),
-            Some("local_execute 0.1s".to_owned()),
+            Some(aux("local_execute", Some("0.1s"), 0)),
             "12.6s".to_owned(),
             Duration::from_secs(3000),
             &CUTOFFS,
