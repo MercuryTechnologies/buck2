@@ -98,7 +98,7 @@ def _unarchive_cmd(
         ), False
     elif ext_type == "zip":
         # gnutar does not intrinsically support zip
-        return cmd_args(archive, format = "unzip {}"), bool(strip_prefix)
+        return cmd_args("unzip", archive), bool(strip_prefix)
     else:
         fail()
 
@@ -273,7 +273,9 @@ def unarchive(
             "project_root=\"$PWD\"",
             cmd_args(script_output.as_output(), format = "cd {}"),
         ] + download + [
-            cmd_args([unarchive_cmd] + exclude_flags, delimiter = " ", relative_to = script_output.as_output()),
+            # cmd's quoting is not the shell's, and the Windows tar.zst command pipes through `|`,
+            # so only the sh script quotes each argument.
+            cmd_args([unarchive_cmd] + exclude_flags, delimiter = " ", relative_to = script_output.as_output()) if exec_is_windows else cmd_args([unarchive_cmd] + exclude_flags, delimiter = " ", quote = "shell", relative_to = script_output.as_output()),
         ] + (["rm -f \"$archive\""] if remote_download else []) + patch_commands,
         is_executable = True,
         allow_args = True,
