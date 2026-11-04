@@ -19,6 +19,7 @@ use std::sync::atomic::Ordering;
 
 use futures::stream;
 use prost::bytes::Bytes;
+use re_grpc_proto::build::bazel::remote::execution::v2::batch_read_blobs_response;
 use re_grpc_proto::build::bazel::remote::execution::v2::batch_update_blobs_response;
 use tokio::net::TcpListener;
 use tokio::net::TcpStream;
@@ -31,12 +32,16 @@ const REPLAY_BUFFER_SIZE: usize = 256 * 1024;
 
 const BATCH_UPDATE_BLOBS: &str =
     "/build.bazel.remote.execution.v2.ContentAddressableStorage/BatchUpdateBlobs";
+const BATCH_READ_BLOBS: &str =
+    "/build.bazel.remote.execution.v2.ContentAddressableStorage/BatchReadBlobs";
+const READ: &str = "/google.bytestream.ByteStream/Read";
 const WRITE: &str = "/google.bytestream.ByteStream/Write";
 
 /// A server whose first connection takes more than `REPLAY_BUFFER_SIZE` of
 /// the first request's body and then sends GOAWAY with last stream ID 0 and
 /// NO_ERROR, so the request was not processed. Later connections serve
-/// `BatchUpdateBlobs` and `ByteStream.Write`.
+/// `BatchUpdateBlobs`, `BatchReadBlobs`, `ByteStream.Read` and
+/// `ByteStream.Write`.
 struct GoawayServer {
     channel: Channel,
     goaway_sent: Arc<AtomicBool>,
@@ -46,6 +51,16 @@ struct GoawayServer {
 
 impl GoawayServer {
     async fn start() -> Self {
+        Self::start_with(REPLAY_BUFFER_SIZE).await
+    }
+
+    /// Refuses the first request once any of its body arrives, so even a
+    /// small request is sent in full before the GOAWAY.
+    async fn refusing_first_request() -> Self {
+        Self::start_with(0).await
+    }
+
+    async fn start_with(refuse_after: usize) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let goaway_sent = Arc::new(AtomicBool::new(false));
@@ -55,7 +70,7 @@ impl GoawayServer {
             let served = served.clone();
             async move {
                 let (tcp, _) = listener.accept().await.unwrap();
-                tokio::spawn(reject_first_request(tcp, goaway_sent));
+                tokio::spawn(reject_first_request(tcp, refuse_after, goaway_sent));
                 loop {
                     let (tcp, _) = listener.accept().await.unwrap();
                     tokio::spawn(serve(tcp, served.clone()));
@@ -78,8 +93,13 @@ impl GoawayServer {
 }
 
 /// Speaks just enough HTTP/2 to receive the first request and send a GOAWAY
-/// that rejects it, which `h2`'s server can't do once it has seen the request.
-async fn reject_first_request(mut tcp: TcpStream, goaway_sent: Arc<AtomicBool>) {
+/// that rejects it once more than `refuse_after` bytes of its body arrived,
+/// which `h2`'s server can't do once it has seen the request.
+async fn reject_first_request(
+    mut tcp: TcpStream,
+    refuse_after: usize,
+    goaway_sent: Arc<AtomicBool>,
+) {
     const DATA: u8 = 0x0;
     const SETTINGS: u8 = 0x4;
     const PING: u8 = 0x6;
@@ -120,9 +140,9 @@ async fn reject_first_request(mut tcp: TcpStream, goaway_sent: Arc<AtomicBool>) 
         let written = match (header[3], header[4] & ACK) {
             (SETTINGS, 0) => write_frame(&mut tcp, SETTINGS, ACK, &[]).await,
             (PING, 0) => write_frame(&mut tcp, PING, ACK, &payload).await,
-            (DATA, _) if body_received <= REPLAY_BUFFER_SIZE => {
+            (DATA, _) if body_received <= refuse_after => {
                 body_received += len;
-                if body_received > REPLAY_BUFFER_SIZE {
+                if body_received > refuse_after {
                     // Last stream ID 0 and NO_ERROR.
                     goaway_sent.store(true, Ordering::SeqCst);
                     write_frame(&mut tcp, GOAWAY, 0, &[0; 8]).await
@@ -161,7 +181,7 @@ async fn serve(tcp: TcpStream, served: Arc<Mutex<Vec<(String, usize)>>>) {
                 data.extend_from_slice(&chunk);
             }
             let messages = grpc_messages(&data);
-            let (blob_bytes, response) = match method.as_str() {
+            let (blob_bytes, responses) = match method.as_str() {
                 BATCH_UPDATE_BLOBS => {
                     let request = BatchUpdateBlobsRequest::decode(messages[0]).unwrap();
                     let response = BatchUpdateBlobsResponse {
@@ -175,7 +195,35 @@ async fn serve(tcp: TcpStream, served: Arc<Mutex<Vec<(String, usize)>>>) {
                             .collect(),
                     };
                     let blob_bytes = request.requests.iter().map(|r| r.data.len()).sum();
-                    (blob_bytes, response.encode_to_vec())
+                    (blob_bytes, vec![response.encode_to_vec()])
+                }
+                BATCH_READ_BLOBS => {
+                    let request = BatchReadBlobsRequest::decode(messages[0]).unwrap();
+                    let response = BatchReadBlobsResponse {
+                        responses: request
+                            .digests
+                            .iter()
+                            .map(|digest| batch_read_blobs_response::Response {
+                                digest: Some(digest.clone()),
+                                data: vec![1; digest.size_bytes as usize],
+                                status: Some(Status::default()),
+                                ..Default::default()
+                            })
+                            .collect(),
+                    };
+                    (0, vec![response.encode_to_vec()])
+                }
+                READ => {
+                    let request = ReadRequest::decode(messages[0]).unwrap();
+                    let blob = read_blob(&request);
+                    let responses = blob
+                        .chunks(READ_CHUNK_SIZE)
+                        .map(|chunk| ReadResponse {
+                            data: chunk.to_vec(),
+                        })
+                        .map(|response| response.encode_to_vec())
+                        .collect();
+                    (blob.len(), responses)
                 }
                 WRITE => {
                     let blob_bytes = messages
@@ -185,7 +233,7 @@ async fn serve(tcp: TcpStream, served: Arc<Mutex<Vec<(String, usize)>>>) {
                     let response = WriteResponse {
                         committed_size: blob_bytes as i64,
                     };
-                    (blob_bytes, response.encode_to_vec())
+                    (blob_bytes, vec![response.encode_to_vec()])
                 }
                 _ => panic!("Unexpected call to {method}"),
             };
@@ -196,7 +244,9 @@ async fn serve(tcp: TcpStream, served: Arc<Mutex<Vec<(String, usize)>>>) {
                 .body(())
                 .unwrap();
             let mut stream = respond.send_response(headers, false).unwrap();
-            stream.send_data(grpc_frame(&response), false).unwrap();
+            for response in responses {
+                stream.send_data(grpc_frame(&response), false).unwrap();
+            }
             let mut trailers = http::HeaderMap::new();
             trailers.insert("grpc-status", http::HeaderValue::from_static("0"));
             stream.send_trailers(trailers).unwrap();
@@ -220,6 +270,90 @@ fn grpc_frame(message: &[u8]) -> Bytes {
     frame.extend_from_slice(&(message.len() as u32).to_be_bytes());
     frame.extend_from_slice(message);
     frame.into()
+}
+
+const READ_CHUNK_SIZE: usize = 1024 * 1024;
+
+/// The part of a blob of ones, sized as its resource name says, that a
+/// `ByteStream.Read` asks for.
+fn read_blob(request: &ReadRequest) -> Vec<u8> {
+    let size: usize = request
+        .resource_name
+        .rsplit('/')
+        .next()
+        .unwrap()
+        .parse()
+        .unwrap();
+    vec![1; size - request.read_offset as usize]
+}
+
+/// A `ByteStream.Read` the server refused is sent again by the
+/// `retry_grpc_request` around opening it, as in `REClient::download`.
+#[tokio::test]
+async fn test_bytestream_read_after_goaway() -> anyhow::Result<()> {
+    let server = GoawayServer::refusing_first_request().await;
+    let bytestream = ByteStreamClient::new(server.channel.clone());
+    let blob_size = 3 * READ_CHUNK_SIZE;
+    let request = ReadRequest {
+        resource_name: format!("blobs/aa/{blob_size}"),
+        ..Default::default()
+    };
+
+    let read = async {
+        let mut stream = retry_grpc_request(
+            DEFAULT_RETRIES,
+            Duration::from_millis(DEFAULT_RETRY_MAX_DELAY_MILLIS),
+            || {
+                let mut bytestream = bytestream.clone();
+                let request = request.clone();
+                async move { Ok(bytestream.read(request).await?.into_inner()) }
+            },
+        )
+        .await?;
+        let mut data = Vec::new();
+        while let Some(response) = stream.message().await? {
+            data.extend(response.data);
+        }
+        anyhow::Ok(data)
+    };
+    let data = tokio::time::timeout(Duration::from_secs(60), read).await??;
+
+    assert_eq!(data, vec![1; blob_size]);
+    assert!(server.goaway_sent.load(Ordering::SeqCst));
+    assert_eq!(server.served(), [(READ.to_owned(), blob_size)]);
+    Ok(())
+}
+
+/// A `BatchReadBlobs` the server refused, as in facebook/buck2#1294, is sent
+/// again by the `retry_grpc_request` around it, as in `REClient::download`.
+#[tokio::test]
+async fn test_batch_read_after_goaway() -> anyhow::Result<()> {
+    let server = GoawayServer::refusing_first_request().await;
+    let cas = ContentAddressableStorageClient::new(server.channel.clone());
+    let request = BatchReadBlobsRequest {
+        digests: vec![Digest {
+            hash: "aa".to_owned(),
+            size_bytes: 3,
+        }],
+        ..Default::default()
+    };
+
+    let read = retry_grpc_request(
+        DEFAULT_RETRIES,
+        Duration::from_millis(DEFAULT_RETRY_MAX_DELAY_MILLIS),
+        || {
+            let mut cas = cas.clone();
+            let request = request.clone();
+            async move { Ok(cas.batch_read_blobs(request).await?.into_inner()) }
+        },
+    );
+    let response = tokio::time::timeout(Duration::from_secs(60), read).await??;
+
+    assert_eq!(response.responses.len(), 1);
+    assert_eq!(response.responses[0].data, [1, 1, 1]);
+    assert!(server.goaway_sent.load(Ordering::SeqCst));
+    assert_eq!(server.served(), [(BATCH_READ_BLOBS.to_owned(), 0)]);
+    Ok(())
 }
 
 fn upload_request(blob: Vec<u8>) -> UploadRequest {
