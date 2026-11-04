@@ -19,8 +19,12 @@ runs:
   - uses: actions/setup-java@v4
     with:
       distribution: temurin
-      java-version: '17'
-  # The demo toolchains in the prelude read the JDK from `[java] java_home`.
-  - name: Point examples/with_prelude at the JDK
-    run: printf '[java]\n  java_home = %s\n' "${JAVA_HOME//\\//}" >> examples/with_prelude/.buckconfig.local
+      java-version: '21'
+  # The demo toolchains in the prelude read the JDK from `[java] java_home`
+  # and the Android SDK from `[android] sdk_path`. The runner images carry an
+  # Android SDK under ANDROID_HOME.
+  - name: Point examples/with_prelude at the JDK and the Android SDK
+    run: |-
+      printf '[java]\n  java_home = %s\n' "${JAVA_HOME//\\//}" >> examples/with_prelude/.buckconfig.local
+      printf '[android]\n  sdk_path = %s\n' "${ANDROID_HOME//\\//}" >> examples/with_prelude/.buckconfig.local
     shell: bash
