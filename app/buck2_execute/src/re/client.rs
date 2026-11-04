@@ -254,13 +254,14 @@ impl RemoteExecutionClient {
         action_digest: ActionDigest,
         use_case: RemoteExecutorUseCase,
         platform: &RE::Platform,
+        identity: Option<&ReActionIdentity<'_>>,
     ) -> buck2_error::Result<Option<ActionResultResponse>> {
         self.data
             .action_cache
             .op(self
                 .data
                 .client
-                .action_cache(action_digest, use_case, platform))
+                .action_cache(action_digest, use_case, platform, identity))
             .await
     }
 
@@ -302,6 +303,7 @@ impl RemoteExecutionClient {
         directories: Vec<remote_execution::Path>,
         inlined_blobs_with_digest: Vec<InlinedBlobWithDigest>,
         use_case: RemoteExecutorUseCase,
+        identity: Option<&ReActionIdentity<'_>>,
     ) -> buck2_error::Result<()> {
         self.data
             .uploads
@@ -310,6 +312,7 @@ impl RemoteExecutionClient {
                 directories,
                 inlined_blobs_with_digest,
                 use_case,
+                identity,
             ))
             .await
     }
@@ -466,6 +469,7 @@ impl RemoteExecutionClient {
         digest: ActionDigest,
         result: TActionResult2,
         use_case: RemoteExecutorUseCase,
+        identity: Option<&ReActionIdentity<'_>>,
         platform: &RE::Platform,
         write_type: ActionCacheWriteType,
     ) -> buck2_error::Result<WriteActionResultResponse> {
@@ -474,7 +478,7 @@ impl RemoteExecutionClient {
             .op(self
                 .data
                 .client
-                .write_action_result(digest, result, use_case, platform, write_type))
+                .write_action_result(digest, result, use_case, identity, platform, write_type))
             .await
     }
 
@@ -1055,6 +1059,7 @@ impl RemoteExecutionClientImpl {
         action_digest: ActionDigest,
         use_case: RemoteExecutorUseCase,
         platform: &RE::Platform,
+        identity: Option<&ReActionIdentity<'_>>,
     ) -> buck2_error::Result<Option<ActionResultResponse>> {
         if let Some(m) = &*INDUCED_CACHE_MISSES {
             if m.get(&action_digest.to_string())
@@ -1070,7 +1075,11 @@ impl RemoteExecutionClientImpl {
             self.client()
                 .get_action_cache_client()
                 .get_action_result(
-                    &use_case.metadata(None),
+                    // The action digest is the action's id, whoever asks.
+                    &RemoteExecutionMetadata {
+                        action_id: Some(action_digest.raw_digest().to_string()),
+                        ..use_case.metadata(identity)
+                    },
                     ActionResultRequest {
                         digest: action_digest.to_re(),
                         platform: Some(re_platform(platform)),
@@ -1109,6 +1118,7 @@ impl RemoteExecutionClientImpl {
         directories: Vec<remote_execution::Path>,
         inlined_blobs_with_digest: Vec<InlinedBlobWithDigest>,
         use_case: RemoteExecutorUseCase,
+        identity: Option<&ReActionIdentity<'_>>,
     ) -> buck2_error::Result<()> {
         with_error_handler(
             "upload_files_and_directories",
@@ -1116,7 +1126,8 @@ impl RemoteExecutionClientImpl {
             self.client()
                 .get_cas_client()
                 .upload(
-                    &use_case.metadata(None),
+                    // The action these blobs belong to, so a BES server can link the upload to it.
+                    &use_case.metadata(identity),
                     UploadRequest {
                         files_with_digest: Some(files_with_digest),
                         inlined_blobs_with_digest: Some(inlined_blobs_with_digest),
@@ -1135,6 +1146,7 @@ impl RemoteExecutionClientImpl {
         metadata: &RemoteExecutionMetadata,
         request: ExecuteRequest,
         action_digest: &ActionDigest,
+        proto_action_key: &buck2_data::ActionKey,
         manager: &mut CommandExecutionManager,
         re_max_queue_time: Option<Duration>,
         platform: &remote_execution::Platform,
@@ -1458,6 +1470,7 @@ impl RemoteExecutionClientImpl {
                             stderr_stream_name: meta.stderr_stream_name.clone(),
                             action_key: action_key.clone(),
                             use_case: re_use_case.clone(),
+                            key: Some(proto_action_key.clone()),
                         });
                     }
                 }
@@ -1523,6 +1536,7 @@ impl RemoteExecutionClientImpl {
                 ..Default::default()
             }),
             respect_file_symlinks: Some(self.respect_file_symlinks),
+            action_id: Some(action_digest.raw_digest().to_string()),
             ..use_case.metadata(Some(identity))
         };
 
@@ -1673,6 +1687,7 @@ impl RemoteExecutionClientImpl {
                 &metadata,
                 request,
                 &action_digest,
+                &identity.proto_action_key,
                 manager,
                 re_max_queue_time,
                 platform,
@@ -1808,7 +1823,10 @@ impl RemoteExecutionClientImpl {
             self.client()
                 .get_cas_client()
                 .download(
-                    &use_case.metadata(None),
+                    &RemoteExecutionMetadata {
+                        action_id: Some(digest.hash.clone()),
+                        ..use_case.metadata(None)
+                    },
                     DownloadRequest {
                         inlined_digests: Some(vec![digest.clone()]),
                         ..Default::default()
@@ -1976,6 +1994,7 @@ impl RemoteExecutionClientImpl {
         digest: ActionDigest,
         result: TActionResult2,
         use_case: RemoteExecutorUseCase,
+        identity: Option<&ReActionIdentity<'_>>,
         platform: &RE::Platform,
         write_type: ActionCacheWriteType,
     ) -> buck2_error::Result<WriteActionResultResponse> {
@@ -2001,7 +2020,8 @@ impl RemoteExecutionClientImpl {
                             attributes,
                             ..Default::default()
                         }),
-                        ..use_case.metadata(None)
+                        action_id: Some(digest.raw_digest().to_string()),
+                        ..use_case.metadata(identity)
                     },
                     WriteActionResultRequest {
                         action_digest: digest.to_re(),

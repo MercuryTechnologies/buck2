@@ -118,6 +118,7 @@ use buck2_execute::execute::result::CommandExecutionReport;
 use buck2_execute::execute::result::CommandExecutionResult;
 use buck2_execute::execute::result::CommandExecutionStatus;
 use buck2_execute::execute::target::CommandExecutionTarget;
+use buck2_execute::execute::target::request_metadata_target_id;
 use buck2_execute::materialize::materializer::HasMaterializer;
 use buck2_execute::materialize::materializer::MaterializationPurpose;
 use buck2_execute_impl::executors::local::EnvironmentBuilder;
@@ -588,6 +589,7 @@ impl<'a> BuckTestOrchestrator<'a> {
         } = key;
         let fs = dice.get_artifact_fs().await?;
         let test_info = Self::get_test_info(dice, &test_target, internal_runner_config).await?;
+        let test_labels = test_labels(&test_info)?;
         let effective_test_execution_caching =
             test_info.supports_test_execution_caching() && !disable_test_execution_caching;
         let disable_local_network_isolation =
@@ -693,6 +695,7 @@ impl<'a> BuckTestOrchestrator<'a> {
             cancellation,
             &test_target,
             &stage,
+            &test_labels,
             test_executor.executor(),
             execution_request,
             liveliness_observer.dupe(),
@@ -854,6 +857,20 @@ async fn prepare_and_execute_dice<'d>(
         .duped_err()
 }
 
+async fn test_discovery_command_report(
+    report: &CommandExecutionReport,
+) -> buck2_data::CommandExecution {
+    report.to_command_execution_proto(true, true, false).await
+}
+
+async fn test_run_command_report(report: &CommandExecutionReport) -> buck2_data::CommandExecution {
+    report.to_command_execution_proto(false, false, false).await
+}
+
+fn test_timeout_proto(timeout: Option<Duration>) -> Option<prost_types::Duration> {
+    timeout.and_then(|timeout| timeout.try_into().ok())
+}
+
 impl Display for TestExecutionKey {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "test_target = {}, ", self.test_target)?;
@@ -991,12 +1008,17 @@ impl TestOrchestrator for BuckTestOrchestrator<'_> {
         names: Vec<String>,
     ) -> buck2_error::Result<()> {
         let test_target = self.session.get(test_target)?;
+        let mut dice = self.dice.ctx();
+        let test_info =
+            Self::get_test_info(&mut dice, &test_target, &self.internal_runner_config).await?;
+        let labels = test_labels(&test_info)?;
 
         self.events.instant_event(TestDiscovery {
             data: Some(buck2_data::test_discovery::Data::Tests(TestSuite {
                 suite_name: suite,
                 test_names: names,
                 target_label: Some(test_target.target().as_proto()),
+                labels,
             })),
         });
 
@@ -1242,6 +1264,7 @@ impl BuckTestOrchestrator<'_> {
         cancellation: &CancellationContext,
         test_target_label: &ConfiguredProvidersLabel,
         stage: &TestStage,
+        test_labels: &[String],
         executor: &CommandExecutor,
         request: CommandExecutionRequest,
         liveliness_observer: Arc<dyn LivelinessObserver>,
@@ -1280,6 +1303,7 @@ impl BuckTestOrchestrator<'_> {
                 let start = TestDiscoveryStart {
                     target_label: Some(test_target.target.as_proto()),
                     suite_name: suite.clone(),
+                    labels: test_labels.to_vec(),
                 };
                 let (result, cached) = events
                     .span_async(start, async move {
@@ -1305,11 +1329,9 @@ impl BuckTestOrchestrator<'_> {
                         let end = TestDiscoveryEnd {
                             suite_name: suite.clone(),
                             target_label: Some(test_target.target.as_proto()),
+                            labels: test_labels.to_vec(),
                             command_report: Some(
-                                result
-                                    .report
-                                    .to_command_execution_proto(true, true, false)
-                                    .await,
+                                test_discovery_command_report(&result.report).await,
                             ),
                             command_host_sharing_requirements: host_sharing_requirements_to_grpc(
                                 prepared_command.request.host_sharing_requirements().clone(),
@@ -1326,6 +1348,7 @@ impl BuckTestOrchestrator<'_> {
                         digest_config,
                         mergebase: &None,
                         re_platform: executor.re_platform(),
+                        paths: request.paths(),
                     };
                     let _result = match executor
                         .cache_upload(
@@ -1350,6 +1373,7 @@ impl BuckTestOrchestrator<'_> {
                     suite_name: suite.clone(),
                     test_names: testcases.clone(),
                     target_label: Some(test_target.target.as_proto()),
+                    labels: test_labels.to_vec(),
                 });
                 let start = TestRunStart {
                     suite: test_suite.clone(),
@@ -1377,16 +1401,12 @@ impl BuckTestOrchestrator<'_> {
                         };
                         let end = TestRunEnd {
                             suite: test_suite,
-                            command_report: Some(
-                                result
-                                    .report
-                                    .to_command_execution_proto(true, true, false)
-                                    .await,
-                            ),
+                            command_report: Some(test_run_command_report(&result.report).await),
                             command_host_sharing_requirements: host_sharing_requirements_to_grpc(
                                 prepared_command.request.host_sharing_requirements().clone(),
                             )
                             .ok(),
+                            timeout: test_timeout_proto(prepared_command.request.timeout()),
                         };
                         ((result, cached), end)
                     })
@@ -1397,6 +1417,7 @@ impl BuckTestOrchestrator<'_> {
                         digest_config,
                         mergebase: &None,
                         re_platform: executor.re_platform(),
+                        paths: request.paths(),
                     };
                     let _result = match executor
                         .cache_upload(
@@ -2320,6 +2341,25 @@ impl<'a> Execute2RequestExpander<'a> {
     }
 }
 
+fn test_labels(test_info: &OwnedTestInfo) -> buck2_error::Result<Vec<String>> {
+    match test_info {
+        OwnedTestInfo::External(info) => info
+            .as_ref()
+            .value()
+            .as_ref()
+            .labels()
+            .map(|label| Ok(label.to_owned()))
+            .collect(),
+        OwnedTestInfo::Internal(info) => info
+            .as_ref()
+            .value()
+            .as_ref()
+            .labels()
+            .map(|label| Ok(label.to_owned()))
+            .collect(),
+    }
+}
+
 async fn resolve_output_root(
     dice: &mut DiceComputations<'_>,
     test_target: &ConfiguredProvidersLabel,
@@ -2492,6 +2532,18 @@ impl CommandExecutionTarget for TestTarget<'_> {
             identifier: "".to_owned(),
         }
     }
+
+    fn action_mnemonic(&self) -> Option<String> {
+        Some("test".to_owned())
+    }
+
+    fn target_label(&self) -> Option<String> {
+        Some(request_metadata_target_id(self.target))
+    }
+
+    fn configuration_hash(&self) -> Option<String> {
+        Some(self.target.cfg().output_hash().as_str().to_owned())
+    }
 }
 
 fn create_action_key_suffix(stage: &TestStage) -> String {
@@ -2547,6 +2599,18 @@ impl CommandExecutionTarget for LocalResourceTarget<'_> {
             identifier: "".to_owned(),
         }
     }
+
+    fn action_mnemonic(&self) -> Option<String> {
+        Some("setup_local_resource".to_owned())
+    }
+
+    fn target_label(&self) -> Option<String> {
+        Some(request_metadata_target_id(self.target))
+    }
+
+    fn configuration_hash(&self) -> Option<String> {
+        Some(self.target.cfg().output_hash().as_str().to_owned())
+    }
 }
 
 struct TestExecutor {
@@ -2590,6 +2654,8 @@ mod tests {
     use buck2_core::cells::name::CellName;
     use buck2_core::configuration::data::ConfigurationData;
     use buck2_core::fs::project::ProjectRootTemp;
+    use buck2_execute::execute::action_digest::ActionDigest;
+    use buck2_execute::execute::output::CommandStdStreams;
     use buck2_execute::re::manager::UnconfiguredRemoteExecutionClient;
     use buck2_test_api::data::TestStage;
     use buck2_test_api::data::TestStatus;
@@ -2601,6 +2667,46 @@ mod tests {
     use futures::stream::TryStreamExt;
 
     use super::*;
+
+    fn make_test_command_report() -> CommandExecutionReport {
+        let digest_config = DigestConfig::testing_default();
+        CommandExecutionReport {
+            claim: None,
+            status: CommandExecutionStatus::Success {
+                execution_kind: CommandExecutionKind::Local {
+                    digest: ActionDigest::empty(digest_config.cas_digest_config()),
+                    command: vec!["test-binary".to_owned()],
+                    env: Default::default(),
+                },
+            },
+            timing: CommandExecutionMetadata::empty(buck2_util::time_span::TimeSpan::empty_now()),
+            std_streams: CommandStdStreams::Local {
+                stdout: b"test stdout".to_vec(),
+                stderr: b"test stderr".to_vec(),
+            },
+            exit_code: Some(0),
+            additional_message: None,
+            inline_environment_metadata: Default::default(),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_run_command_report_preserves_streams() {
+        let report = make_test_command_report();
+        let proto = test_run_command_report(&report).await;
+        let details = proto.details.as_ref().expect("command details");
+
+        assert_eq!(details.cmd_stdout, "test stdout");
+        assert_eq!(details.cmd_stderr, "test stderr");
+    }
+
+    #[test]
+    fn test_timeout_proto_preserves_seconds() {
+        let timeout = test_timeout_proto(Some(Duration::from_secs(42))).expect("timeout");
+
+        assert_eq!(timeout.seconds, 42);
+        assert_eq!(timeout.nanos, 0);
+    }
 
     async fn make() -> buck2_error::Result<(
         BuckTestOrchestrator<'static>,

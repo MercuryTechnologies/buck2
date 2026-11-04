@@ -432,6 +432,9 @@ impl IoHandler for DefaultIoHandler {
             }
             _ => None,
         };
+        // Upstream materializes HTTP downloads directly rather than deferring them, so nothing
+        // that reaches here has a URL.
+        let url: Option<String> = None;
         let materialization_start = buck2_data::MaterializationStart {
             action_digest: action_digest.clone(),
         };
@@ -464,6 +467,7 @@ impl IoHandler for DefaultIoHandler {
                         success: error.is_none(),
                         error,
                         method: Some(method.to_proto() as i32),
+                        url,
                     },
                 )
             })

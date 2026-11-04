@@ -755,7 +755,14 @@ async fn process_build_result(
                 Ok(n) => *n,
                 Err(..) => 0,
             };
-            (res, buck2_data::CreateOutputSymlinksEnd { created })
+            (
+                res,
+                // The materializer creates these links; it does not list them yet.
+                buck2_data::CreateOutputSymlinksEnd {
+                    created,
+                    symlinks: Vec::new(),
+                },
+            )
         })
         .await?;
     }
