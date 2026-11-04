@@ -36,12 +36,15 @@ const BATCH_READ_BLOBS: &str =
     "/build.bazel.remote.execution.v2.ContentAddressableStorage/BatchReadBlobs";
 const READ: &str = "/google.bytestream.ByteStream/Read";
 const WRITE: &str = "/google.bytestream.ByteStream/Write";
+const EXECUTE: &str = "/build.bazel.remote.execution.v2.Execution/Execute";
+const WAIT_EXECUTION: &str = "/build.bazel.remote.execution.v2.Execution/WaitExecution";
+const OPERATION: &str = "operations/action-1";
 
 /// A server whose first connection takes more than `REPLAY_BUFFER_SIZE` of
 /// the first request's body and then sends GOAWAY with last stream ID 0 and
 /// NO_ERROR, so the request was not processed. Later connections serve
-/// `BatchUpdateBlobs`, `BatchReadBlobs`, `ByteStream.Read` and
-/// `ByteStream.Write`.
+/// `BatchUpdateBlobs`, `BatchReadBlobs`, `ByteStream.Read`,
+/// `ByteStream.Write`, `Execute` and `WaitExecution`.
 struct GoawayServer {
     channel: Channel,
     goaway_sent: Arc<AtomicBool>,
@@ -51,16 +54,23 @@ struct GoawayServer {
 
 impl GoawayServer {
     async fn start() -> Self {
-        Self::start_with(REPLAY_BUFFER_SIZE).await
+        Self::start_with(Some(REPLAY_BUFFER_SIZE), false).await
     }
 
     /// Refuses the first request once any of its body arrives, so even a
     /// small request is sent in full before the GOAWAY.
     async fn refusing_first_request() -> Self {
-        Self::start_with(0).await
+        Self::start_with(Some(0), false).await
     }
 
-    async fn start_with(refuse_after: usize) -> Self {
+    /// Refuses nothing. `Execute` reports a named operation that is still
+    /// running and ends the stream, as a server may for a long action, so the
+    /// client resumes it with `WaitExecution`.
+    async fn leaving_executions_running() -> Self {
+        Self::start_with(None, true).await
+    }
+
+    async fn start_with(refuse_after: Option<usize>, leave_running: bool) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let goaway_sent = Arc::new(AtomicBool::new(false));
@@ -69,11 +79,13 @@ impl GoawayServer {
             let goaway_sent = goaway_sent.clone();
             let served = served.clone();
             async move {
-                let (tcp, _) = listener.accept().await.unwrap();
-                tokio::spawn(reject_first_request(tcp, refuse_after, goaway_sent));
+                if let Some(refuse_after) = refuse_after {
+                    let (tcp, _) = listener.accept().await.unwrap();
+                    tokio::spawn(reject_first_request(tcp, refuse_after, goaway_sent));
+                }
                 loop {
                     let (tcp, _) = listener.accept().await.unwrap();
-                    tokio::spawn(serve(tcp, served.clone()));
+                    tokio::spawn(serve(tcp, served.clone(), leave_running));
                 }
             }
         });
@@ -166,7 +178,7 @@ async fn write_frame(tcp: &mut TcpStream, kind: u8, flags: u8, payload: &[u8]) -
     tcp.write_all(&frame).await
 }
 
-async fn serve(tcp: TcpStream, served: Arc<Mutex<Vec<(String, usize)>>>) {
+async fn serve(tcp: TcpStream, served: Arc<Mutex<Vec<(String, usize)>>>, leave_running: bool) {
     let mut connection = h2::server::handshake(tcp).await.unwrap();
     while let Some(request) = connection.accept().await {
         let (request, mut respond) = request.unwrap();
@@ -225,6 +237,8 @@ async fn serve(tcp: TcpStream, served: Arc<Mutex<Vec<(String, usize)>>>) {
                         .collect();
                     (blob.len(), responses)
                 }
+                EXECUTE if leave_running => (0, vec![running_operation().encode_to_vec()]),
+                EXECUTE | WAIT_EXECUTION => (0, vec![finished_operation().encode_to_vec()]),
                 WRITE => {
                     let blob_bytes = messages
                         .iter()
@@ -321,6 +335,103 @@ async fn test_bytestream_read_after_goaway() -> anyhow::Result<()> {
     assert_eq!(data, vec![1; blob_size]);
     assert!(server.goaway_sent.load(Ordering::SeqCst));
     assert_eq!(server.served(), [(READ.to_owned(), blob_size)]);
+    Ok(())
+}
+
+fn running_operation() -> Operation {
+    Operation {
+        name: OPERATION.to_owned(),
+        metadata: Some(prost_types::Any {
+            type_url: String::new(),
+            value: ExecuteOperationMetadata {
+                stage: execution_stage::Value::Executing as i32,
+                ..Default::default()
+            }
+            .encode_to_vec(),
+        }),
+        ..Default::default()
+    }
+}
+
+fn finished_operation() -> Operation {
+    Operation {
+        name: OPERATION.to_owned(),
+        done: true,
+        result: Some(OpResult::Response(prost_types::Any {
+            type_url: String::new(),
+            value: GExecuteResponse {
+                result: Some(ActionResult {
+                    execution_metadata: Some(ExecutedActionMetadata::default()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }
+            .encode_to_vec(),
+        })),
+        ..Default::default()
+    }
+}
+
+/// Runs an action like `REClient::execute_with_progress`, sending `Execute`
+/// to `execute` and `WaitExecution` to `resume`, and returns its last event.
+async fn execute(
+    execute: &Channel,
+    resume: &Channel,
+) -> anyhow::Result<ExecuteWithProgressResponse> {
+    let open = |operation: Option<String>| {
+        let mut execute = ExecutionClient::new(execute.clone());
+        let mut resume = ExecutionClient::new(resume.clone());
+        async move {
+            anyhow::Ok(match operation {
+                None => execute
+                    .execute(GExecuteRequest::default())
+                    .await?
+                    .into_inner(),
+                Some(name) => resume
+                    .wait_execution(WaitExecutionRequest { name })
+                    .await?
+                    .into_inner(),
+            })
+        }
+    };
+    let events: Vec<_> = execution_progress_stream(open, 0).collect().await;
+    events.into_iter().last().context("No execution events")?
+}
+
+/// An `Execute` the server refused was not processed, so it is sent again.
+#[tokio::test]
+async fn test_execute_after_goaway() -> anyhow::Result<()> {
+    let server = GoawayServer::refusing_first_request().await;
+
+    let response = tokio::time::timeout(
+        Duration::from_secs(60),
+        execute(&server.channel, &server.channel),
+    )
+    .await??;
+
+    assert!(response.execute_response.is_some());
+    assert!(server.goaway_sent.load(Ordering::SeqCst));
+    assert_eq!(server.served(), [(EXECUTE.to_owned(), 0)]);
+    Ok(())
+}
+
+/// A `WaitExecution` the server refused while resuming an execution is sent
+/// again.
+#[tokio::test]
+async fn test_wait_execution_after_goaway() -> anyhow::Result<()> {
+    let executor = GoawayServer::leaving_executions_running().await;
+    let resumer = GoawayServer::refusing_first_request().await;
+
+    let response = tokio::time::timeout(
+        Duration::from_secs(60),
+        execute(&executor.channel, &resumer.channel),
+    )
+    .await??;
+
+    assert!(response.execute_response.is_some());
+    assert!(resumer.goaway_sent.load(Ordering::SeqCst));
+    assert_eq!(executor.served(), [(EXECUTE.to_owned(), 0)]);
+    assert_eq!(resumer.served(), [(WAIT_EXECUTION.to_owned(), 0)]);
     Ok(())
 }
 

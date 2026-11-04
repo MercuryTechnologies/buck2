@@ -754,12 +754,16 @@ fn is_transient_io_error(err: &std::io::Error) -> bool {
 ///     `Code::Unknown`. Body errors on an established connection (for
 ///     example a TCP reset during a `BatchReadBlobs` response) take this
 ///     path and need the explicit downcast.
+///   - a request the server refused, see `is_refused_by_server`.
 ///
 /// `tonic::transport::Error` is not matched directly — its transient subset
 /// surfaces as an `io::Error` somewhere in the chain, which we catch above.
 /// Non-transient transport errors (TLS handshake, invalid URI) do not have
 /// an `io::Error` source, so they correctly do not retry.
 fn is_retryable(err: &anyhow::Error) -> bool {
+    if is_refused_by_server(err) {
+        return true;
+    }
     for cause in err.chain() {
         if let Some(status) = cause.downcast_ref::<tonic::Status>() {
             match status.code() {
@@ -784,6 +788,22 @@ fn is_retryable(err: &anyhow::Error) -> bool {
         }
     }
     false
+}
+
+/// Returns true for a request the server refused without processing it: one
+/// above the last stream ID of a graceful GOAWAY, which load balancers such as
+/// nginx and AWS ALB send to recycle a connection, or one reset with
+/// REFUSED_STREAM. Sending it again is safe, see
+/// <https://www.rfc-editor.org/rfc/rfc9113#section-8.7>. tonic reports the
+/// GOAWAY case as INTERNAL, so it has to be recognized from the `h2::Error`.
+fn is_refused_by_server(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| {
+        cause.downcast_ref::<h2::Error>().is_some_and(|error| {
+            error.is_remote()
+                && ((error.is_go_away() && error.reason() == Some(h2::Reason::NO_ERROR))
+                    || error.reason() == Some(h2::Reason::REFUSED_STREAM))
+        })
+    })
 }
 
 /// Attaches an RE classification to gRPC errors, preserving the original chain
