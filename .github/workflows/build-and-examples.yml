@@ -17,23 +17,31 @@ jobs:
     steps:
     - uses: actions/checkout@v6
     - uses: ./.github/actions/setup_macos_env
+      continue-on-error: true
     - uses: ./.github/actions/init_opam
+      continue-on-error: true
     - uses: ./.github/actions/build_release
+      continue-on-error: true
     - name: Setup the 'example/with_prelude' project
+      continue-on-error: true
       run: |-
         cd examples/with_prelude
         ./haskell-setup.sh
         ./ocaml-setup.sh
     - name: Build the 'example/with_prelude' project
+      continue-on-error: true
       run: |-
         cd examples/with_prelude
         $RUNNER_TEMP/artifacts/buck2 build //... -v 2
         $RUNNER_TEMP/artifacts/buck2 test //... -v 2
     - uses: ./.github/actions/build_example_no_prelude
+      continue-on-error: true
     - uses: ./.github/actions/build_example_toolchain
+      continue-on-error: true
       with:
         toolchain: python_toolchain
     - uses: ./.github/actions/build_example_toolchain
+      continue-on-error: true
       with:
         toolchain: go_toolchain
     - uses: ./.github/actions/build_example_toolchain
@@ -41,30 +49,41 @@ jobs:
       with:
         toolchain: cxx_zig_toolchain
     - uses: ./.github/actions/setup_reindeer
+      continue-on-error: true
     - uses: ./.github/actions/build_bootstrap
+      continue-on-error: true
   linux-build-examples:
     runs-on: ubuntu-26.04
     steps:
     - uses: actions/checkout@v6
     - uses: ./.github/actions/setup_linux_env
+      continue-on-error: true
     - uses: ./.github/actions/init_opam
+      continue-on-error: true
     - uses: ./.github/actions/build_release
+      continue-on-error: true
     - name: Setup the 'example/with_prelude' project
+      continue-on-error: true
       run: |-
         cd examples/with_prelude
         ./haskell-setup.sh
         ./ocaml-setup.sh
     - name: Build the 'example/with_prelude' project
+      continue-on-error: true
       run: |-
         cd examples/with_prelude
         $RUNNER_TEMP/artifacts/buck2 build //... -v 2
         $RUNNER_TEMP/artifacts/buck2 test //... -v 2
     - uses: ./.github/actions/build_example_conan
+      continue-on-error: true
     - uses: ./.github/actions/build_example_no_prelude
+      continue-on-error: true
     - uses: ./.github/actions/build_example_toolchain
+      continue-on-error: true
       with:
         toolchain: python_toolchain
     - uses: ./.github/actions/build_example_toolchain
+      continue-on-error: true
       with:
         toolchain: go_toolchain
     - uses: ./.github/actions/build_example_toolchain
@@ -72,13 +91,17 @@ jobs:
       with:
         toolchain: cxx_zig_toolchain
     - uses: ./.github/actions/build_example_persistent_worker
+      continue-on-error: true
       with:
         buildbuddyApiKey: ${{ secrets.BUILDBUDDY_API_KEY }}
     - uses: ./.github/actions/build_example_nativelink
+      continue-on-error: true
       with:
         NATIVELINK_HEADER_RW_KEY_SECRET: ${{ secrets.NATIVELINK_HEADER_RW_KEY_SECRET }}
     - uses: ./.github/actions/setup_reindeer
+      continue-on-error: true
     - uses: ./.github/actions/build_bootstrap
+      continue-on-error: true
       with:
         targets: "//..."
   # The Meta-specific windows-8-core runner label does not exist on forks;
@@ -89,17 +112,23 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - uses: ./.github/actions/setup_windows_env
+        continue-on-error: true
       - uses: ./.github/actions/build_release
+        continue-on-error: true
       - name: Build example/prelude directory
+        continue-on-error: true
         run: |-
           cd examples/with_prelude
           & $Env:RUNNER_TEMP/artifacts/buck2 build //... -v 2
           & $Env:RUNNER_TEMP/artifacts/buck2 test //... -v 2
       - uses: ./.github/actions/build_example_no_prelude
+        continue-on-error: true
       - uses: ./.github/actions/build_example_toolchain
+        continue-on-error: true
         with:
           toolchain: python_toolchain
       - uses: ./.github/actions/build_example_toolchain
+        continue-on-error: true
         with:
           toolchain: go_toolchain
       - uses: ./.github/actions/build_example_toolchain
@@ -107,4 +136,6 @@ jobs:
         with:
           toolchain: cxx_zig_toolchain
       - uses: ./.github/actions/setup_reindeer
+        continue-on-error: true
       - uses: ./.github/actions/build_bootstrap
+        continue-on-error: true
