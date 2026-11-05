@@ -19,8 +19,10 @@ use std::sync::atomic::Ordering;
 
 use futures::stream;
 use prost::bytes::Bytes;
+use re_grpc_proto::build::bazel::remote::execution::v2::ServerCapabilities;
 use re_grpc_proto::build::bazel::remote::execution::v2::batch_read_blobs_response;
 use re_grpc_proto::build::bazel::remote::execution::v2::batch_update_blobs_response;
+use re_grpc_proto::build::bazel::semver::SemVer;
 use tokio::net::TcpListener;
 use tokio::net::TcpStream;
 use tonic::transport::Endpoint;
@@ -38,15 +40,20 @@ const READ: &str = "/google.bytestream.ByteStream/Read";
 const WRITE: &str = "/google.bytestream.ByteStream/Write";
 const EXECUTE: &str = "/build.bazel.remote.execution.v2.Execution/Execute";
 const WAIT_EXECUTION: &str = "/build.bazel.remote.execution.v2.Execution/WaitExecution";
+const GET_CAPABILITIES: &str = "/build.bazel.remote.execution.v2.Capabilities/GetCapabilities";
+const FIND_MISSING_BLOBS: &str =
+    "/build.bazel.remote.execution.v2.ContentAddressableStorage/FindMissingBlobs";
+const GET_ACTION_RESULT: &str = "/build.bazel.remote.execution.v2.ActionCache/GetActionResult";
 const OPERATION: &str = "operations/action-1";
 
-/// A server whose first connection takes more than `REPLAY_BUFFER_SIZE` of
-/// the first request's body and then sends GOAWAY with last stream ID 0 and
-/// NO_ERROR, so the request was not processed. Later connections serve
-/// `BatchUpdateBlobs`, `BatchReadBlobs`, `ByteStream.Read`,
-/// `ByteStream.Write`, `Execute` and `WaitExecution`.
+/// A server that takes more than `REPLAY_BUFFER_SIZE` of the first request's
+/// body and then sends GOAWAY with last stream ID 0 and NO_ERROR, so the
+/// request was not processed. Connections opened after that serve the
+/// requests `REClient` sends.
 struct GoawayServer {
     channel: Channel,
+    /// The server's address, for `REClientBuilder`.
+    address: String,
     goaway_sent: Arc<AtomicBool>,
     /// Method and blob bytes of each request served after the GOAWAY.
     served: Arc<Mutex<Vec<(String, usize)>>>,
@@ -54,23 +61,35 @@ struct GoawayServer {
 
 impl GoawayServer {
     async fn start() -> Self {
-        Self::start_with(Some(REPLAY_BUFFER_SIZE), false).await
+        Self::start_with(FirstRequest::Refuse(REPLAY_BUFFER_SIZE), false).await
     }
 
     /// Refuses the first request once any of its body arrives, so even a
     /// small request is sent in full before the GOAWAY.
     async fn refusing_first_request() -> Self {
-        Self::start_with(Some(0), false).await
+        Self::start_with(FirstRequest::Refuse(0), false).await
     }
 
     /// Refuses nothing. `Execute` reports a named operation that is still
     /// running and ends the stream, as a server may for a long action, so the
     /// client resumes it with `WaitExecution`.
     async fn leaving_executions_running() -> Self {
-        Self::start_with(None, true).await
+        Self::start_with(FirstRequest::Serve, true).await
     }
 
-    async fn start_with(refuse_after: Option<usize>, leave_running: bool) -> Self {
+    /// Refuses nothing, and serves every request.
+    async fn serving() -> Self {
+        Self::start_with(FirstRequest::Serve, false).await
+    }
+
+    /// Answers the first `ByteStream.Read` with `BROKEN_READ_SIZE` bytes of the
+    /// blob, then sends GOAWAY and closes the connection, as a proxy that
+    /// shuts down in the middle of a response does.
+    async fn breaking_first_read() -> Self {
+        Self::start_with(FirstRequest::BreakRead, false).await
+    }
+
+    async fn start_with(first: FirstRequest, leave_running: bool) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let goaway_sent = Arc::new(AtomicBool::new(false));
@@ -79,13 +98,28 @@ impl GoawayServer {
             let goaway_sent = goaway_sent.clone();
             let served = served.clone();
             async move {
-                if let Some(refuse_after) = refuse_after {
-                    let (tcp, _) = listener.accept().await.unwrap();
-                    tokio::spawn(reject_first_request(tcp, refuse_after, goaway_sent));
-                }
                 loop {
                     let (tcp, _) = listener.accept().await.unwrap();
-                    tokio::spawn(serve(tcp, served.clone(), leave_running));
+                    match first {
+                        // Keep refusing until a request was refused: a connection
+                        // can send none, like the one `REClientBuilder` opens to
+                        // query capabilities.
+                        FirstRequest::Refuse(refuse_after)
+                            if !goaway_sent.load(Ordering::SeqCst) =>
+                        {
+                            tokio::spawn(reject_first_request(
+                                tcp,
+                                refuse_after,
+                                goaway_sent.clone(),
+                            ));
+                        }
+                        FirstRequest::BreakRead if !goaway_sent.swap(true, Ordering::SeqCst) => {
+                            tokio::spawn(break_first_read(tcp, served.clone()));
+                        }
+                        _ => {
+                            tokio::spawn(serve(tcp, served.clone(), leave_running));
+                        }
+                    }
                 }
             }
         });
@@ -94,6 +128,7 @@ impl GoawayServer {
             .connect_lazy();
         Self {
             channel,
+            address: format!("grpc://{addr}"),
             goaway_sent,
             served,
         }
@@ -102,6 +137,16 @@ impl GoawayServer {
     fn served(&self) -> Vec<(String, usize)> {
         self.served.lock().unwrap().clone()
     }
+}
+
+#[derive(Clone, Copy)]
+enum FirstRequest {
+    /// Refused with a GOAWAY once more than this many bytes of its body arrived.
+    Refuse(usize),
+    /// A `ByteStream.Read` broken by a GOAWAY and a closed connection.
+    BreakRead,
+    /// Served like any other.
+    Serve,
 }
 
 /// Speaks just enough HTTP/2 to receive the first request and send a GOAWAY
@@ -237,6 +282,33 @@ async fn serve(tcp: TcpStream, served: Arc<Mutex<Vec<(String, usize)>>>, leave_r
                         .collect();
                     (blob.len(), responses)
                 }
+                GET_CAPABILITIES => {
+                    let version = |minor| SemVer {
+                        major: 2,
+                        minor,
+                        ..Default::default()
+                    };
+                    let response = ServerCapabilities {
+                        cache_capabilities: Some(CacheCapabilities {
+                            digest_functions: vec![digest_function::Value::Sha256 as i32],
+                            ..Default::default()
+                        }),
+                        low_api_version: Some(version(0)),
+                        high_api_version: Some(version(3)),
+                        ..Default::default()
+                    };
+                    (0, vec![response.encode_to_vec()])
+                }
+                FIND_MISSING_BLOBS => {
+                    (0, vec![FindMissingBlobsResponse::default().encode_to_vec()])
+                }
+                GET_ACTION_RESULT => {
+                    let response = ActionResult {
+                        execution_metadata: Some(ExecutedActionMetadata::default()),
+                        ..Default::default()
+                    };
+                    (0, vec![response.encode_to_vec()])
+                }
                 EXECUTE if leave_running => (0, vec![running_operation().encode_to_vec()]),
                 EXECUTE | WAIT_EXECUTION => (0, vec![finished_operation().encode_to_vec()]),
                 WRITE => {
@@ -266,6 +338,51 @@ async fn serve(tcp: TcpStream, served: Arc<Mutex<Vec<(String, usize)>>>, leave_r
             stream.send_trailers(trailers).unwrap();
         });
     }
+}
+
+/// How much of the first `ByteStream.Read` `break_first_read` sends.
+const BROKEN_READ_SIZE: usize = 60_000;
+
+/// Sends `BROKEN_READ_SIZE` bytes of the first request, a `ByteStream.Read`,
+/// then GOAWAY, and then closes the connection before the read is complete.
+async fn break_first_read(tcp: TcpStream, served: Arc<Mutex<Vec<(String, usize)>>>) {
+    let mut connection = h2::server::handshake(tcp).await.unwrap();
+    let (request, mut respond) = connection.accept().await.unwrap().unwrap();
+    let answer = async {
+        let method = request.uri().path().to_owned();
+        assert_eq!(method, READ);
+        let mut body = request.into_body();
+        let mut data = Vec::new();
+        while let Some(chunk) = body.data().await {
+            data.extend_from_slice(&chunk.unwrap());
+        }
+        let request = ReadRequest::decode(grpc_messages(&data)[0]).unwrap();
+        let blob = read_blob(&request);
+        served.lock().unwrap().push((method, BROKEN_READ_SIZE));
+
+        let headers = http::Response::builder()
+            .header("content-type", "application/grpc")
+            .body(())
+            .unwrap();
+        let mut stream = respond.send_response(headers, false).unwrap();
+        let response = ReadResponse {
+            data: blob[..BROKEN_READ_SIZE].to_vec(),
+        };
+        stream
+            .send_data(grpc_frame(&response.encode_to_vec()), false)
+            .unwrap();
+        // The connection sends it while it's polled below.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        stream
+    };
+    let stream = tokio::select! {
+        stream = answer => stream,
+        _ = std::future::poll_fn(|cx| connection.poll_closed(cx)) => panic!("Connection closed"),
+    };
+    connection.graceful_shutdown();
+    let flush = std::future::poll_fn(|cx| connection.poll_closed(cx));
+    let _unused = tokio::time::timeout(Duration::from_millis(100), flush).await;
+    drop(stream);
 }
 
 /// Splits a gRPC body into its length-prefixed messages.
@@ -432,6 +549,220 @@ async fn test_wait_execution_after_goaway() -> anyhow::Result<()> {
     assert!(resumer.goaway_sent.load(Ordering::SeqCst));
     assert_eq!(executor.served(), [(EXECUTE.to_owned(), 0)]);
     assert_eq!(resumer.served(), [(WAIT_EXECUTION.to_owned(), 0)]);
+    Ok(())
+}
+
+fn ones_digest(size: usize) -> TDigest {
+    TDigest {
+        hash: hex::encode(Sha256::digest(vec![1; size])),
+        size_in_bytes: size as i64,
+        ..Default::default()
+    }
+}
+
+/// An `REClient` for `server`, with capabilities queried from `engine`.
+async fn client(
+    server: &GoawayServer,
+    engine: &GoawayServer,
+    capabilities: bool,
+) -> anyhow::Result<REClient> {
+    REClientBuilder::build_and_connect(&Buck2OssReConfiguration {
+        engine_address: Some(engine.address.clone()),
+        cas_address: Some(server.address.clone()),
+        action_cache_address: Some(server.address.clone()),
+        capabilities: Some(capabilities),
+        ..Default::default()
+    })
+    .await
+}
+
+/// Runs `call` with a client whose first request `GoawayServer` refuses, and
+/// returns what the server served after that.
+async fn after_goaway<T, F>(
+    call: impl FnOnce(REClient) -> F,
+) -> anyhow::Result<Vec<(String, usize)>>
+where
+    F: Future<Output = anyhow::Result<T>>,
+{
+    let server = GoawayServer::refusing_first_request().await;
+    let client = client(&server, &server, false).await?;
+    tokio::time::timeout(Duration::from_secs(60), call(client)).await??;
+    assert!(server.goaway_sent.load(Ordering::SeqCst));
+    Ok(server.served())
+}
+
+/// Blobs above the batch limit `REClient` uses without capabilities go
+/// through ByteStream.
+const LARGE_BLOB_SIZE: usize = DEFAULT_MAX_TOTAL_BATCH_SIZE + READ_CHUNK_SIZE;
+
+#[tokio::test]
+async fn test_client_capabilities_after_goaway() -> anyhow::Result<()> {
+    let server = GoawayServer::refusing_first_request().await;
+    let connect = client(&server, &server, true);
+    tokio::time::timeout(Duration::from_secs(60), connect).await??;
+    assert!(server.goaway_sent.load(Ordering::SeqCst));
+    assert_eq!(server.served(), [(GET_CAPABILITIES.to_owned(), 0)]);
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_client_find_missing_after_goaway() -> anyhow::Result<()> {
+    let served = after_goaway(|client| async move {
+        let request = GetDigestsTtlRequest {
+            digests: vec![ones_digest(3)],
+            ..Default::default()
+        };
+        client
+            .get_digests_ttl(&RemoteExecutionMetadata::default(), request)
+            .await
+    })
+    .await?;
+    assert_eq!(served, [(FIND_MISSING_BLOBS.to_owned(), 0)]);
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_client_action_cache_after_goaway() -> anyhow::Result<()> {
+    let served = after_goaway(|client| async move {
+        let request = ActionResultRequest {
+            digest: ones_digest(3),
+            ..Default::default()
+        };
+        client
+            .get_action_result(&RemoteExecutionMetadata::default(), request)
+            .await
+    })
+    .await?;
+    assert_eq!(served, [(GET_ACTION_RESULT.to_owned(), 0)]);
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_client_batch_download_after_goaway() -> anyhow::Result<()> {
+    let served = after_goaway(|client| async move {
+        let request = DownloadRequest {
+            inlined_digests: Some(vec![ones_digest(3)]),
+            ..Default::default()
+        };
+        let response = client
+            .download(&RemoteExecutionMetadata::default(), request)
+            .await?;
+        assert_eq!(response.inlined_blobs.unwrap()[0].blob, [1, 1, 1]);
+        anyhow::Ok(())
+    })
+    .await?;
+    assert_eq!(served, [(BATCH_READ_BLOBS.to_owned(), 0)]);
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_client_bytestream_download_after_goaway() -> anyhow::Result<()> {
+    let served = after_goaway(|client| async move {
+        let request = DownloadRequest {
+            inlined_digests: Some(vec![ones_digest(LARGE_BLOB_SIZE)]),
+            ..Default::default()
+        };
+        let response = client
+            .download(&RemoteExecutionMetadata::default(), request)
+            .await?;
+        assert_eq!(
+            response.inlined_blobs.unwrap()[0].blob.len(),
+            LARGE_BLOB_SIZE
+        );
+        anyhow::Ok(())
+    })
+    .await?;
+    assert_eq!(served, [(READ.to_owned(), LARGE_BLOB_SIZE)]);
+    Ok(())
+}
+
+fn upload_ones(size: usize) -> UploadRequest {
+    UploadRequest {
+        inlined_blobs_with_digest: Some(vec![InlinedBlobWithDigest {
+            digest: ones_digest(size),
+            blob: vec![1; size],
+            ..Default::default()
+        }]),
+        ..Default::default()
+    }
+}
+
+#[tokio::test]
+async fn test_client_batch_upload_after_goaway() -> anyhow::Result<()> {
+    let served = after_goaway(|client| async move {
+        client
+            .upload(&RemoteExecutionMetadata::default(), upload_ones(3))
+            .await
+    })
+    .await?;
+    assert_eq!(served, [(BATCH_UPDATE_BLOBS.to_owned(), 3)]);
+    Ok(())
+}
+
+/// The refused request is the `QueryWriteStatus` before the write, which the
+/// client then sends without.
+#[tokio::test]
+async fn test_client_bytestream_upload_after_goaway() -> anyhow::Result<()> {
+    let served = after_goaway(|client| async move {
+        client
+            .upload(
+                &RemoteExecutionMetadata::default(),
+                upload_ones(LARGE_BLOB_SIZE),
+            )
+            .await
+    })
+    .await?;
+    assert_eq!(served, [(WRITE.to_owned(), LARGE_BLOB_SIZE)]);
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_client_execute_after_goaway() -> anyhow::Result<()> {
+    let served = after_goaway(|client| async move {
+        let request = ExecuteRequest {
+            action_digest: ones_digest(3),
+            ..Default::default()
+        };
+        let events: Vec<_> = client
+            .execute_with_progress(&RemoteExecutionMetadata::default(), request)
+            .await?
+            .collect()
+            .await;
+        let response = events.into_iter().last().context("No execution events")??;
+        assert!(response.execute_response.is_some());
+        anyhow::Ok(())
+    })
+    .await?;
+    assert_eq!(served, [(EXECUTE.to_owned(), 0)]);
+    Ok(())
+}
+
+/// A connection that closes in the middle of a `ByteStream.Read` after a
+/// GOAWAY breaks it, and the client resumes it from where it stopped.
+#[tokio::test]
+async fn test_client_resumes_a_read_a_goaway_broke() -> anyhow::Result<()> {
+    let server = GoawayServer::breaking_first_read().await;
+    let engine = GoawayServer::serving().await;
+    let client = client(&server, &engine, false).await?;
+    let request = DownloadRequest {
+        inlined_digests: Some(vec![ones_digest(LARGE_BLOB_SIZE)]),
+        ..Default::default()
+    };
+
+    let download = client.download(&RemoteExecutionMetadata::default(), request);
+    let response = tokio::time::timeout(Duration::from_secs(60), download).await??;
+
+    assert_eq!(
+        response.inlined_blobs.unwrap()[0].blob,
+        vec![1; LARGE_BLOB_SIZE]
+    );
+    assert_eq!(
+        server.served(),
+        [
+            (READ.to_owned(), BROKEN_READ_SIZE),
+            (READ.to_owned(), LARGE_BLOB_SIZE - BROKEN_READ_SIZE),
+        ]
+    );
     Ok(())
 }
 
