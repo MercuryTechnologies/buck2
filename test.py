@@ -13,6 +13,7 @@ Fake script that acts as a test
 
 import argparse
 import importlib.machinery
+import importlib.util
 import json
 import os
 import shlex
@@ -30,9 +31,15 @@ from typing import Optional
 
 # To prevent the next line from creating a pycache dir
 sys.dont_write_bytecode = True
-lint_levels = importlib.machinery.SourceFileLoader(
+# SourceFileLoader.load_module is gone from newer Pythons; load the .bzl file
+# through a spec instead. The explicit loader is still needed, because the
+# file's suffix is not one importlib recognises.
+_lint_levels_loader = importlib.machinery.SourceFileLoader(
     "lint_levels", str(Path(__file__).parent / "lint_levels.bzl")
-).load_module()
+)
+_lint_levels_spec = importlib.util.spec_from_loader("lint_levels", _lint_levels_loader)
+lint_levels = importlib.util.module_from_spec(_lint_levels_spec)
+_lint_levels_loader.exec_module(lint_levels)
 
 
 def is_windows() -> bool:
