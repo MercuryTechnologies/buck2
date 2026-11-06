@@ -26,6 +26,7 @@ use buck2_hash::BuckMutInsertionMap;
 use buck2_util::time_span::TimeSpan;
 use derivative::Derivative;
 use dupe::Dupe;
+use pagable::Pagable;
 use remote_execution::TActionResult2;
 
 use crate::artifact_value::ArtifactValue;
@@ -140,7 +141,7 @@ impl Display for CommandExecutionStatus {
     }
 }
 
-#[derive(Debug, Copy, Clone, Dupe, Allocative)]
+#[derive(Debug, Copy, Clone, Dupe, Allocative, Pagable)]
 pub struct RemoteExecutionTimestamp {
     pub seconds: i64,
     pub nanos: i32,
@@ -154,7 +155,7 @@ impl RemoteExecutionTimestamp {
     }
 }
 
-#[derive(Debug, Copy, Clone, Dupe, Allocative)]
+#[derive(Debug, Copy, Clone, Dupe, Allocative, Pagable)]
 pub struct RemoteExecutionTiming {
     pub queued_timestamp: Option<RemoteExecutionTimestamp>,
     pub worker_start_timestamp: Option<RemoteExecutionTimestamp>,
@@ -204,9 +205,14 @@ impl RemoteExecutionTiming {
 
 /// Unlike action where we only really have just 1 time, commands can have slightly richer timing
 /// data.
-#[derive(Debug, Copy, Clone, Dupe, Allocative)]
+///
+/// Pagable so that a test result, which carries its command's metadata, can be written by
+/// `buck2 suspend`. The time span is made of this process's `Instant`s, so it reads back as an
+/// empty span at the time of the read: the resumed daemon waited for nothing.
+#[derive(Debug, Copy, Clone, Dupe, Allocative, Pagable)]
 pub struct CommandExecutionMetadata {
     /// A TimeSpan covering the time that this build actually waited for this action to complete
+    #[pagable(discard = "TimeSpan::empty_now()")]
     pub time_span: TimeSpan,
 
     /// How long this command actually took to execute. This can be different from the wall_time if
@@ -215,9 +221,11 @@ pub struct CommandExecutionMetadata {
     pub execution_time: Duration,
 
     /// When execution started.
+    #[pagable(flatten_serde)]
     pub start_time: SystemTime,
 
     /// Additional stats.
+    #[pagable(flatten_serde)]
     pub execution_stats: Option<buck2_data::CommandExecutionStats>,
 
     /// How long it took to materialize the action's inputs.

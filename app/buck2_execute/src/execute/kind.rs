@@ -17,6 +17,7 @@ use buck2_data::RePlatform;
 use buck2_hash::BuckFixedSortedMap;
 use derive_more::Display;
 use dupe::Dupe;
+use pagable::Pagable;
 use remote_execution as RE;
 
 use crate::execute::action_digest::ActionDigest;
@@ -24,7 +25,7 @@ use crate::execute::dep_file_digest::DepFileDigest;
 use crate::re::convert::platform_to_proto;
 
 /// How the remote execution service produced the result of a command submitted for execution.
-#[derive(Debug, Clone, Copy, Dupe, PartialEq, Eq, Allocative)]
+#[derive(Debug, Clone, Copy, Dupe, PartialEq, Eq, Allocative, Pagable)]
 pub enum RemoteExecutionOrigin {
     Executed,
     /// Served from the service's own action cache instead of running.
@@ -43,7 +44,7 @@ impl From<RemoteExecutionOrigin> for buck2_data::RemoteCommandOrigin {
     }
 }
 
-#[derive(Debug, Display, Clone, Allocative)]
+#[derive(Debug, Display, Clone, Allocative, Pagable)]
 pub enum CommandExecutionKind {
     /// This action was executed locally.
     #[display("local")]
@@ -268,12 +269,13 @@ impl CommandExecutionKind {
 }
 
 /// Structured data for a RE request.
-#[derive(Debug, Clone, Allocative)]
+#[derive(Debug, Clone, Allocative, Pagable)]
 pub struct RemoteCommandExecutionDetails {
     pub action_digest: ActionDigest,
     pub remote_dep_file_key: Option<DepFileDigest>,
     pub session_id: Option<String>,
     pub use_case: RemoteExecutorUseCase,
+    #[pagable(flatten_serde)]
     pub platform: RePlatform,
     pub persistent_worker: bool,
 }

@@ -10,7 +10,11 @@
 
 use buck2_common::cas_digest::CasDigest;
 use buck2_common::cas_digest::CasDigestKind;
+use pagable::Pagable;
 
+/// Pagable so that a test result naming its remote dep-file key can be written by
+/// `buck2 suspend`, as action digests already are.
+#[derive(Pagable)]
 pub struct DepFileDigestKind {
     _private: (),
 }

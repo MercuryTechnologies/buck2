@@ -186,7 +186,8 @@ use dice::DiceComputations;
 use dice::DiceTransaction;
 use dice::EqualityBehavior;
 use dice::Key;
-use dice::NoValueSerialize;
+use dice::OkPagableValueSerialize;
+use dice::ResidentValueSerialize;
 use dice::ValueSerialize;
 use dice_futures::cancellation::CancellationContext;
 use display_container::fmt_container;
@@ -873,7 +874,10 @@ impl Key for TestExecutionKey {
     }
 
     fn value_serialize() -> impl ValueSerialize<Value = Self::Value> {
-        NoValueSerialize::<Self::Value>::new()
+        // Only `validity`'s values, passed tests, outlive the transaction, and only an `Ok` has a
+        // row. Resident, because a page-in loses the run's waiting data and time span, which a
+        // live daemon still reports for a cached result; a suspend writes the row all the same.
+        ResidentValueSerialize::new(OkPagableValueSerialize::<Self::Value>::new())
     }
 }
 
@@ -1375,7 +1379,9 @@ impl TestOrchestrator for BuckTestOrchestrator<'_> {
         })
     }
 }
-#[derive(Allocative, Clone)]
+/// Pagable so that `buck2 suspend` writes a passed test's result, which the DICE test caching
+/// memoises under its `TestExecutionKey`, and a resumed `buck2 test` does not run it again.
+#[derive(Allocative, Clone, Pagable)]
 struct ExecuteData {
     pub stdout: ExecutionStream,
     pub stderr: ExecutionStream,
@@ -1383,8 +1389,12 @@ struct ExecuteData {
     pub timing: CommandExecutionMetadata,
     pub execution_kind: Option<CommandExecutionKind>,
     pub outputs: Vec<(BuckOutTestPath, ArtifactValue)>,
+    #[pagable(flatten_serde)]
     pub command_execution: Option<buck2_data::CommandExecution>,
+    /// How this run waited before the test ran. It is this run's, so a value read back from
+    /// storage starts without any.
     #[allocative(skip)]
+    #[pagable(discard = "WaitingData::new()")]
     pub waiting_data: WaitingData,
 }
 
@@ -3494,6 +3504,157 @@ mod tests {
             cacheable: true,
         };
         assert_eq!(create_action_key_suffix(&stage), "listing");
+    }
+
+    /// A passed test's key and result must survive `buck2 suspend`: the key is written as a
+    /// `DiceKeyDyn`, and the value through `TestExecutionKey::value_serialize`, which writes a
+    /// row for a passed result and keeps it resident.
+    #[test]
+    fn test_execution_key_and_passed_result_round_trip() {
+        use buck2_build_signals::env::WaitingCategory;
+        use buck2_core::fs::buck_out_path::BuckOutTestPath;
+        use buck2_execute::execute::kind::CommandExecutionKind;
+        use buck2_execute::execute::kind::RemoteCommandExecutionDetails;
+        use buck2_execute::execute::kind::RemoteExecutionOrigin;
+        use buck2_fs::paths::forward_rel_path::ForwardRelativePathBuf;
+        use dice::DiceKeyDyn;
+        use pagable::PagableBoxDeserialize;
+        use pagable::PagableSerialize;
+        use pagable::PagableSerializer;
+        use pagable::testing::TestingDeserializer;
+        use pagable::testing::TestingSerializer;
+
+        let key = TestExecutionKey {
+            test_target: ConfiguredProvidersLabel::new(
+                ConfiguredTargetLabel::testing_parse(
+                    "cell//pkg:foo",
+                    ConfigurationData::testing_new(),
+                ),
+                Default::default(),
+            ),
+            cmd: Arc::new(vec![ArgValue {
+                content: ArgValueContent::ExternalRunnerSpecValue(
+                    ExternalRunnerSpecValue::Verbatim("--flag".to_owned()),
+                ),
+                format: None,
+            }]),
+            env: Arc::new(BuckFixedSortedMap::new()),
+            executor_override: None,
+            required_local_resources: Arc::new(RequiredLocalResources { resources: vec![] }),
+            pre_create_dirs: Arc::new(vec![]),
+            stage: Arc::new(TestStage::Testing {
+                suite: "foo".to_owned(),
+                testcases: vec!["a".to_owned()],
+                variant: None,
+                repeat_count: None,
+            }),
+            options: TestSessionOptions::default(),
+            timeout: Duration::from_secs(60),
+            host_sharing_requirements: Arc::new(HostSharingRequirements::ExclusiveAccess),
+            disable_test_execution_caching: false,
+        };
+
+        // The key, as the image writes it: through its typetag.
+        let dyn_key: &dyn DiceKeyDyn = &key;
+        let mut ser = TestingSerializer::new();
+        dyn_key.pagable_serialize(&mut ser).unwrap();
+        let bytes = ser.finish();
+        let back = <dyn DiceKeyDyn as PagableBoxDeserialize>::deserialize_box(
+            &mut TestingDeserializer::new(&bytes),
+        )
+        .unwrap();
+        let back = back
+            .as_any()
+            .downcast_ref::<TestExecutionKey>()
+            .expect("the typetag names TestExecutionKey");
+        assert_eq!(back, &key);
+
+        let digest_config = DigestConfig::testing_default();
+        let action_digest = ActionDigest::new_sha1([7; 20], 3);
+        let mut timing = CommandExecutionMetadata::empty(TimeSpan::empty_now());
+        timing.execution_time = Duration::from_millis(1500);
+        timing.queue_duration = Some(Duration::from_millis(20));
+        let data = ExecuteData {
+            stdout: ExecutionStream::Inline(b"out".to_vec()),
+            stderr: ExecutionStream::Inline(b"err".to_vec()),
+            status: ExecutionStatus::Finished { exitcode: 0 },
+            timing,
+            execution_kind: Some(CommandExecutionKind::Remote {
+                details: RemoteCommandExecutionDetails {
+                    action_digest: action_digest.dupe(),
+                    remote_dep_file_key: None,
+                    session_id: Some("session".to_owned()),
+                    use_case: buck2_core::execution_types::executor_config::RemoteExecutorUseCase::buck2_default(),
+                    platform: Default::default(),
+                    persistent_worker: false,
+                },
+                queue_time: Duration::from_millis(5),
+                materialized_inputs_for_failed: None,
+                materialized_outputs_for_failed_actions: None,
+                origin: RemoteExecutionOrigin::Executed,
+            }),
+            outputs: vec![(
+                BuckOutTestPath::new(
+                    ForwardRelativePathBuf::unchecked_new("base".to_owned()),
+                    ForwardRelativePathBuf::unchecked_new("out.xml".to_owned()),
+                ),
+                ArtifactValue::file(FileMetadata {
+                    digest: TrackedFileDigest::from_content(
+                        b"xml",
+                        digest_config.cas_digest_config(),
+                    ),
+                    is_executable: false,
+                }),
+            )],
+            command_execution: Some(buck2_data::CommandExecution::default()),
+            waiting_data: WaitingData::with_initial_category(
+                WaitingCategory::TestExecutorScheduling,
+            ),
+        };
+
+        let serializer = TestExecutionKey::value_serialize();
+        assert!(!serializer.pages_out());
+        let mut ser = TestingSerializer::new();
+        serializer
+            .pagable_serialize_value(&Ok(data.clone()), &mut ser as &mut dyn PagableSerializer)
+            .expect("a passed test result has a row")
+            .unwrap();
+        let bytes = ser.finish();
+        let back = serializer
+            .pagable_deserialize_value(&mut TestingDeserializer::new(&bytes))
+            .unwrap()
+            .unwrap_or_else(|_| panic!("an Ok row reads back as Ok"));
+        assert_eq!(back.stdout, data.stdout);
+        assert_eq!(back.stderr, data.stderr);
+        assert_eq!(back.status, data.status);
+        assert_eq!(back.timing.execution_time, data.timing.execution_time);
+        assert_eq!(back.timing.queue_duration, data.timing.queue_duration);
+        assert_eq!(back.timing.start_time, data.timing.start_time);
+        assert_eq!(back.timing.time_span.duration(), Duration::ZERO);
+        assert_eq!(
+            back.execution_kind.as_ref().map(|k| k.to_string()),
+            Some("remote".to_owned())
+        );
+        match back.execution_kind {
+            Some(CommandExecutionKind::Remote { details, .. }) => {
+                assert_eq!(details.action_digest, action_digest);
+                assert_eq!(details.session_id.as_deref(), Some("session"));
+            }
+            other => panic!("expected a remote execution kind, got {other:?}"),
+        }
+        assert_eq!(back.outputs, data.outputs);
+        assert_eq!(back.command_execution, data.command_execution);
+
+        // A failed execution keeps no row.
+        let mut ser = TestingSerializer::new();
+        assert!(
+            serializer
+                .pagable_serialize_value(
+                    &Err(ExecuteError::Cancelled(Cancelled { reason: None })),
+                    &mut ser as &mut dyn PagableSerializer,
+                )
+                .is_none()
+        );
     }
 
     #[test]
