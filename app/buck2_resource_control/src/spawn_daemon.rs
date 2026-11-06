@@ -263,9 +263,12 @@ async fn systemd_check_available() -> buck2_error::Result<()> {
     // the resulting cgroup is visible from this namespace. A cgroup namespace
     // may let systemd-run succeed while reporting a path containing `..`, which
     // the daemon cannot access through its cgroup filesystem.
+    //
+    // `cat`, not `/bin/cat`: systemd-run looks the command up on our PATH, and
+    // some distributions (NixOS) have no /bin/cat.
     match async_background_command("systemd-run")
         .args(SYSTEMD_RUN_SCOPE_ARGS)
-        .args(["--", "/bin/cat", "/proc/self/cgroup"])
+        .args(["--", "cat", "/proc/self/cgroup"])
         .output()
         .await
     {
