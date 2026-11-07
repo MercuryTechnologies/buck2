@@ -497,7 +497,8 @@ impl EventsCtx {
 
     /// Describes why the daemon is believed to have been OOM-killed, if it was.
     ///
-    /// The evidence is read from `dmesg`, so this never reports anything off Linux.
+    /// The evidence is read from `dmesg` and the systemd journal, so this never reports
+    /// anything off Linux.
     #[cfg(target_os = "linux")]
     pub(crate) async fn daemon_oom_reason(&self) -> buck2_error::Result<Option<String>> {
         let Some(pid) = self.daemon_pid else {

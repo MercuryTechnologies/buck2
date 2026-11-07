@@ -34,6 +34,17 @@ static OOMD_KILL_RE: LazyLock<Regex> =
 static SYSTEMD_OOMD_KILL_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"Killed (\S+) due to memory pressure for ").unwrap());
 
+/// Catalog IDs (systemd's `sd-messages.h`) of the records the service manager that owns a unit
+/// writes when processes in it were OOM-killed, with the unit in `UNIT=` (system manager) or
+/// `USER_UNIT=` (user manager).
+const SD_MESSAGE_UNIT_OOMD_KILL: &str = "d989611b15e44c9dbf31e3c81256e4ed";
+const SD_MESSAGE_UNIT_OUT_OF_MEMORY: &str = "fe6faa94e7774663a0da52717891d8ef";
+
+/// How often to read the journal before giving up. The service manager logs a kill only once it
+/// has seen the unit's cgroup events, which can be after the daemon connection closes.
+const JOURNAL_ATTEMPTS: u32 = 4;
+const JOURNAL_RETRY_DELAY: Duration = Duration::from_millis(500);
+
 /// Monotonic lookback used when the daemon start time is unavailable.
 const DMESG_LOOKBACK: Duration = Duration::from_secs(5 * 60);
 
@@ -45,6 +56,8 @@ pub(crate) enum OomEvidence {
     OomdCgroup { cgroup: String, line: String },
     #[display("systemd-oomd reported killing cgroup `{cgroup}` containing the daemon")]
     SystemdOomdCgroup { cgroup: String, line: String },
+    #[display("systemd reported an OOM kill in the daemon's unit `{unit}`")]
+    SystemdUnitOomKill { unit: String, line: String },
 }
 
 impl OomEvidence {
@@ -52,7 +65,8 @@ impl OomEvidence {
         match self {
             Self::KernelVictim { line, .. }
             | Self::OomdCgroup { line, .. }
-            | Self::SystemdOomdCgroup { line, .. } => line,
+            | Self::SystemdOomdCgroup { line, .. }
+            | Self::SystemdUnitOomKill { line, .. } => line,
         }
     }
 }
@@ -85,11 +99,73 @@ pub(crate) async fn find_daemon_oom_evidence(
             return Ok(None);
         }
     };
-    // The dmesg read supplies the upper snapshot. A derived upper timestamp would be unsafe:
+
+    // The log read supplies the upper snapshot. A derived upper timestamp would be unsafe:
     // the kernel can emit its definitive victim record after the daemon connection closes.
     // Raw output fixes timestamps in boot-time seconds and prefixes records with `<priority>`.
-    let child = match buck2_util::process::async_background_command("dmesg")
-        .arg("--raw")
+    if let Some(dmesg) = read_log("dmesg", &["--raw".to_owned()]).await?
+        && let Some(evidence) =
+            find_matching_oom_kill(&dmesg, daemon_pid, cgroup_path_of_buck2_daemon, lower_bound)
+    {
+        tracing::debug!("OOM detection matched dmesg line: {:?}", evidence.line());
+        return Ok(Some(evidence));
+    }
+
+    // systemd-oomd's own log lines go to the journal only, and dmesg is unreadable for
+    // unprivileged users under kernel.dmesg_restrict=1. The service manager that owns the
+    // daemon's scope records both kinds of kill in the journal under a catalog ID, naming the
+    // scope. The scope's name carries the daemon id, so any such record is about this daemon.
+    let Some(unit) = cgroup_path_of_buck2_daemon.and_then(daemon_unit) else {
+        return Ok(None);
+    };
+    let mut journal_args = vec![
+        "--boot".to_owned(),
+        "--quiet".to_owned(),
+        "--no-pager".to_owned(),
+        "--output=cat".to_owned(),
+        "--lines=1".to_owned(),
+    ];
+    // Matches on one field are ORed, matches on different fields ANDed, and `+` ORs the two
+    // groups: either message, for the scope under a user manager or the system manager.
+    for unit_field in ["USER_UNIT", "UNIT"] {
+        if unit_field == "UNIT" {
+            journal_args.push("+".to_owned());
+        }
+        journal_args.extend([
+            format!("MESSAGE_ID={SD_MESSAGE_UNIT_OOMD_KILL}"),
+            format!("MESSAGE_ID={SD_MESSAGE_UNIT_OUT_OF_MEMORY}"),
+            format!("{unit_field}={unit}"),
+        ]);
+    }
+    for attempt in 0..JOURNAL_ATTEMPTS {
+        if attempt > 0 {
+            tokio::time::sleep(JOURNAL_RETRY_DELAY).await;
+        }
+        let Some(journal) = read_log("journalctl", &journal_args).await? else {
+            break;
+        };
+        if let Some(line) = journal.lines().find(|l| !l.trim().is_empty()) {
+            tracing::debug!("OOM detection matched journal record: {:?}", line);
+            return Ok(Some(OomEvidence::SystemdUnitOomKill {
+                unit: unit.to_owned(),
+                line: line.to_owned(),
+            }));
+        }
+    }
+    Ok(None)
+}
+
+/// The daemon's scope: the innermost unit in its cgroup path.
+fn daemon_unit(cgroup_path_of_buck2_daemon: &str) -> Option<&str> {
+    cgroup_path_of_buck2_daemon
+        .split('/')
+        .rfind(|c| c.ends_with(".scope") || c.ends_with(".service"))
+}
+
+/// Runs `program` and returns its stdout, or `None` if it could not run in 5 seconds.
+async fn read_log(program: &str, args: &[String]) -> buck2_error::Result<Option<String>> {
+    let child = match buck2_util::process::async_background_command(program)
+        .args(args)
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .kill_on_drop(true)
@@ -101,7 +177,8 @@ pub(crate) async fn find_daemon_oom_evidence(
                 "dmesg_oom_detection_failed",
                 buck2_error::buck2_error!(
                     buck2_error::ErrorTag::Environment,
-                    "Failed to run dmesg for OOM detection: {}",
+                    "Failed to run {} for OOM detection: {}",
+                    program,
                     e
                 )
             );
@@ -117,7 +194,8 @@ pub(crate) async fn find_daemon_oom_evidence(
                 "dmesg_timeout",
                 buck2_error::buck2_error!(
                     buck2_error::ErrorTag::Environment,
-                    "Failed to wait on dmesg for OOM detection: {}",
+                    "Failed to wait on {} for OOM detection: {}",
+                    program,
                     e
                 )
             );
@@ -128,29 +206,22 @@ pub(crate) async fn find_daemon_oom_evidence(
                 "dmesg_oom_detection_failed",
                 buck2_error::buck2_error!(
                     buck2_error::ErrorTag::Environment,
-                    "dmesg timed out after 5 seconds for OOM detection"
+                    "{} timed out after 5 seconds for OOM detection",
+                    program
                 )
             );
             return Ok(None);
         }
     };
 
-    let stdout_str = String::from_utf8_lossy(&output.stdout);
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
     tracing::debug!(
-        "OOM detection: dmesg returned {} lines, last: {:?}",
-        stdout_str.lines().count(),
-        stdout_str.lines().next_back(),
+        "OOM detection: {} returned {} lines, last: {:?}",
+        program,
+        stdout.lines().count(),
+        stdout.lines().next_back(),
     );
-    if let Some(evidence) = find_matching_oom_kill(
-        &stdout_str,
-        daemon_pid,
-        cgroup_path_of_buck2_daemon,
-        lower_bound,
-    ) {
-        tracing::debug!("OOM detection matched dmesg line: {:?}", evidence.line());
-        return Ok(Some(evidence));
-    }
-    Ok(None)
+    Ok(Some(stdout))
 }
 
 fn dmesg_lower_bound(daemon_start_instant: Option<Instant>) -> buck2_error::Result<Duration> {
@@ -388,6 +459,7 @@ mod tests {
 
     use super::Buck2CgroupMatcher;
     use super::OomEvidence;
+    use super::daemon_unit;
     use super::dmesg_lower_bound_at;
     use super::find_matching_oom_kill;
     use super::parse_dmesg_timestamp;
@@ -442,6 +514,17 @@ mod tests {
             find_matching_oom_kill(line, UNMATCHED_DAEMON_PID, Some(cgroup), lower_bound),
             Some(OomEvidence::SystemdOomdCgroup { cgroup: matched, .. }) if matched == cgroup
         ));
+    }
+
+    #[test]
+    fn test_daemon_unit_is_innermost_unit() {
+        assert_eq!(
+            Some("buck2_daemon.root.v2.abc.scope"),
+            daemon_unit(
+                "workload.slice/user@1999.service/buck2.slice/buck2_daemon.root.v2.abc.scope/daemon"
+            )
+        );
+        assert_eq!(None, daemon_unit("user.slice/buck2.slice"));
     }
 
     #[test]
