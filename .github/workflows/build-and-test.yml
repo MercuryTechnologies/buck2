@@ -42,16 +42,16 @@ jobs:
       with:
         flags: --test-only
   macos-build-and-test:
-    # Upstream: pinned to macos-14 because on the macos-15 runner image
-    # `latest-stable` selects an Xcode/SDK that mis-targets the deployment SDK
-    # and breaks the `cargo build` step (actions/runner-images#12758).
-    # Fork: macos-14-xlarge is the same arm64 image with double the cores. The
+    # macos-14 images were retired by GitHub on 2026-11-02. On macos-15,
+    # `latest-stable` Xcode mis-targets the deployment SDK and breaks the
+    # `cargo build` step (actions/runner-images#12758), so Xcode is pinned.
+    # Fork: macos-15-xlarge is the same arm64 image with double the cores. The
     # work here is compile-bound so it scales; it is billed per minute.
-    runs-on: ${{ github.repository_owner == 'facebook' && 'macos-14' || 'macos-14-xlarge' }}
+    runs-on: ${{ github.repository_owner == 'facebook' && 'macos-15' || 'macos-15-xlarge' }}
     steps:
     - uses: maxim-lobanov/setup-xcode@v1.6.0
       with:
-        xcode-version: latest-stable
+        xcode-version: '16.4'
     - uses: actions/checkout@v6
     - uses: ./.github/actions/setup_macos_env
     - uses: ./.github/actions/build_debug
@@ -89,11 +89,11 @@ jobs:
       with:
         flags: --lint-rust-only
   macos-lint:
-    runs-on: ${{ github.repository_owner == 'facebook' && 'macos-14' || 'macos-14-xlarge' }}
+    runs-on: ${{ github.repository_owner == 'facebook' && 'macos-15' || 'macos-15-xlarge' }}
     steps:
     - uses: maxim-lobanov/setup-xcode@v1.6.0
       with:
-        xcode-version: latest-stable
+        xcode-version: '16.4'
     - uses: actions/checkout@v6
     - uses: ./.github/actions/setup_macos_env
     - uses: Swatinem/rust-cache@v2

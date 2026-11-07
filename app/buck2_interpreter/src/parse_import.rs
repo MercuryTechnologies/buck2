@@ -24,7 +24,7 @@ use buck2_fs::paths::file_name::FileName;
 /// Strip a `?as=toml` or `?as=json` format hint from a load string, e.g.
 /// `load(":blah.lock?as=toml", "value")`. Returns the stripped string and the
 /// requested format if present. The format is carried on the resulting
-/// [`ImportPath`](buck2_core::bzl::ImportPath) so the module type never has to
+/// [`ImportPath`] so the module type never has to
 /// be re-derived from the extension.
 pub fn strip_format_hint(import: &str) -> (&str, Option<ImportFormat>) {
     if let Some(base) = import.strip_suffix("?as=toml") {
