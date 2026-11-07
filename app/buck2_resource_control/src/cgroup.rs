@@ -788,7 +788,7 @@ impl CgroupMinimal {
                 "--scope",
                 "--quiet",
                 "--",
-                "/bin/true",
+                "true",
             ])
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
