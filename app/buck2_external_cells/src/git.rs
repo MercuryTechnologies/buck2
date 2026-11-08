@@ -213,7 +213,9 @@ async fn download_impl(
     // this however, so that case will still avoid doing unnecessary work.
     let io_prov = ctx.global_data().get_io_provider();
     let proj_root = io_prov.project_root().root();
-    let abs_path = proj_root.join(path);
+    // `path` is rendered under the canonical buck-out when a josh map is active, and the fetch
+    // above wrote it through `ProjectRoot::resolve`, so read it back the same way.
+    let abs_path = io_prov.project_root().resolve(path);
     let digest_config = ctx.global_data().get_digest_config();
     let file_digest_config = FileDigestConfig::build(digest_config.cas_digest_config());
     let entry = build_entry_from_disk(abs_path, file_digest_config, io, proj_root)
@@ -328,6 +330,12 @@ impl GitFileOpsDelegate {
     fn get_base_path(&self) -> ProjectRelativePathBuf {
         self.resolve(CellRelativePath::empty())
     }
+
+    /// Where `path` is on disk. With a josh map active the rendered path is under the canonical
+    /// buck-out, and `FsIoProvider` joins a metadata read's path to the project root as given.
+    fn on_disk(&self, path: &CellRelativePath) -> ProjectRelativePathBuf {
+        buck2_core::josh::disk_path(&self.resolve(path)).into_owned()
+    }
 }
 
 #[pagable_typetag]
@@ -338,7 +346,7 @@ impl FileOpsDelegate for GitFileOpsDelegate {
         _ctx: &mut DiceComputations<'_>,
         path: &'async_trait CellRelativePath,
     ) -> buck2_error::Result<Option<String>> {
-        let project_path = self.resolve(path);
+        let project_path = self.on_disk(path);
         (&self.io as &dyn IoProvider)
             .read_file_if_exists(project_path)
             .await
@@ -349,7 +357,7 @@ impl FileOpsDelegate for GitFileOpsDelegate {
         _ctx: &mut DiceComputations<'_>,
         path: &'async_trait CellRelativePath,
     ) -> buck2_error::Result<Arc<[RawDirEntry]>> {
-        let project_path = self.resolve(path);
+        let project_path = self.on_disk(path);
         let mut entries = (&self.io as &dyn IoProvider)
             .read_dir(project_path)
             .await
@@ -367,7 +375,7 @@ impl FileOpsDelegate for GitFileOpsDelegate {
         _ctx: &mut DiceComputations<'_>,
         path: &'async_trait CellRelativePath,
     ) -> buck2_error::Result<Option<RawPathMetadata>> {
-        let project_path = self.resolve(path);
+        let project_path = self.on_disk(path);
 
         let Some(metadata) = (&self.io as &dyn IoProvider)
             .read_path_metadata_if_exists(project_path)
@@ -376,8 +384,9 @@ impl FileOpsDelegate for GitFileOpsDelegate {
         else {
             return Ok(None);
         };
+        let base = self.on_disk(CellRelativePath::empty());
         Ok(Some(metadata.try_map(
-            |path| match path.strip_prefix_opt(self.get_base_path()) {
+            |path| match path.strip_prefix_opt(&base) {
                 Some(path) => Ok(Arc::new(CellPath::new(self.cell, path.to_owned().into()))),
                 None => Err(internal_error!(
                     "Non-cell internal symlink at `{}` in cell `{}`",

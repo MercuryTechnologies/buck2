@@ -72,6 +72,10 @@ pub enum JoshError {
         "[josh] cell `{0}` maps to `{1}`, which is at or under `{2}`, an entry of cell `{3}` (it maps to the project root); the exec root would bind one over the other"
     )]
     Shadow(String, String, String, String),
+    #[error(
+        "[josh] cell `{0}` is an external cell; its sources are rendered under buck-out from its origin, not from its cell path, so the map cannot move it. Give it the path in `[cells]` instead (nothing of it is on disk there)"
+    )]
+    External(String),
     #[error("[josh] the map changed since the daemon started; restart the daemon (`buck2 kill`)")]
     Changed,
     #[error("[josh] verify_hits must be a fraction between 0 and 1, got `{0}`")]
@@ -84,6 +88,10 @@ pub struct JoshCell {
     pub real_path: CellRootPathBuf,
     pub canonical_name: CellName,
     pub canonical_path: CellRootPathBuf,
+    /// A bundled or git external cell. Nothing of it is at its cell path on disk: its sources
+    /// render as `buck-out/v2/external_cells/<origin>/...` in both views, so the exec root binds
+    /// nothing for it and no other cell's entry can overmount it.
+    pub external: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Allocative)]
@@ -106,6 +114,16 @@ impl JoshMap {
     pub fn new(
         entries: &[(String, String)],
         cells: &[(CellName, CellRootPathBuf)],
+        exists: &dyn Fn(&ProjectRelativePath) -> bool,
+    ) -> buck2_error::Result<JoshMap> {
+        Self::new_with_external(entries, cells, &[], exists)
+    }
+
+    /// [`JoshMap::new`] where `external` names the cells that are bundled or git external cells.
+    pub fn new_with_external(
+        entries: &[(String, String)],
+        cells: &[(CellName, CellRootPathBuf)],
+        external: &[CellName],
         exists: &dyn Fn(&ProjectRelativePath) -> bool,
     ) -> buck2_error::Result<JoshMap> {
         let mut mapped: BTreeMap<&str, (CellName, CellRootPathBuf)> = BTreeMap::new();
@@ -141,11 +159,21 @@ impl JoshMap {
                 Some((n, p)) => (*n, p.clone()),
                 None => (*real_name, real_path.clone()),
             };
+            let is_external = external.contains(real_name);
+            // The bundled path is named by the bundled cell and the git path by the commit, so
+            // neither follows a map entry: a moved external cell would render `cell_root` at the
+            // entry and its sources at the origin. Its `[cells]` path names nothing on disk, so a
+            // home can choose it freely and never needs the map to move it. A new name is fine:
+            // names key labels and configurations the same way for every kind of cell.
+            if is_external && canonical_path != *real_path {
+                return Err(JoshError::External(real_name.to_string()).into());
+            }
             list.push(JoshCell {
                 real_name: *real_name,
                 real_path: real_path.clone(),
                 canonical_name,
                 canonical_path,
+                external: is_external,
             });
         }
         // Injective on names and paths.
@@ -246,7 +274,7 @@ impl JoshMap {
             }
             let rr = r.real_path.as_project_relative_path();
             for c in &list {
-                if c.real_name == r.real_name {
+                if c.real_name == r.real_name || c.external {
                     continue;
                 }
                 let cp = c.canonical_path.as_project_relative_path();
@@ -507,7 +535,7 @@ impl JoshMap {
     pub fn canonical_top_level(&self, project_root: &std::path::Path) -> std::collections::HashSet<String> {
         let mut names = std::collections::HashSet::new();
         names.insert("buck-out".to_owned());
-        for c in &self.cells {
+        for c in self.cells.iter().filter(|c| !c.external) {
             let cp = c.canonical_path.as_project_relative_path();
             if cp.is_empty() {
                 let real = project_root.join(c.real_path.as_project_relative_path().as_str());
@@ -868,6 +896,106 @@ mod tests {
         // mwb_ftools is mwb's own `ftools`, so mwb's entry is that cell's tree.
         let exists = |p: &ProjectRelativePath| p.as_str() == "services/web-backend/ftools";
         JoshMap::new(&lab_map(), &lab(), &exists).unwrap();
+    }
+
+    fn lab_external() -> Vec<(CellName, CellRootPathBuf)> {
+        let mut v = lab();
+        v.extend(cells(&[
+            ("prelude", "prelude"),
+            ("buck2-haskell", "buck2-haskell"),
+        ]));
+        v
+    }
+
+    fn external() -> Vec<CellName> {
+        vec![
+            CellName::testing_new("prelude"),
+            CellName::testing_new("buck2-haskell"),
+        ]
+    }
+
+    #[test]
+    fn external_cells_stay_as_they_are() {
+        let m =
+            JoshMap::new_with_external(&lab_map(), &lab_external(), &external(), &never).unwrap();
+        for c in m.cells() {
+            let ext = c.real_name.as_str() == "prelude" || c.real_name.as_str() == "buck2-haskell";
+            assert_eq!(c.external, ext, "{c:?}");
+            if ext {
+                assert_eq!(c.canonical_name, c.real_name);
+                assert_eq!(c.canonical_path, c.real_path);
+            }
+        }
+        let top = m.canonical_top_level(std::path::Path::new("/nonexistent"));
+        assert!(
+            !top.contains("prelude") && !top.contains("buck2-haskell"),
+            "{top:?}"
+        );
+    }
+
+    #[test]
+    fn refuses_moving_an_external_cell() {
+        for entry in ["buck2-haskell:.josh/bh", "bh:bh"] {
+            let mut e = lab_map();
+            e.extend(entries(&[("cell.buck2-haskell", entry)]));
+            let err =
+                JoshMap::new_with_external(&e, &lab_external(), &external(), &never).unwrap_err();
+            assert!(
+                format!("{err}").contains("is an external cell"),
+                "{entry}: {err}"
+            );
+        }
+        // Spelling out the identity is not a move.
+        let mut e = lab_map();
+        e.extend(entries(&[("cell.prelude", "prelude:prelude")]));
+        JoshMap::new_with_external(&e, &lab_external(), &external(), &never).unwrap();
+    }
+
+    #[test]
+    fn renames_an_external_cell_in_place() {
+        // Lab's two pins of buck2-haskell: mwb's at the path mwb gives it, under mwb's name, and
+        // lab's own under another name at a path of its own.
+        let mut c = lab();
+        c.extend(cells(&[
+            ("buck2-haskell", "lab-buck2-haskell"),
+            ("mwb_buck2_haskell", "buck2-haskell"),
+        ]));
+        let ext = vec![
+            CellName::testing_new("buck2-haskell"),
+            CellName::testing_new("mwb_buck2_haskell"),
+        ];
+        let mut e = lab_map();
+        e.extend(entries(&[
+            ("cell.mwb_buck2_haskell", "buck2-haskell:buck2-haskell"),
+            ("cell.buck2-haskell", "lab_buck2_haskell:lab-buck2-haskell"),
+        ]));
+        let m = JoshMap::new_with_external(&e, &c, &ext, &never).unwrap();
+        assert_eq!(
+            m.canonical_cell_name(CellName::testing_new("mwb_buck2_haskell"))
+                .as_str(),
+            "buck2-haskell"
+        );
+        // Both under one canonical name is still a collision.
+        let mut e = lab_map();
+        e.extend(entries(&[(
+            "cell.mwb_buck2_haskell",
+            "buck2-haskell:buck2-haskell",
+        )]));
+        assert!(JoshMap::new_with_external(&e, &c, &ext, &never).is_err());
+    }
+
+    #[test]
+    fn external_cell_is_not_shadowed_by_a_root_mapped_entry() {
+        // Nothing is bound at an external cell's path, so mwb having an entry of that name is
+        // what mwb's own home shows there too.
+        let exists = |p: &ProjectRelativePath| p.as_str() == "services/web-backend/prelude";
+        JoshMap::new_with_external(&lab_map(), &lab_external(), &external(), &exists).unwrap();
+        // The same name for an ordinary cell is still refused.
+        let err = JoshMap::new(&lab_map(), &lab_external(), &exists).unwrap_err();
+        assert!(
+            format!("{err}").contains("bind one over the other"),
+            "{err}"
+        );
     }
 
     #[test]

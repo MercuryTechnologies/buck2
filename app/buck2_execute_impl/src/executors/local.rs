@@ -310,6 +310,11 @@ impl LocalExecutor {
         let mut binds: Vec<(std::path::PathBuf, String, bool)> = Vec::new();
         let cells = josh.cells();
         for c in cells {
+            // An external cell's files are under buck-out, which is bound below; its cell path
+            // names nothing on disk.
+            if c.external {
+                continue;
+            }
             let cp = c.canonical_path.as_project_relative_path();
             let rp = c.real_path.as_project_relative_path();
             if cp.is_empty() {
@@ -332,7 +337,7 @@ impl LocalExecutor {
             let covered = cells.iter().any(|q| {
                 let qcp = q.canonical_path.as_project_relative_path();
                 let qrp = q.real_path.as_project_relative_path();
-                if q.real_name == c.real_name || qcp == cp {
+                if q.real_name == c.real_name || qcp == cp || q.external {
                     return false;
                 }
                 let rel = if qcp.is_empty() {
