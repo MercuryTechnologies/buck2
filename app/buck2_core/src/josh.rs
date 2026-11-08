@@ -417,7 +417,18 @@ impl JoshMap {
     /// text it has in the canonical view. A symlink into buck-out keeps its text (buck-out sits
     /// at the same depth in both views); one to a source is re-pointed at the source's real path,
     /// so it resolves outside the exec root too. `None` when the text needs no change.
-    pub fn disk_symlink_text_rel(&self, link: &str, text: &str) -> Option<String> {
+    ///
+    /// `shadowed` reports whether a top-level name is taken in the canonical exec root (see
+    /// [`JoshMap::canonical_top_level`]). The exec root binds a real top-level entry only when no
+    /// canonical one has its name, so real-view text through a shadowed name would resolve to the
+    /// canonical entry inside the exec root, which is another file. Such a link keeps its
+    /// canonical text: it is right for every action, and dangles only outside the exec root.
+    pub fn disk_symlink_text_rel(
+        &self,
+        link: &str,
+        text: &str,
+        shadowed: &dyn Fn(&str) -> bool,
+    ) -> Option<String> {
         if text.starts_with('/') {
             return None;
         }
@@ -438,8 +449,42 @@ impl JoshMap {
             return None;
         }
         let real_comps: Vec<&str> = real.as_str().split('/').filter(|c| !c.is_empty()).collect();
+        if real_comps.first().is_some_and(|top| shadowed(top)) {
+            tracing::warn!(
+                "josh: symlink {link} -> {text} keeps its canonical text: its real target {} goes \
+                 through a top-level name the canonical view also uses",
+                real
+            );
+            return None;
+        }
         let new = relativize(dir, &real_comps);
         if new == text { None } else { Some(new) }
+    }
+
+    /// The top-level names the canonical exec root gives to canonical entries: every entry of a
+    /// cell mapped to the project root (as it is on disk), the first component of every other
+    /// canonical cell path, and buck-out. The local executor binds a real top-level entry only
+    /// when its name is not among these.
+    pub fn canonical_top_level(&self, project_root: &std::path::Path) -> std::collections::HashSet<String> {
+        let mut names = std::collections::HashSet::new();
+        names.insert("buck-out".to_owned());
+        for c in &self.cells {
+            let cp = c.canonical_path.as_project_relative_path();
+            if cp.is_empty() {
+                let real = project_root.join(c.real_path.as_project_relative_path().as_str());
+                if let Ok(rd) = std::fs::read_dir(real) {
+                    for e in rd.flatten() {
+                        let n = e.file_name().to_string_lossy().into_owned();
+                        if n != RESERVED_DIR && n != "buck-out" {
+                            names.insert(n);
+                        }
+                    }
+                }
+            } else if let Some(first) = cp.as_str().split('/').next() {
+                names.insert(first.to_owned());
+            }
+        }
+        names
     }
 
     /// One line per fact of the map, for the event log and the build report (design D7).
@@ -470,7 +515,12 @@ pub fn disk_symlink_text(link: &std::path::Path, text: &str) -> Option<String> {
     let josh = active()?;
     let d = DISK.get()?;
     let rel = link.strip_prefix(&d.project_root).ok()?.to_str()?;
-    josh.disk_symlink_text_rel(rel, text)
+    // Listed only when a link is about to be re-pointed, which is rare.
+    let top = std::cell::OnceCell::new();
+    josh.disk_symlink_text_rel(rel, text, &|n| {
+        top.get_or_init(|| josh.canonical_top_level(&d.project_root))
+            .contains(n)
+    })
 }
 
 /// Rewrite every relative symlink at or under `path` (an output a local action just wrote, in the
@@ -619,6 +669,10 @@ mod tests {
         false
     }
 
+    fn no_shadow(_: &str) -> bool {
+        false
+    }
+
     fn lab() -> Vec<(CellName, CellRootPathBuf)> {
         cells(&[
             ("root", ""),
@@ -746,36 +800,74 @@ mod tests {
         let m = JoshMap::new(&lab_map(), &lab(), &never).unwrap();
         // A symlinked_dir entry in buck-out pointing at mwb's pkg/a.src.
         assert_eq!(
-            m.disk_symlink_text_rel(
-                "buck-out/josh-b/art/root/pkg/__s_dirs__/sd/a.txt",
-                "../../../../../../../pkg/a.src"
-            )
+            m.disk_symlink_text_rel("buck-out/josh-b/art/root/pkg/__s_dirs__/sd/a.txt", "../../../../../../../pkg/a.src", &no_shadow)
             .as_deref(),
             Some("../../../../../../../services/web-backend/pkg/a.src")
         );
         // Into buck-out: unchanged.
         assert_eq!(
-            m.disk_symlink_text_rel(
-                "buck-out/v2/art/root/pkg/__x__/l",
-                "../../__y__/out"
-            ),
+            m.disk_symlink_text_rel("buck-out/v2/art/root/pkg/__x__/l", "../../__y__/out", &no_shadow),
             None
         );
         // A lab-only cell's source.
         assert_eq!(
-            m.disk_symlink_text_rel("buck-out/v2/art/lab/l/__t__/s", "../../../../../../.josh/lab/l/f"),
+            m.disk_symlink_text_rel("buck-out/v2/art/lab/l/__t__/s", "../../../../../../.josh/lab/l/f", &no_shadow),
             Some("../../../../../../l/f".to_owned())
         );
         // Absolute and out-of-project text: unchanged.
-        assert_eq!(m.disk_symlink_text_rel("buck-out/v2/x", "/etc/passwd"), None);
-        assert_eq!(m.disk_symlink_text_rel("buck-out/v2/x", "../../../up"), None);
+        assert_eq!(m.disk_symlink_text_rel("buck-out/v2/x", "/etc/passwd", &no_shadow), None);
+        assert_eq!(m.disk_symlink_text_rel("buck-out/v2/x", "../../../up", &no_shadow), None);
+    }
+
+    #[test]
+    fn shadowed_real_top_keeps_canonical_text() {
+        let m = JoshMap::new(&lab_map(), &lab(), &never).unwrap();
+        // mwb has a top-level `services` too: the real text would resolve to mwb's services
+        // inside the exec root, so the link keeps its canonical text.
+        let services = |n: &str| n == "services";
+        assert_eq!(
+            m.disk_symlink_text_rel(
+                "buck-out/josh-b/art/root/pkg/__s_dirs__/sd/a.txt",
+                "../../../../../../../pkg/a.src",
+                &services
+            ),
+            None
+        );
+        // A lab source under real `l`, where the canonical view has an `l` of its own.
+        let l = |n: &str| n == "l";
+        assert_eq!(
+            m.disk_symlink_text_rel("buck-out/v2/art/lab/l/__t__/s", "../../../../../../.josh/lab/l/f", &l),
+            None
+        );
+        // An unrelated shadowed name changes nothing.
+        assert_eq!(
+            m.disk_symlink_text_rel("buck-out/v2/art/lab/l/__t__/s", "../../../../../../.josh/lab/l/f", &services)
+                .as_deref(),
+            Some("../../../../../../l/f")
+        );
+    }
+
+    #[test]
+    fn canonical_top_level_lists_root_mapped_cell_entries() {
+        let dir = std::env::temp_dir().join(format!("josh-top-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        for p in ["services/web-backend/pkg", "services/web-backend/.josh-not", "tools", "l"] {
+            std::fs::create_dir_all(dir.join(p)).unwrap();
+        }
+        let m = JoshMap::new(&lab_map(), &lab(), &never).unwrap();
+        let mut top: Vec<String> = m.canonical_top_level(&dir).into_iter().collect();
+        top.sort();
+        let _ = std::fs::remove_dir_all(&dir);
+        // mwb (root-mapped) lists its entries; ftools and the moved lab cells give their first
+        // component; buck-out is always taken. Real-only `tools` and `l` are not taken.
+        assert_eq!(top, vec![".josh", ".josh-not", "buck-out", "ftools", "pkg"]);
     }
 
     #[test]
     fn identity_symlink_text_unchanged() {
         let m = JoshMap::new(&[], &cells(&[("root", ""), ("ftools", "ftools")]), &never).unwrap();
         assert_eq!(
-            m.disk_symlink_text_rel("buck-out/v2/art/root/pkg/__t__/l", "../../../../../../pkg/a.src"),
+            m.disk_symlink_text_rel("buck-out/v2/art/root/pkg/__t__/l", "../../../../../../pkg/a.src", &no_shadow),
             None
         );
     }
