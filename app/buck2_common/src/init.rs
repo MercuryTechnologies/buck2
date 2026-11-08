@@ -626,6 +626,11 @@ pub struct DaemonStartupConfig {
     /// form) without the section, so a daemon with josh off is matched exactly as before.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub josh: Option<Vec<(String, String)>>,
+    /// josh: with `[josh] enabled = true`, the root config's `[cells]` and `[external_cells]`,
+    /// sorted. The daemon builds the map from the cells it reads at startup, so a cell added or
+    /// moved later needs a new daemon too. `None` (and absent) otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub josh_cells: Option<Vec<(String, String)>>,
 }
 
 impl DaemonStartupConfig {
@@ -759,6 +764,29 @@ impl DaemonStartupConfig {
                 v.sort();
                 v
             }),
+            josh_cells: if config
+                .parse::<bool>(BuckconfigKeyRef {
+                    section: "josh",
+                    property: "enabled",
+                })
+                .ok()
+                .flatten()
+                .unwrap_or(false)
+            {
+                let mut v: Vec<(String, String)> = Vec::new();
+                for section in ["cells", "external_cells"] {
+                    if let Some(s) = config.get_section(section) {
+                        v.extend(
+                            s.iter()
+                                .map(|(k, x)| (format!("{section}.{k}"), x.as_str().to_owned())),
+                        );
+                    }
+                }
+                v.sort();
+                Some(v)
+            } else {
+                None
+            },
         })
     }
 
@@ -795,6 +823,7 @@ impl DaemonStartupConfig {
             daemon_idle_timeout_s: None,
             hydration: None,
             josh: None,
+            josh_cells: None,
         }
     }
 }
@@ -834,6 +863,37 @@ mod tests {
         assert_ne!(a, b);
         assert_ne!(a, off);
         assert_ne!(a, none);
+        assert_eq!(DaemonStartupConfig::deserialize(&a.serialize()?)?, a);
+        Ok(())
+    }
+
+    #[test]
+    fn josh_cells_are_a_startup_constraint_only_with_josh_on() -> buck2_error::Result<()> {
+        let mk = |body: &str| -> buck2_error::Result<DaemonStartupConfig> {
+            let c = parse(&[("config", body)], "config")?;
+            DaemonStartupConfig::new(&c, &BuckSettings::empty(), false)
+        };
+        let off = mk("[cells]\nroot = .\nmwb = services/web-backend\n")?;
+        let off2 = mk("[cells]\nroot = .\nmwb = services/wb2\n")?;
+        assert_eq!(off.josh_cells, None);
+        assert_eq!(off, off2);
+        assert!(!off.serialize()?.contains("josh"));
+        let disabled = mk("[josh]\nenabled = false\n[cells]\nroot = .\n")?;
+        assert_eq!(disabled.josh_cells, None);
+        let on = "[josh]\nenabled = true\ncell.mwb = root:.\n";
+        let a = mk(&format!(
+            "{on}[cells]\nroot = .\nmwb = services/web-backend\n"
+        ))?;
+        let moved = mk(&format!("{on}[cells]\nroot = .\nmwb = services/wb2\n"))?;
+        let added = mk(&format!(
+            "{on}[cells]\nroot = .\nmwb = services/web-backend\nlabpkg = pkg\n"
+        ))?;
+        let ext = mk(&format!(
+            "{on}[cells]\nroot = .\nmwb = services/web-backend\n[external_cells]\nmwb = bundled\n"
+        ))?;
+        assert_ne!(a, moved);
+        assert_ne!(a, added);
+        assert_ne!(a, ext);
         assert_eq!(DaemonStartupConfig::deserialize(&a.serialize()?)?, a);
         Ok(())
     }

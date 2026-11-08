@@ -78,6 +78,10 @@ pub enum JoshError {
     External(String),
     #[error("[josh] the map changed since the daemon started; restart the daemon (`buck2 kill`)")]
     Changed,
+    #[error(
+        "[josh] the cells changed since the daemon built its map ({0}); the map, the exec root and the overmount checks would still use the old cells, so restart the daemon (`buck2 kill`)"
+    )]
+    CellsChanged(String),
     #[error("[josh] verify_hits must be a fraction between 0 and 1, got `{0}`")]
     BadVerify(String),
 }
@@ -325,6 +329,41 @@ impl JoshMap {
 
     pub fn cells(&self) -> &[JoshCell] {
         &self.cells
+    }
+
+    /// Refuses a command whose cell resolver no longer has the cells this map was built from.
+    /// The map is built once per daemon, so a cell added or moved since would be missing from
+    /// the validator and the exec root: its sources would render at their real path and resolve
+    /// to whatever the root-mapped cell has there, under the new cell's digests.
+    pub fn check_cells(
+        &self,
+        cells: &[(CellName, CellRootPathBuf)],
+        external: &[CellName],
+    ) -> buck2_error::Result<()> {
+        let mut diffs = Vec::new();
+        for (name, path) in cells {
+            match self.get(*name) {
+                None => diffs.push(format!("`{}` added at `{}`", name, path)),
+                Some(c) if c.real_path != *path => diffs.push(format!(
+                    "`{}` moved from `{}` to `{}`",
+                    name, c.real_path, path
+                )),
+                Some(c) if c.external != external.contains(name) => {
+                    diffs.push(format!("`{}` changed kind", name))
+                }
+                Some(_) => {}
+            }
+        }
+        for c in &self.cells {
+            if !cells.iter().any(|(n, _)| *n == c.real_name) {
+                diffs.push(format!("`{}` removed", c.real_name));
+            }
+        }
+        if diffs.is_empty() {
+            Ok(())
+        } else {
+            Err(JoshError::CellsChanged(diffs.join(", ")).into())
+        }
     }
 
     fn get(&self, real: CellName) -> Option<&JoshCell> {
@@ -741,6 +780,46 @@ mod tests {
 
     fn no_shadow(_: &str) -> bool {
         false
+    }
+
+    #[test]
+    fn check_cells_refuses_a_cell_added_moved_or_removed() -> buck2_error::Result<()> {
+        let map = JoshMap::new(&lab_map(), &lab(), &never)?;
+        map.check_cells(&lab(), &[])?;
+        let mut added = lab();
+        added.push((
+            CellName::testing_new("labpkg"),
+            CellRootPathBuf::testing_new("pkg"),
+        ));
+        let e = map.check_cells(&added, &[]).unwrap_err().to_string();
+        assert!(e.contains("`labpkg` added at `pkg`"), "{e}");
+        let moved: Vec<_> = lab()
+            .into_iter()
+            .map(|(n, p)| {
+                if n.as_str() == "mwb" {
+                    (n, CellRootPathBuf::testing_new("services/wb2"))
+                } else {
+                    (n, p)
+                }
+            })
+            .collect();
+        let e = map.check_cells(&moved, &[]).unwrap_err().to_string();
+        assert!(
+            e.contains("`mwb` moved from `services/web-backend` to `services/wb2`"),
+            "{e}"
+        );
+        let removed: Vec<_> = lab()
+            .into_iter()
+            .filter(|(n, _)| n.as_str() != "ftools")
+            .collect();
+        let e = map.check_cells(&removed, &[]).unwrap_err().to_string();
+        assert!(e.contains("`ftools` removed"), "{e}");
+        let e = map
+            .check_cells(&lab(), &[CellName::testing_new("ftools")])
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("`ftools` changed kind"), "{e}");
+        Ok(())
     }
 
     fn lab() -> Vec<(CellName, CellRootPathBuf)> {

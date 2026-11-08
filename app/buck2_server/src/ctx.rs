@@ -562,6 +562,22 @@ impl ServerCommandContext<'_> {
             &self.config_overrides,
         )
         .await?;
+        // The client restarts the daemon on a [cells] edit in the root config, but not on what
+        // it does not compare (a `-c` override, a daemon another client started), so the cells
+        // this command loads are checked against the ones the josh map was built from.
+        if let Some(map) = buck2_core::josh::installed() {
+            let resolver = &new_configs.cell_resolver;
+            let cells: Vec<_> = resolver
+                .cells()
+                .map(|(name, cell)| (name, cell.path().to_buf()))
+                .collect();
+            let external: Vec<_> = resolver
+                .cells()
+                .filter(|(_, cell)| cell.external().is_some())
+                .map(|(name, _)| name)
+                .collect();
+            map.check_cells(&cells, &external)?;
+        }
 
         self.report_traced_config_paths(&new_configs.config_paths)?;
         if self.reuse_current_config {

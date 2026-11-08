@@ -205,6 +205,47 @@ cd "$E/$WD"
 exec "$U" -U --map-user="$UID_" --map-group="$GID_" -- "$@"
 "#;
 
+/// Puts the given binds of the josh exec root on the host side of `exec_root` as symlinks to
+/// their sources. An action that records an absolute path it saw (a nix indirect GC root for an
+/// out-link) names `exec_root/...`, and the process that reads it back (the nix daemon) runs
+/// outside the namespace, where `exec_root` would otherwise be an empty directory. The namespace
+/// mounts its tmpfs over this, so actions never see the links. A link that cannot be written is
+/// logged and the action still runs: only paths read back on the host depend on it.
+fn josh_mirror(exec_root: &std::path::Path, binds: &[&(std::path::PathBuf, String, bool)]) {
+    use std::sync::atomic::AtomicU64;
+    use std::sync::atomic::Ordering;
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    for (src, dst, _) in binds {
+        let link = exec_root.join(dst);
+        if std::fs::read_link(&link).is_ok_and(|t| t == *src) {
+            continue;
+        }
+        let res = (|| -> std::io::Result<()> {
+            let parent = link.parent().unwrap_or(exec_root);
+            std::fs::create_dir_all(parent)?;
+            // Written beside the link and renamed over it, so a concurrent action never sees
+            // the name missing.
+            let tmp = parent.join(format!(
+                ".josh-mirror-{}-{}",
+                std::process::id(),
+                SEQ.fetch_add(1, Ordering::Relaxed)
+            ));
+            std::os::unix::fs::symlink(src, &tmp)?;
+            std::fs::rename(&tmp, &link).inspect_err(|_| {
+                let _ = std::fs::remove_file(&tmp);
+            })
+        })();
+        if let Err(e) = res {
+            tracing::warn!(
+                "josh: could not mirror the exec root's `{}` on the host at {}: {}",
+                dst,
+                link.display(),
+                e
+            );
+        }
+    }
+}
+
 /// Records, once per daemon and source, a top-level entry the josh exec root left out, in the
 /// daemon log and in `<buck-out>/josh/exec-skipped.txt` where a run can read it back.
 fn josh_record_skip(dir: &std::path::Path, src: &std::path::Path, dst: &str, reason: &str) {
@@ -419,6 +460,17 @@ impl LocalExecutor {
         });
         // Parents before children; the sort is stable, so equal lengths keep their order.
         binds.sort_by_key(|(_, dst, _)| dst.matches('/').count());
+        // Only buck-out is mirrored: an out-link is an output, so that is all a GC root needs.
+        // A link to a source directory would be followed by the daemon's notify watcher, which
+        // then files that directory's inotify watch under the link's path in buck-out, where
+        // every event is ignored, and a later source edit is missed.
+        josh_mirror(
+            &exec_root,
+            &binds
+                .iter()
+                .filter(|(_, dst, _)| dst.as_str() == buck_out.as_str())
+                .collect::<Vec<_>>(),
+        );
 
         let mut a: Vec<OsString> = vec![
             "-Urm".into(),
