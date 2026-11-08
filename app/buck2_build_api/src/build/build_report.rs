@@ -117,6 +117,10 @@ pub struct BuildReport {
     total_configured_graph_sketch: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     error_category: Option<String>,
+    /// josh: the view this build's actions were keyed in (design D7). Absent without a `[josh]`
+    /// section, so a report with josh off is as before.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    josh: Option<Vec<String>>,
 }
 
 /// The fields that stored in the unconfigured `BuildReportEntry` for buck1 backcompat.
@@ -662,6 +666,7 @@ impl<'a> BuildReportCollector<'a> {
                 .map(|m| Self::convert_all_target_build_metrics(&m.all_targets_build_metrics)),
             total_configured_graph_sketch,
             error_category,
+            josh: buck2_core::josh::installed().map(|_| buck2_core::josh::describe_tags()),
         })
     }
 

@@ -31,7 +31,7 @@ pub struct MaterializeTreeStructure {
 
 impl IoRequest for MaterializeTreeStructure {
     fn execute(self: Box<Self>, project_fs: &ProjectRoot) -> buck2_error::Result<()> {
-        materialize_dirs_and_syms(self.entry.as_ref(), project_fs.root().join(&self.path))?;
+        materialize_dirs_and_syms(self.entry.as_ref(), project_fs.resolve(&self.path))?;
 
         Ok(())
     }
@@ -177,7 +177,11 @@ where
                     .categorize_internal()
                     .is_err()
             {
-                fs_util::symlink(s.target().as_str(), dest).categorize_internal()?;
+                // josh: a symlink to a source gets the source's real path on disk; its digest
+                // keeps the canonical text.
+                let text = buck2_core::josh::disk_symlink_text(dest.as_ref(), s.target().as_str());
+                fs_util::symlink(text.as_deref().unwrap_or(s.target().as_str()), dest)
+                    .categorize_internal()?;
             }
             Ok(())
         }

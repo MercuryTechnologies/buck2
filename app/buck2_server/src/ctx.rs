@@ -719,7 +719,10 @@ impl DiceUpdater for DiceCommandUpdater<'_, '_> {
             Arc::new(ConcurrentTargetLabelInterner::default()),
         )?;
 
-        ctx.set_buck_out_path(Some(self.cmd_ctx.buck_out_dir.clone()))?;
+        // josh: actions are rendered under buck-out/v2 whatever the isolation dir (design D4).
+        ctx.set_buck_out_path(Some(buck2_core::josh::rendered_buck_out(
+            self.cmd_ctx.buck_out_dir.clone(),
+        )))?;
 
         let optional_validations = self
             .cmd_ctx
@@ -1034,6 +1037,8 @@ impl DiceCommandUpdater<'_, '_> {
         tags.extend(CleanStaleConfig::adaptive_telemetry_tags(
             clean_stale_config.as_ref(),
         ));
+        // josh: name the view every action of this command was keyed in (design D7).
+        tags.extend(buck2_core::josh::describe_tags());
         self.cmd_ctx
             .events()
             .instant_event(buck2_data::TagEvent { tags });

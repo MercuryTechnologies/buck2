@@ -352,6 +352,10 @@ impl DaemonState {
                 })?;
                 tracing::info!("josh map (identity: {}): {:?}", map.is_identity(), map.cells());
                 buck2_core::josh::init(map)?;
+                buck2_core::josh::init_disk(
+                    paths.buck_out_dir(),
+                    fs.root().as_path().to_path_buf(),
+                );
             }
 
             let buffer_size = root_config
@@ -660,7 +664,7 @@ impl DaemonState {
             let materializer = Self::create_materializer(
                 io.project_root().dupe(),
                 digest_config,
-                paths.buck_out_dir(),
+                buck2_core::josh::rendered_buck_out(paths.buck_out_dir()),
                 re_client_manager.dupe(),
                 blocking_executor.dupe(),
                 materializations,

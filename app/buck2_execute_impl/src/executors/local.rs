@@ -220,13 +220,11 @@ impl LocalExecutor {
             return Ok(None);
         };
         let tools = josh_tools()?;
+        // The rendered buck-out root (buck-out/v2) and where it is on disk
+        // (buck-out/<isolation dir>).
         let buck_out = self.artifact_fs.buck_out_path_resolver().root();
-        let exec_root = self
-            .root
-            .as_path()
-            .join(buck_out.as_str())
-            .join("josh")
-            .join("exec");
+        let buck_out_disk = self.artifact_fs.fs().resolve(buck_out);
+        let exec_root = buck_out_disk.as_path().join("josh").join("exec");
         std::fs::create_dir_all(&exec_root)
             .map_err(|e| buck2_error::buck2_error!(buck2_error::ErrorTag::Environment, "josh exec root {}: {}", exec_root.display(), e))?;
         let meta = std::fs::metadata(&exec_root)
@@ -271,7 +269,31 @@ impl LocalExecutor {
                 binds.push((root.join(rp.as_str()), cp.as_str().to_owned()));
             }
         }
-        binds.push((root.join(buck_out.as_str()), buck_out.as_str().to_owned()));
+        binds.push((
+            buck_out_disk.as_path().to_path_buf(),
+            buck_out.as_str().to_owned(),
+        ));
+        // A symlink to a source is written with the source's real path on disk, so the real
+        // top-level entries must resolve in the exec root too. Bind those that no canonical
+        // entry already takes; a name both views use resolves in the canonical view.
+        let taken: std::collections::HashSet<String> = binds
+            .iter()
+            .map(|(_, dst)| dst.split('/').next().unwrap_or("").to_owned())
+            .collect();
+        let mut real_top: Vec<String> = std::fs::read_dir(root)
+            .map_err(|e| {
+                buck2_error::buck2_error!(buck2_error::ErrorTag::Environment, "josh: read {}: {}", root.display(), e)
+            })?
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| {
+                n != buck2_core::josh::RESERVED_DIR && n != "buck-out" && !taken.contains(n)
+            })
+            .collect();
+        real_top.sort();
+        for n in real_top {
+            binds.push((root.join(&n), n));
+        }
         // Parents before children; the sort is stable, so equal lengths keep their order.
         binds.sort_by_key(|(_, dst)| dst.matches('/').count());
 
@@ -1066,15 +1088,25 @@ impl LocalExecutor {
                     Some(&ContentBasedPathHash::for_output_artifact()),
                 )?
                 .into_path();
-            let abspath = self.root.join(&path);
+            let abspath = self.artifact_fs.fs().resolve(&path);
             let (entry, hashing_info) = build_entry_from_disk(
-                abspath,
+                abspath.clone(),
                 FileDigestConfig::build(digest_config.cas_digest_config()),
                 self.blocking_executor.as_ref(),
                 self.artifact_fs.fs().root(),
             )
             .await
             .with_buck_error_context(|| format!("collecting output {path:?}"))?;
+            // josh: the entry above holds the canonical symlink text, which keys the action as
+            // in the tree's own home; on disk a symlink to a source must name its real path.
+            buck2_core::josh::rewrite_disk_symlinks(abspath.as_path()).map_err(|e| {
+                buck2_error::buck2_error!(
+                    buck2_error::ErrorTag::Environment,
+                    "josh: rewriting symlinks under {}: {}",
+                    abspath,
+                    e
+                )
+            })?;
             total_hashing_time += hashing_info.hashing_duration;
             total_hashed_outputs += hashing_info.hashed_artifacts_count;
             if let Some(entry) = entry {

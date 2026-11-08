@@ -140,7 +140,8 @@ impl ProjectRoot {
     /// # buck2_error::Ok(())
     /// ```
     pub fn resolve(&self, path: impl AsRef<ProjectRelativePath>) -> AbsNormPathBuf {
-        self.root().join(path.as_ref())
+        // josh: a rendered buck-out path is under the daemon's isolation dir on disk.
+        self.root().join(&*crate::josh::disk_path(path.as_ref()))
     }
 
     ///
@@ -314,7 +315,7 @@ impl ProjectRoot {
         contents: impl AsRef<[u8]>,
         executable: bool,
     ) -> buck2_error::Result<()> {
-        let abs_path = self.root().join(path.as_ref());
+        let abs_path = self.resolve(path.as_ref());
         if let Some(parent) = abs_path.parent() {
             fs_util::create_dir_all(parent).with_buck_error_context(|| {
                 format!("`write_file` for `{abs_path}` creating directory `{parent}`")
@@ -332,7 +333,7 @@ impl ProjectRoot {
         path: impl AsRef<ProjectRelativePath>,
         executable: bool,
     ) -> buck2_error::Result<File> {
-        let abs_path = self.root().join(path.as_ref());
+        let abs_path = self.resolve(path.as_ref());
         if let Some(parent) = abs_path.parent() {
             fs_util::create_dir_all(parent).with_buck_error_context(|| {
                 format!("`create_file` for `{abs_path}` creating directory `{parent}`")
@@ -355,7 +356,7 @@ impl ProjectRoot {
 
     // TODO(nga): refactor this to global function.
     pub fn set_executable(&self, path: impl AsRef<ProjectRelativePath>) -> buck2_error::Result<()> {
-        let path = self.root().join(path.as_ref());
+        let path = self.resolve(path.as_ref());
         fs_util::set_executable(path, true).categorize_internal()
     }
 

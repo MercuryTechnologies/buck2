@@ -319,8 +319,8 @@ impl DefaultIoHandler {
 
                             materialize_files(
                                 a.dest_entry.as_ref(),
-                                &self.fs.root().join(&a.src),
-                                &self.fs.root().join(&a.dest),
+                                &self.fs.resolve(&a.src),
+                                &self.fs.resolve(&a.dest),
                                 a.executable_bit_override,
                             )?;
                         }

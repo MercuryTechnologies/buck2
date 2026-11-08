@@ -330,6 +330,199 @@ pub fn installed() -> Option<&'static JoshMap> {
     JOSH.get().map(|m| &**m)
 }
 
+/// The buck-out root every action is rendered with when the map is active, whatever the daemon's
+/// isolation dir (design D4). On disk the outputs stay under `buck-out/<isolation dir>`;
+/// [`disk_path`] maps a rendered path there.
+pub const CANONICAL_BUCK_OUT: &str = "buck-out/v2";
+
+struct JoshDisk {
+    real_buck_out: ProjectRelativePathBuf,
+    project_root: std::path::PathBuf,
+    /// The isolation dir differs from the canonical one, so buck-out paths need mapping.
+    remap_buck_out: bool,
+}
+
+static DISK: OnceLock<JoshDisk> = OnceLock::new();
+
+/// Record the daemon's on-disk buck-out root and project root. Called once at daemon start, after
+/// [`init`].
+pub fn init_disk(real_buck_out: ProjectRelativePathBuf, project_root: std::path::PathBuf) {
+    let remap_buck_out = active().is_some() && real_buck_out.as_str() != CANONICAL_BUCK_OUT;
+    let _ = DISK.set(JoshDisk {
+        real_buck_out,
+        project_root,
+        remap_buck_out,
+    });
+}
+
+/// The buck-out root to render actions with: [`CANONICAL_BUCK_OUT`] when the map is active,
+/// `real` otherwise, so with josh off or an identity map nothing changes.
+pub fn rendered_buck_out(real: ProjectRelativePathBuf) -> ProjectRelativePathBuf {
+    if active().is_some() {
+        ProjectRelativePathBuf::unchecked_new(CANONICAL_BUCK_OUT.to_owned())
+    } else {
+        real
+    }
+}
+
+/// Where a rendered project-relative path is on disk. Only the buck-out root differs: a rendered
+/// `buck-out/v2/...` is `buck-out/<isolation dir>/...` on disk. Sources are mapped by the callers
+/// that know a path is a rendered source ([`JoshMap::to_real`]), because a real source path read
+/// through the cell resolver must not be mapped twice.
+pub fn disk_path(p: &ProjectRelativePath) -> std::borrow::Cow<'_, ProjectRelativePath> {
+    if let Some(d) = DISK.get() {
+        if d.remap_buck_out {
+            if let Some(rest) =
+                p.strip_prefix_opt(ProjectRelativePath::unchecked_new(CANONICAL_BUCK_OUT))
+            {
+                return std::borrow::Cow::Owned(d.real_buck_out.join(rest));
+            }
+        }
+    }
+    std::borrow::Cow::Borrowed(p)
+}
+
+/// Lexically resolve `text` relative to the directory components `dir`. `None` when it climbs
+/// out of the project.
+fn lexical_join<'a>(dir: &[&'a str], text: &'a str) -> Option<Vec<&'a str>> {
+    let mut parts: Vec<&str> = dir.to_vec();
+    for comp in text.split('/') {
+        match comp {
+            "" | "." => {}
+            ".." => {
+                parts.pop()?;
+            }
+            c => parts.push(c),
+        }
+    }
+    Some(parts)
+}
+
+/// The relative path from directory `from` to `to`, both as components from the project root.
+fn relativize(from: &[&str], to: &[&str]) -> String {
+    let n = from.iter().zip(to.iter()).take_while(|(a, b)| a == b).count();
+    let mut out: Vec<&str> = std::iter::repeat_n("..", from.len() - n).collect();
+    out.extend(&to[n..]);
+    if out.is_empty() {
+        ".".to_owned()
+    } else {
+        out.join("/")
+    }
+}
+
+impl JoshMap {
+    /// The text a relative symlink at project-relative `link` should have on disk, given the
+    /// text it has in the canonical view. A symlink into buck-out keeps its text (buck-out sits
+    /// at the same depth in both views); one to a source is re-pointed at the source's real path,
+    /// so it resolves outside the exec root too. `None` when the text needs no change.
+    pub fn disk_symlink_text_rel(&self, link: &str, text: &str) -> Option<String> {
+        if text.starts_with('/') {
+            return None;
+        }
+        let comps: Vec<&str> = link.split('/').filter(|c| !c.is_empty()).collect();
+        let dir = &comps[..comps.len().checked_sub(1)?];
+        let target = lexical_join(dir, text)?;
+        if target.first() == Some(&"buck-out") {
+            return None;
+        }
+        let target_s = target.join("/");
+        let canonical = if target_s.is_empty() {
+            ProjectRelativePathBuf::unchecked_new(String::new())
+        } else {
+            ProjectRelativePathBuf::try_from(target_s.clone()).ok()?
+        };
+        let real = self.to_real(&canonical, None);
+        if real.as_str() == target_s {
+            return None;
+        }
+        let real_comps: Vec<&str> = real.as_str().split('/').filter(|c| !c.is_empty()).collect();
+        let new = relativize(dir, &real_comps);
+        if new == text { None } else { Some(new) }
+    }
+
+    /// One line per fact of the map, for the event log and the build report (design D7).
+    pub fn describe(&self) -> Vec<String> {
+        let mut v: Vec<String> = self
+            .cells
+            .iter()
+            .map(|c| {
+                format!(
+                    "cell {}={}:{}",
+                    c.real_name,
+                    c.canonical_name,
+                    if c.canonical_path.as_project_relative_path().is_empty() {
+                        ".".to_owned()
+                    } else {
+                        c.canonical_path.as_project_relative_path().to_string()
+                    }
+                )
+            })
+            .collect();
+        v.sort();
+        v
+    }
+}
+
+/// [`JoshMap::disk_symlink_text_rel`] for a symlink at absolute path `link`.
+pub fn disk_symlink_text(link: &std::path::Path, text: &str) -> Option<String> {
+    let josh = active()?;
+    let d = DISK.get()?;
+    let rel = link.strip_prefix(&d.project_root).ok()?.to_str()?;
+    josh.disk_symlink_text_rel(rel, text)
+}
+
+/// Rewrite every relative symlink at or under `path` (an output a local action just wrote, in the
+/// canonical view) to its on-disk text. The action's output digest was already taken from the
+/// canonical text, so the key and the cache entry are those of the tree's own home.
+pub fn rewrite_disk_symlinks(path: &std::path::Path) -> std::io::Result<u64> {
+    if active().is_none() {
+        return Ok(0);
+    }
+    let md = match std::fs::symlink_metadata(path) {
+        Ok(md) => md,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(e) => return Err(e),
+    };
+    if md.file_type().is_symlink() {
+        let text = std::fs::read_link(path)?;
+        if let Some(new) = text.to_str().and_then(|t| disk_symlink_text(path, t)) {
+            std::fs::remove_file(path)?;
+            std::os::unix::fs::symlink(new, path)?;
+            return Ok(1);
+        }
+        Ok(0)
+    } else if md.is_dir() {
+        let mut n = 0;
+        for e in std::fs::read_dir(path)? {
+            n += rewrite_disk_symlinks(&e?.path())?;
+        }
+        Ok(n)
+    } else {
+        Ok(0)
+    }
+}
+
+/// What a command ran under, as event-log tags (design D7): nothing without a `[josh]` section,
+/// so an event log with josh off is as before; `josh:identity` in the tree's own home;
+/// `josh:active` plus the map and the rendered and on-disk buck-out roots otherwise.
+pub fn describe_tags() -> Vec<String> {
+    match installed() {
+        None => Vec::new(),
+        Some(m) if m.is_identity() => vec!["josh:identity".to_owned()],
+        Some(m) => {
+            let mut v = vec!["josh:active".to_owned(), "josh:view=canonical".to_owned()];
+            if let Some(d) = DISK.get() {
+                v.push(format!(
+                    "josh:buck-out={}->{}",
+                    CANONICAL_BUCK_OUT, d.real_buck_out
+                ));
+            }
+            v.extend(m.describe().into_iter().map(|l| format!("josh:{l}")));
+            v
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -470,5 +663,51 @@ mod tests {
         assert!(JoshMap::new(&e, &lab(), &never).is_err());
         let e = entries(&[("cell.mwb", "root")]);
         assert!(JoshMap::new(&e, &lab(), &never).is_err());
+    }
+
+    #[test]
+    fn symlink_text_to_source_points_at_real_path() {
+        let m = JoshMap::new(&lab_map(), &lab(), &never).unwrap();
+        // A symlinked_dir entry in buck-out pointing at mwb's pkg/a.src.
+        assert_eq!(
+            m.disk_symlink_text_rel(
+                "buck-out/josh-b/art/root/pkg/__s_dirs__/sd/a.txt",
+                "../../../../../../../pkg/a.src"
+            )
+            .as_deref(),
+            Some("../../../../../../../services/web-backend/pkg/a.src")
+        );
+        // Into buck-out: unchanged.
+        assert_eq!(
+            m.disk_symlink_text_rel(
+                "buck-out/v2/art/root/pkg/__x__/l",
+                "../../__y__/out"
+            ),
+            None
+        );
+        // A lab-only cell's source.
+        assert_eq!(
+            m.disk_symlink_text_rel("buck-out/v2/art/lab/l/__t__/s", "../../../../../../.josh/lab/l/f"),
+            Some("../../../../../../l/f".to_owned())
+        );
+        // Absolute and out-of-project text: unchanged.
+        assert_eq!(m.disk_symlink_text_rel("buck-out/v2/x", "/etc/passwd"), None);
+        assert_eq!(m.disk_symlink_text_rel("buck-out/v2/x", "../../../up"), None);
+    }
+
+    #[test]
+    fn identity_symlink_text_unchanged() {
+        let m = JoshMap::new(&[], &cells(&[("root", ""), ("ftools", "ftools")]), &never).unwrap();
+        assert_eq!(
+            m.disk_symlink_text_rel("buck-out/v2/art/root/pkg/__t__/l", "../../../../../../pkg/a.src"),
+            None
+        );
+    }
+
+    #[test]
+    fn relativize_paths() {
+        assert_eq!(relativize(&["a", "b"], &["a", "c"]), "../c");
+        assert_eq!(relativize(&[], &["a"]), "a");
+        assert_eq!(relativize(&["a"], &["a"]), ".");
     }
 }
