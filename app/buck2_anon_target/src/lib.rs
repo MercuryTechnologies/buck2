@@ -16,6 +16,7 @@ pub(crate) mod anon_promises;
 pub(crate) mod anon_target_attr;
 pub(crate) mod anon_target_attr_coerce;
 pub(crate) mod anon_target_attr_resolve;
+pub(crate) mod anon_target_josh;
 pub(crate) mod anon_target_node;
 pub(crate) mod anon_targets;
 pub mod bxl;

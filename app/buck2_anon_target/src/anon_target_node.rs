@@ -84,6 +84,9 @@ pub(crate) struct AnonTarget {
     strong_hash: u64,
     /// Cached hash value
     hash: u64,
+    /// josh: the hash the outputs are placed under. It equals `strong_hash` unless the josh map
+    /// is active, when it is computed over canonical cell names (`anon_target_josh`).
+    path_hash: u64,
 }
 
 #[derive(Hash, Eq, PartialEq, Clone, Debug, Allocative, StrongHash, Pagable)]
@@ -149,6 +152,14 @@ impl AnonTarget {
         exec_cfg.hash(&mut strong_hash);
         variant.hash(&mut strong_hash);
         let strong_hash = strong_hash.finish();
+        let path_hash = crate::anon_target_josh::josh_path_hash(
+            &rule_type,
+            &name,
+            &attrs,
+            &exec_cfg,
+            &variant,
+            strong_hash,
+        );
 
         AnonTarget {
             name,
@@ -158,6 +169,7 @@ impl AnonTarget {
             variant,
             hash: full_hash,
             strong_hash,
+            path_hash,
         }
     }
 
@@ -289,7 +301,7 @@ impl BaseDeferredKeyDyn for AnonTarget {
         let cell_relative_path = self.name().pkg().cell_relative_path().as_str();
         let mut configuration_path_hash = CompactString::with_capacity(16);
         let path_hash = if path_resolution_method == BuckOutPathKind::Configuration {
-            write!(&mut configuration_path_hash, "{:x}", self.strong_hash)
+            write!(&mut configuration_path_hash, "{:x}", self.path_hash)
                 .expect("u64 hex formatting fits in 16 bytes");
             configuration_path_hash.as_str()
         } else if let Some(content_hash) = content_hash {
@@ -303,12 +315,16 @@ impl BaseDeferredKeyDyn for AnonTarget {
         // It is performance critical that we use slices and allocate via `join` instead of
         // repeated calls to `join` on the path object because `join` allocates on each call,
         // which has a significant impact.
+        let cell_name = match buck2_core::josh::active() {
+            Some(josh) => josh.canonical_cell_name(self.name().pkg().cell_name()),
+            None => self.name().pkg().cell_name(),
+        };
         let parts = [
             base.as_str(),
             "/",
             prefix.as_str(),
             "-anon/",
-            self.name().pkg().cell_name().as_str(),
+            cell_name.as_str(),
             if path_resolution_method == BuckOutPathKind::Configuration {
                 "/"
             } else {
