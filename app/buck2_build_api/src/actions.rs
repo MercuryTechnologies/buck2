@@ -301,6 +301,13 @@ pub trait ActionExecutionCtx: Send + Sync {
         result: &CommandExecutionResult,
     ) -> Result<(), ExecuteError>;
 
+    /// Whether this action's executor can run a command locally under `executor_preference`.
+    /// josh verify mode asks before a re-run, because a re-run on a remote executor can be
+    /// answered from the very cache entry it is meant to check. False unless the context knows.
+    fn is_local_execution_possible(&self, _executor_preference: ExecutorPreference) -> bool {
+        false
+    }
+
     /// Executes a command
     /// TODO(bobyf) this seems like it deserves critical sections?
     async fn exec_cmd(

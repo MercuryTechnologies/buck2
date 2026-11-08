@@ -26,6 +26,10 @@ pub struct ArtifactFs {
     cell_resolver: CellResolver,
     buck_out_path_resolver: BuckOutPathResolver,
     project_filesystem: ProjectRoot,
+    /// josh: resolve to where things are on disk rather than to the canonical view actions are
+    /// keyed in. Only [`ArtifactFs::real_view`] sets it, for paths that leave buck2: the ones it
+    /// prints, writes into a build report, or hands to a host process as `buck2 run` argv.
+    josh_real_view: bool,
 }
 
 impl ArtifactFs {
@@ -38,6 +42,24 @@ impl ArtifactFs {
             cell_resolver,
             buck_out_path_resolver,
             project_filesystem,
+            josh_real_view: false,
+        }
+    }
+
+    /// The same filesystem resolving to paths that exist on disk: sources at their real cell
+    /// path, buck-out under the daemon's own isolation dir. Never used to key or run an action.
+    /// Without an active josh map this is `self`.
+    pub fn real_view(&self) -> Self {
+        let mut fs = self.dupe();
+        fs.josh_real_view = crate::josh::active().is_some();
+        fs
+    }
+
+    fn on_disk(&self, p: ProjectRelativePathBuf) -> ProjectRelativePathBuf {
+        if self.josh_real_view {
+            crate::josh::disk_path(&p).into_owned()
+        } else {
+            p
         }
     }
 
@@ -45,7 +67,9 @@ impl ArtifactFs {
         &self,
         path: &BuildArtifactPath,
     ) -> Option<ProjectRelativePathBuf> {
-        self.buck_out_path_resolver.unhashed_gen(path)
+        self.buck_out_path_resolver
+            .unhashed_gen(path)
+            .map(|p| self.on_disk(p))
     }
 
     pub fn resolve_build(
@@ -53,15 +77,20 @@ impl ArtifactFs {
         path: &BuildArtifactPath,
         content_hash: Option<&ContentBasedPathHash>,
     ) -> buck2_error::Result<ProjectRelativePathBuf> {
-        self.buck_out_path_resolver.resolve_gen(path, content_hash)
+        Ok(self.on_disk(
+            self.buck_out_path_resolver
+                .resolve_gen(path, content_hash)?,
+        ))
     }
 
     pub fn resolve_build_configuration_hash_path(
         &self,
         path: &BuildArtifactPath,
     ) -> buck2_error::Result<ProjectRelativePathBuf> {
-        self.buck_out_path_resolver
-            .resolve_gen_configuration_hash_path(path)
+        Ok(self.on_disk(
+            self.buck_out_path_resolver
+                .resolve_gen_configuration_hash_path(path)?,
+        ))
     }
 
     pub fn resolve_cell_path(
@@ -70,7 +99,7 @@ impl ArtifactFs {
     ) -> buck2_error::Result<ProjectRelativePathBuf> {
         // josh: actions see every cell at its canonical path. On disk it stays where it is;
         // `josh::JoshMap::to_real` maps a rendered path back.
-        if let Some(josh) = crate::josh::active() {
+        if let Some(josh) = crate::josh::active().filter(|_| !self.josh_real_view) {
             if let Some(root) = josh.canonical_cell_path(path.cell()) {
                 return Ok(root.join(path.path()));
             }
@@ -87,10 +116,12 @@ impl ArtifactFs {
             .get(source_artifact_path.package().cell_name())?
             .external()
         {
-            Ok(self.buck_out_path_resolver.resolve_external_cell_source(
-                source_artifact_path.to_cell_path().path(),
-                origin.dupe(),
-            ))
+            Ok(
+                self.on_disk(self.buck_out_path_resolver.resolve_external_cell_source(
+                    source_artifact_path.to_cell_path().path(),
+                    origin.dupe(),
+                )),
+            )
         } else {
             Ok(self
                 .resolve_cell_path(source_artifact_path.package().as_cell_path())?
@@ -102,7 +133,7 @@ impl ArtifactFs {
         &self,
         path: &BuildArtifactPath,
     ) -> buck2_error::Result<ProjectRelativePathBuf> {
-        self.buck_out_path_resolver.resolve_offline_cache(path)
+        Ok(self.on_disk(self.buck_out_path_resolver.resolve_offline_cache(path)?))
     }
 
     pub fn fs(&self) -> &ProjectRoot {

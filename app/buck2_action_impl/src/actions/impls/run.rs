@@ -483,18 +483,53 @@ fn josh_unshared_salt(owner: &BaseDeferredKey) -> Option<String> {
 
 /// Re-run a cache hit locally and compare outputs (josh verify mode, design D6). Returns the
 /// result to use and whether it must not be uploaded.
+///
+/// The re-run is forced onto the local executor. Sent through the action's own executor it could
+/// go to RE, where `skip_cache_lookup` is false outside `--no-remote-cache`, so the server would
+/// answer from the entry under test and every check would pass. An executor that cannot run the
+/// action locally gets no re-run at all (`josh:verify=no-local`), and a re-run that reports any
+/// kind but a local execution is not compared.
 async fn josh_verify_hit(
     ctx: &mut dyn ActionExecutionCtx,
-    req: &CommandExecutionRequest,
+    req: &mut CommandExecutionRequest,
     prepared_action: &buck2_execute::execute::prepared::PreparedAction,
     hit: CommandExecutionResult,
 ) -> (CommandExecutionResult, bool) {
     use buck2_core::josh::VerifyOutcome;
+    use buck2_execute::execute::kind::CommandExecutionKind;
+    use buck2_execute::execute::result::CommandExecutionStatus;
     let digest = prepared_action.action_and_blobs.action.to_string();
-    let what = format!("{} {}", ctx.target().category(), ctx.target().identifier().unwrap_or(""));
+    let what = format!(
+        "{} {}",
+        ctx.target().category(),
+        ctx.target().identifier().unwrap_or("")
+    );
+    if !ctx.is_local_execution_possible(ExecutorPreference::LocalRequired) {
+        ctx.events().instant_event(buck2_data::TagEvent {
+            tags: vec![buck2_core::josh::verify_tag(
+                VerifyOutcome::NoLocal,
+                &digest,
+                &what,
+            )],
+        });
+        return (hit, false);
+    }
+    // The preference is not part of the action digest, so the request keys as before; it is put
+    // back before the request is used again.
+    let preference = req.executor_preference;
+    req.executor_preference = ExecutorPreference::LocalRequired;
     let manager = ctx.command_execution_manager(WaitingData::new());
     let mut local = ctx.exec_cmd(manager, req, prepared_action).await;
-    let (outcome, use_local) = if !local.was_success() {
+    req.executor_preference = preference;
+    let ran_locally = matches!(
+        &local.report.status,
+        CommandExecutionStatus::Success {
+            execution_kind: CommandExecutionKind::Local { .. }
+        }
+    );
+    let (outcome, use_local) = if local.was_success() && !ran_locally {
+        (VerifyOutcome::NoLocal, false)
+    } else if !local.was_success() {
         (VerifyOutcome::LocalFailed, false)
     } else if local.outputs == hit.outputs {
         (VerifyOutcome::Ok, false)
@@ -1197,7 +1232,7 @@ impl RunAction {
             return Ok(ExecuteResult::LocalDepFileHit(outputs, metadata));
         }
 
-        let req =
+        let mut req =
             self.command_execution_request(ctx, prepared_run_action, host_sharing_requirements)?;
 
         // Prepare the action, check the action cache, fully check the local dep file cache if needed, then execute the command
@@ -1222,7 +1257,7 @@ impl RunAction {
                             .as_bytes(),
                     ) =>
             {
-                let (hit, no_upload) = josh_verify_hit(ctx, &req, &prepared_action, hit).await;
+                let (hit, no_upload) = josh_verify_hit(ctx, &mut req, &prepared_action, hit).await;
                 josh_no_upload = no_upload;
                 ControlFlow::Break(hit)
             }

@@ -647,6 +647,8 @@ pub enum VerifyOutcome {
     Ok,
     FalseShare,
     LocalFailed,
+    /// Not checked: the action's executor cannot run it locally, or the re-run was not local.
+    NoLocal,
 }
 
 pub fn verify_tag(outcome: VerifyOutcome, digest: &str, what: &str) -> String {
@@ -654,6 +656,7 @@ pub fn verify_tag(outcome: VerifyOutcome, digest: &str, what: &str) -> String {
         VerifyOutcome::Ok => "josh:verify=ok",
         VerifyOutcome::FalseShare => "josh:JoshFalseShare",
         VerifyOutcome::LocalFailed => "josh:verify=local-failed",
+        VerifyOutcome::NoLocal => "josh:verify=no-local",
     };
     format!("{o} {digest} {what}")
 }

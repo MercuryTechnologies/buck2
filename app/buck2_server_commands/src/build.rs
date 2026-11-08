@@ -556,7 +556,9 @@ async fn process_streaming_build_result(
     let fs = server_ctx.project_root();
     let cwd: &buck2_core::fs::project_rel_path::ProjectRelativePath = server_ctx.working_dir();
     let cell_resolver = ctx.ctx().get_cell_resolver().await?;
-    let artifact_fs = ctx.ctx().get_artifact_fs().await?;
+    // josh: a build report names outputs for the user and their tools, so it uses the paths
+    // that exist on disk, not the canonical view the actions were keyed in.
+    let artifact_fs = &ctx.ctx().get_artifact_fs().await?.real_view();
 
     let build_report_opts = build_report_opts(
         &mut ctx.ctx(),
@@ -685,7 +687,10 @@ async fn process_build_result(
     let response_options = request.response_options.unwrap_or_default();
 
     let cell_resolver = ctx.ctx().get_cell_resolver().await?;
-    let artifact_fs = ctx.ctx().get_artifact_fs().await?;
+    // josh: everything below leaves buck2 (`--show-output` paths, `buck2 run` argv, the build
+    // report, unhashed links), so it resolves where files are on disk. Actions were keyed and
+    // run in the canonical view, which can name paths that do not exist outside the exec root.
+    let artifact_fs = &ctx.ctx().get_artifact_fs().await?.real_view();
 
     let result_reports = ResultReporter::convert(
         artifact_fs,

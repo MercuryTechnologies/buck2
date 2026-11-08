@@ -105,7 +105,8 @@ async fn targets_show_outputs(
     )
     .await?;
 
-    let artifact_fs = ctx.ctx().get_artifact_fs().await?;
+    // josh: printed paths are where the outputs are on disk.
+    let artifact_fs = &ctx.ctx().get_artifact_fs().await?.real_view();
 
     let mut targets_paths = Vec::new();
 

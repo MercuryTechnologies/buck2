@@ -620,6 +620,12 @@ pub struct DaemonStartupConfig {
     pub daemon_idle_timeout_s: Option<u64>,
     /// Pagable DICE storage settings, or `None` when paging is disabled.
     pub hydration: Option<HydrationConfig>,
+    /// josh: the root cell's `[josh]` section, sorted. The daemon installs its cell map once, at
+    /// startup, and every path and configuration hash it interns afterwards depends on it, so the
+    /// only sound way to apply an edit is a new daemon. `None` (and absent from the serialized
+    /// form) without the section, so a daemon with josh off is matched exactly as before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub josh: Option<Vec<(String, String)>>,
 }
 
 impl DaemonStartupConfig {
@@ -745,6 +751,14 @@ impl DaemonStartupConfig {
                 property: "daemon_idle_timeout_s",
             })?,
             hydration: HydrationConfig::from_config(config)?,
+            josh: config.get_section("josh").map(|s| {
+                let mut v: Vec<(String, String)> = s
+                    .iter()
+                    .map(|(k, v)| (k.to_owned(), v.as_str().to_owned()))
+                    .collect();
+                v.sort();
+                v
+            }),
         })
     }
 
@@ -780,6 +794,7 @@ impl DaemonStartupConfig {
             macos_qos_class: None,
             daemon_idle_timeout_s: None,
             hydration: None,
+            josh: None,
         }
     }
 }
@@ -796,6 +811,30 @@ mod tests {
         let config = parse(&[("config", indoc!(r#""#))], "config")?;
         let startup_config = DaemonStartupConfig::new(&config, &BuckSettings::empty(), false)?;
         assert_eq!(startup_config.daemon_idle_timeout_s, None);
+        Ok(())
+    }
+
+    #[test]
+    fn josh_section_is_a_startup_constraint() -> buck2_error::Result<()> {
+        let none = parse(&[("config", "")], "config")?;
+        let none = DaemonStartupConfig::new(&none, &BuckSettings::empty(), false)?;
+        assert_eq!(none.josh, None);
+        // With josh off the serialized constraint is what an unmodified buck2 writes.
+        assert!(!none.serialize()?.contains("josh"));
+
+        let on = |body: &str| -> buck2_error::Result<DaemonStartupConfig> {
+            let c = parse(&[("config", body)], "config")?;
+            DaemonStartupConfig::new(&c, &BuckSettings::empty(), false)
+        };
+        let a = on("[josh]\nenabled = true\ncell.mwb = root:.\n")?;
+        let a2 = on("[josh]\ncell.mwb = root:.\nenabled = true\n")?;
+        let b = on("[josh]\nenabled = true\ncell.mwb = root:services\n")?;
+        let off = on("[josh]\nenabled = false\ncell.mwb = root:.\n")?;
+        assert_eq!(a, a2);
+        assert_ne!(a, b);
+        assert_ne!(a, off);
+        assert_ne!(a, none);
+        assert_eq!(DaemonStartupConfig::deserialize(&a.serialize()?)?, a);
         Ok(())
     }
 

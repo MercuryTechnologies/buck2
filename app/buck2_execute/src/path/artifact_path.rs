@@ -110,9 +110,9 @@ impl ArtifactPath<'_> {
         } = self;
 
         let base_path = match base_path {
-            Either::Left(build) => artifact_fs
-                .buck_out_path_resolver()
-                .resolve_gen(build, content_hash)?,
+            // Through ArtifactFs, not its BuckOutPathResolver, so a josh real-view fs maps the
+            // path to where it is on disk.
+            Either::Left(build) => artifact_fs.resolve_build(build, content_hash)?,
             Either::Right(source) => artifact_fs.resolve_source(*source)?,
         };
 
@@ -133,9 +133,7 @@ impl ArtifactPath<'_> {
         } = self;
 
         let base_path = match base_path {
-            Either::Left(build) => artifact_fs
-                .buck_out_path_resolver()
-                .resolve_gen_configuration_hash_path(build)?,
+            Either::Left(build) => artifact_fs.resolve_build_configuration_hash_path(build)?,
             Either::Right(source) => artifact_fs.resolve_source(*source)?,
         };
 

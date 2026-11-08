@@ -713,6 +713,11 @@ impl ActionExecutionCtx for BuckActionExecutionContext<'_, '_> {
         res
     }
 
+    fn is_local_execution_possible(&self, executor_preference: ExecutorPreference) -> bool {
+        self.executor
+            .is_local_execution_possible(executor_preference)
+    }
+
     async fn exec_cmd(
         &mut self,
         manager: CommandExecutionManager,
