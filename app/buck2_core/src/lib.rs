@@ -27,6 +27,7 @@ pub mod bzl;
 pub mod category;
 pub mod cells;
 pub mod ci;
+pub mod josh;
 pub mod client_only;
 pub mod configuration;
 pub mod content_hash;

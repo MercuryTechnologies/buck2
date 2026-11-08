@@ -264,12 +264,16 @@ impl BaseDeferredKey {
                     path_identifier.concat()
                 };
 
+                let cell_name = match crate::josh::active() {
+                    Some(josh) => josh.canonical_cell_name(target.pkg().cell_name()),
+                    None => target.pkg().cell_name(),
+                };
                 let hashed_path = [
                     base.as_str(),
                     "/",
                     prefix.as_str(),
                     "/",
-                    target.pkg().cell_name().as_str(),
+                    cell_name.as_str(),
                     "/",
                     path_or_hash.as_str(),
                     path.as_str(),

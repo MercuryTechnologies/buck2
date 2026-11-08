@@ -68,6 +68,13 @@ impl ArtifactFs {
         &self,
         path: CellPathRef,
     ) -> buck2_error::Result<ProjectRelativePathBuf> {
+        // josh: actions see every cell at its canonical path. On disk it stays where it is;
+        // `josh::JoshMap::to_real` maps a rendered path back.
+        if let Some(josh) = crate::josh::active() {
+            if let Some(root) = josh.canonical_cell_path(path.cell()) {
+                return Ok(root.join(path.path()));
+            }
+        }
         self.cell_resolver.resolve_path(path)
     }
 
@@ -85,8 +92,8 @@ impl ArtifactFs {
                 origin.dupe(),
             ))
         } else {
-            Ok(cell_resolver
-                .resolve_path(source_artifact_path.package().as_cell_path())?
+            Ok(self
+                .resolve_cell_path(source_artifact_path.package().as_cell_path())?
                 .join(source_artifact_path.path()))
         }
     }

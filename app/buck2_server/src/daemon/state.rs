@@ -328,6 +328,32 @@ impl DaemonState {
                 .parse_single_cell(cells.root_cell(), &fs)
                 .await?;
 
+            if root_config
+                .parse::<bool>(BuckconfigKeyRef {
+                    section: "josh",
+                    property: "enabled",
+                })?
+                .unwrap_or(false)
+            {
+                let entries: Vec<(String, String)> = root_config
+                    .get_section("josh")
+                    .map(|s| {
+                        s.iter()
+                            .map(|(k, v)| (k.to_owned(), v.as_str().to_owned()))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let cell_list: Vec<_> = cells
+                    .cells()
+                    .map(|(name, cell)| (name, cell.path().to_buf()))
+                    .collect();
+                let map = buck2_core::josh::JoshMap::new(&entries, &cell_list, &|p| {
+                    fs.resolve(p).as_path().exists()
+                })?;
+                tracing::info!("josh map (identity: {}): {:?}", map.is_identity(), map.cells());
+                buck2_core::josh::init(map)?;
+            }
+
             let buffer_size = root_config
                 .parse(BuckconfigKeyRef {
                     section: "buck2",

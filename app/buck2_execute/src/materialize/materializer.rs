@@ -469,6 +469,11 @@ impl CopiedArtifact {
         dest_entry: ActionDirectoryEntry<ActionImmutableDirectory>,
         executable_bit_override: Option<bool>,
     ) -> Self {
+        // josh: `src` was rendered in the canonical view; the materializer reads the real one.
+        let src = match buck2_core::josh::active() {
+            Some(josh) => josh.to_real(&src, None),
+            None => src,
+        };
         Self {
             src,
             dest,

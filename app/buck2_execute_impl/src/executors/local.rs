@@ -148,7 +148,158 @@ pub struct LocalExecutor {
     daemon_id: DaemonId,
 }
 
+/// The tools the josh exec root needs, found once on the daemon's PATH.
+struct JoshTools {
+    unshare: String,
+    mount: String,
+    mkdir: String,
+}
+
+fn josh_tools() -> buck2_error::Result<&'static JoshTools> {
+    static TOOLS: std::sync::OnceLock<Result<JoshTools, String>> = std::sync::OnceLock::new();
+    let tools = TOOLS.get_or_init(|| {
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        let dirs: Vec<std::path::PathBuf> = std::env::split_paths(&path).collect();
+        let find = |name: &str, prefer: Option<&std::path::Path>| -> Result<String, String> {
+            if let Some(d) = prefer {
+                let p = d.join(name);
+                if p.is_file() {
+                    return Ok(p.to_string_lossy().into_owned());
+                }
+            }
+            dirs.iter()
+                .map(|d| d.join(name))
+                .find(|p| p.is_file())
+                .map(|p| p.to_string_lossy().into_owned())
+                .ok_or_else(|| format!("josh: `{name}` not found on the daemon's PATH"))
+        };
+        let unshare = find("unshare", None)?;
+        // mount from util-linux beside unshare, not a setuid wrapper earlier on PATH.
+        let dir = std::path::Path::new(&unshare).parent().map(|p| p.to_owned());
+        Ok(JoshTools {
+            mount: find("mount", dir.as_deref())?,
+            mkdir: find("mkdir", dir.as_deref())?,
+            unshare,
+        })
+    });
+    tools
+        .as_ref()
+        .map_err(|e| buck2_error::buck2_error!(buck2_error::ErrorTag::Environment, "{}", e))
+}
+
+/// Runs in a new user and mount namespace: mounts a tmpfs on the exec root, binds every cell's
+/// real directory at its canonical path and buck-out at its own, then drops back to the caller's
+/// uid and gid in a nested user namespace and runs the command from the canonical working dir.
+const JOSH_EXEC_SCRIPT: &str = r#"set -e
+M=$1; MK=$2; U=$3; E=$4; WD=$5; UID_=$6; GID_=$7; N=$8; shift 8
+"$M" -t tmpfs -o mode=0755 josh "$E"
+while [ "$N" -gt 0 ]; do
+  if [ -d "$1" ]; then "$MK" -p "$E/$2"; else : > "$E/$2"; fi
+  "$M" --bind "$1" "$E/$2"
+  shift 2
+  N=$((N - 1))
+done
+shift
+cd "$E/$WD"
+exec "$U" -U --map-user="$UID_" --map-group="$GID_" -- "$@"
+"#;
+
 impl LocalExecutor {
+    /// josh: when the cells are remapped, the command line that runs `exe args` in the canonical
+    /// exec root `buck-out/<iso>/josh/exec`, where every path the action was rendered with
+    /// resolves (physically, too) as it does in the tree's own home. `None` with josh off or an
+    /// identity map, so those run exactly as before.
+    fn josh_wrap(
+        &self,
+        exe: &str,
+        args: &[OsString],
+        working_directory: &ProjectRelativePath,
+    ) -> buck2_error::Result<Option<(String, Vec<OsString>)>> {
+        use std::os::unix::fs::MetadataExt;
+        let Some(josh) = buck2_core::josh::active() else {
+            return Ok(None);
+        };
+        let tools = josh_tools()?;
+        let buck_out = self.artifact_fs.buck_out_path_resolver().root();
+        let exec_root = self
+            .root
+            .as_path()
+            .join(buck_out.as_str())
+            .join("josh")
+            .join("exec");
+        std::fs::create_dir_all(&exec_root)
+            .map_err(|e| buck2_error::buck2_error!(buck2_error::ErrorTag::Environment, "josh exec root {}: {}", exec_root.display(), e))?;
+        let meta = std::fs::metadata(&exec_root)
+            .map_err(|e| buck2_error::buck2_error!(buck2_error::ErrorTag::Environment, "josh exec root: {}", e))?;
+        let root = self.root.as_path();
+        let mut binds: Vec<(std::path::PathBuf, String)> = Vec::new();
+        let cells = josh.cells();
+        for c in cells {
+            let cp = c.canonical_path.as_project_relative_path();
+            let rp = c.real_path.as_project_relative_path();
+            if cp.is_empty() {
+                let real = root.join(rp.as_str());
+                let entries = std::fs::read_dir(&real).map_err(|e| {
+                    buck2_error::buck2_error!(buck2_error::ErrorTag::Environment, "josh: read {}: {}", real.display(), e)
+                })?;
+                let mut names: Vec<String> = entries
+                    .filter_map(|e| e.ok())
+                    .map(|e| e.file_name().to_string_lossy().into_owned())
+                    .filter(|n| n != buck2_core::josh::RESERVED_DIR && n != "buck-out")
+                    .collect();
+                names.sort();
+                for n in names {
+                    binds.push((real.join(&n), n));
+                }
+                continue;
+            }
+            // Covered when an enclosing cell's bind already puts it at its canonical path.
+            let covered = cells.iter().any(|q| {
+                let qcp = q.canonical_path.as_project_relative_path();
+                let qrp = q.real_path.as_project_relative_path();
+                if q.real_name == c.real_name || qcp == cp {
+                    return false;
+                }
+                let rel = if qcp.is_empty() {
+                    Some(cp.as_forward_relative_path())
+                } else {
+                    cp.strip_prefix_opt(qcp)
+                };
+                rel.is_some_and(|rel| qrp.join(rel) == *rp)
+            });
+            if !covered {
+                binds.push((root.join(rp.as_str()), cp.as_str().to_owned()));
+            }
+        }
+        binds.push((root.join(buck_out.as_str()), buck_out.as_str().to_owned()));
+        // Parents before children; the sort is stable, so equal lengths keep their order.
+        binds.sort_by_key(|(_, dst)| dst.matches('/').count());
+
+        let mut a: Vec<OsString> = vec![
+            "-Urm".into(),
+            "--".into(),
+            "/bin/sh".into(),
+            "-c".into(),
+            JOSH_EXEC_SCRIPT.into(),
+            "josh".into(),
+            tools.mount.clone().into(),
+            tools.mkdir.clone().into(),
+            tools.unshare.clone().into(),
+            exec_root.clone().into_os_string(),
+            working_directory.as_str().to_owned().into(),
+            meta.uid().to_string().into(),
+            meta.gid().to_string().into(),
+            binds.len().to_string().into(),
+        ];
+        for (src, dst) in binds {
+            a.push(src.into_os_string());
+            a.push(dst.into());
+        }
+        a.push("--".into());
+        a.push(exe.into());
+        a.extend(args.iter().cloned());
+        Ok(Some((tools.unshare.clone(), a)))
+    }
     pub fn new(
         artifact_fs: ArtifactFs,
         materializer: Arc<dyn Materializer>,
@@ -194,7 +345,16 @@ impl LocalExecutor {
         network_access: Option<NetworkAccess>,
     ) -> impl futures::future::Future<Output = buck2_error::Result<CommandResult>> + Send + 'a {
         async move {
-            let working_directory = self.root.join_cow(working_directory);
+            let args: Vec<OsString> = args.into_iter().map(|a| a.as_ref().to_owned()).collect();
+            let wrapped = self.josh_wrap(exe, &args, working_directory)?;
+            let (exe, args, working_directory) = match &wrapped {
+                Some((e, a)) => (
+                    e.as_str(),
+                    a.clone(),
+                    std::borrow::Cow::Borrowed(&*self.root),
+                ),
+                None => (exe, args, self.root.join_cow(working_directory)),
+            };
 
             let result = match &self.forkserver {
                 #[cfg(unix)]

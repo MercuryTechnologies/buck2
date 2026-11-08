@@ -55,6 +55,11 @@ starlark_simple_value!(StarlarkArtifactValue);
 impl StarlarkArtifactValue {
     /// Create a new artifact value. Must be materialised to disk before calling this function.
     pub fn new(artifact: Artifact, path: ProjectRelativePathBuf, fs: ProjectRoot) -> Self {
+        // josh: `path` was rendered in the canonical view; read the file where it is on disk.
+        let path = match buck2_core::josh::active() {
+            Some(josh) => josh.to_real(&path, None),
+            None => path,
+        };
         Self { artifact, path, fs }
     }
 }

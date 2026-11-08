@@ -1,0 +1,474 @@
+/*
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
+ *
+ * This source code is dual-licensed under either the MIT license found in the
+ * LICENSE-MIT file in the root directory of this source tree or the Apache
+ * License, Version 2.0 found in the LICENSE-APACHE file in the root directory
+ * of this source tree. You may select, at your option, one of the
+ * above-listed licenses.
+ */
+
+//! josh: a layout-invariant ("canonical") view of the cells, so that one tree imported into
+//! another repository at another path, under another cell name, keys its actions as it does in
+//! its own home.
+//!
+//! The map is read once, at daemon start, from the root cell's `[josh]` section:
+//!
+//! ```ini
+//! [josh]
+//!   enabled = true
+//!   # <real cell name> = <canonical name>:<canonical path, "." for the project root>
+//!   cell.mwb = root:.
+//!   cell.root = lab:.josh/lab
+//! ```
+//!
+//! A cell with no entry maps to itself. When every cell maps to itself (the home the tree comes
+//! from), the map is the identity and nothing changes: [`active`] returns `None`, so every key is
+//! computed by exactly the code paths that run with josh off.
+//!
+//! When the map is not the identity, actions are rendered in the canonical view: source paths,
+//! the cell name in buck-out paths and the configuration hash use canonical names and paths. On
+//! disk, buck-out uses the canonical cell names and configuration hashes too, so the only
+//! differences between the views are where sources sit, which [`JoshMap::to_real`] undoes, and
+//! the isolation dir, which this version still renders as it is on disk.
+
+use std::collections::BTreeMap;
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::sync::OnceLock;
+
+use allocative::Allocative;
+
+
+use crate::cells::cell_root_path::CellRootPath;
+use crate::cells::cell_root_path::CellRootPathBuf;
+use crate::cells::name::CellName;
+use buck2_fs::paths::forward_rel_path::ForwardRelativePath;
+use crate::fs::project_rel_path::ProjectRelativePath;
+use crate::fs::project_rel_path::ProjectRelativePathBuf;
+
+/// The top-level directory a remapped cell's canonical path may use for cells that must move out
+/// of the way. A cell mapped to the project root must not contain it.
+pub const RESERVED_DIR: &str = ".josh";
+
+#[derive(Debug, buck2_error::Error)]
+#[buck2(tag = Input)]
+pub enum JoshError {
+    #[error("[josh] {0}: expected `<canonical name>:<canonical path>`, got `{1}`")]
+    BadEntry(String, String),
+    #[error("[josh] {0} names a cell that does not exist")]
+    UnknownCell(String),
+    #[error("[josh] the map is not injective on names: `{0}` and `{1}` both map to `{2}`")]
+    NameCollision(String, String, String),
+    #[error("[josh] the map is not injective on paths: `{0}` and `{1}` both map to `{2}`")]
+    PathCollision(String, String, String),
+    #[error(
+        "[josh] canonical paths must nest as the real ones do: `{0}` is under `{1}` in one view but not the other"
+    )]
+    Nesting(String, String),
+    #[error("[josh] `{0}` is reserved and must not exist in cell `{1}` (it maps to the project root)")]
+    Reserved(String, String),
+    #[error("[josh] the map changed since the daemon started; restart the daemon (`buck2 kill`)")]
+    Changed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Allocative)]
+pub struct JoshCell {
+    pub real_name: CellName,
+    pub real_path: CellRootPathBuf,
+    pub canonical_name: CellName,
+    pub canonical_path: CellRootPathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Allocative)]
+pub struct JoshMap {
+    /// Every cell, sorted by canonical path, longest first, so that the first canonical prefix
+    /// that matches a path is the innermost cell.
+    cells: Vec<JoshCell>,
+    by_real: HashMap<CellName, usize>,
+    identity: bool,
+}
+
+fn is_under(p: &ProjectRelativePath, base: &ProjectRelativePath) -> bool {
+    base.is_empty() || p.starts_with(base)
+}
+
+impl JoshMap {
+    /// `entries` are the `[josh]` keys `cell.<real name>` with their values; `cells` is every
+    /// cell the resolver knows, with its real path. `exists` reports whether a project-relative
+    /// path exists on disk (for the reserved-dir check).
+    pub fn new(
+        entries: &[(String, String)],
+        cells: &[(CellName, CellRootPathBuf)],
+        exists: &dyn Fn(&ProjectRelativePath) -> bool,
+    ) -> buck2_error::Result<JoshMap> {
+        let mut mapped: BTreeMap<&str, (CellName, CellRootPathBuf)> = BTreeMap::new();
+        for (key, value) in entries {
+            let Some(real) = key.strip_prefix("cell.") else {
+                continue;
+            };
+            let (name, path) = value
+                .split_once(':')
+                .ok_or_else(|| JoshError::BadEntry(key.clone(), value.clone()))?;
+            let name = name.trim();
+            let path = path.trim();
+            if name.is_empty() {
+                return Err(JoshError::BadEntry(key.clone(), value.clone()).into());
+            }
+            let path = if path == "." || path.is_empty() {
+                ProjectRelativePathBuf::unchecked_new(String::new())
+            } else {
+                ProjectRelativePathBuf::try_from(path.to_owned())
+                    .map_err(|_| JoshError::BadEntry(key.clone(), value.clone()))?
+            };
+            if !cells.iter().any(|(c, _)| c.as_str() == real) {
+                return Err(JoshError::UnknownCell(key.clone()).into());
+            }
+            mapped.insert(
+                real,
+                (CellName::unchecked_new(name)?, CellRootPathBuf::new(path)),
+            );
+        }
+        let mut list = Vec::new();
+        for (real_name, real_path) in cells {
+            let (canonical_name, canonical_path) = match mapped.get(real_name.as_str()) {
+                Some((n, p)) => (*n, p.clone()),
+                None => (*real_name, real_path.clone()),
+            };
+            list.push(JoshCell {
+                real_name: *real_name,
+                real_path: real_path.clone(),
+                canonical_name,
+                canonical_path,
+            });
+        }
+        // Injective on names and paths.
+        for (i, a) in list.iter().enumerate() {
+            for b in &list[i + 1..] {
+                if a.canonical_name == b.canonical_name {
+                    return Err(JoshError::NameCollision(
+                        a.real_name.to_string(),
+                        b.real_name.to_string(),
+                        a.canonical_name.to_string(),
+                    )
+                    .into());
+                }
+                if a.canonical_path == b.canonical_path {
+                    return Err(JoshError::PathCollision(
+                        a.real_name.to_string(),
+                        b.real_name.to_string(),
+                        a.canonical_path.as_project_relative_path().to_string(),
+                    )
+                    .into());
+                }
+            }
+        }
+        // Nesting: if a cell is under another in one view, it must be under it in the other, at
+        // the same relative path. Otherwise one path would have two readings.
+        for a in &list {
+            for b in &list {
+                if a.real_name == b.real_name {
+                    continue;
+                }
+                let ra = a.real_path.as_project_relative_path();
+                let rb = b.real_path.as_project_relative_path();
+                let ca = a.canonical_path.as_project_relative_path();
+                let cb = b.canonical_path.as_project_relative_path();
+                let real_under = is_under(ra, rb);
+                let canon_under = is_under(ca, cb);
+                // A cell moved to the reserved dir may leave a cell that maps to the root.
+                let moved_out = ca
+                    .as_forward_relative_path()
+                    .iter()
+                    .next()
+                    .is_some_and(|s| s.as_str() == RESERVED_DIR);
+                if real_under && canon_under {
+                    let rr = ra.strip_prefix_opt(rb).map(|x| x.as_str().to_owned());
+                    let cr = ca.strip_prefix_opt(cb).map(|x| x.as_str().to_owned());
+                    let rr = if rb.is_empty() { Some(ra.as_str().to_owned()) } else { rr };
+                    let cr = if cb.is_empty() { Some(ca.as_str().to_owned()) } else { cr };
+                    if rr != cr && !(cb.is_empty() && moved_out) {
+                        return Err(JoshError::Nesting(
+                            a.real_name.to_string(),
+                            b.real_name.to_string(),
+                        )
+                        .into());
+                    }
+                } else if real_under != canon_under {
+                    // Under the project root in the canonical view only because the root is
+                    // mapped, or moved out to the reserved dir: both are what the map is for.
+                    if canon_under && cb.is_empty() {
+                        continue;
+                    }
+                    if real_under && rb.is_empty() {
+                        continue;
+                    }
+                    return Err(
+                        JoshError::Nesting(a.real_name.to_string(), b.real_name.to_string())
+                            .into(),
+                    );
+                }
+            }
+        }
+        // The reserved dir and buck-out must not exist in a cell that maps to the root.
+        for c in &list {
+            if c.canonical_path.as_project_relative_path().is_empty()
+                && c.real_path != c.canonical_path
+            {
+                for reserved in [RESERVED_DIR, "buck-out"] {
+                    let p = c
+                        .real_path
+                        .as_project_relative_path()
+                        .join(ForwardRelativePath::unchecked_new(reserved));
+                    if exists(&p) {
+                        return Err(
+                            JoshError::Reserved(p.to_string(), c.real_name.to_string()).into()
+                        );
+                    }
+                }
+            }
+        }
+        let identity = list
+            .iter()
+            .all(|c| c.real_name == c.canonical_name && c.real_path == c.canonical_path);
+        list.sort_by(|a, b| {
+            b.canonical_path
+                .as_project_relative_path()
+                .as_str()
+                .len()
+                .cmp(&a.canonical_path.as_project_relative_path().as_str().len())
+        });
+        let by_real = list
+            .iter()
+            .enumerate()
+            .map(|(i, c)| (c.real_name, i))
+            .collect();
+        Ok(JoshMap {
+            cells: list,
+            by_real,
+            identity,
+        })
+    }
+
+    pub fn is_identity(&self) -> bool {
+        self.identity
+    }
+
+    pub fn cells(&self) -> &[JoshCell] {
+        &self.cells
+    }
+
+    fn get(&self, real: CellName) -> Option<&JoshCell> {
+        self.by_real.get(&real).map(|i| &self.cells[*i])
+    }
+
+    pub fn canonical_cell_name(&self, real: CellName) -> CellName {
+        self.get(real).map_or(real, |c| c.canonical_name)
+    }
+
+    pub fn canonical_cell_path(&self, real: CellName) -> Option<&CellRootPath> {
+        self.get(real).map(|c| c.canonical_path.as_path())
+    }
+
+    /// Rewrite the cell of a `cell//...` label string to its canonical name. Strings that are not
+    /// labels, or name no remapped cell, are returned unchanged.
+    pub fn canonical_label_str(&self, s: &str) -> Option<String> {
+        let (cell, rest) = s.split_once("//")?;
+        let c = self.cells.iter().find(|c| c.real_name.as_str() == cell)?;
+        if c.canonical_name == c.real_name {
+            return None;
+        }
+        Some(format!("{}//{}", c.canonical_name, rest))
+    }
+
+    /// A project-relative path in the canonical view, as it is on disk. `buck_out` is the
+    /// on-disk buck-out root (`buck-out/<isolation dir>`), which renders as itself in this version.
+    pub fn to_real(
+        &self,
+        p: &ProjectRelativePath,
+        buck_out: Option<&ProjectRelativePath>,
+    ) -> ProjectRelativePathBuf {
+        if p.starts_with(ProjectRelativePath::unchecked_new("buck-out"))
+            || buck_out.is_some_and(|b| p.starts_with(b))
+        {
+            return p.to_buf();
+        }
+        for c in &self.cells {
+            let cp = c.canonical_path.as_project_relative_path();
+            if cp.is_empty() {
+                return c.real_path.as_project_relative_path().join(p.as_forward_relative_path());
+            }
+            if let Some(rest) = p.strip_prefix_opt(cp) {
+                return c.real_path.as_project_relative_path().join(rest);
+            }
+        }
+        p.to_buf()
+    }
+}
+
+static JOSH: OnceLock<Arc<JoshMap>> = OnceLock::new();
+
+/// Install the daemon's map. A second call with an equal map is a no-op; a different one is an
+/// error, because configurations and paths computed under the first are already interned.
+pub fn init(map: JoshMap) -> buck2_error::Result<()> {
+    let map = Arc::new(map);
+    let got = JOSH.get_or_init(|| map.clone());
+    if **got != *map {
+        return Err(JoshError::Changed.into());
+    }
+    Ok(())
+}
+
+/// The installed map when it is not the identity. `None` means every key is computed as it is
+/// with josh off.
+pub fn active() -> Option<&'static JoshMap> {
+    JOSH.get().map(|m| &**m).filter(|m| !m.identity)
+}
+
+/// The installed map, identity included, for recording which view a build ran in.
+pub fn installed() -> Option<&'static JoshMap> {
+    JOSH.get().map(|m| &**m)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cells(v: &[(&str, &str)]) -> Vec<(CellName, CellRootPathBuf)> {
+        v.iter()
+            .map(|(n, p)| (CellName::testing_new(n), CellRootPathBuf::testing_new(p)))
+            .collect()
+    }
+
+    fn entries(v: &[(&str, &str)]) -> Vec<(String, String)> {
+        v.iter()
+            .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+            .collect()
+    }
+
+    fn never(_: &ProjectRelativePath) -> bool {
+        false
+    }
+
+    fn lab() -> Vec<(CellName, CellRootPathBuf)> {
+        cells(&[
+            ("root", ""),
+            ("mwb", "services/web-backend"),
+            ("mwb_ftools", "services/web-backend/ftools"),
+            ("ftools", "tools"),
+        ])
+    }
+
+    fn lab_map() -> Vec<(String, String)> {
+        entries(&[
+            ("cell.mwb", "root:."),
+            ("cell.mwb_ftools", "ftools:ftools"),
+            ("cell.ftools", "lab_ftools:.josh/lab_ftools"),
+            ("cell.root", "lab:.josh/lab"),
+        ])
+    }
+
+    #[test]
+    fn identity_without_entries() {
+        let m = JoshMap::new(&[], &cells(&[("root", ""), ("ftools", "ftools")]), &never).unwrap();
+        assert!(m.is_identity());
+    }
+
+    #[test]
+    fn lab_shape_maps_and_resolves() {
+        let m = JoshMap::new(&lab_map(), &lab(), &never).unwrap();
+        assert!(!m.is_identity());
+        let mwb = CellName::testing_new("mwb");
+        assert_eq!(m.canonical_cell_name(mwb).as_str(), "root");
+        assert_eq!(
+            m.canonical_cell_name(CellName::testing_new("root")).as_str(),
+            "lab"
+        );
+        assert_eq!(
+            m.to_real(ProjectRelativePath::unchecked_new("pkg/a.src"), None)
+                .as_str(),
+            "services/web-backend/pkg/a.src"
+        );
+        assert_eq!(
+            m.to_real(ProjectRelativePath::unchecked_new("ftools/cc.sh"), None)
+                .as_str(),
+            "services/web-backend/ftools/cc.sh"
+        );
+        assert_eq!(
+            m.to_real(
+                ProjectRelativePath::unchecked_new(".josh/lab_ftools/cc.sh"),
+                None
+            )
+            .as_str(),
+            "tools/cc.sh"
+        );
+        assert_eq!(
+            m.to_real(ProjectRelativePath::unchecked_new(".josh/lab/lab/l.src"), None)
+                .as_str(),
+            "lab/l.src"
+        );
+        assert_eq!(
+            m.to_real(ProjectRelativePath::unchecked_new("buck-out/v2/art/x"), None)
+                .as_str(),
+            "buck-out/v2/art/x"
+        );
+        assert_eq!(
+            m.canonical_label_str("mwb//platforms:default").as_deref(),
+            Some("root//platforms:default")
+        );
+        assert_eq!(m.canonical_label_str("builtin"), None);
+    }
+
+    #[test]
+    fn refuses_name_collision() {
+        // lab's own cell `ftools` left unmapped collides with mwb_ftools -> ftools.
+        let e = entries(&[
+            ("cell.mwb", "root:."),
+            ("cell.mwb_ftools", "ftools:ftools"),
+            ("cell.root", "lab:.josh/lab"),
+        ]);
+        let err = JoshMap::new(&e, &lab(), &never).unwrap_err();
+        assert!(format!("{err}").contains("not injective on names"), "{err}");
+    }
+
+    #[test]
+    fn refuses_path_collision() {
+        // lab's root left at the project root collides with mwb mapped there.
+        let e = entries(&[
+            ("cell.mwb", "root:."),
+            ("cell.mwb_ftools", "ftools:ftools"),
+            ("cell.ftools", "lab_ftools:.josh/lab_ftools"),
+            ("cell.root", "lab:."),
+        ]);
+        let err = JoshMap::new(&e, &lab(), &never).unwrap_err();
+        assert!(format!("{err}").contains("not injective on paths"), "{err}");
+    }
+
+    #[test]
+    fn refuses_inconsistent_nesting() {
+        // mwb_ftools is under mwb at `ftools` really, but mapped to `tools2`.
+        let e = entries(&[
+            ("cell.mwb", "root:."),
+            ("cell.mwb_ftools", "ftools:tools2"),
+            ("cell.ftools", "lab_ftools:.josh/lab_ftools"),
+            ("cell.root", "lab:.josh/lab"),
+        ]);
+        let err = JoshMap::new(&e, &lab(), &never).unwrap_err();
+        assert!(format!("{err}").contains("nest"), "{err}");
+    }
+
+    #[test]
+    fn refuses_reserved_dir_in_root_mapped_cell() {
+        let exists = |p: &ProjectRelativePath| p.as_str() == "services/web-backend/.josh";
+        let err = JoshMap::new(&lab_map(), &lab(), &exists).unwrap_err();
+        assert!(format!("{err}").contains("reserved"), "{err}");
+    }
+
+    #[test]
+    fn refuses_unknown_cell_and_bad_entry() {
+        let e = entries(&[("cell.nope", "root:.")]);
+        assert!(JoshMap::new(&e, &lab(), &never).is_err());
+        let e = entries(&[("cell.mwb", "root")]);
+        assert!(JoshMap::new(&e, &lab(), &never).is_err());
+    }
+}

@@ -444,7 +444,15 @@ impl HashedConfigurationPlatform {
     fn new(configuration_platform: ConfigurationPlatform) -> Self {
         let output_hash = {
             let mut hasher = Blake3StrongHasher::new();
-            configuration_platform.strong_hash(&mut hasher);
+            // josh: hash the configuration as it is named in the canonical view, so that a
+            // platform imported under another cell name hashes as it does in its own home. The
+            // map is injective, so distinct real configurations still hash apart.
+            match crate::josh::active()
+                .and_then(|josh| canonical_configuration_platform(josh, &configuration_platform))
+            {
+                Some(canonical) => canonical.strong_hash(&mut hasher),
+                None => configuration_platform.strong_hash(&mut hasher),
+            }
             ConfigurationHash::new(hasher.finish())
         };
 
@@ -462,6 +470,71 @@ impl HashedConfigurationPlatform {
     }
 }
 
+fn canonical_target_label(
+    josh: &crate::josh::JoshMap,
+    label: &crate::target::label::label::TargetLabel,
+    changed: &mut bool,
+) -> Option<crate::target::label::label::TargetLabel> {
+    let cell = label.pkg().cell_name();
+    let canonical = josh.canonical_cell_name(cell);
+    if canonical == cell {
+        return Some(label.dupe());
+    }
+    *changed = true;
+    let pkg = crate::package::PackageLabel::new(canonical, label.pkg().cell_relative_path()).ok()?;
+    Some(crate::target::label::label::TargetLabel::new(pkg, label.name()))
+}
+
+fn canonical_constraint_value(
+    josh: &crate::josh::JoshMap,
+    v: &ConstraintValue,
+    changed: &mut bool,
+) -> Option<ConstraintValue> {
+    let target = canonical_target_label(josh, v.0.target(), changed)?;
+    Some(ConstraintValue(crate::provider::label::ProvidersLabel::new(
+        target,
+        v.0.name().clone(),
+    )))
+}
+
+/// The configuration platform with every cell name replaced by its canonical one, or `None` when
+/// no name changes (then the real platform is hashed, exactly as with josh off).
+fn canonical_configuration_platform(
+    josh: &crate::josh::JoshMap,
+    platform: &ConfigurationPlatform,
+) -> Option<ConfigurationPlatform> {
+    let ConfigurationPlatform::Bound(label, data, exec) = platform else {
+        return None;
+    };
+    let mut changed = false;
+    let label = match josh.canonical_label_str(label.as_str()) {
+        Some(s) => {
+            changed = true;
+            BoundConfigurationLabel::new(s).ok()?
+        }
+        None => label.clone(),
+    };
+    let mut constraints = BTreeMap::new();
+    for (k, v) in &data.constraints {
+        let key = ConstraintKey {
+            key: canonical_target_label(josh, &k.key, &mut changed)?,
+            default: match &k.default {
+                Some(d) => Some(canonical_constraint_value(josh, d, &mut changed)?),
+                None => None,
+            },
+        };
+        constraints.insert(key, canonical_constraint_value(josh, v, &mut changed)?);
+    }
+    if !changed {
+        return None;
+    }
+    Some(ConfigurationPlatform::Bound(
+        label,
+        ConfigurationDataData { constraints },
+        *exec,
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
@@ -471,6 +544,56 @@ mod tests {
     use crate::configuration::constraints::ConstraintValue;
     use crate::configuration::data::ConfigurationData;
     use crate::configuration::data::ConfigurationDataData;
+
+    /// josh: a platform imported under another cell name hashes as it is named in its home, and
+    /// the cell that gives up that name is renamed, so the two cannot collide.
+    #[test]
+    fn test_josh_canonical_configuration_platform() {
+        use crate::cells::cell_root_path::CellRootPathBuf;
+        use crate::cells::name::CellName;
+        use crate::configuration::bound_label::BoundConfigurationLabel;
+
+        let cells = vec![
+            (CellName::testing_new("root"), CellRootPathBuf::testing_new("")),
+            (
+                CellName::testing_new("mwb"),
+                CellRootPathBuf::testing_new("services/web-backend"),
+            ),
+        ];
+        let josh = crate::josh::JoshMap::new(
+            &[
+                ("cell.mwb".to_owned(), "root:.".to_owned()),
+                ("cell.root".to_owned(), "lab:.josh/lab".to_owned()),
+            ],
+            &cells,
+            &|_| false,
+        )
+        .unwrap();
+        let platform = |label: &str, cell: &str| {
+            super::ConfigurationPlatform::Bound(
+                BoundConfigurationLabel::new(label.to_owned()).unwrap(),
+                ConfigurationDataData {
+                    constraints: BTreeMap::from_iter([(
+                        ConstraintKey::testing_new(&format!("{cell}//bar:c")),
+                        ConstraintValue::testing_new(&format!("{cell}//bar:v"), None),
+                    )]),
+                },
+                false,
+            )
+        };
+        assert_eq!(
+            super::canonical_configuration_platform(&josh, &platform("mwb//platforms:default", "mwb")),
+            Some(platform("root//platforms:default", "root"))
+        );
+        assert_eq!(
+            super::canonical_configuration_platform(&josh, &platform("root//platforms:default", "root")),
+            Some(platform("lab//platforms:default", "lab"))
+        );
+        assert_eq!(
+            super::canonical_configuration_platform(&josh, &platform("other//p:d", "other")),
+            None
+        );
+    }
 
     /// We don't want the output hash to change by accident. This test is here to assert that it
     /// doesn't. If we have a legit reason to update the config hash, we can update the hash here,

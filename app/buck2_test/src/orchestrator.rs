@@ -1716,8 +1716,12 @@ impl BuckTestOrchestrator<'_> {
                 supports_re = false;
                 // For compatibility with v1,
                 let cell_resolver = dice.get_cell_resolver().await?;
-                let cell = cell_resolver.get(test_target.target().pkg().cell_name())?;
-                cell.path().to_buf()
+                let cell_name = test_target.target().pkg().cell_name();
+                let cell = cell_resolver.get(cell_name)?;
+                match buck2_core::josh::active().and_then(|j| j.canonical_cell_path(cell_name)) {
+                    Some(canonical) => canonical.to_buf(),
+                    None => cell.path().to_buf(),
+                }
             };
 
             let expander = Execute2RequestExpander {
