@@ -347,8 +347,9 @@ impl DaemonState {
                     .cells()
                     .map(|(name, cell)| (name, cell.path().to_buf()))
                     .collect();
+                // symlink_metadata, so a dangling link still counts as an entry that is there.
                 let map = buck2_core::josh::JoshMap::new(&entries, &cell_list, &|p| {
-                    fs.resolve(p).as_path().exists()
+                    std::fs::symlink_metadata(fs.resolve(p).as_path()).is_ok()
                 })?;
                 tracing::info!("josh map (identity: {}): {:?}", map.is_identity(), map.cells());
                 buck2_core::josh::init(map)?;

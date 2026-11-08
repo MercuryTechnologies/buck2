@@ -204,6 +204,26 @@ cd "$E/$WD"
 exec "$U" -U --map-user="$UID_" --map-group="$GID_" -- "$@"
 "#;
 
+/// Records, once per daemon and source, a top-level entry the josh exec root left out, in the
+/// daemon log and in `<buck-out>/josh/exec-skipped.txt` where a run can read it back.
+fn josh_record_skip(dir: &std::path::Path, src: &std::path::Path, dst: &str, reason: &str) {
+    use std::io::Write;
+    static SEEN: std::sync::Mutex<Option<std::collections::HashSet<std::path::PathBuf>>> =
+        std::sync::Mutex::new(None);
+    let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    if !seen.get_or_insert_with(Default::default).insert(src.to_path_buf()) {
+        return;
+    }
+    tracing::warn!("josh: exec root skips {} at `{}`: {}", src.display(), dst, reason);
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.join("exec-skipped.txt"))
+    {
+        let _ = writeln!(f, "{}\t{}\t{}", dst, src.display(), reason);
+    }
+}
+
 impl LocalExecutor {
     /// josh: when the cells are remapped, the command line that runs `exe args` in the canonical
     /// exec root `buck-out/<iso>/josh/exec`, where every path the action was rendered with
@@ -230,7 +250,9 @@ impl LocalExecutor {
         let meta = std::fs::metadata(&exec_root)
             .map_err(|e| buck2_error::buck2_error!(buck2_error::ErrorTag::Environment, "josh exec root: {}", e))?;
         let root = self.root.as_path();
-        let mut binds: Vec<(std::path::PathBuf, String)> = Vec::new();
+        // (real source, canonical destination, whether it is a top-level entry that is skipped
+        // when it cannot be bound).
+        let mut binds: Vec<(std::path::PathBuf, String, bool)> = Vec::new();
         let cells = josh.cells();
         for c in cells {
             let cp = c.canonical_path.as_project_relative_path();
@@ -247,7 +269,7 @@ impl LocalExecutor {
                     .collect();
                 names.sort();
                 for n in names {
-                    binds.push((real.join(&n), n));
+                    binds.push((real.join(&n), n, true));
                 }
                 continue;
             }
@@ -266,19 +288,20 @@ impl LocalExecutor {
                 rel.is_some_and(|rel| qrp.join(rel) == *rp)
             });
             if !covered {
-                binds.push((root.join(rp.as_str()), cp.as_str().to_owned()));
+                binds.push((root.join(rp.as_str()), cp.as_str().to_owned(), false));
             }
         }
         binds.push((
             buck_out_disk.as_path().to_path_buf(),
             buck_out.as_str().to_owned(),
+            false,
         ));
         // A symlink to a source is written with the source's real path on disk, so the real
         // top-level entries must resolve in the exec root too. Bind those that no canonical
         // entry already takes; a name both views use resolves in the canonical view.
         let taken: std::collections::HashSet<String> = binds
             .iter()
-            .map(|(_, dst)| dst.split('/').next().unwrap_or("").to_owned())
+            .map(|(_, dst, _)| dst.split('/').next().unwrap_or("").to_owned())
             .collect();
         let mut real_top: Vec<String> = std::fs::read_dir(root)
             .map_err(|e| {
@@ -292,10 +315,50 @@ impl LocalExecutor {
             .collect();
         real_top.sort();
         for n in real_top {
-            binds.push((root.join(&n), n));
+            binds.push((root.join(&n), n, true));
         }
+        // The map validator refuses a cell at or under a root-mapped cell's entry, but that tree
+        // can gain the entry after the daemon started. Two binds at one place, or one inside
+        // another, mean one tree's files are read under the other's digests, whatever the bind
+        // order, so the action is refused instead. Skippable entries count too: skipping one
+        // must not be what lets a cell take its name.
+        let nests = |a: &str, b: &str| {
+            a == b || b.strip_prefix(a).is_some_and(|rest| rest.starts_with('/'))
+        };
+        for (i, (sa, a, _)) in binds.iter().enumerate() {
+            for (sb, b, _) in &binds[i + 1..] {
+                if nests(a, b) || nests(b, a) {
+                    return Err(buck2_error::buck2_error!(
+                        buck2_error::ErrorTag::Input,
+                        "josh: the exec root would bind {} at `{}` and {} at `{}`, one over the other; \
+                         a cell's canonical path collides with an entry of the cell mapped to the \
+                         project root",
+                        sa.display(),
+                        a,
+                        sb.display(),
+                        b
+                    ));
+                }
+            }
+        }
+        // A top-level entry that is not a directory or regular file once followed (a dangling
+        // `result` link left by a nix gc, a socket, a fifo) cannot be bind-mounted onto what the
+        // script creates for it. No declared input can live there, so it is left out of the exec
+        // root and recorded rather than failing every action.
+        binds.retain(|(src, dst, skippable)| {
+            if !*skippable {
+                return true;
+            }
+            let reason = match std::fs::metadata(src) {
+                Ok(m) if m.is_dir() || m.is_file() => return true,
+                Ok(m) => format!("special file ({:?})", m.file_type()),
+                Err(e) => format!("unresolvable ({e})"),
+            };
+            josh_record_skip(&buck_out_disk.as_path().join("josh"), src, dst, &reason);
+            false
+        });
         // Parents before children; the sort is stable, so equal lengths keep their order.
-        binds.sort_by_key(|(_, dst)| dst.matches('/').count());
+        binds.sort_by_key(|(_, dst, _)| dst.matches('/').count());
 
         let mut a: Vec<OsString> = vec![
             "-Urm".into(),
@@ -313,7 +376,7 @@ impl LocalExecutor {
             meta.gid().to_string().into(),
             binds.len().to_string().into(),
         ];
-        for (src, dst) in binds {
+        for (src, dst, _) in binds {
             a.push(src.into_os_string());
             a.push(dst.into());
         }

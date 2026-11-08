@@ -68,6 +68,10 @@ pub enum JoshError {
     Nesting(String, String),
     #[error("[josh] `{0}` is reserved and must not exist in cell `{1}` (it maps to the project root)")]
     Reserved(String, String),
+    #[error(
+        "[josh] cell `{0}` maps to `{1}`, which is at or under `{2}`, an entry of cell `{3}` (it maps to the project root); the exec root would bind one over the other"
+    )]
+    Shadow(String, String, String, String),
     #[error("[josh] the map changed since the daemon started; restart the daemon (`buck2 kill`)")]
     Changed,
     #[error("[josh] verify_hits must be a fraction between 0 and 1, got `{0}`")]
@@ -227,6 +231,41 @@ impl JoshMap {
                             JoshError::Reserved(p.to_string(), c.real_name.to_string()).into()
                         );
                     }
+                }
+            }
+        }
+        // A cell mapped to the project root brings every real top-level entry of its tree into
+        // the canonical view. Another cell whose canonical path is at or under one of those
+        // entries would be bound over it or into it, and an action keyed on one cell's file would
+        // read the other's. Only a cell that really sits at that place in the root-mapped tree
+        // may use the name, and no remapped cell may use buck-out, which the rendered buck-out
+        // takes.
+        for r in &list {
+            if !r.canonical_path.as_project_relative_path().is_empty() {
+                continue;
+            }
+            let rr = r.real_path.as_project_relative_path();
+            for c in &list {
+                if c.real_name == r.real_name {
+                    continue;
+                }
+                let cp = c.canonical_path.as_project_relative_path();
+                let Some(first) = cp.as_forward_relative_path().iter().next() else {
+                    continue;
+                };
+                let at_home = rr.join(cp.as_forward_relative_path());
+                if c.real_path.as_project_relative_path().as_str() == at_home.as_str() {
+                    continue;
+                }
+                let entry = rr.join(ForwardRelativePath::unchecked_new(first.as_str()));
+                if first.as_str() == "buck-out" || exists(&entry) {
+                    return Err(JoshError::Shadow(
+                        c.real_name.to_string(),
+                        cp.to_string(),
+                        entry.to_string(),
+                        r.real_name.to_string(),
+                    )
+                    .into());
                 }
             }
         }
@@ -785,6 +824,47 @@ mod tests {
         let exists = |p: &ProjectRelativePath| p.as_str() == "services/web-backend/.josh";
         let err = JoshMap::new(&lab_map(), &lab(), &exists).unwrap_err();
         assert!(format!("{err}").contains("reserved"), "{err}");
+    }
+
+    fn lab_with(extra: (&str, &str)) -> Vec<(CellName, CellRootPathBuf)> {
+        let mut v = lab();
+        v.extend(cells(&[extra]));
+        v
+    }
+
+    #[test]
+    fn refuses_cell_at_root_mapped_entry() {
+        // The review's case: a lab cell left at `pkg` while mwb, mapped to the root, has its own
+        // `pkg`. Binding both at `pkg` let an action keyed on lab's file read mwb's.
+        let exists = |p: &ProjectRelativePath| p.as_str() == "services/web-backend/pkg";
+        let err = JoshMap::new(&lab_map(), &lab_with(("labpkg", "pkg")), &exists).unwrap_err();
+        assert!(format!("{err}").contains("bind one over the other"), "{err}");
+        // Without mwb's `pkg` the same map is fine.
+        JoshMap::new(&lab_map(), &lab_with(("labpkg", "pkg")), &never).unwrap();
+    }
+
+    #[test]
+    fn refuses_cell_under_root_mapped_entry() {
+        let exists = |p: &ProjectRelativePath| p.as_str() == "services/web-backend/pkg";
+        let mut e = lab_map();
+        e.extend(entries(&[("cell.labd", "labd:pkg/deep")]));
+        let err = JoshMap::new(&e, &lab_with(("labd", "labd")), &exists).unwrap_err();
+        assert!(format!("{err}").contains("bind one over the other"), "{err}");
+    }
+
+    #[test]
+    fn refuses_remapped_cell_in_buck_out() {
+        let mut e = lab_map();
+        e.extend(entries(&[("cell.labd", "labd:buck-out/x")]));
+        let err = JoshMap::new(&e, &lab_with(("labd", "labd")), &never).unwrap_err();
+        assert!(format!("{err}").contains("bind one over the other"), "{err}");
+    }
+
+    #[test]
+    fn accepts_cell_really_inside_root_mapped_cell() {
+        // mwb_ftools is mwb's own `ftools`, so mwb's entry is that cell's tree.
+        let exists = |p: &ProjectRelativePath| p.as_str() == "services/web-backend/ftools";
+        JoshMap::new(&lab_map(), &lab(), &exists).unwrap();
     }
 
     #[test]
