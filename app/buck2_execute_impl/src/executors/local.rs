@@ -64,6 +64,7 @@ use buck2_execute::execute::request::CommandExecutionOutputRef;
 use buck2_execute::execute::request::CommandExecutionRequest;
 use buck2_execute::execute::request::ExecutorPreference;
 use buck2_execute::execute::request::NetworkAccess;
+use buck2_execute::execute::request::WorkerSpec;
 use buck2_execute::execute::result::CommandExecutionMetadata;
 use buck2_execute::execute::result::CommandExecutionResult;
 use buck2_execute::knobs::ExecutorGlobalKnobs;
@@ -224,7 +225,61 @@ fn josh_record_skip(dir: &std::path::Path, src: &std::path::Path, dst: &str, rea
     }
 }
 
+/// Records, once per daemon and worker, that a worker action ran its fallback command because
+/// the josh map is active, in the daemon log and in `<buck-out>/josh/worker-fallback.txt`.
+fn josh_record_worker_fallback(dir: &std::path::Path, worker: &WorkerSpec) {
+    use std::io::Write;
+    static SEEN: std::sync::Mutex<Option<std::collections::HashSet<u64>>> =
+        std::sync::Mutex::new(None);
+    let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    if !seen
+        .get_or_insert_with(Default::default)
+        .insert(worker.id.0)
+    {
+        return;
+    }
+    let exe = worker.exe.join(" ");
+    let reason = "josh map active: a persistent worker runs outside the canonical exec root";
+    tracing::warn!(
+        "josh: worker {} (`{}`) not used, running the fallback command: {}",
+        worker.id,
+        exe,
+        reason
+    );
+    let _ = std::fs::create_dir_all(dir);
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.join("worker-fallback.txt"))
+    {
+        let _ = writeln!(f, "{}\t{}\t{}", worker.id, exe, reason);
+    }
+}
+
 impl LocalExecutor {
+    /// josh: a persistent worker is spawned once, at the real project root and outside any
+    /// mount namespace, and later requests reuse it, so it never sees the canonical exec root
+    /// that the request's paths were rendered for. While the map is active the request runs its
+    /// fallback command instead, which goes through `josh_wrap` like any other local action.
+    /// The fallback is the same command remote execution runs, so the action key is unchanged.
+    fn josh_refuses_worker(&self, request: &CommandExecutionRequest) -> bool {
+        let Some(worker) = request.worker() else {
+            return false;
+        };
+        if buck2_core::josh::active().is_none() {
+            return false;
+        }
+        let buck_out = self.artifact_fs.buck_out_path_resolver().root();
+        let dir = self
+            .artifact_fs
+            .fs()
+            .resolve(buck_out)
+            .as_path()
+            .join("josh");
+        josh_record_worker_fallback(&dir, worker);
+        true
+    }
+
     /// josh: when the cells are remapped, the command line that runs `exe args` in the canonical
     /// exec root `buck-out/<iso>/josh/exec`, where every path the action was rendered with
     /// resolves (physically, too) as it does in the tree's own home. `None` with josh off or an
@@ -1303,6 +1358,9 @@ impl LocalExecutor {
         &self,
         request: &CommandExecutionRequest,
     ) -> Option<HostSharingGuard> {
+        if self.josh_refuses_worker(request) {
+            return None;
+        }
         if let (Some(worker_spec), Some(worker_pool)) = (request.worker(), self.worker_pool.dupe())
         {
             if let Some(broker) = &worker_pool.get_worker_broker(worker_spec) {
@@ -1346,6 +1404,9 @@ impl LocalExecutor {
         CommandExecutionResult,
         (Option<Arc<WorkerHandle>>, CommandExecutionManagerWithClaim),
     > {
+        if self.josh_refuses_worker(request) {
+            return ControlFlow::Continue((None, manager));
+        }
         if let (Some(worker_spec), Some(worker_pool), ForkserverAccess::Client(_)) =
             (request.worker(), self.worker_pool.dupe(), &self.forkserver)
         {
