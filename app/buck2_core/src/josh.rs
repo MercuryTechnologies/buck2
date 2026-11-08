@@ -70,6 +70,8 @@ pub enum JoshError {
     Reserved(String, String),
     #[error("[josh] the map changed since the daemon started; restart the daemon (`buck2 kill`)")]
     Changed,
+    #[error("[josh] verify_hits must be a fraction between 0 and 1, got `{0}`")]
+    BadVerify(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Allocative)]
@@ -502,13 +504,84 @@ pub fn rewrite_disk_symlinks(path: &std::path::Path) -> std::io::Result<u64> {
     }
 }
 
+/// Verify mode (design D6): the fraction of action-cache hits that are re-run locally and whose
+/// outputs are compared with the ones the cache served. Read once at daemon start from
+/// `[josh] verify_hits`; unset or 0 leaves every hit as it is.
+static VERIFY: OnceLock<f64> = OnceLock::new();
+
+/// Parse and install `[josh] verify_hits`.
+pub fn init_verify(value: Option<&str>) -> buck2_error::Result<()> {
+    let Some(v) = value else {
+        return Ok(());
+    };
+    let f: f64 = v
+        .trim()
+        .parse()
+        .map_err(|_| JoshError::BadVerify(v.to_owned()))?;
+    if !(0.0..=1.0).contains(&f) {
+        return Err(JoshError::BadVerify(v.to_owned()).into());
+    }
+    let got = VERIFY.get_or_init(|| f);
+    if *got != f {
+        return Err(JoshError::Changed.into());
+    }
+    Ok(())
+}
+
+pub fn verify_fraction() -> f64 {
+    VERIFY.get().copied().unwrap_or(0.0)
+}
+
+/// Whether the hit for an action with digest bytes `digest` is verified. The choice depends only
+/// on the digest, so a sample picks the same actions in every build and every home.
+pub fn verify_selects_fraction(fraction: f64, digest: &[u8]) -> bool {
+    if fraction <= 0.0 {
+        return false;
+    }
+    if fraction >= 1.0 {
+        return true;
+    }
+    let mut b = [0u8; 8];
+    let n = digest.len().min(8);
+    b[..n].copy_from_slice(&digest[..n]);
+    (u64::from_be_bytes(b) as f64) < fraction * (u64::MAX as f64)
+}
+
+pub fn verify_selects(digest: &[u8]) -> bool {
+    verify_selects_fraction(verify_fraction(), digest)
+}
+
+/// The outcome of verifying one hit, as an event-log tag. `JoshFalseShare` is the one a reader
+/// counts: the cache served outputs that a local run of the same action did not produce.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VerifyOutcome {
+    Ok,
+    FalseShare,
+    LocalFailed,
+}
+
+pub fn verify_tag(outcome: VerifyOutcome, digest: &str, what: &str) -> String {
+    let o = match outcome {
+        VerifyOutcome::Ok => "josh:verify=ok",
+        VerifyOutcome::FalseShare => "josh:JoshFalseShare",
+        VerifyOutcome::LocalFailed => "josh:verify=local-failed",
+    };
+    format!("{o} {digest} {what}")
+}
+
 /// What a command ran under, as event-log tags (design D7): nothing without a `[josh]` section,
 /// so an event log with josh off is as before; `josh:identity` in the tree's own home;
 /// `josh:active` plus the map and the rendered and on-disk buck-out roots otherwise.
 pub fn describe_tags() -> Vec<String> {
     match installed() {
         None => Vec::new(),
-        Some(m) if m.is_identity() => vec!["josh:identity".to_owned()],
+        Some(m) if m.is_identity() => {
+            let mut v = vec!["josh:identity".to_owned()];
+            if verify_fraction() > 0.0 {
+                v.push(format!("josh:verify_hits={}", verify_fraction()));
+            }
+            v
+        }
         Some(m) => {
             let mut v = vec!["josh:active".to_owned(), "josh:view=canonical".to_owned()];
             if let Some(d) = DISK.get() {
@@ -518,6 +591,9 @@ pub fn describe_tags() -> Vec<String> {
                 ));
             }
             v.extend(m.describe().into_iter().map(|l| format!("josh:{l}")));
+            if verify_fraction() > 0.0 {
+                v.push(format!("josh:verify_hits={}", verify_fraction()));
+            }
             v
         }
     }
@@ -701,6 +777,21 @@ mod tests {
         assert_eq!(
             m.disk_symlink_text_rel("buck-out/v2/art/root/pkg/__t__/l", "../../../../../../pkg/a.src"),
             None
+        );
+    }
+
+    #[test]
+    fn verify_sampling_is_by_digest() {
+        assert!(!verify_selects_fraction(0.0, &[0; 32]));
+        assert!(verify_selects_fraction(1.0, &[0xff; 32]));
+        assert!(verify_selects_fraction(0.5, &[0x10; 32]));
+        assert!(!verify_selects_fraction(0.5, &[0xf0; 32]));
+        // Same digest, same answer.
+        let d = [0x7f, 0xff, 0, 0, 0, 0, 0, 0];
+        assert_eq!(verify_selects_fraction(0.5, &d), verify_selects_fraction(0.5, &d));
+        assert_eq!(
+            verify_tag(VerifyOutcome::FalseShare, "ab:1", "c i"),
+            "josh:JoshFalseShare ab:1 c i"
         );
     }
 

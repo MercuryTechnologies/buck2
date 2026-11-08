@@ -267,6 +267,9 @@ pub(crate) fn analysis_actions_methods_run(methods: &mut MethodsBuilder) {
         #[starlark(require = named, default = false)] no_outputs_cleanup: bool,
         #[starlark(require = named, default = false)] incremental_remote_outputs: bool,
         #[starlark(require = named, default = NoneOr::None)] allow_cache_upload: NoneOr<bool>,
+        // josh (design D6): False keys this action with its real cell name when the cell map is
+        // active, so it is never shared with the tree's own home. A no-op without a map.
+        #[starlark(require = named, default = true)] josh_share: bool,
         #[starlark(require = named, default = false)] allow_dep_file_cache_upload: bool,
         #[starlark(require = named, default = false)] allow_offline_output_cache: bool,
         #[starlark(require = named, default = false)] force_full_hybrid_if_capable: bool,
@@ -605,6 +608,7 @@ pub(crate) fn analysis_actions_methods_run(methods: &mut MethodsBuilder) {
             no_outputs_cleanup,
             incremental_remote_outputs,
             allow_cache_upload: allow_cache_upload.into_option(),
+            josh_share,
             allow_dep_file_cache_upload,
             allow_offline_output_cache,
             force_full_hybrid_if_capable,

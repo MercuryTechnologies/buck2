@@ -356,6 +356,12 @@ impl DaemonState {
                     paths.buck_out_dir(),
                     fs.root().as_path().to_path_buf(),
                 );
+                buck2_core::josh::init_verify(
+                    entries
+                        .iter()
+                        .find(|(k, _)| k == "verify_hits")
+                        .map(|(_, v)| v.as_str()),
+                )?;
             }
 
             let buffer_size = root_config

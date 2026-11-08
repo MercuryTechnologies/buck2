@@ -286,6 +286,8 @@ pub(crate) struct UnregisteredRunAction {
     pub(crate) no_outputs_cleanup: bool,
     pub(crate) incremental_remote_outputs: bool,
     pub(crate) allow_cache_upload: Option<bool>,
+    /// `josh_share = False`: see [`JOSH_UNSHARED_ENV`].
+    pub(crate) josh_share: bool,
     pub(crate) allow_dep_file_cache_upload: bool,
     pub(crate) allow_offline_output_cache: bool,
     pub(crate) force_full_hybrid_if_capable: bool,
@@ -460,7 +462,54 @@ enum ExecuteResult {
         executor_preference: ExecutorPreference,
         action_and_blobs: ActionDigestAndBlobs,
         input_files_bytes: u64,
+        /// josh verify mode found the hit to be a false share; the local result replaces it and
+        /// must not be uploaded.
+        josh_no_upload: bool,
     },
+}
+
+/// The env var that salts an action declared with `josh_share = False` (design D6). It holds the
+/// owner's real cell name, so the action keys differently from the same action in the tree's own
+/// home, where the map is the identity and nothing is added.
+const JOSH_UNSHARED_ENV: &str = "BUCK2_JOSH_UNSHARED";
+
+fn josh_unshared_salt(owner: &BaseDeferredKey) -> Option<String> {
+    buck2_core::josh::active()?;
+    Some(match owner {
+        BaseDeferredKey::TargetLabel(t) => t.pkg().cell_name().as_str().to_owned(),
+        other => other.to_string(),
+    })
+}
+
+/// Re-run a cache hit locally and compare outputs (josh verify mode, design D6). Returns the
+/// result to use and whether it must not be uploaded.
+async fn josh_verify_hit(
+    ctx: &mut dyn ActionExecutionCtx,
+    req: &CommandExecutionRequest,
+    prepared_action: &buck2_execute::execute::prepared::PreparedAction,
+    hit: CommandExecutionResult,
+) -> (CommandExecutionResult, bool) {
+    use buck2_core::josh::VerifyOutcome;
+    let digest = prepared_action.action_and_blobs.action.to_string();
+    let what = format!("{} {}", ctx.target().category(), ctx.target().identifier().unwrap_or(""));
+    let manager = ctx.command_execution_manager(WaitingData::new());
+    let mut local = ctx.exec_cmd(manager, req, prepared_action).await;
+    let (outcome, use_local) = if !local.was_success() {
+        (VerifyOutcome::LocalFailed, false)
+    } else if local.outputs == hit.outputs {
+        (VerifyOutcome::Ok, false)
+    } else {
+        (VerifyOutcome::FalseShare, true)
+    };
+    ctx.events().instant_event(buck2_data::TagEvent {
+        tags: vec![buck2_core::josh::verify_tag(outcome, &digest, &what)],
+    });
+    if use_local {
+        local.rejected_execution = Some(hit.report);
+        (local, true)
+    } else {
+        (hit, false)
+    }
 }
 
 pub struct DepFilesPlaceholderArtifactPathMapper {}
@@ -924,6 +973,12 @@ impl RunAction {
             &mut extra_env,
         )?;
 
+        if !self.inner.josh_share {
+            if let Some(salt) = josh_unshared_salt(ctx.target().owner()) {
+                extra_env.push((JOSH_UNSHARED_ENV.to_owned(), salt));
+            }
+        }
+
         for output in self.outputs.iter() {
             if output.get_path().is_content_based_path() {
                 let full_path = fs.buck_out_path_resolver().resolve_gen(
@@ -1151,6 +1206,28 @@ impl RunAction {
         let manager = ctx.command_execution_manager(waiting_data);
 
         let action_cache_result = ctx.action_cache(manager, &req, &prepared_action).await;
+        // josh verify mode (design D6): a sampled hit is re-run locally and its outputs compared
+        // with the ones the cache served. A hit whose outputs a local run does not reproduce is a
+        // false share: the local result is used instead, and it is never uploaded, so it cannot
+        // overwrite the entry another home wrote.
+        let mut josh_no_upload = false;
+        let action_cache_result = match action_cache_result {
+            ControlFlow::Break(hit)
+                if hit.was_action_cache_hit()
+                    && buck2_core::josh::verify_selects(
+                        prepared_action
+                            .action_and_blobs
+                            .action
+                            .raw_digest()
+                            .as_bytes(),
+                    ) =>
+            {
+                let (hit, no_upload) = josh_verify_hit(ctx, &req, &prepared_action, hit).await;
+                josh_no_upload = no_upload;
+                ControlFlow::Break(hit)
+            }
+            other => other,
+        };
 
         let (req, result) = match action_cache_result {
             ControlFlow::Break(_) => (req, action_cache_result),
@@ -1251,6 +1328,7 @@ impl RunAction {
             executor_preference: req.executor_preference,
             action_and_blobs,
             input_files_bytes: req.paths().input_files_bytes(),
+            josh_no_upload,
         })
     }
 
@@ -1615,6 +1693,7 @@ impl Action for RunAction {
             executor_preference,
             action_and_blobs,
             input_files_bytes,
+            josh_no_upload,
         ) = match self.execute_inner(ctx, waiting_data).await? {
             ExecuteResult::LocalDepFileHit(outputs, metadata) => {
                 return Ok((outputs, metadata));
@@ -1625,12 +1704,14 @@ impl Action for RunAction {
                 executor_preference,
                 action_and_blobs,
                 input_files_bytes,
+                josh_no_upload,
             } => (
                 result,
                 dep_file_bundle,
                 executor_preference,
                 action_and_blobs,
                 input_files_bytes,
+                josh_no_upload,
             ),
         };
 
@@ -1661,6 +1742,7 @@ impl Action for RunAction {
         // If there is a dep file entry AND if dep file cache upload is enabled, upload it
         if result.was_success()
             && !result.was_served_by_remote_dep_file_cache()
+            && !josh_no_upload
             && (allow_cache_upload || supports_remote_dep_files || force_cache_upload()?)
         {
             let re_result = result.action_result.take();
@@ -1686,6 +1768,8 @@ impl Action for RunAction {
             result.cache_upload_result = buck2_data::UploadResult::ActionNotSuccessful;
         } else if result.was_served_by_remote_dep_file_cache() {
             result.cache_upload_result = buck2_data::UploadResult::RemoteDepFileCacheHit;
+        } else if josh_no_upload {
+            result.cache_upload_result = buck2_data::UploadResult::JoshFalseShare;
         } else if !allow_cache_upload {
             result.cache_upload_result = buck2_data::UploadResult::ActionUploadNotAllowed;
         }

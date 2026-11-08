@@ -2046,6 +2046,8 @@ enum UploadResult {
   UPLOAD_RESULT_FAILED_WRITE_ACTION_RESULT = 14;
   UPLOAD_RESULT_FAILED_OTHER = 15;
   UPLOAD_RESULT_HAD_DEP_FILE_BUNDLE = 16;
+  // josh verify mode found the hit to be a false share; the local result is not uploaded.
+  UPLOAD_RESULT_JOSH_FALSE_SHARE = 17;
 }
 
 message CommandInvalidationInfo {
