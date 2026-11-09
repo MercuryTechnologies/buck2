@@ -626,9 +626,10 @@ pub struct DaemonStartupConfig {
     /// form) without the section, so a daemon with josh off is matched exactly as before.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub josh: Option<Vec<(String, String)>>,
-    /// josh: with `[josh] enabled = true`, the root config's `[cells]` and `[external_cells]`,
-    /// sorted. The daemon builds the map from the cells it reads at startup, so a cell added or
-    /// moved later needs a new daemon too. `None` (and absent) otherwise.
+    /// josh: with `[josh] enabled = true`, the root config's `[cells]`, `[repositories]` (the
+    /// legacy name buck2 reads when `[cells]` is absent) and `[external_cells]`, sorted. The
+    /// daemon builds the map from the cells it reads at startup, so a cell added or moved later
+    /// needs a new daemon too. `None` (and absent) otherwise.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub josh_cells: Option<Vec<(String, String)>>,
 }
@@ -781,7 +782,7 @@ impl DaemonStartupConfig {
                 .unwrap_or(false)
             {
                 let mut v: Vec<(String, String)> = Vec::new();
-                for section in ["cells", "external_cells"] {
+                for section in ["cells", "repositories", "external_cells"] {
                     if let Some(s) = config.get_section(section) {
                         v.extend(
                             s.iter()
@@ -901,6 +902,12 @@ mod tests {
         assert_ne!(a, moved);
         assert_ne!(a, added);
         assert_ne!(a, ext);
+        // The legacy section name counts the same way.
+        let legacy = mk(&format!("{on}[repositories]\nroot = .\nmwb = services/web-backend\n"))?;
+        let legacy_added = mk(&format!(
+            "{on}[repositories]\nroot = .\nmwb = services/web-backend\nlabq = labq\n"
+        ))?;
+        assert_ne!(legacy, legacy_added);
         assert_eq!(DaemonStartupConfig::deserialize(&a.serialize()?)?, a);
         Ok(())
     }
