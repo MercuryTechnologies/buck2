@@ -328,6 +328,7 @@ impl DaemonState {
                 .parse_single_cell(cells.root_cell(), &fs)
                 .await?;
 
+            buck2_core::josh::init_startup_section(buck2_common::init::josh_section(root_config));
             if root_config
                 .parse::<bool>(BuckconfigKeyRef {
                     section: "josh",

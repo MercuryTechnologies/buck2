@@ -633,6 +633,20 @@ pub struct DaemonStartupConfig {
     pub josh_cells: Option<Vec<(String, String)>>,
 }
 
+/// josh: the `[josh]` section of `config`, sorted by key, or `None` without one. The daemon
+/// builds its map from the root config's, the client compares it to restart the daemon, and
+/// every command's is checked against the daemon's.
+pub fn josh_section(config: &LegacyBuckConfig) -> Option<Vec<(String, String)>> {
+    config.get_section("josh").map(|s| {
+        let mut v: Vec<(String, String)> = s
+            .iter()
+            .map(|(k, v)| (k.to_owned(), v.as_str().to_owned()))
+            .collect();
+        v.sort();
+        v
+    })
+}
+
 impl DaemonStartupConfig {
     pub fn new(
         config: &LegacyBuckConfig,
@@ -756,14 +770,7 @@ impl DaemonStartupConfig {
                 property: "daemon_idle_timeout_s",
             })?,
             hydration: HydrationConfig::from_config(config)?,
-            josh: config.get_section("josh").map(|s| {
-                let mut v: Vec<(String, String)> = s
-                    .iter()
-                    .map(|(k, v)| (k.to_owned(), v.as_str().to_owned()))
-                    .collect();
-                v.sort();
-                v
-            }),
+            josh: josh_section(config),
             josh_cells: if config
                 .parse::<bool>(BuckconfigKeyRef {
                     section: "josh",

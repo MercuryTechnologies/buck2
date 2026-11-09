@@ -578,6 +578,11 @@ impl ServerCommandContext<'_> {
                 .collect();
             map.check_cells(&cells, &external)?;
         }
+        // A `-c josh.*` or a `--config-file` reaches this command's config but not the map,
+        // which the daemon built from the files alone, so a difference is refused, not ignored.
+        buck2_core::josh::check_section(
+            buck2_common::init::josh_section(&new_configs.root_config).as_deref(),
+        )?;
 
         self.report_traced_config_paths(&new_configs.config_paths)?;
         if self.reuse_current_config {

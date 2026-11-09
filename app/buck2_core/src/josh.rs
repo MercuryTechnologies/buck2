@@ -84,6 +84,10 @@ pub enum JoshError {
     CellsChanged(String),
     #[error("[josh] verify_hits must be a fraction between 0 and 1, got `{0}`")]
     BadVerify(String),
+    #[error(
+        "[josh] {0}. The daemon builds its map once, from the root config's files, so `-c josh.*` and `--config-file` cannot change it; set [josh] in .buckconfig or .buckconfig.local, which starts a new daemon"
+    )]
+    Override(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Allocative)]
@@ -415,6 +419,60 @@ impl JoshMap {
 }
 
 static JOSH: OnceLock<Arc<JoshMap>> = OnceLock::new();
+
+/// The root config's `[josh]` section, sorted, as the daemon read it at startup from the config
+/// files alone (`None` without one). The map, the verify fraction and the exec root all come
+/// from it.
+static STARTUP_SECTION: OnceLock<Option<Vec<(String, String)>>> = OnceLock::new();
+
+/// Record the `[josh]` section the daemon started with. Called once at daemon start, whether or
+/// not the section enables josh.
+pub fn init_startup_section(section: Option<Vec<(String, String)>>) {
+    let _ = STARTUP_SECTION.set(section);
+}
+
+/// The keys on which `command` (a command's root `[josh]` section, sorted) differs from
+/// `started` (the daemon's), as one message, or `None` when they agree. A missing section is
+/// the same as an empty one.
+pub fn section_diff(
+    started: Option<&[(String, String)]>,
+    command: Option<&[(String, String)]>,
+) -> Option<String> {
+    let started = started.unwrap_or(&[]);
+    let command = command.unwrap_or(&[]);
+    if started == command {
+        return None;
+    }
+    let get = |s: &[(String, String)], k: &str| {
+        s.iter()
+            .find(|(x, _)| x == k)
+            .map_or_else(|| "unset".to_owned(), |(_, v)| format!("`{v}`"))
+    };
+    let keys: std::collections::BTreeSet<&str> =
+        started.iter().chain(command).map(|(k, _)| k.as_str()).collect();
+    let diffs: Vec<String> = keys
+        .into_iter()
+        .filter_map(|k| {
+            let (a, b) = (get(started, k), get(command, k));
+            (a != b).then(|| format!("`josh.{k}` is {b} for this command but {a} in the daemon"))
+        })
+        .collect();
+    Some(diffs.join(", "))
+}
+
+/// Refuses a command whose root config has another `[josh]` section than the daemon started
+/// with. The client restarts the daemon when the files change, but a `-c josh.*` or a
+/// `--config-file` reaches only the command's config: the map would silently stay the
+/// daemon's, and an "off" comparison made that way would run with josh on.
+pub fn check_section(command: Option<&[(String, String)]>) -> buck2_error::Result<()> {
+    let Some(started) = STARTUP_SECTION.get() else {
+        return Ok(());
+    };
+    match section_diff(started.as_deref(), command) {
+        None => Ok(()),
+        Some(d) => Err(JoshError::Override(d).into()),
+    }
+}
 
 /// Install the daemon's map. A second call with an equal map is a no-op; a different one is an
 /// error, because configurations and paths computed under the first are already interned.
@@ -1113,6 +1171,30 @@ mod tests {
         assert_eq!(
             m.disk_symlink_text_rel("buck-out/v2/art/root/pkg/__t__/l", "../../../../../../pkg/a.src", ROOT),
             None
+        );
+    }
+
+    #[test]
+    fn section_diff_names_each_changed_key() {
+        let on = entries(&[("enabled", "true"), ("cell.mwb", "root:.")]);
+        let mut sorted = on.clone();
+        sorted.sort();
+        assert_eq!(section_diff(Some(&sorted), Some(&sorted)), None);
+        assert_eq!(section_diff(None, None), None);
+        assert_eq!(section_diff(None, Some(&[])), None);
+        let off = entries(&[("cell.mwb", "root:."), ("enabled", "false")]);
+        assert_eq!(
+            section_diff(Some(&sorted), Some(&off)).as_deref(),
+            Some("`josh.enabled` is `false` for this command but `true` in the daemon")
+        );
+        let more = entries(&[("cell.mwb", "root:."), ("enabled", "true"), ("verify_hits", "1")]);
+        assert_eq!(
+            section_diff(Some(&sorted), Some(&more)).as_deref(),
+            Some("`josh.verify_hits` is `1` for this command but unset in the daemon")
+        );
+        assert_eq!(
+            section_diff(None, Some(&entries(&[("enabled", "true")]))).as_deref(),
+            Some("`josh.enabled` is `true` for this command but unset in the daemon")
         );
     }
 
