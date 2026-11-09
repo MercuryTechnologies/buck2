@@ -6,7 +6,6 @@
 # of this source tree. You may select, at your option, one of the
 # above-listed licenses.
 
-load("@prelude//xplugins:types.bzl", "XPluginsFunctionMappingManifestInfo")
 load(
     ":apple_bundle_types.bzl",
     "AppleBundleInfo",
@@ -20,8 +19,7 @@ load(
 
 def _apple_finalize_bundle_impl(ctx):
     original_bundle = ctx.attrs.bundle
-    original_bundle_info = original_bundle[AppleBundleInfo]
-    bundle_artifact = original_bundle_info.bundle
+    bundle_artifact = original_bundle[DefaultInfo].default_outputs[0]
     finalized_bundle = ctx.actions.declare_output(bundle_artifact.basename, has_content_based_path = False)
 
     cmd = cmd_args([
@@ -39,6 +37,7 @@ def _apple_finalize_bundle_impl(ctx):
         identifier = bundle_artifact.basename,
     )
 
+    original_bundle_info = original_bundle[AppleBundleInfo]
     finalized_bundle_info = AppleBundleInfo(
         bundle = finalized_bundle,
         bundle_type = original_bundle_info.bundle_type,
@@ -49,9 +48,6 @@ def _apple_finalize_bundle_impl(ctx):
     )
 
     forwarded_providers = [original_bundle[AppleDebuggableInfo], original_bundle[AppleInfoPlistInfo], original_bundle[AppleBundleLinkerMapInfo]]
-    xplugins_function_mapping_manifest_info = original_bundle.get(XPluginsFunctionMappingManifestInfo)
-    if xplugins_function_mapping_manifest_info:
-        forwarded_providers.append(xplugins_function_mapping_manifest_info)
 
     return [
         DefaultInfo(default_output = finalized_bundle),
@@ -60,7 +56,7 @@ def _apple_finalize_bundle_impl(ctx):
 
 apple_finalize_bundle = rule(
     attrs = {
-        "bundle": attrs.dep(providers = [AppleBundleInfo]),
+        "bundle": attrs.dep(),
         "finalizer": attrs.exec_dep(providers = [RunInfo]),
         "sign_key": attrs.string(default = "fbios-debug"),
     },

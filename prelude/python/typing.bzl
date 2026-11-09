@@ -176,11 +176,16 @@ def create_per_target_type_check(
 ) -> DefaultInfo:
     if not typing_enabled:
         # Use empty dict to signal that no type checking was performed.
-        empty_result = ctx.attrs._python_internal_tools[PythonInternalToolsInfo].empty_typing_result
+        output_file = ctx.actions.write_json("type_check_result.json", {}, has_content_based_path = False)
+        sharded_output_file = ctx.actions.write_json(
+            "sharded_type_check_result.json",
+            {},
+            has_content_based_path = False,
+        )
         return DefaultInfo(
-            default_output = empty_result,
+            default_output = output_file,
             sub_targets = {
-                "shard_default": [DefaultInfo(default_output = empty_result)],
+                "shard_default": [DefaultInfo(default_output = sharded_output_file)],
             },
         )
 

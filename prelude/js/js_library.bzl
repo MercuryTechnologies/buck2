@@ -7,13 +7,11 @@
 # above-listed licenses.
 
 load("@prelude//:paths.bzl", "paths")
-load("@prelude//:prelude_rule.bzl", "prelude_rule")
 load("@prelude//js:js_providers.bzl", "JsLibraryInfo", "get_transitive_outputs")
 load("@prelude//js:js_utils.bzl", "TRANSFORM_PROFILES", "get_canonical_src_name", "get_flavors", "run_worker_commands")
 load("@prelude//utils:arglike.bzl", "ArgLike")  # @unused Used as a type
 load("@prelude//utils:expect.bzl", "expect")
 load("@prelude//utils:utils.bzl", "map_idx")
-load(":attrs.bzl", "js_library_attrs")
 
 # A group of sources that all have the same canonical name. The main_source is arbitrary but
 # consistent (it is just the first source encountered when processing the src files).
@@ -213,7 +211,7 @@ def _build_library_files(ctx: AnalysisContext, transform_profile: str, flavors: 
     )
     return output_path
 
-def _build_js_library(ctx: AnalysisContext, transform_profile: str, library_files: Artifact, flavors: list[str], dep_library_files: list[Artifact]) -> Artifact:
+def _build_js_library(ctx: AnalysisContext, transform_profile: str, library_files: Artifact, flavors: list[str], js_library_deps: list[Artifact]) -> Artifact:
     output_path = ctx.actions.declare_output(
         "library-dependencies-out/{}.jslib".format(transform_profile),
         has_content_based_path = True,
@@ -221,7 +219,7 @@ def _build_js_library(ctx: AnalysisContext, transform_profile: str, library_file
     job_args = {
         "aggregatedSourceFilesFilePath": library_files,
         "command": "library-dependencies",
-        "dependencyLibraryFilePaths": dep_library_files,
+        "dependencyLibraryFilePaths": js_library_deps,
         "flavors": flavors,
         "outputPath": output_path.as_output(),
         "platform": ctx.attrs._platform,
@@ -265,17 +263,12 @@ def js_library_impl(ctx: AnalysisContext) -> list[Provider]:
                 [dep[DefaultInfo].sub_targets[transform_profile] for dep in ctx.attrs.deps],
             )
         )
-        # Dependency resolution only needs each dep's own module map (file
-        # paths, haste IDs and package info), all of which is present in the
-        # dep's `library_files` output. Depending on that instead of the dep's
-        # resolved `.jslib` output keeps the depth of the action graph constant
-        # instead of proportional to the depth of the js_library target graph.
         js_library = _build_js_library(
             ctx,
             transform_profile,
             library_files,
             flavors,
-            [js_library_dep.library_files for js_library_dep in js_library_deps],
+            [js_library_dep.output for js_library_dep in js_library_deps],
         )
 
         transitive_outputs = get_transitive_outputs(
@@ -287,7 +280,6 @@ def js_library_impl(ctx: AnalysisContext) -> list[Provider]:
         sub_targets[transform_profile] = [
             DefaultInfo(default_output = js_library),
             JsLibraryInfo(
-                library_files = library_files,
                 output = js_library,
                 transitive_outputs = transitive_outputs,
             ),
@@ -296,15 +288,3 @@ def js_library_impl(ctx: AnalysisContext) -> list[Provider]:
     return [
         DefaultInfo(default_output = None, sub_targets = sub_targets),
     ]
-
-js_library = prelude_rule(
-    name = "js_library",
-    impl = js_library_impl,
-    docs = """
-        A `js_library()` rule groups together JavaScript source files and assets so they
-        can be consumed by a `js_bundle()`.
-    """,
-    examples = None,
-    further = None,
-    attrs = js_library_attrs(),
-)

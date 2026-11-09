@@ -30,13 +30,7 @@ class PerTestJUnitCoverageRunListener
 constructor(
     outputDir: File,
     agent: CoverageAgent = ReflectiveCoverageAgent(),
-    private val extensionManager: PerTestCoverageExtensionManager =
-        PerTestCoverageExtensionManager.load(),
 ) : BasePerTestCoverageRunListener(outputDir, agent) {
-
-  init {
-    extensionManager.initialize(outputDir)
-  }
 
   /** Default implementation that calls JaCoCo's `RT.getAgent()` via reflection. */
   class ReflectiveCoverageAgent : CoverageAgent {
@@ -73,24 +67,5 @@ constructor(
     runCount += 1
     val base = sanitizeFileName(description?.displayName ?: "anon")
     return "_${base}_$runCount"
-  }
-
-  override fun testStarted(description: Description) {
-    super.testStarted(description)
-    val testName = coverageTestName(description) ?: return
-    extensionManager.testStarted(testName)
-  }
-
-  override fun testFinished(description: Description) {
-    val testName = coverageTestName(description)
-    if (testName != null) {
-      extensionManager.testFinished(testName)
-    }
-    super.testFinished(description)
-  }
-
-  override fun close() {
-    extensionManager.close()
-    super.close()
   }
 }

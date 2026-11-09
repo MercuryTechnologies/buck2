@@ -105,7 +105,7 @@ public class D8Utils {
         classpathFiles,
         minSdkVersion,
         threadCount,
-        ImmutableSet.of());
+        false);
   }
 
   public static D8Output runD8CommandWithOutputClassDescriptors(
@@ -129,7 +129,7 @@ public class D8Utils {
         classpathFiles,
         minSdkVersion,
         threadCount,
-        ImmutableSet.of(D8OutputOption.CLASS_DESCRIPTORS));
+        true);
   }
 
   private static D8Output runD8Command(
@@ -142,7 +142,7 @@ public class D8Utils {
       Collection<Path> classpathFiles,
       Optional<Integer> minSdkVersion,
       OptionalInt threadCount,
-      Set<D8OutputOption> outputOptions)
+      boolean captureOutputClassDescriptors)
       throws CompilationFailedException, IOException {
     Set<Path> inputs = new HashSet<>();
     for (Path toDex : filesToDex) {
@@ -223,21 +223,10 @@ public class D8Utils {
                   if (threadCount.isPresent()) {
                     opt.threadCount = threadCount.getAsInt();
                   }
-                  // Verbose synthetic names: keep backport-with-forwarding helpers in a distinct
-                  // namespace so they do not collide with lambda $N ordinals across separate dex
-                  // invocations (fb4a ARFU NoSuchMethodError).
-                  try {
-                    Object desugarSpecificOptions = opt.desugarSpecificOptions();
-                    desugarSpecificOptions
-                        .getClass()
-                        .getField("enableVerboseSyntheticNames")
-                        .setBoolean(desugarSpecificOptions, true);
-                  } catch (NoSuchFieldException | IllegalAccessException ignored) {
-                  }
                 });
 
     OutputClassDescriptorConsumer outputClassDescriptorConsumer = null;
-    if (outputOptions.contains(D8OutputOption.CLASS_DESCRIPTORS)) {
+    if (captureOutputClassDescriptors) {
       outputClassDescriptorConsumer = new OutputClassDescriptorConsumer(recordingConsumer);
       builder.setProgramConsumer(outputClassDescriptorConsumer);
     } else {
@@ -309,7 +298,7 @@ public class D8Utils {
             new BufferedInputStream(new FileInputStream(rawSecondaryDexPath.toFile()))) {
 
       ZipEntry customEntry = new ZipEntry("classes.dex");
-      if (compression.equals("xzs")) {
+      if (compression.equals("xz") || compression.equals("xzs")) {
         try (ByteArrayOutputStream bos = new ByteArrayOutputStream()) {
           ByteStreams.copy(secondaryDexInputStream, bos);
           byte[] bytes = bos.toByteArray();
@@ -354,10 +343,10 @@ public class D8Utils {
       }
 
       long jarSize = Files.size(secondaryDexOutputJarPath);
-      if (compression.equals("xzs")) {
+      if (compression.equals("xz") || compression.equals("xzs")) {
         Preconditions.checkState(
             uncompressedSize + 120 == jarSize,
-            "For xzs compression, we expect the .dex to be stored uncompressed and the "
+            "For xz and xzs compression, we expect the .dex to be stored uncompressed and the "
                 + "overhead of the .jar itself to be 120 bytes!");
       }
 

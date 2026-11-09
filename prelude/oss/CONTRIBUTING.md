@@ -41,11 +41,7 @@ outlined on that page and do not file a public issue.
 
 ## Coding Style
 
-Format with `python3 fmt.py` in a checkout of
-[facebook/buck2](https://github.com/facebook/buck2) (this repository is its
-`prelude` directory); it runs `starlark_fmt` exactly as Meta's internal
-formatter does, so a formatted pull request needs no Starlark reformatting
-when it is imported.
+We use several Python formatters.
 
 ## License
 

@@ -20,14 +20,12 @@ package com.facebook
 import com.facebook.buck.jvm.kotlin.compilerplugins.common.isStub
 import org.jetbrains.kotlin.backend.common.extensions.IrGenerationExtension
 import org.jetbrains.kotlin.backend.common.extensions.IrPluginContext
-import org.jetbrains.kotlin.backend.common.lower.DeclarationIrBuilder
 import org.jetbrains.kotlin.descriptors.ClassKind
 import org.jetbrains.kotlin.descriptors.DescriptorVisibilities
 import org.jetbrains.kotlin.descriptors.Modality
 import org.jetbrains.kotlin.ir.IrBuiltIns
 import org.jetbrains.kotlin.ir.IrElement
 import org.jetbrains.kotlin.ir.IrStatement
-import org.jetbrains.kotlin.ir.builders.irCallConstructor
 import org.jetbrains.kotlin.ir.declarations.*
 import org.jetbrains.kotlin.ir.expressions.*
 import org.jetbrains.kotlin.ir.expressions.impl.IrConstImpl
@@ -35,18 +33,12 @@ import org.jetbrains.kotlin.ir.expressions.impl.IrReturnImpl
 import org.jetbrains.kotlin.ir.symbols.IrReturnTargetSymbol
 import org.jetbrains.kotlin.ir.symbols.UnsafeDuringIrConstructionAPI
 import org.jetbrains.kotlin.ir.types.*
-import org.jetbrains.kotlin.ir.util.constructors
 import org.jetbrains.kotlin.ir.util.kotlinFqName
-import org.jetbrains.kotlin.ir.util.parentAsClass
-import org.jetbrains.kotlin.ir.util.primaryConstructor
 import org.jetbrains.kotlin.name.Name
 import org.jetbrains.kotlin.psi.KtFile
 
-internal class NonAbiDeclarationsStrippingIrExtension(
-    private val sourceFiles: List<KtFile>,
-    private val repairLog: AbiGenRepairLog,
-    private val keptInlineBodies: Set<IrSimpleFunction>,
-) : IrGenerationExtension {
+internal class NonAbiDeclarationsStrippingIrExtension(private val sourceFiles: List<KtFile>) :
+    IrGenerationExtension {
 
   private fun shouldStripAnnotation(annotation: IrConstructorCall): Boolean {
     val annotationClass = annotation.symbol.owner.parent as? IrClass ?: return false
@@ -212,13 +204,7 @@ internal class NonAbiDeclarationsStrippingIrExtension(
     stripSourceRetentionAnnotations(moduleFragment)
 
     moduleFragment.transform(
-        NonAbiDeclarationsStrippingIrVisitor(
-            pluginContext.irFactory,
-            pluginContext.irBuiltIns,
-            pluginContext,
-            repairLog,
-            keptInlineBodies,
-        ),
+        NonAbiDeclarationsStrippingIrVisitor(pluginContext.irFactory, pluginContext.irBuiltIns),
         null,
     )
   }
@@ -228,9 +214,6 @@ internal class NonAbiDeclarationsStrippingIrExtension(
 internal class NonAbiDeclarationsStrippingIrVisitor(
     private val irFactory: IrFactory,
     private val irBuiltins: IrBuiltIns,
-    private val pluginContext: IrPluginContext,
-    private val repairLog: AbiGenRepairLog,
-    private val keptInlineBodies: Set<IrSimpleFunction>,
 ) : IrElementTransformerVoidCompat() {
 
   override fun visitFile(declaration: IrFile): IrFile {
@@ -246,20 +229,23 @@ internal class NonAbiDeclarationsStrippingIrVisitor(
   }
 
   override fun visitClass(declaration: IrClass): IrStatement {
-    // Strip supertypes whose class file the ABI jar will not contain, since the reference would
-    // dangle. Internal supertypes are kept because source-only ABI is consumed within the same
+    // Strip PRIVATE supertypes from the class's implemented interfaces.
+    // Internal supertypes are kept because source-only ABI is consumed within the same
     // module, where internal types are accessible. Stripping them would cause Java consumers
     // to see "incompatible types" errors when a public class implements an internal interface.
+
+    // First, collect the supertypes that will be stripped (private only)
     val strippedSupertypes =
         declaration.superTypes.filter { superType ->
           val superClass = superType.classOrNull?.owner ?: return@filter false
-          isClassAbsentFromAbi(superClass)
+          isClassPrivate(superClass)
         }
 
+    // Strip the private supertypes
     declaration.superTypes =
         declaration.superTypes.filter { superType ->
           val superClass = superType.classOrNull?.owner ?: return@filter true
-          !isClassAbsentFromAbi(superClass)
+          !isClassPrivate(superClass)
         }
 
     // For each stripped supertype that was an interface, convert fake override methods
@@ -287,13 +273,13 @@ internal class NonAbiDeclarationsStrippingIrVisitor(
       if (!decl.isFakeOverride) continue
       if (!decl.visibility.isPublicAPI) continue
 
-      // Materialize only when the declaring class is gone from the ABI. If it survives -- any
-      // nested private class does -- the fake override still resolves, and emitting a body here
-      // would add a method the library jar does not have.
+      // Check if any of the overridden symbols is from a class that implements a non-public
+      // interface
       val shouldMaterialize =
           decl.overriddenSymbols.any { overriddenSymbol ->
-            val overriddenParent = overriddenSymbol.owner.parent as? IrClass
-            overriddenParent != null && isClassAbsentFromAbi(overriddenParent)
+            val overridden = overriddenSymbol.owner
+            val overriddenParent = overridden.parent as? IrClass
+            overriddenParent != null && !isClassPubliclyAccessible(overriddenParent)
           }
 
       if (shouldMaterialize) {
@@ -366,22 +352,33 @@ internal class NonAbiDeclarationsStrippingIrVisitor(
     }
   }
 
-  // True when removeNonPublicApi will drop this class from the ABI, which is the only reason a
-  // supertype has to leave a supertype list. Only top-level private classes are dropped; a nested
-  // private class is kept, so a `private sealed class`/`sealed interface` and everything nested
-  // under it stays referenceable and must keep appearing as a supertype.
-  private fun isClassAbsentFromAbi(irClass: IrClass): Boolean {
-    var current: IrClass = irClass
-    while (true) {
-      if (current.visibility == DescriptorVisibilities.LOCAL) {
+  // Check if a class is publicly accessible (it and all its containing classes are public)
+  private fun isClassPubliclyAccessible(irClass: IrClass): Boolean {
+    var current: IrClass? = irClass
+    while (current != null) {
+      if (!current.visibility.isPublicAPI) {
+        return false
+      }
+      // Get the containing class, if any
+      current = current.parent as? IrClass
+    }
+    return true
+  }
+
+  // Check if a class or any of its containing classes is private/local (not internal or public).
+  // Internal classes are accessible within the same module (source-only ABI scope).
+  private fun isClassPrivate(irClass: IrClass): Boolean {
+    var current: IrClass? = irClass
+    while (current != null) {
+      val visibility = current.visibility
+      if (
+          visibility == DescriptorVisibilities.PRIVATE || visibility == DescriptorVisibilities.LOCAL
+      ) {
         return true
       }
-      val outer = current.parent as? IrClass
-      if (outer == null) {
-        return current.visibility == DescriptorVisibilities.PRIVATE
-      }
-      current = outer
+      current = current.parent as? IrClass
     }
+    return false
   }
 
   override fun visitField(declaration: IrField): IrStatement {
@@ -400,14 +397,6 @@ internal class NonAbiDeclarationsStrippingIrVisitor(
         val defaultExpressionBody = generateDefaultExpressionBody(declaration.type)
         if (defaultExpressionBody != null) {
           declaration.initializer = defaultExpressionBody
-          // For a non-const field this only affects the initializer, which is not part of the
-          // ABI. For a const val it rewrites the ConstantValue attribute consumers inline.
-          val ownerPrefix = (declaration.parent as? IrClass)?.kotlinFqName?.asString()?.plus(".")
-          repairLog.recordReplacedFieldInitializer(
-              (ownerPrefix ?: "") + declaration.name.asString(),
-              "initializer contained a call that source-only ABI cannot evaluate; " +
-                  "replaced with the default value for ${declaration.type.classFqName?.asString()}",
-          )
         }
       }
     }
@@ -438,73 +427,33 @@ internal class NonAbiDeclarationsStrippingIrVisitor(
     // For primitive types, create a default constant value
     // The code handles properties like val DEFAULT_SHADOW_COLOR: Int = Color.argb(128, 0, 0, 0)
     // If we don't set a default value, compiler crashes because it expects a ConstExpression
-    // Primitives are matched by classifier (isInt/isLong/...) rather than by instance equality with
-    // irBuiltins: a value class deserialized from another module carries a non-canonical underlying
-    // primitive type that is not `==` to irBuiltins.longType, and matching it by instance used to
-    // drop through to the null branch -- storing ACONST_NULL into an unboxed primitive slot. The
-    // predicates are non-null-only, so a nullable primitive (a boxed, reference slot) still falls
-    // through to null, which is correct there.
     var defaultValue: IrExpression? =
         when {
-          constructedType.isInt() -> IrConstImpl.int(-1, -1, irBuiltins.intType, 0)
-          constructedType.isBoolean() -> IrConstImpl.boolean(-1, -1, irBuiltins.booleanType, false)
-          constructedType.isString() -> IrConstImpl.string(-1, -1, irBuiltins.stringType, "")
-          constructedType.isDouble() -> IrConstImpl.double(-1, -1, irBuiltins.doubleType, 0.0)
-          constructedType.isFloat() -> IrConstImpl.float(-1, -1, irBuiltins.floatType, 0.0f)
-          constructedType.isLong() -> IrConstImpl.long(-1, -1, irBuiltins.longType, 0L)
-          constructedType.isChar() -> IrConstImpl.char(-1, -1, irBuiltins.charType, '\u0000')
-          constructedType.isByte() -> IrConstImpl.byte(-1, -1, irBuiltins.byteType, 0)
-          constructedType.isShort() -> IrConstImpl.short(-1, -1, irBuiltins.shortType, 0)
+          constructedType == irBuiltins.intType -> IrConstImpl.int(-1, -1, irBuiltins.intType, 0)
+          constructedType == irBuiltins.booleanType ->
+              IrConstImpl.boolean(-1, -1, irBuiltins.booleanType, false)
+          constructedType == irBuiltins.stringType ->
+              IrConstImpl.string(-1, -1, irBuiltins.stringType, "")
+          constructedType == irBuiltins.doubleType ->
+              IrConstImpl.double(-1, -1, irBuiltins.doubleType, 0.0)
+          constructedType == irBuiltins.floatType ->
+              IrConstImpl.float(-1, -1, irBuiltins.floatType, 0.0f)
+          constructedType == irBuiltins.longType ->
+              IrConstImpl.long(-1, -1, irBuiltins.longType, 0L)
+          constructedType == irBuiltins.charType ->
+              IrConstImpl.char(-1, -1, irBuiltins.charType, '\u0000')
+          constructedType == irBuiltins.byteType -> IrConstImpl.byte(-1, -1, irBuiltins.byteType, 0)
+          constructedType == irBuiltins.shortType ->
+              IrConstImpl.short(-1, -1, irBuiltins.shortType, 0)
           else ->
-              // For value/inline classes (e.g. Compose's `Color`, which wraps `ULong`/`long`) a
-              // null default is wrong: the JVM slot is the unboxed primitive, so the
-              // compiler-generated `<fn>$default` method would emit ACONST_NULL into e.g. a `long`
-              // slot and fail bytecode verification ("Expected J, but found R"). Build a boxed
-              // default from the underlying primitive so inline-class lowering unboxes it to the
-              // correct primitive zero. Falls back to null for everything else.
-              generateInlineClassDefaultValue(constructedType)
-                  ?: IrConstImpl.constNull(
-                      -1,
-                      -1,
-                      constructedType.makeNullable(),
-                  ) // If we can't handle this type, return null
+              IrConstImpl.constNull(
+                  -1,
+                  -1,
+                  constructedType.makeNullable(),
+              ) // If we can't handle this type, return null
         }
 
     return defaultValue
-  }
-
-  // Build a default value for a non-null value/inline class over a primitive, whose `<fn>$default`
-  // slot is the *unboxed* primitive. Returns null (leaving the caller's ACONST_NULL fallback) for a
-  // non-value class or a nullable value class -- which is boxed, so its slot is a reference and
-  // null
-  // is correct.
-  //
-  // The underlying primitive is read from the class's inline-class representation, which survives
-  // deserialization even when the value class's constructor does not: a value class reached through
-  // a source-only-ABI dependency deserializes with zero constructors (e.g. WA
-  // `TranscriptionStatus`,
-  // `ctors=0`). When a constructor *is* materialized we invoke it, so inline-class lowering unboxes
-  // the call to the primitive zero (ICONST_0/LCONST_0). When it is not, we emit the underlying
-  // primitive directly -- the slot is already that primitive, so a bare zero verifies -- rather
-  // than
-  // dropping through to ACONST_NULL and failing bytecode verification ("Expected I, but found R").
-  private fun generateInlineClassDefaultValue(type: IrSimpleType): IrExpression? {
-    val irClass = type.classOrNull?.owner ?: return null
-    if (!irClass.isValue) return null
-    if (type.isNullable()) return null
-    val constructor = irClass.primaryConstructor ?: irClass.constructors.singleOrNull()
-    val underlyingType =
-        irClass.inlineClassRepresentation?.underlyingType
-            ?: constructor?.valueParameters?.singleOrNull()?.type
-            ?: return null
-    val underlyingDefault = generateDefaultValue(underlyingType) ?: return null
-    return if (constructor != null && constructor.valueParameters.size == 1) {
-      DeclarationIrBuilder(pluginContext, constructor.symbol)
-          .irCallConstructor(constructor.symbol, emptyList())
-          .apply { putValueArgument(0, underlyingDefault) }
-    } else {
-      underlyingDefault
-    }
   }
 
   private fun IrDeclarationContainer.removeNonPublicApi() {
@@ -512,27 +461,9 @@ internal class NonAbiDeclarationsStrippingIrVisitor(
     val inlineClassBackingFieldName =
         (this as? IrClass)?.inlineClassRepresentation?.underlyingPropertyName
 
-    // Members of a private nested class are unreachable however they are declared: Kotlin
-    // resolves the metadata-private owner, Java sees a non-public nested class. Class-abi
-    // drops them (keeping the shell); effective visibility drops them here too. Value,
-    // enum, enum-entry and annotation classes keep the old behavior: backend lowerings
-    // read their members (value-class lowering crashes once its fake-override equals is
-    // gone), and enum-entry overrides stay reachable through the enum type.
-    val ownerIsPrivateNestedClass =
-        this is IrClass &&
-            parent is IrClass &&
-            (visibility == DescriptorVisibilities.PRIVATE ||
-                visibility == DescriptorVisibilities.LOCAL) &&
-            inlineClassRepresentation == null &&
-            kind != ClassKind.ENUM_CLASS &&
-            kind != ClassKind.ENUM_ENTRY &&
-            kind != ClassKind.ANNOTATION_CLASS
-
-    this.declarations.filterIsInstance<IrProperty>().forEach { property ->
-      if (property.isDelegated) property.backingField = null
-    }
-
     this.declarations.removeAll { declaration ->
+      // Keep synthetic declarations (generated by compiler)
+      if (declaration.origin.isSynthetic) return@removeAll false
       // Keep constructors (needed for instantiation)
       if (declaration is IrConstructor) return@removeAll false
       // Keep companion objects (may contain public members)
@@ -551,68 +482,19 @@ internal class NonAbiDeclarationsStrippingIrVisitor(
       if (declaration.isInlineClassBackingMember(inlineClassBackingFieldName))
           return@removeAll false
 
-      if (declaration.isPropertyDelegateBackingField()) return@removeAll true
-
-      // Keep synthetic declarations (generated by compiler)
-      if (declaration.origin.isSynthetic) return@removeAll false
-
-      // Members of a private nested class are unreachable even when declared public, with
-      // three exemptions. Const and @JvmStatic/@JvmField members feed public statics on the
-      // outer class that callers genuinely reach, so dropping their IR breaks consumers.
-      // Fake overrides emit no bytecode but backend lowerings look some of them up, so
-      // removing them crashes compilation instead of shrinking the ABI.
-      // Private members go first, so the exemptions only ever keep non-private ones,
-      // matching the general private-member rule below.
-      if (ownerIsPrivateNestedClass) {
-        if (declaration.isPrivateOrLocal()) return@removeAll true
-        if (declaration.origin == IrDeclarationOrigin.FAKE_OVERRIDE) return@removeAll false
-        if ((declaration as? IrProperty)?.isConst == true) return@removeAll false
-        if (declaration.hasJvmStaticOrJvmField()) return@removeAll false
-        return@removeAll true
-      }
-
       // Remove private/local members only (NOT internal - K1 kept internal in ABI)
-      declaration.isPrivateOrLocal()
+      val visibility = (declaration as? IrDeclarationWithVisibility)?.visibility
+      visibility == DescriptorVisibilities.PRIVATE ||
+          visibility == DescriptorVisibilities.PRIVATE_TO_THIS ||
+          visibility == DescriptorVisibilities.LOCAL
     }
   }
-
-  private fun IrDeclaration.isPropertyDelegateBackingField(): Boolean =
-      this is IrField &&
-          visibility == DescriptorVisibilities.PRIVATE &&
-          origin == IrDeclarationOrigin.PROPERTY_DELEGATE
 
   private fun IrDeclaration.isInlineClassBackingMember(backingFieldName: Name?): Boolean {
     if (backingFieldName == null) return false
     return (this is IrField || this is IrProperty) &&
         (this as IrDeclarationWithName).name == backingFieldName
   }
-
-  private fun IrDeclaration.isPrivateOrLocal(): Boolean {
-    val visibility = (this as? IrDeclarationWithVisibility)?.visibility
-    return visibility == DescriptorVisibilities.PRIVATE ||
-        visibility == DescriptorVisibilities.PRIVATE_TO_THIS ||
-        visibility == DescriptorVisibilities.LOCAL
-  }
-
-  // @JvmField lands on the backing field and @get:/@set: use-site targets land on the
-  // accessors, so a property consults all four holders.
-  private fun IrDeclaration.hasJvmStaticOrJvmField(): Boolean =
-      relatedAnnotationContainers().any { container ->
-        container.annotations?.any {
-          when (it.type.classFqName?.asString()) {
-            "kotlin.jvm.JvmStatic",
-            "kotlin.jvm.JvmField" -> true
-            else -> false
-          }
-        } == true
-      }
-
-  private fun IrDeclaration.relatedAnnotationContainers(): List<IrAnnotationContainer> =
-      when (this) {
-        is IrProperty -> listOfNotNull<IrAnnotationContainer>(this, backingField, getter, setter)
-        is IrAnnotationContainer -> listOf(this)
-        else -> emptyList()
-      }
 
   private fun generateDefaultReturnStatement(
       type: IrType,
@@ -632,28 +514,7 @@ internal class NonAbiDeclarationsStrippingIrVisitor(
     return irFactory.createExpressionBody(-1, -1, defaultValue)
   }
 
-  // Replace each defaulted value parameter's default with a fabricated, type-correct default.
-  // For source-only ABI only the presence and type of a default matter, not its value. This
-  // turns a value-class-over-primitive default into a boxed constructor call, which inline-class
-  // lowering unboxes to the primitive zero, rather than the ACONST_NULL codegen would otherwise
-  // store into the synthetic `$default` overload's unboxed slot ("Expected I, but found R").
-  // Shared by visitSimpleFunction and visitConstructor -- the latter is where the WA
-  // TranscriptionViewModel.VmState `<init>$default` crash lived.
-  private fun regenerateDefaultParameterValues(function: IrFunction) {
-    function.valueParameters
-        .filter { it.defaultValue != null }
-        .forEach { parameter ->
-          generateDefaultExpressionBody(parameter.type)?.let { parameter.defaultValue = it }
-        }
-  }
-
   override fun visitSimpleFunction(declaration: IrSimpleFunction): IrStatement {
-    if (declaration in keptInlineBodies) {
-      // Callers inline this body from the ABI: leave it, and the lambdas in it, unchanged.
-      val body = declaration.body
-      declaration.body = null
-      return super.visitSimpleFunction(declaration).also { declaration.body = body }
-    }
     if (!declaration.origin.isSynthetic) {
       if (declaration.parent is IrProperty) {
         // for properties we need to generate a default body
@@ -667,24 +528,15 @@ internal class NonAbiDeclarationsStrippingIrVisitor(
       } else {
         declaration.body = irFactory.createBlockBody(-1, -1)
       }
-      // handles default values in functions like fun foo(x: Int = Something.SomeValue)
-      regenerateDefaultParameterValues(declaration)
+      val parametersWithDefaultValues =
+          declaration.valueParameters.filter { it.defaultValue != null }
+      for (parameter in parametersWithDefaultValues) {
+        // if we can - we resolve the default value to a constant
+        // handles default values in functions like fun foo(x: Int = Something.SomeValue)
+        generateDefaultExpressionBody(parameter.type)?.let { parameter.defaultValue = it }
+      }
     }
     return super.visitSimpleFunction(declaration)
-  }
-
-  override fun visitConstructor(declaration: IrConstructor): IrStatement {
-    // A defaulted value-class-over-primitive constructor parameter reaches the synthetic
-    // `<init>$default` with an unboxed slot; regenerate its default as visitSimpleFunction does
-    // so the slot gets the unboxed primitive zero rather than ACONST_NULL. Bodies are left to the
-    // default traversal -- unlike 2.3.0, this compiler path needs no constructor body stubbing.
-    // Skip annotation classes: their constructor parameter defaults ARE the ABI (the
-    // `AnnotationDefault` attribute), so regenerating them drops the element default and breaks
-    // consumers ("annotation @X is missing a default value for the element ...").
-    if (declaration.parentAsClass.kind != ClassKind.ANNOTATION_CLASS) {
-      regenerateDefaultParameterValues(declaration)
-    }
-    return super.visitConstructor(declaration)
   }
 
   override fun visitAnonymousInitializer(

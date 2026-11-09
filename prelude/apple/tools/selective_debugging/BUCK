@@ -28,14 +28,6 @@ python_binary(
     ],
 )
 
-python_binary(
-    name = "benchmark",
-    main = "benchmark.py",
-    deps = [
-        ":lib",
-    ],
-)
-
 meta_python_test(
     name = "tests",
     srcs = [

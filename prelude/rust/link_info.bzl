@@ -117,9 +117,10 @@ DEFAULT_STATIC_LIB_OUTPUT_STYLE = LibOutputStyle("pic_archive")
 
 RustProcMacroPlugin = plugins.kind()
 
-# Provided by `rust_proc_macro_alias`, which is how a proc macro appears among a crate's deps. It
-# only carries the `target_label` of the proc macro; the proc macro's own providers are accessed
-# through `ctx.plugins` (see `get_available_proc_macros`).
+# This provider is used for proc macros in those places where `RustLinkInfo` would typically be used
+# for libraries. It represents a proc macro in the dependency graph, and contains as a field the
+# `target_label` of that proc macro. The actual providers will always be accessed later through
+# `ctx.plugins`
 RustProcMacroMarker = provider(
     fields = {
         "label": typing.Any,
@@ -159,30 +160,17 @@ TransitiveDeps = transitive_set(
     },
 )
 
-# A proc macro, in the places where a library would provide `RustLinkInfo`. rustc loads proc
-# macros rather than linking them into their dependents, so this carries none of a library's link
-# providers, and there is no per-link-strategy information because proc macros are always built
-# the same way.
-RustProcMacroInfo = provider(
-    fields = {
-        "crate": CrateName,
-        "dylib": Artifact,
-        # `dylib`, wrapped in a 1-element transitive set.
-        "singleton_tset": TransitiveDeps,
-    },
-)
-
 # Information which is keyed on link_style
 RustLinkStrategyInfo = record(
     # Path to the rlib, rmeta, dylib, etc.
     outputs = field(dict[MetadataKind, Artifact]),
     # Same as `outputs`, but wrapped in a 1-element transitive set.
     singleton_tset = field(dict[MetadataKind, TransitiveDeps]),
-    # Transitive dependencies which are relevant to the consumer. Proc macros are tracked
-    # separately, below.
+    # Transitive dependencies which are relevant to the consumer. For crate types which do not
+    # propagate their deps (specifically proc macros), this set is empty
+    # This does not include the proc macros, which are passed separately in `RustLinkInfo`
     transitive_deps = field(dict[MetadataKind, TransitiveDeps]),
-    # The proc macros among the transitive Rust deps, as keys into `get_available_proc_macros`.
-    transitive_proc_macro_deps = field(set[TargetLabel]),
+    transitive_proc_macro_deps = field(set[RustProcMacroMarker]),
     # Rustc-generated debug info which is referenced -- but not included -- by the
     # linkable rlib. Does not include external debug info from non-Rust native deps.
     #
@@ -287,16 +275,13 @@ RustOrNativeDependency = record(
     flags = field(list[str]),
 )
 
-# A Rust crate among a crate's dependencies: a library or a proc macro, told apart by the type of
-# `info`.
 RustDependency = record(
-    info = field(RustLinkInfo | RustProcMacroInfo),
-    # For a proc macro, the label it is listed under in `ctx.plugins` (and so its key in
-    # `get_available_proc_macros`), not that of the alias in `deps`.
+    info = field(RustLinkInfo),
     label = field(ConfiguredProvidersLabel),
     dep = field(Dependency),
     name = field(None | str | ResolvedStringWithMacros),
     flags = field(list[str]),
+    proc_macro_marker = field(RustProcMacroMarker | None),
 )
 
 # Information about cxx link groups that rust depends on
@@ -306,7 +291,7 @@ RustCxxLinkGroupInfo = record(
     # symbol files args to ensure we export the required symbols
     symbol_files_info = field(LinkInfo),
     # targets to link against
-    filtered_targets = field(set[TargetLabel]),
+    filtered_targets = field(list[TargetLabel]),
     # information about the link groups
     link_group_info = field(LinkGroupInfo | None),
     # shared libraries created from link groups
@@ -401,7 +386,7 @@ def gather_explicit_sysroot_deps(dep_ctx: DepCollectionContext) -> list[RustOrNa
 
 def resolve_deps(ctx: AnalysisContext, dep_ctx: DepCollectionContext) -> list[RustOrNativeDependency]:
     dependencies = _do_resolve_deps(
-        deps = ctx.attrs.deps + dep_ctx.linker_deps,
+        deps = ctx.attrs.deps,
         named_deps = ctx.attrs.named_deps,
         flagged_deps = ctx.attrs.flagged_deps,
     )
@@ -422,13 +407,10 @@ def resolve_rust_deps_inner(ctx: AnalysisContext, all_deps: list[RustOrNativeDep
     for dep in all_deps:
         proc_macro_marker = dep.dep.get(RustProcMacroMarker)
         if proc_macro_marker != None:
-            proc_macro = available_proc_macros[proc_macro_marker.label]
-            label = proc_macro.label
-            info = proc_macro[RustProcMacroInfo]
-        elif RustProcMacroInfo in dep.dep:
-            # Only the alias propagates the proc macro as a plugin, which is
-            # what makes it available to this crate's transitive dependents.
-            fail("{}: proc macro `{}` must be depended on through its `rust_proc_macro_alias` target".format(ctx.label, dep.dep.label))
+            # Confusingly, this is not `proc_macro_marker.label`, since that has type
+            # `target_label`, but this wants a `label`
+            label = available_proc_macros[proc_macro_marker.label].label
+            info = available_proc_macros[proc_macro_marker.label][RustLinkInfo]
         else:
             label = dep.dep.label
             info = dep.dep.get(RustLinkInfo)
@@ -442,6 +424,7 @@ def resolve_rust_deps_inner(ctx: AnalysisContext, all_deps: list[RustOrNativeDep
                 dep = dep.dep,
                 name = dep.name,
                 flags = dep.flags,
+                proc_macro_marker = proc_macro_marker,
             )
         )
     return rust_deps
@@ -470,13 +453,13 @@ def _native_link_dependencies(ctx: AnalysisContext, dep_ctx: DepCollectionContex
 #
 # This is intended to be used to access the Rust -> Rust link providers
 def _rust_non_proc_macro_link_infos(ctx: AnalysisContext, dep_ctx: DepCollectionContext) -> list[RustLinkInfo]:
-    return [d.info for d in resolve_rust_deps(ctx, dep_ctx) if isinstance(d.info, RustLinkInfo)]
+    return [d.info for d in resolve_rust_deps(ctx, dep_ctx) if d.proc_macro_marker == None]
 
 def inherited_exported_link_deps(ctx: AnalysisContext, dep_ctx: DepCollectionContext) -> RustExportedLinkDeps:
     return ctx.actions.tset(
         RustExportedLinkDeps,
         value = _native_link_dependencies(ctx, dep_ctx),
-        children = [info.exported_link_deps for info in _rust_non_proc_macro_link_infos(ctx, dep_ctx)],
+        children = [dep.info.exported_link_deps for dep in resolve_rust_deps(ctx, dep_ctx) if dep.proc_macro_marker == None],
     )
 
 def inherited_third_party_builds(ctx: AnalysisContext, dep_ctx: DepCollectionContext) -> list[ThirdPartyBuildInfo]:
@@ -633,7 +616,7 @@ def inherited_link_group_lib_infos(ctx: AnalysisContext, dep_ctx: DepCollectionC
 
 def inherited_rust_external_debug_info(ctx: AnalysisContext, dep_ctx: DepCollectionContext, link_strategy: LinkStrategy) -> list[ArtifactTSet]:
     toolchain_info = ctx.attrs._rust_toolchain[RustToolchainInfo]
-    return filter(None, [strategy_info(toolchain_info, info, link_strategy).rust_debug_info for info in _rust_non_proc_macro_link_infos(ctx, dep_ctx)])
+    return filter(None, [strategy_info(toolchain_info, d.info, link_strategy).rust_debug_info for d in resolve_rust_deps(ctx, dep_ctx)])
 
 def inherited_external_debug_info(ctx: AnalysisContext, dep_ctx: DepCollectionContext, dep_link_strategy: LinkStrategy) -> ArtifactTSet:
     inherited_debug_infos = []

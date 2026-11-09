@@ -56,30 +56,6 @@ CxxExtensionLinkInfoReduced = record(
     shared_only_libs = field(list[LinkableProviders], []),
 )
 
-_SharedDepKind = enum(
-    # Linked into its own, standalone link group.
-    "dlopen",
-    # Linked dynamically against the library's prebuilt shared lib.
-    "shared_only",
-)
-
-def _classify_shared_dep(dep: Dependency) -> _SharedDepKind | None:
-    dlopenable = dep.get(DlopenableLibraryInfo)
-    if dlopenable != None:
-        if dlopenable.prebuilt_shared_lib:
-            return _SharedDepKind("shared_only")
-        return _SharedDepKind("dlopen")
-
-    # Try to detect prebuilt, shared-only libraries.
-    # TODO(agallagher): We need a more general way to support this, which
-    # should *just* use `preferred_linkage` (and so it supports non-prebuilt
-    # libs too), but this will require hoisting the rules first-order deps
-    # up the tree as `dlopen_deps` so that we link them properly.
-    if MergedLinkInfo in dep and LinkableRootInfo not in dep:
-        return _SharedDepKind("shared_only")
-
-    return None
-
 def merge_native_deps(ctx, deps: list[Dependency], shared_deps: list[Dependency] = []) -> NativeDepsInfoTSet:
     native_deps = {}
     children = []
@@ -104,10 +80,9 @@ def merge_native_deps(ctx, deps: list[Dependency], shared_deps: list[Dependency]
     dlopen_deps = {}
     shared_only_deps = {}
     for dep in shared_deps:
-        kind = _classify_shared_dep(dep)
-        if kind == _SharedDepKind("dlopen"):
+        if DlopenableLibraryInfo in dep:
             dlopen_deps[dep.label] = dep
-        elif kind == _SharedDepKind("shared_only"):
+        elif MergedLinkInfo in dep and LinkableRootInfo not in dep:
             shared_only_deps[dep.label] = dep
 
     return ctx.actions.tset(
@@ -153,10 +128,17 @@ def merge_cxx_extension_info(
     dlopen_deps = {}
     shared_only_libs = {}
     for dep in shared_deps:
-        kind = _classify_shared_dep(dep)
-        if kind == _SharedDepKind("dlopen"):
+        # Libs that should be linked into their own, standalone link groups
+        if DlopenableLibraryInfo in dep:
             dlopen_deps[dep.label] = linkable(dep)
-        elif kind == _SharedDepKind("shared_only"):
+            continue
+
+        # Try to detect prebuilt, shared-only libraries.
+        # TODO(agallagher): We need a more general way to support this, which
+        # should *just* use `preferred_linkage` (and so it supports non-prebuilt
+        # libs too), but this will require hoisting the rules first-order deps
+        # up the tree as `dlopen_deps` so that we link them properly.
+        if MergedLinkInfo in dep and LinkableRootInfo not in dep:
             shared_only_libs[dep.label] = linkable(dep)
 
     children = []

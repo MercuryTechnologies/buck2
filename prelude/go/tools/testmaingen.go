@@ -62,14 +62,12 @@ var (
 	pkgImportPath string
 	outputFile    string
 	testCoverMode string
-	xTestFilesArg string
 	coverPkgs     = make(stringSetFlag)
 )
 
 func init() {
 	flag.StringVar(&pkgImportPath, "import-path", "test", "The import path in the test file")
 	flag.StringVar(&outputFile, "output", "", "The path to the output file. Default to stdout.")
-	flag.StringVar(&xTestFilesArg, "xtest-files", "", "An argsfile containing external test files.")
 	flag.Var(&coverPkgs, "cover-pkgs", "A comma-separated list of packages to gather coverage info on")
 	flag.StringVar(&testCoverMode, "cover-mode", "", "Cover mode (see `go tool cover`)")
 }
@@ -92,47 +90,19 @@ func loadArgs(args []string) []string {
 	return newArgs
 }
 
-func loadArgsFile(filename string) ([]string, error) {
-	if filename == "" {
-		return nil, nil
-	}
-	file, err := os.Open(filename)
-	if err != nil {
-		return nil, err
-	}
-	defer file.Close()
-
-	args := make([]string, 0)
-	scanner := bufio.NewScanner(file)
-	for scanner.Scan() {
-		args = append(args, scanner.Text())
-	}
-	if err := scanner.Err(); err != nil {
-		return nil, err
-	}
-	return args, nil
-}
-
 func main() {
 	os.Args = loadArgs(os.Args)
 	flag.Parse()
 
-	// Sorted, so the same inputs give the same file; nil when there are none, which
-	// the template reads as "cover the package under test".
-	var pkgs []*Package
-	var testCoverPaths []string
-	for _, importPath := range slices.Sorted(maps.Keys(coverPkgs)) {
+	pkgs := make([]*Package, 0, len(coverPkgs))
+	testCoverPaths := make([]string, 0, len(coverPkgs))
+	for importPath := range coverPkgs {
 		pkg := &Package{ImportPath: importPath}
 		pkgs = append(pkgs, pkg)
 		testCoverPaths = append(testCoverPaths, importPath)
 	}
 
-	xTestFiles, err := loadArgsFile(xTestFilesArg)
-	if err != nil {
-		log.Fatalln("Could not read external test files argsfile:", err)
-	}
-
-	testFuncs, err := loadTestFuncsFromFiles(pkgImportPath, flag.Args(), xTestFiles)
+	testFuncs, err := loadTestFuncsFromFiles(pkgImportPath, flag.Args())
 	if err != nil {
 		log.Fatalln("Could not read test files:", err)
 	}
@@ -158,7 +128,7 @@ func main() {
 	}
 }
 
-func loadTestFuncsFromFiles(packageImportPath string, files []string, xFiles []string) (*testFuncs, error) {
+func loadTestFuncsFromFiles(packageImportPath string, files []string) (*testFuncs, error) {
 	t := &testFuncs{
 		Package: &Package{
 			ImportPath: packageImportPath,
@@ -166,11 +136,6 @@ func loadTestFuncsFromFiles(packageImportPath string, files []string, xFiles []s
 	}
 	for _, filename := range files {
 		if err := t.load(filename, "_test", &t.ImportTest, &t.NeedTest); err != nil {
-			return nil, err
-		}
-	}
-	for _, filename := range xFiles {
-		if err := t.load(filename, "_xtest", &t.ImportXtest, &t.NeedXtest); err != nil {
 			return nil, err
 		}
 	}

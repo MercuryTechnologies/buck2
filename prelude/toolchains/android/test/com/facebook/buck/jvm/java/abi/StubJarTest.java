@@ -12,14 +12,11 @@ package com.facebook.buck.jvm.java.abi;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertNotEquals;
-import static org.junit.Assert.assertNotNull;
-import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
 
 import com.facebook.buck.cd.model.java.AbiGenerationMode;
 import com.facebook.buck.core.filesystems.AbsPath;
 import com.facebook.buck.jvm.java.JarDumper;
-import com.facebook.buck.jvm.java.abi.kotlin.KotlinMetadataReader;
 import com.facebook.buck.jvm.java.testutil.compiler.TestCompiler;
 import com.facebook.buck.jvm.kotlin.testutil.compiler.KotlinTestCompiler;
 import com.facebook.buck.util.environment.EnvVariablesProvider;
@@ -32,14 +29,12 @@ import com.google.common.collect.ImmutableSortedSet;
 import com.google.common.collect.Lists;
 import com.google.common.hash.HashCode;
 import com.google.common.hash.Hashing;
-import com.google.common.io.ByteStreams;
 import com.google.common.io.CharStreams;
 import com.google.common.io.Files;
 import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.File;
 import java.io.IOException;
-import java.io.InputStream;
 import java.io.InputStreamReader;
 import java.nio.file.Path;
 import java.nio.file.Paths;
@@ -54,7 +49,6 @@ import java.util.SortedSet;
 import java.util.concurrent.Callable;
 import java.util.jar.JarEntry;
 import java.util.jar.JarFile;
-import java.util.jar.JarOutputStream;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import java.util.stream.Collectors;
@@ -71,11 +65,6 @@ import org.junit.rules.TemporaryFolder;
 import org.junit.runner.RunWith;
 import org.junit.runners.Parameterized;
 import org.objectweb.asm.ClassReader;
-import org.objectweb.asm.ClassWriter;
-import org.objectweb.asm.Opcodes;
-import org.objectweb.asm.tree.AnnotationNode;
-import org.objectweb.asm.tree.ClassNode;
-import org.objectweb.asm.tree.MethodNode;
 
 // The stub source is easier to read as long lines, so...
 // CHECKSTYLE.OFF: LineLengthCheck
@@ -108,33 +97,11 @@ public class StubJarTest {
   }
 
   public boolean isKotlin22() {
-    return isKotlinVersion("2.2");
-  }
-
-  public boolean isKotlin23() {
-    return isKotlinVersion("2.3");
+    return EnvVariablesProvider.getSystemEnv().get("KOTLIN_VERSION").equals("2.2.0");
   }
 
   public boolean isKotlin20() {
-    return isKotlinVersion("2.0");
-  }
-
-  private boolean isKotlinVersion(String majorMinor) {
-    return EnvVariablesProvider.getSystemEnv().get("KOTLIN_VERSION").startsWith(majorMinor + ".");
-  }
-
-  private String metadataForKotlinVersion(String metadata22, String metadata20) {
-    if (isKotlin23()) {
-      String kotlin22Version = "mv={2, 2, 0}";
-      if (!metadata22.contains(kotlin22Version)) {
-        throw new IllegalArgumentException("Missing Kotlin 2.2 metadata version: " + metadata22);
-      }
-      return metadata22.replace(kotlin22Version, "mv={2, 3, 0}");
-    }
-    if (isKotlin22()) {
-      return metadata22;
-    }
-    return metadata20;
+    return EnvVariablesProvider.getSystemEnv().get("KOTLIN_VERSION").equals("2.0.20");
   }
 
   private static final ImmutableSortedSet<Path> EMPTY_CLASSPATH = ImmutableSortedSet.of();
@@ -202,7 +169,7 @@ public class StubJarTest {
             "",
             "  // compiled from: A.kt",
             "",
-            metadataForKotlinVersion(metadata22, metadata20),
+            isKotlin22() ? metadata22 : metadata20,
             "",
             "  // access flags 0x1",
             "  public <init>()V",
@@ -333,7 +300,7 @@ public class StubJarTest {
             "",
             "  // compiled from: A.kt",
             "",
-            metadataForKotlinVersion(metadata22, metadata20),
+            isKotlin22() ? metadata22 : metadata20,
             "",
             "  // access flags 0x1",
             "  public <init>()V",
@@ -417,7 +384,7 @@ public class StubJarTest {
             "",
             "  // compiled from: A.kt",
             "",
-            metadataForKotlinVersion(metadata22, metadata20),
+            isKotlin22() ? metadata22 : metadata20,
             "",
             "  // access flags 0x1",
             "  public <init>()V",
@@ -502,7 +469,7 @@ public class StubJarTest {
             "",
             "  // compiled from: A.kt",
             "",
-            metadataForKotlinVersion(metadata22, metadata20),
+            isKotlin22() ? metadata22 : metadata20,
             "",
             "  // access flags 0x1",
             "  public <init>()V",
@@ -581,7 +548,7 @@ public class StubJarTest {
             "",
             "  // compiled from: A.kt",
             "",
-            metadataForKotlinVersion(metadata22, metadata20),
+            isKotlin22() ? metadata22 : metadata20,
             "",
             "  // access flags 0x1",
             "  public <init>()V",
@@ -704,7 +671,7 @@ public class StubJarTest {
             "",
             "  OUTERCLASS com/example/buck/AKt test (I)Lkotlin/jvm/functions/Function0;",
             "",
-            metadataForKotlinVersion(metadata22, metadata20),
+            isKotlin22() ? metadata22 : metadata20,
             "  // access flags 0x19",
             "  public final static INNERCLASS com/example/buck/AKt$test$1 null null",
             "",
@@ -821,13 +788,10 @@ public class StubJarTest {
             "",
             "  OUTERCLASS com/example/buck/AKt test ()Lkotlin/jvm/functions/Function2;",
             "",
-            isKotlin23()
-                ? "  @Lkotlin/coroutines/jvm/internal/DebugMetadata;(f=\"A.kt\", l={}, nl={}, i={},"
-                    + " s={}, n={}, m=\"invokeSuspend\", c=\"com.example.buck.AKt$test$1\", v=2)"
-                : "  @Lkotlin/coroutines/jvm/internal/DebugMetadata;(f=\"A.kt\", l={}, i={}, s={},"
-                    + " n={}, m=\"invokeSuspend\", c=\"com.example.buck.AKt$test$1\")",
+            "  @Lkotlin/coroutines/jvm/internal/DebugMetadata;(f=\"A.kt\", l={}, i={}, s={}, n={},"
+                + " m=\"invokeSuspend\", c=\"com.example.buck.AKt$test$1\")",
             "",
-            metadataForKotlinVersion(metadata22, metadata20),
+            isKotlin22() ? metadata22 : metadata20,
             "  // access flags 0x19",
             "  public final static INNERCLASS com/example/buck/AKt$test$1 null null",
             "",
@@ -1020,7 +984,7 @@ public class StubJarTest {
             "",
             "  OUTERCLASS com/example/buck/AKt test (I)Lkotlin/jvm/functions/Function1;",
             "",
-            metadataForKotlinVersion(metadata22, metadata20),
+            isKotlin22() ? metadata22 : metadata20,
             "  // access flags 0x19",
             "  public final static INNERCLASS com/example/buck/AKt$test$1 null null",
             "  // access flags 0x19",
@@ -1098,7 +1062,7 @@ public class StubJarTest {
             "  // compiled from: A.kt",
             "  OUTERCLASS com/example/buck/AKt$test$1 invoke (I)Lkotlin/jvm/functions/Function1;",
             "",
-            metadataForKotlinVersion(metadata22, metadata20),
+            isKotlin22() ? metadata22 : metadata20,
             "  // access flags 0x19",
             "  public final static INNERCLASS com/example/buck/AKt$test$1 null null",
             "  // access flags 0x19",
@@ -1216,7 +1180,7 @@ public class StubJarTest {
             "",
             "  // compiled from: A.kt",
             "",
-            metadataForKotlinVersion(metadata22, metadata20),
+            isKotlin22() ? metadata22 : metadata20,
             "",
             "  // access flags 0x1",
             "  public <init>()V",
@@ -1229,371 +1193,6 @@ public class StubJarTest {
             "  public final someOtherMethod()V",
             "}")
         .createAndCheckStubJar();
-  }
-
-  @Test
-  public void kotlinHiddenDeprecatedOverloadRetained() throws IOException {
-    if (!isValidForKotlin()) {
-      return;
-    }
-    if (!testingMode.equals(MODE_JAR_BASED)) {
-      // Class-ABI stubbing of HIDDEN members only applies to jar-based stubs.
-      return;
-    }
-
-    // `A` is an interface on purpose: concrete classes already keep SYNTHETIC|DEPRECATED
-    // members via `shouldInclude`, so only interfaces (and abstract classes) exercise the
-    // HIDDEN-retention path. `LazyListScope` (the motivating real-world case) is an interface.
-    File outputDir = temp.newFolder();
-    AbsPath fullJar;
-    try (KotlinTestCompiler compiler = new KotlinTestCompiler()) {
-      compiler.init();
-      compiler.addSourceFileContents(
-          "A.kt",
-          "package com.example.buck",
-          "interface A {",
-          "  @Deprecated(message=\"old\", level=DeprecationLevel.HIDDEN)",
-          "  fun f(content: (() -> Unit)?)",
-          "  fun f(content: ((Int) -> Unit)?)",
-          "}");
-      compiler.compile();
-      fullJar = AbsPath.of(outputDir.toPath()).resolve("output.jar");
-      compiler.getClasses().createJar(fullJar.getPath(), false);
-    }
-
-    AbsPath stubJar = AbsPath.of(temp.newFolder().toPath()).resolve("stub.jar");
-    new StubJar(fullJar, false).writeTo(stubJar);
-
-    try (JarFile jar = new JarFile(stubJar.toFile())) {
-      JarEntry entry = jar.getJarEntry("com/example/buck/A.class");
-      assertNotNull(entry);
-      ClassNode stub = new ClassNode(Opcodes.ASM9);
-      new ClassReader(jar.getInputStream(entry)).accept(stub, ClassReader.SKIP_CODE);
-
-      MethodNode hidden = null;
-      MethodNode visible = null;
-      for (MethodNode method : stub.methods) {
-        if (method.name.equals("f") && method.desc.equals("(Lkotlin/jvm/functions/Function0;)V")) {
-          hidden = method;
-        }
-        if (method.name.equals("f") && method.desc.equals("(Lkotlin/jvm/functions/Function1;)V")) {
-          visible = method;
-        }
-        assertTrue(
-            "compiler-generated synthetics should stay stripped: " + method.name,
-            !method.name.contains("access$")
-                && !method.name.contains("$lambda")
-                && !method.name.contains("$r8$"));
-      }
-      assertNotNull("visible overload kept", visible);
-      assertNotNull("HIDDEN overload kept in interface ABI stub", hidden);
-      assertTrue(
-          "HIDDEN overload must stay synthetic", (hidden.access & Opcodes.ACC_SYNTHETIC) != 0);
-      assertTrue(hasHiddenDeprecation(hidden));
-    }
-
-    // End to end: a call that is ambiguous when both overloads look visible
-    // resolves against the ABI now that the HIDDEN marker is present.
-    try (KotlinTestCompiler compiler = new KotlinTestCompiler()) {
-      compiler.init();
-      compiler.addSourceFileContents(
-          "B.kt",
-          "package com.example.buck",
-          "class B {",
-          "  fun use(a: A) {",
-          "    a.f(null)",
-          "    a.f { println(it) }",
-          "  }",
-          "}");
-      compiler.addClasspath(ImmutableSortedSet.of(stubJar.getPath()));
-      compiler.compile();
-    }
-  }
-
-  @Test
-  public void kotlinHiddenDeprecatedOverloadRetainedAbstractClass() throws IOException {
-    if (!isValidForKotlin()) {
-      return;
-    }
-    if (!testingMode.equals(MODE_JAR_BASED)) {
-      // Class-ABI stubbing of HIDDEN members only applies to jar-based stubs.
-      return;
-    }
-
-    // Abstract-class counterpart to the interface case above: `shouldInclude` also drops
-    // SYNTHETIC members on abstract classes, so this exercises the same retention path.
-    File outputDir = temp.newFolder();
-    AbsPath fullJar;
-    try (KotlinTestCompiler compiler = new KotlinTestCompiler()) {
-      compiler.init();
-      compiler.addSourceFileContents(
-          "A.kt",
-          "package com.example.buck",
-          "abstract class A {",
-          "  @Deprecated(message=\"old\", level=DeprecationLevel.HIDDEN)",
-          "  abstract fun f(content: (() -> Unit)?)",
-          "  abstract fun f(content: ((Int) -> Unit)?)",
-          "}");
-      compiler.compile();
-      fullJar = AbsPath.of(outputDir.toPath()).resolve("output.jar");
-      compiler.getClasses().createJar(fullJar.getPath(), false);
-    }
-
-    AbsPath stubJar = AbsPath.of(temp.newFolder().toPath()).resolve("stub.jar");
-    new StubJar(fullJar, false).writeTo(stubJar);
-
-    try (JarFile jar = new JarFile(stubJar.toFile())) {
-      JarEntry entry = jar.getJarEntry("com/example/buck/A.class");
-      assertNotNull(entry);
-      ClassNode stub = new ClassNode(Opcodes.ASM9);
-      new ClassReader(jar.getInputStream(entry)).accept(stub, ClassReader.SKIP_CODE);
-
-      MethodNode hidden = null;
-      MethodNode visible = null;
-      for (MethodNode method : stub.methods) {
-        if (method.name.equals("f") && method.desc.equals("(Lkotlin/jvm/functions/Function0;)V")) {
-          hidden = method;
-        }
-        if (method.name.equals("f") && method.desc.equals("(Lkotlin/jvm/functions/Function1;)V")) {
-          visible = method;
-        }
-      }
-      assertNotNull("visible overload kept", visible);
-      assertNotNull("HIDDEN overload kept in abstract-class ABI stub", hidden);
-      assertTrue(
-          "HIDDEN overload must stay synthetic", (hidden.access & Opcodes.ACC_SYNTHETIC) != 0);
-      assertTrue(hasHiddenDeprecation(hidden));
-    }
-
-    try (KotlinTestCompiler compiler = new KotlinTestCompiler()) {
-      compiler.init();
-      compiler.addSourceFileContents(
-          "B.kt",
-          "package com.example.buck",
-          "class C : A() {",
-          "  override fun f(content: (() -> Unit)?) {}",
-          "  override fun f(content: ((Int) -> Unit)?) {}",
-          "}",
-          "class B {",
-          "  fun use(a: A) {",
-          "    a.f(null)",
-          "    a.f { println(it) }",
-          "  }",
-          "}");
-      compiler.addClasspath(ImmutableSortedSet.of(stubJar.getPath()));
-      compiler.compile();
-    }
-  }
-
-  /**
-   * Stubbing must still succeed, with inline info intact, when @kotlin.Metadata is newer than the
-   * bundled kotlin-metadata-jvm reads strictly (2.4.0, as shipped in real artifacts such as
-   * clerk-android-api 1.1.7). Jar-based only: the version bump is applied to the compiled jar.
-   */
-  @Test
-  public void kotlinNewerMetadataVersionStillStubs() throws IOException {
-    if (!isValidForKotlin()) {
-      return;
-    }
-    if (!testingMode.equals(MODE_JAR_BASED)) {
-      return;
-    }
-
-    File outputDir = temp.newFolder();
-    AbsPath fullJar;
-    try (KotlinTestCompiler compiler = new KotlinTestCompiler()) {
-      compiler.init();
-      compiler.addSourceFileContents(
-          "A.kt",
-          "package com.example.buck",
-          "class A {",
-          "  inline fun greet(name: String, greeting: String = \"hi\"): String = greeting + name",
-          "  fun plain(x: Int): Int = x",
-          "}");
-      compiler.compile();
-      fullJar = AbsPath.of(outputDir.toPath()).resolve("output.jar");
-      compiler.getClasses().createJar(fullJar.getPath(), false);
-    }
-
-    AbsPath bumpedJar = AbsPath.of(temp.newFolder().toPath()).resolve("bumped.jar");
-    rewriteKotlinMetadataVersion(fullJar, bumpedJar, new int[] {2, 4, 0});
-
-    AbsPath stubJar = AbsPath.of(temp.newFolder().toPath()).resolve("stub.jar");
-    new StubJar(bumpedJar, false).writeTo(stubJar);
-
-    Set<String> inputMethodNames;
-    try (JarFile jar = new JarFile(bumpedJar.toFile())) {
-      inputMethodNames = methodNames(readClass(jar, "com/example/buck/A.class"));
-    }
-
-    try (JarFile jar = new JarFile(stubJar.toFile())) {
-      ClassNode stub = readClass(jar, "com/example/buck/A.class");
-      Set<String> stubMethodNames = methodNames(stub);
-
-      assertTrue("inline function kept", stubMethodNames.contains("greet"));
-      assertTrue(
-          "inline $default kept, so the lenient read provided inline info",
-          stubMethodNames.contains("greet$default"));
-      assertTrue("plain function kept", stubMethodNames.contains("plain"));
-      if (inputMethodNames.contains("greet$$forInline")) {
-        assertTrue("inline $$forInline kept", stubMethodNames.contains("greet$$forInline"));
-      }
-
-      assertEquals(
-          "metadata version preserved in stub",
-          Arrays.asList(2, 4, 0),
-          kotlinMetadataVersion(stub));
-    }
-  }
-
-  /**
-   * Metadata the lenient reader cannot parse must fail loudly, naming the kind and version, rather
-   * than degrading to empty inline info. A corrupt `d1` fails both the strict and lenient reads.
-   */
-  @Test
-  public void kotlinUnparsableMetadataFailsLoudly() {
-    AnnotationNode annotation = new AnnotationNode("Lkotlin/Metadata;");
-    annotation.values =
-        Arrays.asList(
-            "k",
-            1,
-            "mv",
-            Arrays.asList(2, 2, 0),
-            "d1",
-            Arrays.asList("bogus"),
-            "d2",
-            Arrays.asList(""),
-            "xs",
-            "",
-            "pn",
-            "",
-            "xi",
-            0);
-    try {
-      KotlinMetadataReader.readMetadata(annotation);
-      fail("expected unreadable Kotlin metadata to fail loudly");
-    } catch (IllegalArgumentException expected) {
-      assertTrue(
-          "message names kind and version: " + expected.getMessage(),
-          expected.getMessage().contains("kind=1") && expected.getMessage().contains("[2, 2, 0]"));
-      assertNotNull("lenient cause is wrapped", expected.getCause());
-    }
-  }
-
-  private static ClassNode readClass(JarFile jar, String entryName) throws IOException {
-    JarEntry entry = jar.getJarEntry(entryName);
-    assertNotNull(entry);
-    ClassNode node = new ClassNode(Opcodes.ASM9);
-    try (InputStream in = jar.getInputStream(entry)) {
-      new ClassReader(in).accept(node, ClassReader.SKIP_CODE);
-    }
-    return node;
-  }
-
-  private static Set<String> methodNames(ClassNode node) {
-    return node.methods.stream().map(method -> method.name).collect(Collectors.toSet());
-  }
-
-  private static List<Integer> kotlinMetadataVersion(ClassNode node) {
-    if (node.visibleAnnotations != null) {
-      for (AnnotationNode annotation : node.visibleAnnotations) {
-        if (!"Lkotlin/Metadata;".equals(annotation.desc) || annotation.values == null) {
-          continue;
-        }
-        for (int i = 0; i + 1 < annotation.values.size(); i += 2) {
-          if ("mv".equals(annotation.values.get(i))) {
-            @SuppressWarnings("unchecked")
-            List<Integer> mv = (List<Integer>) annotation.values.get(i + 1);
-            return mv;
-          }
-        }
-      }
-    }
-    return Collections.emptyList();
-  }
-
-  private static void rewriteKotlinMetadataVersion(
-      AbsPath inputJar, AbsPath outputJar, int[] version) throws IOException {
-    try (JarFile jar = new JarFile(inputJar.toFile());
-        JarOutputStream out =
-            new JarOutputStream(java.nio.file.Files.newOutputStream(outputJar.getPath()))) {
-      for (JarEntry entry : Collections.list(jar.entries())) {
-        out.putNextEntry(new JarEntry(entry.getName()));
-        if (!entry.isDirectory()) {
-          byte[] bytes;
-          try (InputStream in = jar.getInputStream(entry)) {
-            bytes = ByteStreams.toByteArray(in);
-          }
-          if (entry.getName().endsWith(".class")) {
-            bytes = withKotlinMetadataVersion(bytes, version);
-          }
-          out.write(bytes);
-        }
-        out.closeEntry();
-      }
-    }
-  }
-
-  private static byte[] withKotlinMetadataVersion(byte[] classBytes, int[] version) {
-    ClassNode node = new ClassNode(Opcodes.ASM9);
-    new ClassReader(classBytes).accept(node, 0);
-    boolean rewritten = false;
-    if (node.visibleAnnotations != null) {
-      for (AnnotationNode annotation : node.visibleAnnotations) {
-        if (!"Lkotlin/Metadata;".equals(annotation.desc) || annotation.values == null) {
-          continue;
-        }
-        for (int i = 0; i + 1 < annotation.values.size(); i += 2) {
-          if ("mv".equals(annotation.values.get(i))) {
-            List<Integer> mv = new ArrayList<>();
-            for (int v : version) {
-              mv.add(v);
-            }
-            annotation.values.set(i + 1, mv);
-            rewritten = true;
-          }
-        }
-      }
-    }
-    if (!rewritten) {
-      return classBytes;
-    }
-    ClassWriter writer = new ClassWriter(0);
-    node.accept(writer);
-    return writer.toByteArray();
-  }
-
-  private static boolean hasHiddenDeprecation(MethodNode method) {
-    if (hasHiddenDeprecation(method.visibleAnnotations)) {
-      return true;
-    }
-    return hasHiddenDeprecation(method.invisibleAnnotations);
-  }
-
-  private static boolean hasHiddenDeprecation(java.util.List<AnnotationNode> annotations) {
-    if (annotations == null) {
-      return false;
-    }
-    for (AnnotationNode annotation : annotations) {
-      if (!"Lkotlin/Deprecated;".equals(annotation.desc) || annotation.values == null) {
-        continue;
-      }
-      for (int i = 0; i + 1 < annotation.values.size(); i += 2) {
-        if (!"level".equals(annotation.values.get(i))) {
-          continue;
-        }
-        Object level = annotation.values.get(i + 1);
-        if (level instanceof String[]) {
-          String[] enumValue = (String[]) level;
-          if (enumValue.length == 2
-              && "Lkotlin/DeprecationLevel;".equals(enumValue[0])
-              && "HIDDEN".equals(enumValue[1])) {
-            return true;
-          }
-        }
-      }
-    }
-    return false;
   }
 
   @Test
@@ -1651,7 +1250,7 @@ public class StubJarTest {
             "",
             "  // compiled from: A.kt",
             "",
-            metadataForKotlinVersion(metadata22, metadata20),
+            isKotlin22() ? metadata22 : metadata20,
             "",
             "  // access flags 0x1",
             "  public <init>()V",
@@ -1786,7 +1385,7 @@ public class StubJarTest {
             "",
             "  // compiled from: B.kt",
             "",
-            metadataForKotlinVersion(metadata22, metadata20),
+            isKotlin22() ? metadata22 : metadata20,
             "",
             "  // access flags 0x19",
             "  public final static getString(Lcom/example/buck/A;)Ljava/lang/String;",
@@ -1843,9 +1442,9 @@ public class StubJarTest {
             "",
             "  OUTERCLASS com/example/buck/BKt getString (Lcom/example/buck/A;)Ljava/lang/String;",
             "",
-            metadataForKotlinVersion(
-                "  @Lkotlin/Metadata;(mv={2, 2, 0}, k=3, xi=176)",
-                "  @Lkotlin/Metadata;(mv={2, 0, 0}, k=3, xi=176)"),
+            isKotlin22()
+                ? "  @Lkotlin/Metadata;(mv={2, 2, 0}, k=3, xi=176)"
+                : "  @Lkotlin/Metadata;(mv={2, 0, 0}, k=3, xi=176)",
             "  // access flags 0x19",
             "  public final static INNERCLASS com/example/buck/BKt$getString$1 null null",
             "",
@@ -1974,7 +1573,7 @@ public class StubJarTest {
             "",
             "  // compiled from: A.kt",
             "",
-            metadataForKotlinVersion(metadata22, metadata20),
+            isKotlin22() ? metadata22 : metadata20,
             "",
             "  // access flags 0x1",
             "  public <init>()V",
@@ -2083,9 +1682,9 @@ public class StubJarTest {
             "  OUTERCLASS com/example/buck/A someMethod$default"
                 + " (Lcom/example/buck/A;Lkotlin/jvm/functions/Function1;ILjava/lang/Object;)V",
             "",
-            metadataForKotlinVersion(
-                "  @Lkotlin/Metadata;(mv={2, 2, 0}, k=3, xi=176)",
-                "  @Lkotlin/Metadata;(mv={2, 0, 0}, k=3, xi=176)"),
+            isKotlin22()
+                ? "  @Lkotlin/Metadata;(mv={2, 2, 0}, k=3, xi=176)"
+                : "  @Lkotlin/Metadata;(mv={2, 0, 0}, k=3, xi=176)",
             "  // access flags 0x19",
             "  public final static INNERCLASS com/example/buck/A$someMethod$1 null null",
             "",
@@ -2233,7 +1832,7 @@ public class StubJarTest {
             "",
             "  // compiled from: B.kt",
             "",
-            metadataForKotlinVersion(metadata22, metadata20),
+            isKotlin22() ? metadata22 : metadata20,
             "",
             "  // access flags 0x19",
             "  public final static useSomeInterface(Lcom/example/buck/A;)V",
@@ -2285,7 +1884,7 @@ public class StubJarTest {
             "",
             "  OUTERCLASS com/example/buck/BKt useSomeInterface (Lcom/example/buck/A;)V",
             "",
-            metadataForKotlinVersion(innerMetadata21, innerMetadata20),
+            isKotlin22() ? innerMetadata21 : innerMetadata20,
             "  // access flags 0x609",
             "  public static abstract INNERCLASS com/example/buck/A$SomeInterface"
                 + " com/example/buck/A SomeInterface",
@@ -2417,7 +2016,7 @@ public class StubJarTest {
             "",
             "  // compiled from: B.kt",
             "",
-            metadataForKotlinVersion(metadata22, metadata20),
+            isKotlin22() ? metadata22 : metadata20,
             "  // access flags 0x9",
             "  public static INNERCLASS com/example/buck/B$C com/example/buck/B C",
             "",
@@ -2432,7 +2031,7 @@ public class StubJarTest {
             "",
             "  // compiled from: B.kt",
             "",
-            metadataForKotlinVersion(innerMetadata21, innerMetadata20),
+            isKotlin22() ? innerMetadata21 : innerMetadata20,
             "  // access flags 0x9",
             "  public static INNERCLASS com/example/buck/B$C com/example/buck/B C",
             "",
@@ -2489,7 +2088,7 @@ public class StubJarTest {
             "",
             "  OUTERCLASS com/example/buck/B$C useSomeInterface ()V",
             "",
-            metadataForKotlinVersion(innerInnerMetadata21, innerInnerMetadata20),
+            isKotlin22() ? innerInnerMetadata21 : innerInnerMetadata20,
             "  // access flags 0x609",
             "  public static abstract INNERCLASS com/example/buck/A$SomeInterface"
                 + " com/example/buck/A SomeInterface",
@@ -2610,7 +2209,7 @@ public class StubJarTest {
             "",
             "  // compiled from: B.kt",
             "",
-            metadataForKotlinVersion(metadata22, metadata20),
+            isKotlin22() ? metadata22 : metadata20,
             "",
             "  // access flags 0x19",
             "  // signature"
@@ -2678,9 +2277,9 @@ public class StubJarTest {
             "  // compiled from: B.kt",
             "  OUTERCLASS com/example/buck/BKt null",
             "",
-            metadataForKotlinVersion(
-                "  @Lkotlin/Metadata;(mv={2, 2, 0}, k=3, xi=176)",
-                "  @Lkotlin/Metadata;(mv={2, 0, 0}, k=3, xi=176)"),
+            isKotlin22()
+                ? "  @Lkotlin/Metadata;(mv={2, 2, 0}, k=3, xi=176)"
+                : "  @Lkotlin/Metadata;(mv={2, 0, 0}, k=3, xi=176)",
             "  // access flags 0x19",
             "  public final static INNERCLASS com/example/buck/BKt$sam$i$java_lang_Runnable$0 null"
                 + " null",
@@ -4654,22 +4253,29 @@ public class StubJarTest {
       return;
     }
 
-    // Members of a private nested class are unreachable however declared, so class-abi keeps
-    // only the shell: getCount/foo drop from bytecode and from @kotlin.Metadata, the default
-    // constructor stays.
     tester = new Tester(Language.KOTLIN);
     String innerMetadata21 =
-        "  @Lkotlin/Metadata;(mv={2, 2, 0}, k=1, xi=48, d1={\"\\u0000\\u000c\\n"
+        "  @Lkotlin/Metadata;(mv={2, 2, 0}, k=1, xi=48, d1={\"\\u0000\\u0018\\n"
             + "\\u0002\\u0018\\u0002\\n"
             + "\\u0002\\u0010\\u0000\\n"
-            + "\\u0002\\u0008\\u0002\\u0008\\u0002\\u0018\\u00002\\u00020\\u0001B\\u0007\\u00a2\\u0006\\u0004\\u0008\\u0002\\u0010\\u0003\"},"
-            + " d2={\"Lcom/example/buck/A$B;\", \"\", \"<init>\", \"()V\"})";
+            + "\\u0002\\u0008\\u0003\\n"
+            + "\\u0002\\u0010\\u0008\\n"
+            + "\\u0002\\u0008\\u0003\\n"
+            + "\\u0002\\u0010\\u0002\\u0008\\u0002\\u0018\\u00002\\u00020\\u0001B\\u0007\\u00a2\\u0006\\u0004\\u0008\\u0002\\u0010\\u0003J\\u0006\\u0010\\u0008\\u001a\\u00020\\u0009R\\u0014\\u0010\\u0004\\u001a\\u00020\\u0005X\\u0086D\\u00a2\\u0006\\u0008\\n"
+            + "\\u0000\\u001a\\u0004\\u0008\\u0006\\u0010\\u0007\"},"
+            + " d2={\"Lcom/example/buck/A$B;\", \"\", \"<init>\", \"()V\", \"count\", \"\","
+            + " \"getCount\", \"()I\", \"foo\", \"\"})";
     String innerMetadata20 =
-        "  @Lkotlin/Metadata;(mv={2, 0, 0}, k=1, xi=48, d1={\"\\u0000\\u000c\\n"
+        "  @Lkotlin/Metadata;(mv={2, 0, 0}, k=1, xi=48, d1={\"\\u0000\\u0018\\n"
             + "\\u0002\\u0018\\u0002\\n"
             + "\\u0002\\u0010\\u0000\\n"
-            + "\\u0002\\u0008\\u0002\\u0008\\u0002\\u0018\\u00002\\u00020\\u0001B\\u0007\\u00a2\\u0006\\u0004\\u0008\\u0002\\u0010\\u0003\"},"
-            + " d2={\"Lcom/example/buck/A$B;\", \"\", \"<init>\", \"()V\"})";
+            + "\\u0002\\u0008\\u0003\\n"
+            + "\\u0002\\u0010\\u0008\\n"
+            + "\\u0002\\u0008\\u0003\\n"
+            + "\\u0002\\u0010\\u0002\\u0008\\u0002\\u0018\\u00002\\u00020\\u0001B\\u0007\\u00a2\\u0006\\u0004\\u0008\\u0002\\u0010\\u0003J\\u0006\\u0010\\u0008\\u001a\\u00020\\u0009R\\u0014\\u0010\\u0004\\u001a\\u00020\\u0005X\\u0086D\\u00a2\\u0006\\u0008\\n"
+            + "\\u0000\\u001a\\u0004\\u0008\\u0006\\u0010\\u0007\"},"
+            + " d2={\"Lcom/example/buck/A$B;\", \"\", \"<init>\", \"()V\", \"count\", \"\","
+            + " \"getCount\", \"()I\", \"foo\", \"\"})";
     String metadata22 =
         "  @Lkotlin/Metadata;(mv={2, 2, 0}, k=1, xi=48, d1={\"\\u0000\\u000c\\n"
             + "\\u0002\\u0018\\u0002\\n"
@@ -4702,12 +4308,18 @@ public class StubJarTest {
             "",
             "  // compiled from: A.kt",
             "",
-            metadataForKotlinVersion(innerMetadata21, innerMetadata20),
+            isKotlin22() ? innerMetadata21 : innerMetadata20,
             "  // access flags 0x1A",
             "  private final static INNERCLASS com/example/buck/A$B com/example/buck/A B",
             "",
             "  // access flags 0x1",
             "  public <init>()V",
+            "",
+            "  // access flags 0x11",
+            "  public final getCount()I",
+            "",
+            "  // access flags 0x11",
+            "  public final foo()V",
             "}")
         .addExpectedStub(
             "com/example/buck/A",
@@ -4717,7 +4329,7 @@ public class StubJarTest {
             "",
             "  // compiled from: A.kt",
             "",
-            metadataForKotlinVersion(metadata22, metadata20),
+            isKotlin22() ? metadata22 : metadata20,
             "  // access flags 0x1A",
             "  private final static INNERCLASS com/example/buck/A$B com/example/buck/A B",
             "",
@@ -6087,7 +5699,7 @@ public class StubJarTest {
             "",
             "  // compiled from: A.kt",
             "",
-            metadataForKotlinVersion(metadata22, metadata20),
+            isKotlin22() ? metadata22 : metadata20,
             "",
             "  // access flags 0x1",
             "  public <init>()V",
@@ -6199,7 +5811,7 @@ public class StubJarTest {
             "",
             "  // compiled from: A.kt",
             "",
-            metadataForKotlinVersion(metadata22, metadata20),
+            isKotlin22() ? metadata22 : metadata20,
             "",
             "  // access flags 0x1",
             "  public <init>()V",
@@ -7950,7 +7562,7 @@ public class StubJarTest {
             "",
             "  // compiled from: Obj.kt",
             "",
-            metadataForKotlinVersion(metadata22, metadata20),
+            isKotlin22() ? metadata22 : metadata20,
             "",
             "  // access flags 0x19",
             "  public final static Lcom/example/buck/Obj; INSTANCE",
@@ -8023,7 +7635,7 @@ public class StubJarTest {
             "",
             "  // compiled from: A.kt",
             "",
-            metadataForKotlinVersion(metadata22, metadata20),
+            isKotlin22() ? metadata22 : metadata20,
             "",
             "  // access flags 0x1",
             "  public <init>()V",
@@ -8046,324 +7658,6 @@ public class StubJarTest {
             "    @Lorg/jetbrains/annotations/NotNull;() // invisible, parameter 0",
             "}")
         .createAndCheckStubJar();
-  }
-
-  @Test
-  public void kotlinStripsMembersOfPrivateNestedClassButKeepsShell() throws IOException {
-    if (!isValidForKotlin()) {
-      return;
-    }
-    if (!testingMode.equals(MODE_JAR_BASED)) {
-      // Class-ABI stubbing of private nested members only applies to jar-based stubs.
-      return;
-    }
-
-    // A public member of a private nested class (e.g. `private companion object { val x ... }`)
-    // is unreachable: Kotlin sees the metadata-private owner, Java sees a non-public nested
-    // class. Class-abi keeps the class shells (InnerClasses/constant-pool/@Metadata references
-    // require the files) but drops all of their members.
-    File outputDir = temp.newFolder();
-    AbsPath fullJar;
-    try (KotlinTestCompiler compiler = new KotlinTestCompiler()) {
-      compiler.init();
-      compiler.addSourceFileContents(
-          "A.kt",
-          "package com.example.buck",
-          "open class A {",
-          "  private companion object {",
-          "    val helper: String = \"x\"",
-          "    fun compute(): Int = 42",
-          "  }",
-          "  private class Helper {",
-          "    fun run(): String = \"y\"",
-          "  }",
-          "  fun publicMethod(): String = \"hello\"",
-          "}");
-      compiler.compile();
-      fullJar = AbsPath.of(outputDir.toPath()).resolve("output.jar");
-      compiler.getClasses().createJar(fullJar.getPath(), false);
-    }
-
-    AbsPath stubJar = AbsPath.of(temp.newFolder().toPath()).resolve("stub.jar");
-    new StubJar(fullJar, false).writeTo(stubJar);
-
-    try (JarFile jar = new JarFile(stubJar.toFile())) {
-      assertStrippedToConstructor(jar, "com/example/buck/A$Companion.class");
-      assertStrippedToConstructor(jar, "com/example/buck/A$Helper.class");
-
-      JarEntry outer = jar.getJarEntry("com/example/buck/A.class");
-      assertNotNull(outer);
-      ClassNode outerStub = new ClassNode(Opcodes.ASM9);
-      new ClassReader(jar.getInputStream(outer)).accept(outerStub, ClassReader.SKIP_CODE);
-      assertTrue(
-          "public member of public class kept",
-          outerStub.methods.stream().anyMatch(m -> m.name.equals("publicMethod")));
-    }
-  }
-
-  private static void assertStrippedToConstructor(JarFile jar, String entryName)
-      throws IOException {
-    JarEntry entry = jar.getJarEntry(entryName);
-    assertNotNull(entryName + " shell kept", entry);
-    ClassNode stub = new ClassNode(Opcodes.ASM9);
-    new ClassReader(jar.getInputStream(entry)).accept(stub, ClassReader.SKIP_CODE);
-    assertTrue(entryName + " has no fields", stub.fields.isEmpty());
-    assertTrue(
-        entryName + " keeps only constructors",
-        !stub.methods.isEmpty() && stub.methods.stream().allMatch(m -> m.name.equals("<init>")));
-  }
-
-  @Test
-  public void kotlinKeepsJvmStaticMembersOfPrivateCompanion() throws IOException {
-    if (!isValidForKotlin() || !testingMode.equals(MODE_JAR_BASED)) {
-      return;
-    }
-
-    AbsPath stubJar =
-        compileKotlinToStubJar(
-            "A.kt",
-            "package com.example.buck",
-            "open class A {",
-            "  private companion object {",
-            "    @JvmStatic fun probe(): Boolean = true",
-            "    @JvmStatic val staticProp: String = \"s\"",
-            "    val dropped: String = \"x\"",
-            "  }",
-            "}");
-    try (JarFile jar = new JarFile(stubJar.toFile())) {
-      ClassNode companion = readClass(jar, "com/example/buck/A$Companion.class");
-      Set<String> companionMethods = methodNames(companion);
-      assertTrue(
-          "companion keeps @JvmStatic member: " + companionMethods,
-          companionMethods.contains("probe"));
-      assertTrue(
-          "companion keeps @JvmStatic property: " + companionMethods,
-          companionMethods.contains("getStaticProp")
-              && companionMethods.contains("getStaticProp$annotations"));
-      assertTrue(
-          "companion drops plain member: " + companionMethods,
-          companionMethods.stream().noneMatch(name -> name.equals("getDropped")));
-
-      ClassNode outer = readClass(jar, "com/example/buck/A.class");
-      Set<String> outerMethods = methodNames(outer);
-      assertTrue(
-          "outer keeps @JvmStatic copies: " + outerMethods,
-          outerMethods.contains("probe") && outerMethods.contains("getStaticProp"));
-    }
-  }
-
-  @Test
-  public void kotlinKeepsJvmFieldMembersOfPrivateCompanion() throws IOException {
-    if (!isValidForKotlin() || !testingMode.equals(MODE_JAR_BASED)) {
-      return;
-    }
-
-    AbsPath stubJar =
-        compileKotlinToStubJar(
-            "A.kt",
-            "package com.example.buck",
-            "open class A {",
-            "  private companion object {",
-            "    @JvmField val flag: String = \"f\"",
-            "    val dropped: String = \"x\"",
-            "  }",
-            "}");
-    try (JarFile jar = new JarFile(stubJar.toFile())) {
-      ClassNode companion = readClass(jar, "com/example/buck/A$Companion.class");
-      assertTrue("companion drops unannotated fields", companion.fields.isEmpty());
-      Set<String> companionMethods = methodNames(companion);
-      assertTrue(
-          "companion drops plain member: " + companionMethods,
-          companionMethods.stream().noneMatch(name -> name.equals("getDropped")));
-
-      ClassNode outer = readClass(jar, "com/example/buck/A.class");
-      Set<String> outerFields =
-          outer.fields.stream().map(field -> field.name).collect(Collectors.toSet());
-      assertTrue("outer keeps @JvmField static: " + outerFields, outerFields.contains("flag"));
-    }
-  }
-
-  @Test
-  public void kotlinDropsUnrelatedOverloadOfJvmStaticAccessor() throws IOException {
-    if (!isValidForKotlin() || !testingMode.equals(MODE_JAR_BASED)) {
-      return;
-    }
-
-    AbsPath stubJar =
-        compileKotlinToStubJar(
-            "A.kt",
-            "package com.example.buck",
-            "open class A {",
-            "  private companion object {",
-            "    @JvmStatic val staticProp: String = \"s\"",
-            "    fun getStaticProp(x: Int): Int = x",
-            "  }",
-            "}");
-    try (JarFile jar = new JarFile(stubJar.toFile())) {
-      ClassNode companion = readClass(jar, "com/example/buck/A$Companion.class");
-      Set<String> companionMethods = methodNames(companion);
-      assertTrue(
-          "companion keeps @JvmStatic accessor: " + companionMethods,
-          companionMethods.contains("getStaticProp")
-              && companionMethods.contains("getStaticProp$annotations"));
-      assertTrue(
-          "companion drops unrelated overload: " + companionMethods,
-          companion.methods.stream()
-              .filter(m -> m.name.equals("getStaticProp"))
-              .allMatch(m -> m.desc.equals("()Ljava/lang/String;")));
-    }
-  }
-
-  @Test
-  public void kotlinKeepsMembersOfPrivateValueEnumAndAnnotationClasses() throws IOException {
-    if (!isValidForKotlin() || !testingMode.equals(MODE_JAR_BASED)) {
-      return;
-    }
-
-    AbsPath stubJar =
-        compileKotlinToStubJar(
-            "A.kt",
-            "package com.example.buck",
-            "open class A {",
-            "  @JvmInline private value class State(val x: Int)",
-            "  private enum class Mode { ON, OFF }",
-            "  private annotation class Marker(val x: String)",
-            "}");
-    try (JarFile jar = new JarFile(stubJar.toFile())) {
-      assertNotStrippedToConstructor(jar, "com/example/buck/A$State.class");
-      assertNotStrippedToConstructor(jar, "com/example/buck/A$Mode.class");
-      assertNotStrippedToConstructor(jar, "com/example/buck/A$Marker.class");
-    }
-  }
-
-  private static void assertNotStrippedToConstructor(JarFile jar, String entryName)
-      throws IOException {
-    ClassNode stub = readClass(jar, entryName);
-    assertTrue(
-        entryName + " keeps members",
-        !stub.methods.isEmpty()
-            && stub.methods.stream().anyMatch(method -> !method.name.equals("<init>")));
-  }
-
-  @Test
-  public void kotlinMetadataOmitsStrippedMembersOfPrivateNestedClass() throws IOException {
-    if (!isValidForKotlin() || !testingMode.equals(MODE_JAR_BASED)) {
-      return;
-    }
-
-    AbsPath stubJar =
-        compileKotlinToStubJar(
-            "A.kt",
-            "package com.example.buck",
-            "open class A {",
-            "  private companion object {",
-            "    @JvmStatic fun probe(): Boolean = true",
-            "    private @JvmStatic fun hidden(): Boolean = true",
-            "    @JvmField val flag: String = \"f\"",
-            "    const val TAG: String = \"t\"",
-            "    private const val HIDDEN_CONST: String = \"h\"",
-            "    val dropped: String = \"x\"",
-            "  }",
-            "  private data class Holder(val kept: String)",
-            "  fun publicMethod(): String = \"hello\"",
-            "}");
-    try (JarFile jar = new JarFile(stubJar.toFile())) {
-      ClassNode companion = readClass(jar, "com/example/buck/A$Companion.class");
-      assertEquals(
-          "companion metadata keeps @JvmStatic function, drops private one",
-          ImmutableSortedSet.of("probe"),
-          ImmutableSortedSet.copyOf(
-              KotlinMetadataReader.getFunctionNames(kotlinMetadataOf(companion))));
-      assertEquals(
-          "companion metadata keeps @JvmField/const, drops plain and private ones",
-          ImmutableSortedSet.of("TAG", "flag"),
-          ImmutableSortedSet.copyOf(
-              KotlinMetadataReader.getPropertyNames(kotlinMetadataOf(companion))));
-
-      ClassNode holder = readClass(jar, "com/example/buck/A$Holder.class");
-      assertTrue(
-          "holder metadata drops functions",
-          KotlinMetadataReader.getFunctionNames(kotlinMetadataOf(holder)).isEmpty());
-      assertTrue(
-          "holder metadata drops properties",
-          KotlinMetadataReader.getPropertyNames(kotlinMetadataOf(holder)).isEmpty());
-
-      ClassNode outer = readClass(jar, "com/example/buck/A.class");
-      assertTrue(
-          "outer metadata untouched",
-          KotlinMetadataReader.getFunctionNames(kotlinMetadataOf(outer)).contains("publicMethod"));
-    }
-  }
-
-  private static KotlinMetadataReader.ParsedMetadata kotlinMetadataOf(ClassNode node) {
-    return KotlinMetadataReader.readMetadata(kotlinMetadataAnnotation(node));
-  }
-
-  private static AnnotationNode kotlinMetadataAnnotation(ClassNode node) {
-    assertNotNull(node.visibleAnnotations);
-    for (AnnotationNode annotation : node.visibleAnnotations) {
-      if ("Lkotlin/Metadata;".equals(annotation.desc)) {
-        return annotation;
-      }
-    }
-    fail("no @kotlin.Metadata on " + node.name);
-    throw new AssertionError("unreachable");
-  }
-
-  @Test
-  public void kotlinMetadataBytesUnchangedWhenNothingStripped() throws IOException {
-    if (!isValidForKotlin() || !testingMode.equals(MODE_JAR_BASED)) {
-      return;
-    }
-
-    File outputDir = temp.newFolder();
-    AbsPath fullJar;
-    try (KotlinTestCompiler compiler = new KotlinTestCompiler()) {
-      compiler.init();
-      compiler.addSourceFileContents(
-          "A.kt",
-          "package com.example.buck",
-          "open class A {",
-          "  private companion object {",
-          "    @JvmStatic fun probe(): Boolean = true",
-          "  }",
-          "}");
-      compiler.compile();
-      fullJar = AbsPath.of(outputDir.toPath()).resolve("output.jar");
-      compiler.getClasses().createJar(fullJar.getPath(), false);
-    }
-
-    AbsPath stubJar = AbsPath.of(temp.newFolder().toPath()).resolve("stub.jar");
-    new StubJar(fullJar, false).writeTo(stubJar);
-
-    List<Object> inputValues;
-    try (JarFile jar = new JarFile(fullJar.toFile())) {
-      inputValues =
-          kotlinMetadataAnnotation(readClass(jar, "com/example/buck/A$Companion.class")).values;
-    }
-    try (JarFile jar = new JarFile(stubJar.toFile())) {
-      assertEquals(
-          "metadata bytes preserved when no member strips",
-          inputValues,
-          kotlinMetadataAnnotation(readClass(jar, "com/example/buck/A$Companion.class")).values);
-    }
-  }
-
-  private AbsPath compileKotlinToStubJar(String fileName, String... sourceLines)
-      throws IOException {
-    File outputDir = temp.newFolder();
-    AbsPath fullJar;
-    try (KotlinTestCompiler compiler = new KotlinTestCompiler()) {
-      compiler.init();
-      compiler.addSourceFileContents(fileName, sourceLines);
-      compiler.compile();
-      fullJar = AbsPath.of(outputDir.toPath()).resolve("output.jar");
-      compiler.getClasses().createJar(fullJar.getPath(), false);
-    }
-
-    AbsPath stubJar = AbsPath.of(temp.newFolder().toPath()).resolve("stub.jar");
-    new StubJar(fullJar, false).writeTo(stubJar);
-    return stubJar;
   }
 
   @Test
@@ -8413,150 +7707,6 @@ public class StubJarTest {
             "A.kt", "package com.example.buck", "open class A", "open class B", "private class C")
         .addExpectedStub("com/example/buck/A")
         .addExpectedStub("com/example/buck/B")
-        .createAndCheckStubJar();
-  }
-
-  @Test
-  public void kotlinKeepsFilePrivateInterfaceImplementedByPublicEnum() throws IOException {
-    if (!isValidForKotlin()) {
-      return;
-    }
-
-    if (testingMode.equals(MODE_SOURCE_BASED)) {
-      return;
-    }
-
-    // A file-private supertype that a retained class still references must be kept, otherwise
-    // consumers fail with "cannot access ... which is a supertype of ...".
-    tester = new Tester(Language.KOTLIN);
-    tester
-        .setSourceFile(
-            "A.kt",
-            "package com.example.buck",
-            "@Suppress(\"EXPOSED_SUPER_INTERFACE\")",
-            "public enum class RegexLike : FlagEnum<RegexLike> {",
-            "  A;",
-            "  override fun flagValue(): Int = ordinal",
-            "}",
-            "private interface FlagEnum<T> {",
-            "  fun flagValue(): Int",
-            "}")
-        .addExpectedStub("com/example/buck/RegexLike")
-        .addExpectedStub("com/example/buck/FlagEnum")
-        .createAndCheckStubJar();
-  }
-
-  @Test
-  public void kotlinKeepsTransitivelyReferencedFilePrivateClasses() throws IOException {
-    if (!isValidForKotlin()) {
-      return;
-    }
-
-    if (testingMode.equals(MODE_SOURCE_BASED)) {
-      return;
-    }
-
-    tester = new Tester(Language.KOTLIN);
-    tester
-        .setSourceFile(
-            "A.kt",
-            "package com.example.buck",
-            "@Suppress(\"EXPOSED_SUPER_CLASS\")",
-            "open class A : Mid()",
-            "private open class Mid : Base {",
-            "  override fun name(): String = \"mid\"",
-            "}",
-            "private interface Base {",
-            "  fun name(): String",
-            "}")
-        .addExpectedStub("com/example/buck/A")
-        .addExpectedStub("com/example/buck/Mid")
-        .addExpectedStub("com/example/buck/Base")
-        .createAndCheckStubJar();
-  }
-
-  @Test
-  public void kotlinExcludesFilePrivateClassesReferencedOnlyByExcludedOnes() throws IOException {
-    if (!isValidForKotlin()) {
-      return;
-    }
-
-    if (testingMode.equals(MODE_SOURCE_BASED)) {
-      return;
-    }
-
-    // UnusedImpl references UnusedBase, but nothing written references either of them,
-    // so both stay excluded.
-    tester = new Tester(Language.KOTLIN);
-    tester
-        .setSourceFile(
-            "A.kt",
-            "package com.example.buck",
-            "open class A {",
-            "  fun publicMethod(): String = \"hello\"",
-            "}",
-            "private interface UnusedBase {",
-            "  fun unused(): Int",
-            "}",
-            "private class UnusedImpl : UnusedBase {",
-            "  override fun unused(): Int = 1",
-            "}")
-        .addExpectedStub("com/example/buck/A")
-        .createAndCheckStubJar();
-  }
-
-  @Test
-  public void kotlinExcludesNestedClassOfUnreferencedFilePrivateInlineScope() throws IOException {
-    if (!isValidForKotlin()) {
-      return;
-    }
-
-    if (testingMode.equals(MODE_SOURCE_BASED)) {
-      return;
-    }
-
-    // The lambda nested in UnusedHolder.provide is captured by an inline scope, but its
-    // outer is a file-private class that nothing references, so both must be dropped.
-    tester = new Tester(Language.KOTLIN);
-    tester
-        .setSourceFile(
-            "A.kt",
-            "package com.example.buck",
-            "open class A {",
-            "  fun publicMethod(): String = \"hello\"",
-            "}",
-            "private class UnusedHolder {",
-            "  inline fun provide(): () -> Unit = { println(\"unused\") }",
-            "}")
-        .addExpectedStub("com/example/buck/A")
-        .createAndCheckStubJar();
-  }
-
-  @Test
-  public void kotlinKeepsNestedClassOfReferencedFilePrivateInlineScope() throws IOException {
-    if (!isValidForKotlin()) {
-      return;
-    }
-
-    if (testingMode.equals(MODE_SOURCE_BASED)) {
-      return;
-    }
-
-    // UsedHolder is kept via A's supertype edge, so its inline scope stays live and the
-    // nested lambda must be kept with it.
-    tester = new Tester(Language.KOTLIN);
-    tester
-        .setSourceFile(
-            "A.kt",
-            "package com.example.buck",
-            "@Suppress(\"EXPOSED_SUPER_CLASS\")",
-            "open class A : UsedHolder()",
-            "private open class UsedHolder {",
-            "  inline fun provide(): () -> Unit = { println(\"used\") }",
-            "}")
-        .addExpectedStub("com/example/buck/A")
-        .addExpectedStub("com/example/buck/UsedHolder")
-        .addExpectedStub("com/example/buck/UsedHolder$provide$1")
         .createAndCheckStubJar();
   }
 
@@ -8678,6 +7828,7 @@ public class StubJarTest {
 
     private final List<String> expectedStubDirectory = new ArrayList<>();
     private final List<String> actualStubDirectory = new ArrayList<>();
+    private final List<String> actualFullDirectory = new ArrayList<>();
     private final Map<String, List<String>> expectedFullAbis = new HashMap<>();
     private final Map<String, List<String>> actualFullAbis = new HashMap<>();
     private final Map<String, List<String>> expectedStubs = new HashMap<>();
@@ -8709,6 +7860,7 @@ public class StubJarTest {
 
     private void resetActuals() {
       actualStubDirectory.clear();
+      actualFullDirectory.clear();
       actualFullAbis.clear();
       actualStubs.clear();
       stubJarPath = null;
@@ -9058,6 +8210,70 @@ public class StubJarTest {
       assertNotEquals(originalHash, Files.asByteSource(stubJarPath.toFile()).hash(Hashing.sha1()));
     }
 
+    @SuppressWarnings("unused")
+    public Tester dumpTestCode(boolean includeFullAbi) throws IOException {
+      if (includeFullAbi) {
+        compileFullJar();
+        dumpFullJarAbi();
+      }
+      createStubJar();
+      dumpStubJar();
+
+      String indent = "            ";
+      StringBuilder result = new StringBuilder();
+      result.append("Test lines:\n");
+      result.append("    tester\n");
+      result.append("        .setSourceFile(\n");
+      result.append(indent);
+      result.append('"');
+      result.append(sourceFileName);
+      for (String sourceLine : sourceFileContents.split("\n")) {
+        result.append("\",\n");
+        result.append(indent);
+        result.append('"');
+        result.append(sourceLine.replace("\"", "\\\""));
+      }
+      result.append("\")\n");
+      for (String fileName : actualFullDirectory) {
+        if (fileName.endsWith("/") || fileName.equals(JarFile.MANIFEST_NAME)) {
+          continue;
+        }
+        if (includeFullAbi) {
+          result.append("        .addExpectedFullAbi(\n");
+          result.append(indent);
+          result.append('"');
+          result.append(fileName, 0, fileName.length() - ".class".length());
+
+          for (String abiLine : actualFullAbis.get(fileName)) {
+            result.append("\",\n");
+            result.append(indent);
+            result.append('"');
+            result.append(abiLine.replace("\"", "\\\""));
+          }
+          result.append("\")\n");
+        }
+
+        if (actualStubs.containsKey(fileName)) {
+          result.append("        .addExpectedStub(\n");
+          result.append(indent);
+          result.append('"');
+          result.append(fileName, 0, fileName.length() - ".class".length());
+
+          for (String stubLine : actualStubs.get(fileName)) {
+            result.append("\",\n");
+            result.append(indent);
+            result.append('"');
+            result.append(stubLine.replace("\"", "\\\""));
+          }
+          result.append("\")\n");
+        }
+      }
+      result.append("        .createAndCheckStubJar();\n");
+
+      fail(result.toString());
+      return this;
+    }
+
     protected void dumpStubJar() throws IOException {
       try (JarFile file = new JarFile(stubJarPath.toFile())) {
         Iterable<JarEntry> entries = file.stream()::iterator;
@@ -9083,6 +8299,7 @@ public class StubJarTest {
           if (JarFile.MANIFEST_NAME.equals(name)) {
             continue;
           }
+          actualFullDirectory.add(name);
           actualFullAbis.put(
               name,
               new JarDumper()

@@ -81,7 +81,6 @@ _MacOSBundleDestinationPaths = AppleBundleDestinationPaths(
     bundleroot = macOS_content_path,
     loginitems = paths.join(macOS_content_path, "Library/LoginItems"),
     launchagents = paths.join(macOS_content_path, "Library/LaunchAgents"),
-    extensionkit_extensions = paths.join(macOS_content_path, "Extensions"),
 )
 
 _MacOSFrameworkBundleDestinationPaths = AppleBundleDestinationPaths(
@@ -127,34 +126,34 @@ def bundle_relative_path_for_destination(destination: AppleBundleDestination, sd
     else:
         bundle_destinations = _get_apple_bundle_destinations_for_sdk_name(sdk_name)
 
-    if destination == AppleBundleDestination("resources"):
+    if destination.value == "resources":
         return bundle_destinations.resources
-    elif destination == AppleBundleDestination("frameworks"):
+    elif destination.value == "frameworks":
         return bundle_destinations.frameworks
-    elif destination == AppleBundleDestination("executables"):
+    elif destination.value == "executables":
         return bundle_destinations.executables
-    elif destination == AppleBundleDestination("extensionkit_extensions"):
+    elif destination.value == "extensionkit_extensions":
         return bundle_destinations.extensionkit_extensions
-    elif destination == AppleBundleDestination("plugins"):
+    elif destination.value == "plugins":
         return bundle_destinations.plugins
-    elif destination == AppleBundleDestination("xpcservices"):
+    elif destination.value == "xpcservices":
         return bundle_destinations.xpcservices
-    elif destination == AppleBundleDestination("metadata"):
+    elif destination.value == "metadata":
         return bundle_destinations.metadata
-    elif destination == AppleBundleDestination("watchapp"):
+    elif destination.value == "watchapp":
         return bundle_destinations.watchapp
-    elif destination == AppleBundleDestination("headers"):
+    elif destination.value == "headers":
         return bundle_destinations.headers
-    elif destination == AppleBundleDestination("modules"):
+    elif destination.value == "modules":
         return bundle_destinations.modules
-    elif destination == AppleBundleDestination("quicklook"):
+    elif destination.value == "quicklook":
         return bundle_destinations.quicklook
-    elif destination == AppleBundleDestination("bundleroot"):
+    elif destination.value == "bundleroot":
         return bundle_destinations.bundleroot
-    elif destination == AppleBundleDestination("loginitems"):
+    elif destination.value == "loginitems":
         return bundle_destinations.loginitems
-    elif destination == AppleBundleDestination("launchagents"):
+    elif destination.value == "launchagents":
         return bundle_destinations.launchagents
-    elif destination == AppleBundleDestination("appclips"):
+    elif destination.value == "appclips":
         return bundle_destinations.appclips
     fail("Unsupported Apple bundle destination {}".format(destination))

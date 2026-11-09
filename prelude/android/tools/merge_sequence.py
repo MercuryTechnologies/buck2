@@ -320,15 +320,11 @@ class FinalLibGraph:
         )
 
         name_counters = {}
-        used_names: set[str] = set()
         final_lib_names: dict[FinalLibKey, str] = {}
         for key in sorted_final_lib_keys:
             dep_data = self.graph[key]
             if dep_data.is_excluded:
-                # The name of an excluded library is its target label, which no soname equals.
-                assert dep_data.base_library_name not in used_names
                 final_lib_names[key] = dep_data.base_library_name
-                used_names.add(dep_data.base_library_name)
             else:
                 lib_name, ext = os.path.splitext(dep_data.base_library_name)
                 if len(
@@ -336,18 +332,11 @@ class FinalLibGraph:
                 ) > 1 and not is_root_module(dep_data.module):
                     lib_name += "_" + dep_data.module
 
-                # An entry can itself be named like a counter suffix (`libfoo_1.so`), so
-                # a candidate is only taken once no other library has it.
-                count = name_counters.get(lib_name, 0)
-                while True:
-                    suffix = "" if count == 0 else "_{}".format(count)
-                    count += 1
-                    final_name = lib_name + suffix + ext
-                    if final_name not in used_names:
-                        break
+                count = name_counters.setdefault(lib_name, 0) + 1
                 name_counters[lib_name] = count
-                used_names.add(final_name)
-                final_lib_names[key] = final_name
+                if count > 1:
+                    lib_name += "_{}".format(count - 1)
+                final_lib_names[key] = lib_name + ext
         return final_lib_names
 
 

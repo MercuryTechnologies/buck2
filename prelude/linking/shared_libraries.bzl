@@ -127,8 +127,6 @@ SharedLibraryInfo = provider(
     }
 )
 
-EMPTY_SHARED_LIBRARY_INFO = SharedLibraryInfo(set = None)
-
 def get_strip_non_global_flags(cxx_toolchain: CxxToolchainInfo) -> list:
     if cxx_toolchain.strip_flags_info and cxx_toolchain.strip_flags_info.strip_non_global_flags:
         return cxx_toolchain.strip_flags_info.strip_non_global_flags
@@ -213,23 +211,10 @@ def create_shared_libraries(
 def merge_shared_libraries(actions: AnalysisActions, node: [SharedLibraries, None] = None, deps: list[SharedLibraryInfo] = []) -> SharedLibraryInfo:
     kwargs = {}
 
-    contributing_deps = []
-    children = []
-    for dep in deps:
-        if dep.set != None:
-            contributing_deps.append(dep)
-            children.append(dep.set)
-
-    if node == None:
-        if not children:
-            return EMPTY_SHARED_LIBRARY_INFO
-        if len(children) == 1:
-            # With no local value, one contributing dep is already the complete
-            # merged result.
-            return contributing_deps[0]
+    children = filter(None, [dep.set for dep in deps])
     if children:
         kwargs["children"] = children
-    if node != None:
+    if node:
         kwargs["value"] = node
 
     set = actions.tset(SharedLibrariesTSet, **kwargs) if kwargs else None

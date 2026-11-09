@@ -10,7 +10,6 @@ erlang_application(
     applications = [
         "kernel",
         "stdlib",
-        "compiler",
     ],
     erl_opts = [
         "+debug_info",

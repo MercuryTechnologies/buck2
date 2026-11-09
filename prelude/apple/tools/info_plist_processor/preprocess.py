@@ -59,39 +59,29 @@ def _process_line(
         print("Found minimum OS version key in plist file", file=sys.stderr)
         sys.exit(1)
 
-    return _expand(line, pattern, substitutions, [])
-
-
-def _expand(
-    text: str,
-    pattern: re.Pattern[str],
-    substitutions: dict[str, str],
-    expanding: list[str],
-) -> str:
-    # `expanding` lists the variables whose values are being expanded, outermost first, so a
-    # variable that shows up inside its own value is a cycle.
-    result = []
+    result = line
     pos = 0
+    substituted_keys = set()
     while True:
-        match = pattern.search(text, pos)
+        match = pattern.search(result, pos)
         if match is None:
-            result.append(text[pos:])
-            return "".join(result)
-        result.append(text[pos : match.start()])
+            break
         key = match.group(_ReGroupName.variable)
+        if key in substituted_keys:
+            raise RuntimeError(f"Recursive plist variable: ... -> {key} -> ...")
         if key in substitutions:
-            if key in expanding:
-                raise RuntimeError(
-                    "Recursive plist variable: " + " -> ".join(expanding + [key])
-                )
-            expanding.append(key)
-            result.append(
-                _expand(substitutions[key], pattern, substitutions, expanding)
+            result = (
+                result[: match.start()] + substitutions[key] + result[match.end() :]
             )
-            expanding.pop()
+            substituted_keys.add(key)
+            # Keep the same position to handle the situation when variable was expanded into another variable
+            new_pos = match.start()
         else:
-            result.append(match.group(0))
-        pos = match.end()
+            new_pos = match.end()
+        if new_pos != pos:
+            substituted_keys = set()
+            pos = new_pos
+    return result
 
 
 def preprocess(

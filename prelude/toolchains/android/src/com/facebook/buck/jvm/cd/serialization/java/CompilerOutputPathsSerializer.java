@@ -34,19 +34,17 @@ public class CompilerOutputPathsSerializer {
   public static CompilerOutputPaths deserialize(
       OutputPathsValue.OutputPaths outputPaths, Optional<RelPath> tmpDir) {
     return new CompilerOutputPaths(
-        tmpDir.get().resolveRel("__classes__"),
+        toRelPath(outputPaths.getClassesDir()),
         toRelPath(outputPaths.getOutputJarDirPath()),
         toOptionalRelPath(outputPaths.getAbiJarPath()),
-        toOptionalRelPath(outputPaths.getAnnotationPath())
-            .orElseGet(() -> tmpDir.get().resolveRel("__gen__")),
+        toRelPath(outputPaths.getAnnotationPath()),
         outputPaths.getPathToSourcesList().isEmpty()
             ? tmpDir.map(p -> p.resolveRel("__srcs__")).get()
             : toRelPath(outputPaths.getPathToSourcesList()),
         outputPaths.getWorkingDirectory().isEmpty()
             ? tmpDir.get()
             : toRelPath(outputPaths.getWorkingDirectory()),
-        toOptionalRelPath(outputPaths.getOutputJarPath()),
-        toOptionalRelPath(outputPaths.getCompilerClassToSourceMap()).orElse(null));
+        toOptionalRelPath(outputPaths.getOutputJarPath()));
   }
 
   private static RelPath toRelPath(String relPath) {

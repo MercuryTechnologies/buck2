@@ -27,7 +27,6 @@ import java.util.Set;
  */
 public class TpxStandardOutputTestListener {
   private final TestResultsOutputSender sender;
-  private final Map<String, String> resultMetadata;
 
   private Map<String, TestIdentifierStatus> testIdentifierStatuses = new HashMap<>();
   private Set<String> finishedTests = new HashSet<>();
@@ -61,13 +60,7 @@ public class TpxStandardOutputTestListener {
   }
 
   public TpxStandardOutputTestListener(TestResultsOutputSender sender) {
-    this(sender, Collections.emptyMap());
-  }
-
-  public TpxStandardOutputTestListener(
-      TestResultsOutputSender sender, Map<String, String> resultMetadata) {
     this.sender = sender;
-    this.resultMetadata = resultMetadata;
   }
 
   /**
@@ -176,8 +169,7 @@ public class TpxStandardOutputTestListener {
   public void testOmitted(String identifier, String reason) {
     long currentTime = System.currentTimeMillis();
     sender.sendTestStart(identifier, currentTime);
-    sender.sendTestFinish(
-        identifier, TestStatus.OMIT, currentTime, 0, Optional.of(reason), resultMetadata);
+    sender.sendTestFinish(identifier, TestStatus.OMIT, currentTime, 0, Optional.of(reason));
   }
 
   /**
@@ -238,8 +230,7 @@ public class TpxStandardOutputTestListener {
         resultStatus,
         endedTime,
         duration,
-        Optional.ofNullable(testIdentifierStatus.trace),
-        resultMetadata);
+        Optional.ofNullable(testIdentifierStatus.trace));
   }
 
   /**

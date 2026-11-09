@@ -8,8 +8,6 @@
 
 # pyre-strict
 
-from __future__ import annotations
-
 import datetime
 import logging
 import re
@@ -31,7 +29,6 @@ from .provisioning_profile_diagnostics import (
     UnsupportedPlatform,
 )
 from .provisioning_profile_metadata import ProvisioningProfileMetadata
-from .serialization import expect_dict, expect_keys
 
 _LOGGER: logging.Logger = logging.getLogger(__name__)
 
@@ -72,12 +69,6 @@ def _matches_or_array_is_subset_of(
         return True
     if isinstance(expected_value, list) and isinstance(actual_value, list):
         return set(expected_value).issubset(set(actual_value))
-    if (
-        isinstance(expected_value, str)
-        and isinstance(actual_value, list)
-        and all(isinstance(value, str) for value in actual_value)
-    ):
-        return expected_value in actual_value
     return actual_value == expected_value
 
 
@@ -182,25 +173,6 @@ class SelectedProvisioningProfileInfo:
     profile: ProvisioningProfileMetadata
     identity: CodeSigningIdentity
 
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "identity": self.identity.to_dict(),
-            "profile": self.profile.to_dict(),
-        }
-
-    @staticmethod
-    def from_dict(value: object) -> SelectedProvisioningProfileInfo:
-        data = expect_dict(value, "SelectedProvisioningProfileInfo")
-        expect_keys(
-            data,
-            "SelectedProvisioningProfileInfo",
-            frozenset({"identity", "profile"}),
-        )
-        return SelectedProvisioningProfileInfo(
-            profile=ProvisioningProfileMetadata.from_dict(data["profile"]),
-            identity=CodeSigningIdentity.from_dict(data["identity"]),
-        )
-
 
 def _filter_matching_selected_provisioning_profile_infos(
     selected_profile_infos: list[SelectedProvisioningProfileInfo],
@@ -287,9 +259,7 @@ def select_best_provisioning_profile_core(
             )
             continue
 
-        # `ExpirationDate` is read as a naive UTC time, so compare it with UTC, not local time.
-        now_utc = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None)
-        if now_utc > profile.expiration_date:
+        if datetime.datetime.now() > profile.expiration_date:
             log_mismatched_profile(
                 ProfileExpired(
                     profile=profile, bundle_id_match_length=current_match_length

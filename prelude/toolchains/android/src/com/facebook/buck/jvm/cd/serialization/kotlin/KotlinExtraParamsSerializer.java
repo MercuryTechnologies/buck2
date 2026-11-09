@@ -11,7 +11,6 @@
 package com.facebook.buck.jvm.cd.serialization.kotlin;
 
 import com.facebook.buck.core.filesystems.AbsPath;
-import com.facebook.buck.core.filesystems.RelPath;
 import com.facebook.buck.jvm.cd.command.kotlin.KotlinExtraParams;
 import com.facebook.buck.jvm.cd.serialization.AbsPathSerializer;
 import com.facebook.buck.jvm.cd.serialization.java.ResolvedJavacOptionsSerializer;
@@ -40,8 +39,7 @@ public class KotlinExtraParamsSerializer {
   /** Protocol buffer model to internal buck representation. */
   public static KotlinExtraParams deserialize(
       com.facebook.buck.cd.model.java.ResolvedJavacOptions resolvedJavacOptions,
-      com.facebook.buck.cd.model.kotlin.KotlinExtraParams kotlinExtraParams,
-      Optional<RelPath> scratchDir) {
+      com.facebook.buck.cd.model.kotlin.KotlinExtraParams kotlinExtraParams) {
     return new KotlinExtraParams(
         kotlinExtraParams.getExtraClassPathsList().stream()
             .map(AbsPathSerializer::deserialize)
@@ -51,6 +49,8 @@ public class KotlinExtraParamsSerializer {
             .collect(ImmutableList.toImmutableList()),
         AbsPathSerializer.deserialize(kotlinExtraParams.getStandardLibraryClassPath()),
         AbsPathSerializer.deserialize(kotlinExtraParams.getAnnotationProcessingClassPath()),
+        AnnotationProcessingToolSerializer.deserialize(
+            kotlinExtraParams.getAnnotationProcessingTool()),
         kotlinExtraParams.getExtraKotlincArgumentsList().stream()
             .collect(ImmutableList.toImmutableList()),
         kotlinExtraParams.getKotlinCompilerPluginsMap().entrySet().stream()
@@ -62,8 +62,7 @@ public class KotlinExtraParamsSerializer {
             .collect(
                 ImmutableMap.toImmutableMap(
                     Map.Entry::getKey, e -> AbsPathSerializer.deserialize(e.getValue()))),
-        Optional.of(
-            "exception: java.lang.RuntimeException: Terminating compilation. We're done with ABI."),
+        Optional.ofNullable(kotlinExtraParams.getKosabiJvmAbiGenEarlyTerminationMessagePrefix()),
         kotlinExtraParams.getFriendPathsList().stream()
             .map(AbsPathSerializer::deserialize)
             .collect(ImmutableSortedSet.toImmutableSortedSet(AbsPath.comparator())),
@@ -86,16 +85,12 @@ public class KotlinExtraParamsSerializer {
         Optional.of(kotlinExtraParams.getIncrementalStateDir())
             .filter(s -> !s.isEmpty())
             .map(AbsPathSerializer::deserialize),
+        kotlinExtraParams.getShouldKsp2RunIncrementally(),
         kotlinExtraParams.getLanguageVersion(),
-        (kotlinExtraParams.getShouldKotlincRunIncrementally()
-                ? AbsPathSerializer.deserialize(kotlinExtraParams.getIncrementalStateDir())
-                : scratchDir.get().toAbsolutePath())
-            .resolve("__kotlin_classes__"),
+        AbsPathSerializer.deserialize(kotlinExtraParams.getKotlinClassesDir()),
         Optional.of(kotlinExtraParams.getJavaBinary()).filter(s -> !s.isEmpty()),
         kotlinExtraParams.getApplicabilityClasspathList().stream()
             .map(AbsPathSerializer::deserialize)
-            .collect(ImmutableList.toImmutableList()),
-        kotlinExtraParams.getShouldKosabiUseShallowClassUsage(),
-        kotlinExtraParams.getKosabiAbiValidationMode());
+            .collect(ImmutableList.toImmutableList()));
   }
 }

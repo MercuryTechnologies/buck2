@@ -23,7 +23,6 @@ load(
     "@prelude//cxx:cxx_toolchain_types.bzl",
     "CxxToolchainInfo",
     "LinkerType",
-    "ShlibInterfacesMode",
 )
 load(
     "@prelude//cxx/dist_lto:dist_lto.bzl",
@@ -33,7 +32,6 @@ load(
     "@prelude//cxx/dist_lto/darwin:dist_lto.bzl",
     "cxx_darwin_dist_link",
 )
-load("@prelude//linking:add_elf_sections.bzl", "add_elf_sections_to_executable")
 load("@prelude//linking:execution_preference.bzl", "LinkExecutionPreference", "LinkExecutionPreferenceInfo", "get_action_execution_attributes")
 load(
     "@prelude//linking:link_info.bzl",
@@ -61,7 +59,6 @@ load(
 )
 load(":bitcode.bzl", "make_bitcode_bundle")
 load(":cxx_context.bzl", "get_cxx_toolchain_info")
-load(":cxx_library_utility.bzl", "EMPTY_DEFAULT_INFO")
 load(
     ":cxx_link_utility.bzl",
     "LinkArgsOutput",
@@ -86,12 +83,6 @@ load(
     "get_output_flags",
     "get_shared_library_flags",
     "get_shared_library_name_linker_flags",
-)
-load(
-    ":shared_library_interface.bzl",
-    "run_shared_library_interface_producer",
-    "shared_library_interface_path",
-    "shared_library_interface_producer",
 )
 
 CxxLinkerMapData = record(
@@ -186,8 +177,6 @@ def cxx_link_into(
     output: Artifact,
     result_type: CxxLinkResultType,
     opts: LinkOptions,
-    output_has_content_based_path: bool = False,
-    build_info_json: Artifact | None = None,
 ) -> CxxLinkResult:
     cxx_toolchain_info = opts.cxx_toolchain or get_cxx_toolchain_info(ctx)
     linker_info = cxx_toolchain_info.linker_info
@@ -216,18 +205,9 @@ def cxx_link_into(
         gc_sections_output = None
         gc_sections_data = None
 
-    # Only `stub_from_linker_invocation` has the linker emit the interface; in
-    # every other mode it is derived from the linked output, within the link
-    # action.
-    linker_emits_shared_library_interface = linker_info.type == LinkerType("darwin") and linker_info.shlib_interfaces == ShlibInterfacesMode(
-        "stub_from_linker_invocation"
+    shared_library_interface = (
+        ctx.actions.declare_output(output.short_path + ".tbd", has_content_based_path = False) if opts.produce_shared_library_interface else None
     )
-    if not opts.produce_shared_library_interface:
-        shared_library_interface = None
-    elif linker_emits_shared_library_interface:
-        shared_library_interface = ctx.actions.declare_output(output.short_path + ".tbd", has_content_based_path = False)
-    else:
-        shared_library_interface = ctx.actions.declare_output(shared_library_interface_path(output.short_path), has_content_based_path = True)
 
     if is_incremental_link:
         ilk_filename = paths.replace_extension(output.short_path, ".ilk")
@@ -236,8 +216,6 @@ def cxx_link_into(
         ilk_artifact = None
 
     if linker_info.supports_distributed_thinlto and opts.enable_distributed_thinlto:
-        if opts.stderr_output != None:
-            fail("stderr_output is only supported for local link actions")
         if not linker_info.lto_mode == LtoMode("thin"):
             fail("Cannot use distributed thinlto if the cxx toolchain doesn't use thin-lto lto_mode")
         if linker_info.runtime_library_files:
@@ -254,7 +232,7 @@ def cxx_link_into(
                 linker_info.thin_lto_double_codegen_enabled,
                 is_result_executable,
                 sanitizer_runtime_args,
-                shared_library_interface if linker_emits_shared_library_interface else None,
+                shared_library_interface,
                 linker_map,
             )
         elif linker_type == LinkerType("gnu"):
@@ -268,21 +246,10 @@ def cxx_link_into(
                 gc_sections_output,
                 dwp_tool_available,
                 is_result_executable,
-                build_info_json,
             )
             extra_outputs = {}
         else:
             fail("Linker type {} not supported for distributed thin-lto".format(linker_type))
-
-        # A distributed link has no single link command to wrap.
-        if shared_library_interface != None and not linker_emits_shared_library_interface:
-            run_shared_library_interface_producer(
-                ctx = ctx,
-                linker_info = linker_info,
-                shared_lib = exe.output,
-                interface = shared_library_interface,
-                identifier = opts.identifier,
-            )
 
         return CxxLinkResult(
             linked_object = exe,
@@ -380,7 +347,7 @@ def cxx_link_into(
         has_content_based_path = cxx_toolchain_info.cxx_compiler_info.supports_content_based_paths,
     )
 
-    if shared_library_interface != None and linker_emits_shared_library_interface:
+    if opts.produce_shared_library_interface:
         # If we ask the linker to produce a shared library interface, it won't produce any other outputs
         # so we shouldn't declare any extra outputs.
         shared_library_interface_generation_linker_args = create_local_linker_invocation(add_linker_outputs = False).link_args
@@ -481,23 +448,6 @@ def cxx_link_into(
             command,
         )
 
-    if opts.stderr_output != None:
-        command = cmd_args(
-            cxx_toolchain_info.internal_tools.stderr_to_file,
-            cmd_args(opts.stderr_output, format = "--out={}"),
-            command,
-        )
-
-    if shared_library_interface != None and not linker_emits_shared_library_interface:
-        command = cmd_args(
-            cxx_toolchain_info.internal_tools.shlib_interface_link_wrapper,
-            output.as_output(),
-            shared_library_interface.as_output(),
-            shared_library_interface_producer(linker_info),
-            "--shlib-interface-link-wrapper-link-command",
-            command,
-        )
-
     link_execution_preference_info = LinkExecutionPreferenceInfo(
         preference = opts.link_execution_preference,
     )
@@ -506,14 +456,6 @@ def cxx_link_into(
     )
 
     enable_late_build_info_stamping = is_result_executable and cxx_stamp_build_info(ctx)
-
-    if is_incremental_link:
-        allow_cache_upload = False
-    elif enable_late_build_info_stamping:
-        allow_cache_upload = True
-    else:
-        # Preserves `None`: no preference, as opposed to a decision not to upload.
-        allow_cache_upload = opts.allow_cache_upload
 
     ctx.actions.run(
         command,
@@ -524,9 +466,10 @@ def cxx_link_into(
         category = category,
         identifier = opts.identifier,
         force_full_hybrid_if_capable = action_execution_properties.full_hybrid,
-        allow_cache_upload = allow_cache_upload,
+        allow_cache_upload = (opts.allow_cache_upload or enable_late_build_info_stamping) and not is_incremental_link,
         error_handler = opts.error_handler,
         no_outputs_cleanup = is_incremental_link,
+        eager_materialization_enabled = True,
     )
 
     external_debug_info = link_external_debug_info(
@@ -541,7 +484,6 @@ def cxx_link_into(
         strip_args = opts.strip_args_factory(ctx) if opts.strip_args_factory else cmd_args()
         output = strip_object(ctx, cxx_toolchain_info, output, strip_args, opts.category_suffix, allow_cache_upload = enable_late_build_info_stamping)
 
-    prebolt_output = output
     use_bolt = is_result_executable and cxx_use_bolt(ctx)
     if use_bolt:
         bolt_output = bolt(ctx, output, external_debug_info, opts.identifier, dwp_tool_available, allow_cache_upload = enable_late_build_info_stamping)
@@ -585,19 +527,13 @@ def cxx_link_into(
         output = renamed
 
     if is_result_executable:
-        output = add_elf_sections_to_executable(ctx, output, has_content_based_path = output_has_content_based_path)
-        output = stamp_build_info(
-            ctx,
-            output,
-            links = opts.links,
-            build_info_json = build_info_json,
-        )
+        output = stamp_build_info(ctx, output, links = opts.links)
 
     linked_object = LinkedObject(
         output = output,
         link_args = opts.links + opts.binary_links,
         bitcode_bundle = bitcode_artifact.artifact if bitcode_artifact else None,
-        prebolt_output = prebolt_output,
+        prebolt_output = output,
         unstripped_output = unstripped_output,
         dwp = dwp_artifact,
         external_debug_info = external_debug_info,
@@ -649,7 +585,7 @@ def _anon_link_impl(ctx):
     split_debug_output_placeholder = ctx.actions.write("placeholder_split_debug_output", "", has_content_based_path = False)
 
     return [
-        EMPTY_DEFAULT_INFO,
+        DefaultInfo(),
         _AnonLinkInfo(result = link_result),
         _AnonLinkInfoPlaceholder(dwp = dwp_placeholder, split_debug_output = split_debug_output_placeholder),
     ]
@@ -671,15 +607,9 @@ def _get_link_artifact(p: ProviderCollection, name: str) -> Artifact:
     else:
         return getattr(p[_AnonLinkInfoPlaceholder], name)
 
-def _anon_cxx_link(
-    ctx: AnalysisContext, output: str, result_type: CxxLinkResultType, opts: LinkOptions, script_flags: list[(Artifact, str)] = []
-) -> CxxLinkResult:
-    if opts.stderr_output != None:
-        fail("stderr_output is not supported for anonymous link actions")
+def _anon_cxx_link(ctx: AnalysisContext, output: str, result_type: CxxLinkResultType, opts: LinkOptions) -> CxxLinkResult:
     if opts.cxx_toolchain:
         fail("anon link requires getting toolchain from ctx.attrs._cxx_toolchain")
-    if opts.produce_shared_library_interface:
-        fail("anon link cannot produce a shared library interface")
     cxx_toolchain = ctx.attrs._cxx_toolchain[CxxToolchainInfo]
     anon_link_target = ctx.actions.anon_target(
         _anon_link_rule,
@@ -689,7 +619,6 @@ def _anon_cxx_link(
                 output = output,
                 result_type = result_type,
                 opts = opts,
-                script_flags = script_flags,
             ),
         ),
     )
@@ -730,19 +659,14 @@ def _anon_cxx_link(
         shared_library_interface = None,
     )
 
-def _cxx_link(
-    ctx: AnalysisContext, output: str, result_type: CxxLinkResultType, opts: LinkOptions, anonymous: bool = False, anon_script_flags: list[(Artifact, str)] = []
-):
+def _cxx_link(ctx: AnalysisContext, output: str, result_type: CxxLinkResultType, opts: LinkOptions, anonymous: bool = False):
     if anonymous:
         return _anon_cxx_link(
             ctx = ctx,
             output = output,
             result_type = result_type,
             opts = opts,
-            script_flags = anon_script_flags,
         )
-    if anon_script_flags:
-        fail("anon_script_flags is only consumed by anonymous links; pass these flags in `opts` instead")
     return cxx_link_into(
         ctx = ctx,
         output = ctx.actions.declare_output(output, has_content_based_path = False),
@@ -760,9 +684,6 @@ def cxx_link_shared_library(
     # Overrides the default flags used to specify building shared libraries
     shared_library_flags: [SharedLibraryFlagOverrides, None] = None,
     anonymous: bool = False,
-    # (artifact, format) linker flags for an anonymous link. See
-    # `serialize_anon_attrs`; non-anonymous links take these in `opts`.
-    anon_script_flags: list[(Artifact, str)] = [],
 ) -> CxxLinkResult:
     # links: list[LinkArgs] = [],
     # link_execution_preference: LinkExecutionPreference = LinkExecutionPreference("any"),
@@ -784,7 +705,6 @@ def cxx_link_shared_library(
         result_type = CxxLinkResultType("shared_library"),
         opts = merged_opts,
         anonymous = anonymous,
-        anon_script_flags = anon_script_flags,
     )
 
 def _build_cxx_link_shared_library_options(

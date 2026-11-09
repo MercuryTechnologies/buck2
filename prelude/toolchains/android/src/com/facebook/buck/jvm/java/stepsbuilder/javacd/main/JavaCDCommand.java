@@ -18,8 +18,6 @@ import com.facebook.buck.jvm.cd.DepFileUtils;
 import com.facebook.buck.jvm.cd.JvmCDCommand;
 import com.facebook.buck.jvm.cd.command.PostBuildParams;
 import com.facebook.buck.jvm.cd.command.java.BuildJavaCommand;
-import com.facebook.buck.jvm.java.CompilerClassToSourceMap;
-import com.facebook.buck.jvm.java.CompilerOutputPaths;
 import com.facebook.buck.jvm.java.JavaStepsBuilder;
 import com.facebook.buck.jvm.java.abi.StubJar;
 import com.google.common.base.Preconditions;
@@ -30,9 +28,7 @@ import java.io.IOException;
 import java.io.Reader;
 import java.nio.file.Path;
 import java.nio.file.Paths;
-import java.util.List;
 import java.util.Optional;
-import java.util.stream.Collectors;
 import org.kohsuke.args4j.CmdLineException;
 import org.kohsuke.args4j.CmdLineParser;
 import org.kohsuke.args4j.Option;
@@ -49,10 +45,7 @@ public class JavaCDCommand implements JvmCDCommand {
   private int loggingLevel = 0;
 
   private final JavaStepsBuilder stepsBuilder;
-  private final ImmutableMap<Path, Path> jarToJarDirMap;
   private final PostBuildParams postBuildParams;
-  private final CompilerOutputPaths compilerOutputPaths;
-  private final List<Path> sourcePaths;
 
   public JavaCDCommand(String[] args, ImmutableMap<String, String> env)
       throws CmdLineException, IOException {
@@ -76,17 +69,6 @@ public class JavaCDCommand implements JvmCDCommand {
         BuildJavaCommand.Companion.fromProto(proto.getBuildCommand(), Optional.of(buckScratchPath));
     this.postBuildParams = PostBuildParams.Companion.fromProto(proto.getPostBuildParams());
     this.stepsBuilder = new JavaStepsBuilder(buildJavaCommand);
-    this.jarToJarDirMap = buildJavaCommand.getBaseJarCommand().getJarToJarDirMap();
-    this.compilerOutputPaths =
-        buildJavaCommand
-            .getBaseJarCommand()
-            .getCompilerOutputPathsValue()
-            .getLibraryCompilerOutputPath();
-    CompilerClassToSourceMap.prepare(compilerOutputPaths, stepsBuilder.getRuleCellRoot().getPath());
-    this.sourcePaths =
-        buildJavaCommand.getBaseJarCommand().getJavaSrcs().stream()
-            .map(RelPath::getPath)
-            .collect(Collectors.toList());
   }
 
   public void maybeWriteClassAbi() throws IOException {
@@ -122,7 +104,7 @@ public class JavaCDCommand implements JvmCDCommand {
       DepFileUtils.usedClassesToDepFile(
           postBuildParams.getUsedClassesPaths(),
           postBuildParams.getDepFile(),
-          jarToJarDirMap,
+          Optional.ofNullable(postBuildParams.getJarToJarDirMap()),
           false);
     }
   }
@@ -153,8 +135,6 @@ public class JavaCDCommand implements JvmCDCommand {
 
   @Override
   public void postExecute() throws IOException {
-    CompilerClassToSourceMap.writeCombined(
-        compilerOutputPaths, stepsBuilder.getRuleCellRoot().getPath(), sourcePaths);
     maybeWriteClassAbi();
     maybeWriteAbiDir();
     maybeWriteDepFile();

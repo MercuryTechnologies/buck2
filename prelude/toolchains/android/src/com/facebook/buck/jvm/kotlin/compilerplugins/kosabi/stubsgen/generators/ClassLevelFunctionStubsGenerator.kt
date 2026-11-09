@@ -27,11 +27,7 @@ class ClassLevelFunctionStubsGenerator : StubsGenerator {
 
   override fun generateStubs(context: GenerationContext) {
     val classLevelFunctionImportsCandidate = context.importedDeclarations - context.declaredTypes
-    // A member import proven to name a class (an all-caps outer used as a type) is stubbed as a
-    // class elsewhere; stubbing it as a fun too would invent a bogus top-level declaration.
-    val stubbedFuns = classLevelFunctionImportsCandidate.filter {
-      it.isTopLevelDeclaration() && !context.isProvenClassImport(it)
-    }
+    val stubbedFuns = classLevelFunctionImportsCandidate.filter { it.isTopLevelDeclaration() }
 
     stubbedFuns
         .groupBy { it.pkg }

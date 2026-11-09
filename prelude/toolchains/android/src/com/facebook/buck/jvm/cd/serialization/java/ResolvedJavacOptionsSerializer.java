@@ -38,7 +38,7 @@ public class ResolvedJavacOptionsSerializer {
     return new ResolvedJavacOptions(
         bootclasspathList,
         JavacLanguageLevelOptionsSerializer.deserialize(options.getLanguageLevelOptions()),
-        true,
+        options.getDebug(),
         options.getVerbose(),
         JavacPluginParamsSerializer.deserialize(options.getJavaAnnotationProcessorParams()),
         JavacPluginParamsSerializer.deserialize(options.getStandardJavacPluginParams()),

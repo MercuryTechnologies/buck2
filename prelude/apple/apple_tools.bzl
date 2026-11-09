@@ -13,9 +13,7 @@ def apple_tools_impl(ctx: AnalysisContext) -> list[Provider]:
         DefaultInfo(),
         AppleToolsInfo(
             assemble_bundle = ctx.attrs.assemble_bundle[RunInfo],
-            provisioning_manifest = ctx.attrs.provisioning_manifest[RunInfo],
-            resolve_signing_context = ctx.attrs.resolve_signing_context[RunInfo],
-            signing_info = ctx.attrs.signing_info[RunInfo],
+            signing_context = ctx.attrs.signing_context[RunInfo],
             split_arch_combine_dsym_bundles_tool = ctx.attrs.split_arch_combine_dsym_bundles_tool[RunInfo],
             dry_codesign_tool = ctx.attrs.dry_codesign_tool[RunInfo],
             adhoc_codesign_tool = ctx.attrs.adhoc_codesign_tool[RunInfo],
@@ -32,6 +30,5 @@ def apple_tools_impl(ctx: AnalysisContext) -> list[Provider]:
             static_archive_linker = ctx.attrs.static_archive_linker[RunInfo],
             spm_packager = ctx.attrs.spm_packager[RunInfo],
             bundle_telemetry_logger = ctx.attrs.bundle_telemetry_logger[RunInfo] if ctx.attrs.bundle_telemetry_logger else None,
-            swiftmodule_change_analysis = ctx.attrs.swiftmodule_change_analysis[RunInfo] if ctx.attrs.swiftmodule_change_analysis else None,
         ),
     ]

@@ -18,8 +18,6 @@ import com.facebook.buck.testresultsoutput.TestResultsOutputEvent.TestStatus;
 import java.io.FileNotFoundException;
 import java.io.FileOutputStream;
 import java.io.IOException;
-import java.util.Collections;
-import java.util.Map;
 import java.util.Optional;
 
 /**
@@ -126,18 +124,8 @@ public class TestResultsOutputSender implements AutoCloseable {
    */
   public void sendTestFinish(
       String name, TestStatus status, long endedTime, long duration, Optional<String> message) {
-    sendTestFinish(name, status, endedTime, duration, message, Collections.emptyMap());
-  }
 
-  public void sendTestFinish(
-      String name,
-      TestStatus status,
-      long endedTime,
-      long duration,
-      Optional<String> message,
-      Map<String, String> metadata) {
-
-    FinishEvent finishEvent = new FinishEvent(name, status, endedTime, duration, message, metadata);
+    FinishEvent finishEvent = new FinishEvent(name, status, endedTime, duration, message);
 
     byte[] serialized;
     try {

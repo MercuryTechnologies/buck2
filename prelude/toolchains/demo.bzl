@@ -7,9 +7,8 @@
 # above-listed licenses.
 
 load("@prelude//android/tools:jdk_system_image.bzl", "jdk_system_image")
-load("@prelude//nodejs:nodejs_toolchain.bzl", "system_nodejs_toolchain")
 load("@prelude//tests:test_toolchain.bzl", "noop_test_toolchain")
-load("@prelude//toolchains:android.bzl", "android_sdk_tools", "system_android_aidl_toolchain", "system_android_toolchain")
+load("@prelude//toolchains:android.bzl", "android_sdk_tools", "system_android_toolchain")
 load("@prelude//toolchains:cxx.bzl", "system_cxx_toolchain")
 load("@prelude//toolchains:dex.bzl", "system_dex_toolchain", "system_noop_dex_toolchain")
 load("@prelude//toolchains:erlang.bzl", "system_erlang_toolchain")
@@ -26,16 +25,10 @@ load(
 )
 load("@prelude//toolchains:kotlin.bzl", "kotlincd_toolchain", "system_kotlin_bootstrap_toolchain")
 load("@prelude//toolchains:ocaml.bzl", "system_ocaml_toolchain")
-load(
-    "@prelude//toolchains:python.bzl",
-    "remote_python_toolchain",
-    "system_python_bootstrap_toolchain",
-    "system_python_wheel_toolchain",
-)
+load("@prelude//toolchains:python.bzl", "remote_python_toolchain", "system_python_wheel_toolchain")
 load("@prelude//toolchains:remote_test_execution.bzl", "remote_test_execution_toolchain")
 load("@prelude//toolchains:rust.bzl", "system_rust_toolchain")
 load("@prelude//toolchains:zip_file.bzl", "zip_file_toolchain")
-load("@prelude//toolchains/go:remote_go_proto_toolchain.bzl", "remote_go_proto_toolchain")
 load("@prelude//toolchains/go:system_go_bootstrap_toolchain.bzl", "system_go_bootstrap_toolchain")
 load("@prelude//toolchains/go:system_go_toolchain.bzl", "system_go_toolchain")
 
@@ -56,12 +49,6 @@ def system_demo_toolchains():
     """
     android_sdk_tools(
         name = "android_sdk_tools",
-        visibility = ["PUBLIC"],
-    )
-
-    system_android_aidl_toolchain(
-        name = "android_aidl",
-        android_sdk_tools_target = ":android_sdk_tools",
         visibility = ["PUBLIC"],
     )
 
@@ -106,11 +93,6 @@ def system_demo_toolchains():
 
     system_go_toolchain(
         name = "go",
-        visibility = ["PUBLIC"],
-    )
-
-    remote_go_proto_toolchain(
-        name = "go_proto",
         visibility = ["PUBLIC"],
     )
 
@@ -252,12 +234,6 @@ def system_demo_toolchains():
 
     remote_python_toolchain(
         name = "python",
-        bootstrap = False,
-        visibility = ["PUBLIC"],
-    )
-
-    system_python_bootstrap_toolchain(
-        name = "python_bootstrap",
         visibility = ["PUBLIC"],
     )
 
@@ -284,11 +260,6 @@ def system_demo_toolchains():
 
     zip_file_toolchain(
         name = "zip_file",
-        visibility = ["PUBLIC"],
-    )
-
-    system_nodejs_toolchain(
-        name = "nodejs",
         visibility = ["PUBLIC"],
     )
 

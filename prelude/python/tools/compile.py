@@ -6,6 +6,7 @@
 # of this source tree. You may select, at your option, one of the
 # above-listed licenses.
 
+# pyre-strict
 
 """
 Example usage (internal):
@@ -36,13 +37,19 @@ from types import TracebackType
 DEFAULT_FORMAT: str = importlib.util.cache_from_source("{pkg}/{name}.py")
 
 
-def get_pyc_path(src_path: str, fmt: str) -> str:
-    # Split the path, not a dotted module name: `b.c.py` is not module `c` of `b`.
-    package, name = os.path.split(src_path[: -len(".py")])
+def get_py_path(module: str) -> str:
+    return module.replace(".", os.sep) + ".py"
+
+
+def get_pyc_path(module: str, fmt: str) -> str:
+    try:
+        package, name = module.rsplit(".", 1)
+    except ValueError:
+        package, name = "", module
     parts = fmt.split(os.sep)
     for idx in range(len(parts)):
         if parts[idx] == "{pkg}":
-            parts[idx] = package
+            parts[idx] = package.replace(".", os.sep)
         elif parts[idx].startswith("{name}"):
             parts[idx] = parts[idx].format(name=name)
     return os.path.join(*parts)
@@ -74,7 +81,6 @@ def pretty_exception(
     typ: type[BaseException], exc: BaseException, tb: TracebackType, src: str
 ) -> None:
     try:
-        # pyrefly: ignore [missing-module-attribute]
         from colorama import Fore, just_fix_windows_console, Style
 
         just_fix_windows_console()
@@ -138,7 +144,7 @@ def main(argv: list[str]) -> None:
         "--invalidation-mode",
         type=str,
         default=PycInvalidationMode.UNCHECKED_HASH.name,
-        choices=[PycInvalidationMode.UNCHECKED_HASH.name],
+        choices=[m.name for m in PycInvalidationMode],
     )
     parser.add_argument(
         "--debug",
@@ -156,20 +162,22 @@ def main(argv: list[str]) -> None:
         with open(manifest_path) as mf:
             manifest = json.load(mf)
         for dst, src, _ in manifest:
-            # Normalize first, so `get_pyc_path` sees one spelling of the path.
+            # This is going to try to turn a path into a Python module, so
+            # reduce the scope for bugs in get_pyc_path by normalizing first.
             dst = os.path.normpath(dst)
             # We only care about python sources.
-            _, ext = os.path.splitext(dst)
+            base, ext = os.path.splitext(dst)
             if ext != ".py":
                 continue
-            dest_pyc = get_pyc_path(dst, args.format)
+            module = base.replace(os.sep, ".")
+            dest_pyc = get_pyc_path(module, args.format)
             pyc = os.path.join(args.output, dest_pyc)
             _mkdirs(os.path.dirname(pyc))
             try:
                 compile(
                     src,
                     cfile=pyc,
-                    dfile=dst,
+                    dfile=get_py_path(module),
                     doraise=True,
                     invalidation_mode=invalidation_mode,
                 )

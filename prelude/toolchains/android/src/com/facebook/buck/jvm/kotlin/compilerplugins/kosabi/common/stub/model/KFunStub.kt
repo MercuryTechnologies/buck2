@@ -10,7 +10,9 @@
 
 package com.facebook.kotlin.compilerplugins.kosabi.common.stub.model
 
-open class KFunStub(val name: String, val namedArgs: List<Pair<String, Type>>) {
+private typealias NamedArg = Pair<String, Type>
+
+open class KFunStub(val name: String, val namedArgs: List<NamedArg>) {
   constructor(name: String, args: Int) : this(name, List(args) { "p$it" to KType.ANY_NULLABLE })
 
   var ret: Type = KType.UNIT
@@ -20,16 +22,14 @@ open class KFunStub(val name: String, val namedArgs: List<Pair<String, Type>>) {
   // Top level functions are always static
   var static: Boolean = false
   var private: Boolean = false
-  var protected: Boolean = false
-  var isOverride: Boolean = false
   var abstract: Boolean = false
   var isConstructor: Boolean = false
   var isOperator: Boolean = false
   var isFinal: Boolean = false
   var annotations: List<KAnnotation> = emptyList()
   // Boolean: isSuper, super else this
-  // List<Pair<String, Type>>: constructor parameters name and value
-  var constructorSuperDelegate: Pair<Boolean, List<Pair<String, Type>>> = Pair(false, emptyList())
+  // List<NamedArg>: constructor parameters name and value
+  var constructorSuperDelegate: Pair<Boolean, List<NamedArg>> = Pair(false, emptyList())
 
   companion object {
     fun withTypedArgs(name: String, args: List<Type>) =
@@ -37,7 +37,7 @@ open class KFunStub(val name: String, val namedArgs: List<Pair<String, Type>>) {
   }
 }
 
-class KCtorStub(namedArgs: List<Pair<String, Type>>) : KFunStub("<init>", namedArgs) {
+class KCtorStub(namedArgs: List<NamedArg>) : KFunStub("<init>", namedArgs) {
   // Note
   // It's not correct to pass Any? as an annotation argument
   constructor(args: Int) : this(List(args) { "p$it" to KType.ANY_NULLABLE })

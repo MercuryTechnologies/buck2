@@ -6,11 +6,10 @@
 # of this source tree. You may select, at your option, one of the
 # above-listed licenses.
 
-load("@prelude//android:android_toolchain.bzl", "AidlToolchainInfo", "AndroidPlatformInfo", "AndroidToolchainInfo")
+load("@prelude//android:android_toolchain.bzl", "AndroidPlatformInfo", "AndroidToolchainInfo")
 load("@prelude//csharp:toolchain.bzl", "CSharpToolchainInfo")
 load("@prelude//go:toolchain.bzl", "GoToolchainInfo")
-load("@prelude//go:go_proto_toolchain.bzl", "GoProtoToolchainInfo")
-load("@prelude//go_bootstrap:toolchain.bzl", "GoBootstrapToolchainInfo")
+load("@prelude//go_bootstrap:go_bootstrap.bzl", "GoBootstrapToolchainInfo")
 load("@prelude//haskell:toolchain.bzl", "HaskellPlatformInfo", "HaskellToolchainInfo")
 load("@prelude//java:dex_toolchain.bzl", "DexToolchainInfo")
 load(
@@ -24,11 +23,10 @@ load(
     "@prelude//kotlin:kotlin_toolchain.bzl",
     "KotlinToolchainInfo",
 )
-load("@prelude//nodejs:nodejs_toolchain.bzl", "NodejsToolchainInfo")
 load("@prelude//python:python_wheel_toolchain.bzl", "PythonWheelToolchainInfo")
 load("@prelude//python:toolchain.bzl", "PythonPlatformInfo", "PythonToolchainInfo")
 load("@prelude//python/cython:cython_toolchain.bzl", "CythonToolchainInfo")
-load("@prelude//python_bootstrap:toolchain.bzl", "PythonBootstrapToolchainInfo")
+load("@prelude//python_bootstrap:python_bootstrap.bzl", "PythonBootstrapToolchainInfo")
 load("@prelude//rust:rust_toolchain.bzl", "RustToolchainInfo")
 load("@prelude//tests:remote_test_execution_toolchain.bzl", "RemoteTestExecutionToolchainInfo")
 load("@prelude//tests:test_listing.bzl", "TestListingInfo")
@@ -40,9 +38,6 @@ def _toolchain(lang: str, providers: list[typing.Any], *, default: typing.Any = 
 
 def _android_toolchain():
     return _toolchain("android", [AndroidToolchainInfo, AndroidPlatformInfo, TestListingInfo])
-
-def _android_aidl_toolchain():
-    return _toolchain("android_aidl", [AidlToolchainInfo])
 
 def _csharp_toolchain():
     return _toolchain("csharp", [CSharpToolchainInfo])
@@ -67,9 +62,6 @@ def _dex_toolchain():
 
 def _go_toolchain():
     return _toolchain("go", [GoToolchainInfo])
-
-def _go_proto_toolchain():
-    return _toolchain("go_proto", [GoProtoToolchainInfo])
 
 def _go_bootstrap_toolchain():
     return _toolchain("go_bootstrap", [GoBootstrapToolchainInfo])
@@ -98,9 +90,6 @@ def _kotlin_toolchain():
 def _kotlin_for_android_toolchain():
     return _toolchain("kotlin_for_android", [KotlinToolchainInfo])
 
-def _nodejs_toolchain():
-    return _toolchain("nodejs", [NodejsToolchainInfo])
-
 def _prebuilt_jar_toolchain():
     # Override is allowed for bootstrapping prebuilt jar toolchains
     return _toolchain("prebuilt_jar", [PrebuiltJarToolchainInfo])
@@ -128,13 +117,11 @@ def _test_toolchain():
 
 toolchains_common = struct(
     android = _android_toolchain,
-    android_aidl = _android_aidl_toolchain,
     csharp = _csharp_toolchain,
     cxx = _cxx_toolchain,
     cython = _cython_toolchain,
     dex = _dex_toolchain,
     go = _go_toolchain,
-    go_proto = _go_proto_toolchain,
     go_bootstrap = _go_bootstrap_toolchain,
     haskell = _haskell_toolchain,
     java = _java_toolchain,
@@ -144,7 +131,6 @@ toolchains_common = struct(
     java_test = _java_test_toolchain,
     kotlin = _kotlin_toolchain,
     kotlin_for_android = _kotlin_for_android_toolchain,
-    nodejs = _nodejs_toolchain,
     prebuilt_jar = _prebuilt_jar_toolchain,
     python = _python_toolchain,
     python_bootstrap = _python_bootstrap_toolchain,

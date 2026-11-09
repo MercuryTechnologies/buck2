@@ -10,9 +10,8 @@
 
 -compile(warn_missing_spec_all).
 
--export([produce_json_file/2]).
-
 -include_lib("common/include/tpx_records.hrl").
+-export([produce_json_file/2]).
 
 -import(common_util, [unicode_characters_to_binary/1]).
 

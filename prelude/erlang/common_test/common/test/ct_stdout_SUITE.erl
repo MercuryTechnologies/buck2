@@ -9,6 +9,10 @@
 -module(ct_stdout_SUITE).
 -typing([eqwalizer]).
 
+-include_lib("stdlib/include/assert.hrl").
+
+-define(UNICODE_REPLACEMENT_CHAR_UTF8, <<239, 191, 189>>).
+
 -export([all/0]).
 
 -export([
@@ -16,11 +20,6 @@
     test_collect_method_stdout_sanitizes_invalid_utf8_in_truncated_middle/1,
     test_collect_method_stdout_sanitizes_invalid_utf8_without_truncation/1
 ]).
-
-% elp:ignore WA003 (better_assertions) - Open Source
--include_lib("stdlib/include/assert.hrl").
-
--define(UNICODE_REPLACEMENT_CHAR_UTF8, <<239, 191, 189>>).
 
 all() ->
     [

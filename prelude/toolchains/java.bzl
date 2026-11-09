@@ -7,7 +7,6 @@
 # above-listed licenses.
 
 load("@prelude//:paths.bzl", "paths")
-load("@prelude//:prelude.bzl", _native = "native")
 load(
     "@prelude//java:java_toolchain.bzl",
     "AbiGenerationMode",
@@ -18,71 +17,6 @@ load(
     "PrebuiltJarToolchainInfo",
 )
 load("@prelude//tests:test_listing.bzl", "TestListingInfo")
-
-TEMURIN_JDK_ARCHIVE = {
-    "linux": {
-        "arm64": {
-            "sha256": "8d498ec88e1c1989fab95c6784240ab92d011e29c54d20a3f9c324b13476f9ad",
-            "url": "https://github.com/adoptium/temurin21-binaries/releases/download/jdk-21.0.11%2B10/OpenJDK21U-jdk_aarch64_linux_hotspot_21.0.11_10.tar.gz",
-        },
-        "x86_64": {
-            "sha256": "4b2220e232a97997b436ca6ab15cbf70171ecff52958a46159dfa5a8c44ca4de",
-            "url": "https://github.com/adoptium/temurin21-binaries/releases/download/jdk-21.0.11%2B10/OpenJDK21U-jdk_x64_linux_hotspot_21.0.11_10.tar.gz",
-        },
-    },
-}
-
-_JDK_TOOLS = {
-    "jar": "jar_tool",
-    "java": "java_tool",
-    "javac": "javac_tool",
-    "jlink": "jlink_tool",
-    "jmod": "jmod_tool",
-}
-
-def _jdk_archive_select(jdk_archives, key: str):
-    return select({
-        "prelude//os:{}".format(os): select({
-            "prelude//cpu:{}".format(cpu): archive[key]
-            for cpu, archive in value.items()
-        })
-        for os, value in jdk_archives.items()
-    })
-
-def download_jdk_tools(
-        name: str,
-        jdk_archives = TEMURIN_JDK_ARCHIVE,
-        remote_download: bool = True,
-        strip_prefix: str = "jdk-21.0.11+10",
-        tool_names = _JDK_TOOLS,
-        visibility = None):
-    archive = name + "_archive"
-
-    _native.http_archive(
-        name = archive,
-        urls = [_jdk_archive_select(jdk_archives, "url")],
-        sha256 = _jdk_archive_select(jdk_archives, "sha256"),
-        type = "tar.gz",
-        strip_prefix = strip_prefix,
-        remote_download = remote_download,
-        sub_targets = {
-            "jar": ["bin/jar"],
-            "java": ["bin/java"],
-            "javac": ["bin/javac"],
-            "jlink": ["bin/jlink"],
-            "jmod": ["bin/jmod"],
-            "jrt_fs_jar": ["lib/jrt-fs.jar"],
-        },
-        visibility = visibility,
-    )
-
-    for tool, tool_name in tool_names.items():
-        _native.command_alias(
-            name = tool_name,
-            exe = ":{}[{}]".format(archive, tool),
-            resources = [":{}".format(archive)],
-            visibility = visibility,
-        )
 
 def _system_java_tool_impl(ctx):
     return [
@@ -109,11 +43,6 @@ system_java_lib = rule(
     },
 )
 
-def prebuilt_jar_bootstrap_toolchain(name, java, visibility = None):
-    kwargs = {}
-
-    _prebuilt_jar_toolchain_rule(name = name, java = java, visibility = visibility, **kwargs)
-
 def system_prebuilt_jar_bootstrap_toolchain(name, java, visibility = None):
     kwargs = {}
 
@@ -133,8 +62,7 @@ def _prebuilt_jar_toolchain_rule_impl(ctx):
 
 _prebuilt_jar_toolchain_rule = rule(
     attrs = {
-        # this just goes into the RunInfo of the result, so it's target, not exec
-        "java": attrs.dep(providers = [RunInfo]),
+        "java": attrs.dep(),
     },
     impl = _prebuilt_jar_toolchain_rule_impl,
     is_toolchain_rule = True,
@@ -155,19 +83,6 @@ def javacd_toolchain(name, java, javac, jar, jlink, jmod, jrt_fs_jar, java_for_t
         javacd = "prelude//toolchains/android/src/com/facebook/buck/jvm/java/stepsbuilder/javacd/main:javacd_tool",
         javac_protocol = "javacd",
         javacd_main_class = "com.facebook.buck.jvm.java.stepsbuilder.javacd.main.JavaCDMain",
-        jlink = jlink,
-        jmod = jmod,
-        jrt_fs_jar = jrt_fs_jar,
-    )
-
-def java_bootstrap_toolchain(name, java, javac, jlink, jmod, jrt_fs_jar, visibility = None):
-    _java_toolchain(
-        name = name,
-        visibility = visibility,
-        java = java,
-        is_bootstrap_toolchain = True,
-        javac = javac,
-        javac_protocol = "classic",
         jlink = jlink,
         jmod = jmod,
         jrt_fs_jar = jrt_fs_jar,
@@ -201,7 +116,6 @@ def _java_toolchain_impl(ctx):
             cp_snapshot_generator = None,
             dep_files = None,
             fat_jar_main_class_lib = ctx.attrs.fat_jar_main_class_lib,
-            compiler_class_to_source_map = ctx.attrs.compiler_class_to_source_map,
             gen_class_to_source_map = ctx.attrs.gen_class_to_source_map,
             gen_class_to_source_map_include_sourceless_compiled_packages = ctx.attrs.gen_class_to_source_map_include_sourceless_compiled_packages,
             gen_class_to_source_map_debuginfo = None,
@@ -240,20 +154,10 @@ _java_toolchain = rule(
     impl = _java_toolchain_impl,
     is_toolchain_rule = True,
     attrs = {
-        "class_abi_generator": attrs.option(attrs.exec_dep(providers = [RunInfo]), default = None),
+        "class_abi_generator": attrs.option(attrs.dep(providers = [RunInfo]), default = None),
         "class_loader_bootstrapper": attrs.option(attrs.source(), default = None),
-        "compile_and_package": attrs.exec_dep(
-            default = "prelude//java/tools:compile_and_package",
-            providers = [RunInfo],
-        ),
-        "compiler_class_to_source_map": attrs.exec_dep(
-            default = "prelude//java/tools:compiler_class_to_source_map",
-            providers = [RunInfo],
-        ),
-        "fat_jar": attrs.exec_dep(
-            default = "prelude//java/tools:fat_jar",
-            providers = [RunInfo],
-        ),
+        "compile_and_package": attrs.dep(default = "prelude//java/tools:compile_and_package"),
+        "fat_jar": attrs.dep(default = "prelude//java/tools:fat_jar"),
         "fat_jar_main_class_lib": attrs.option(attrs.source(), default = None),
         "gen_class_to_source_map": attrs.exec_dep(
             default = "prelude//java/tools:gen_class_to_source_map",
@@ -266,16 +170,16 @@ _java_toolchain = rule(
             ],
         ),
         "is_bootstrap_toolchain": attrs.bool(default = False),
-        "jar": attrs.option(attrs.exec_dep(providers = [RunInfo]), default = None),
+        "jar": attrs.option(attrs.dep(providers = [RunInfo]), default = None),
         "jar_builder": attrs.source(default = "prelude//toolchains/android/src/com/facebook/buck/util/zip:jar_builder"),
-        "java": attrs.exec_dep(providers = [RunInfo]),
-        "java_for_tests": attrs.option(attrs.exec_dep(providers = [RunInfo]), default = None),
-        "javac": attrs.option(attrs.one_of(attrs.exec_dep(), attrs.source(), attrs.string()), default = None),
+        "java": attrs.exec_dep(),
+        "java_for_tests": attrs.option(attrs.dep(providers = [RunInfo]), default = None),
+        "javac": attrs.option(attrs.one_of(attrs.dep(), attrs.source(), attrs.string()), default = None),
         "javac_protocol": attrs.enum(JavacProtocol.values()),
         "javacd": attrs.option(attrs.source(), default = None),
         "javacd_main_class": attrs.option(attrs.string(), default = None),
-        "jlink": attrs.exec_dep(providers = [RunInfo]),
-        "jmod": attrs.exec_dep(providers = [RunInfo]),
+        "jlink": attrs.exec_dep(),
+        "jmod": attrs.exec_dep(),
         "jrt_fs_jar": attrs.source(),
         "merge_class_to_source_maps": attrs.exec_dep(
             default = "prelude//java/tools:merge_class_to_source_maps",
@@ -321,8 +225,8 @@ _java_test_toolchain_rule = rule(
             attrs.string(),
             default = [],
         ),
-        "list_class_names": attrs.exec_dep(providers = [RunInfo]),
-        "list_tests": attrs.option(attrs.exec_dep(providers = [RunInfo]), default = None),
+        "list_class_names": attrs.dep(providers = [RunInfo]),
+        "list_tests": attrs.option(attrs.dep(providers = [RunInfo]), default = None),
         "test_runner_library_jar": attrs.source(),
         "testng_test_runner_main_class_args": attrs.list(attrs.string()),
     },

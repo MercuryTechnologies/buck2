@@ -8,11 +8,6 @@
 
 load("@prelude//:prelude.bzl", "native")
 load(
-    "@prelude//os_lookup:defs.bzl",
-    "Os",
-    "OsLookup",
-)
-load(
     "@prelude//python:python_wheel_toolchain.bzl",
     "PythonWheelToolchainInfo",
 )
@@ -21,17 +16,10 @@ load(
     "PythonPlatformInfo",
     "PythonToolchainInfo",
 )
-load("@prelude//python_bootstrap:toolchain.bzl", "PythonBootstrapToolchainInfo")
-
-def _python_wheel_toolchain_impl(ctx):
-    return [
-        DefaultInfo(),
-        PythonWheelToolchainInfo(
-            abi = ctx.attrs.abi,
-            platform = ctx.attrs.platform,
-            python = ctx.attrs.python,
-        ),
-    ]
+load(
+    "@prelude//python_bootstrap:python_bootstrap.bzl",
+    "PythonBootstrapToolchainInfo",
+)
 
 def _system_python_wheel_toolchain_impl(ctx):
     return [
@@ -53,38 +41,16 @@ system_python_wheel_toolchain = rule(
     is_toolchain_rule = True,
 )
 
-python_wheel_toolchain = rule(
-    impl = _python_wheel_toolchain_impl,
-    attrs = {
-        "abi": attrs.string(default = "none"),
-        "platform": attrs.string(default = "linux_x86_64"),
-        "python": attrs.string(default = "py3"),
-    },
-    is_toolchain_rule = True,
-)
-
 _INTERPRETER = select({
     "DEFAULT": "python3",
     "config//os:windows": "python.exe",
 })
 
-_EXEC_OS_TYPE = attrs.default_only(attrs.exec_dep(default = "prelude//os_lookup/targets:os_lookup"))
-
-def _interpreter_for_os(os: Os) -> str:
-    return "python.exe" if os == Os("windows") else "python3"
-
-def _system_python_bootstrap_toolchain_impl(ctx):
-    # the interpreter name needs to be selected based on the exec platform, not the target
-    interpreter = ctx.attrs.interpreter or _interpreter_for_os(ctx.attrs._exec_os_type[OsLookup].os)
+def _python_bootstrap_toolchain_impl(ctx):
+    interpreter = ctx.attrs.interpreter if isinstance(ctx.attrs.interpreter, str) else ctx.attrs.interpreter[RunInfo].args
     return [
         DefaultInfo(),
         PythonBootstrapToolchainInfo(interpreter = interpreter),
-    ]
-
-def _python_bootstrap_toolchain_impl(ctx):
-    return [
-        DefaultInfo(),
-        PythonBootstrapToolchainInfo(interpreter = ctx.attrs.interpreter[RunInfo].args),
     ]
 
 # Creates a new bootstrap toolchain using Python that is installed on your system.
@@ -99,10 +65,9 @@ def _python_bootstrap_toolchain_impl(ctx):
 # )
 # ```
 system_python_bootstrap_toolchain = rule(
-    impl = _system_python_bootstrap_toolchain_impl,
+    impl = _python_bootstrap_toolchain_impl,
     attrs = {
-        "interpreter": attrs.option(attrs.string(), default = None),
-        "_exec_os_type": _EXEC_OS_TYPE,
+        "interpreter": attrs.string(default = _INTERPRETER),
     },
     is_toolchain_rule = True,
 )
@@ -125,15 +90,12 @@ def _system_python_toolchain_impl(ctx):
     A very simple toolchain that is hardcoded to the current environment.
     """
 
-    # the "host" (exec platform) interpreter needs to be selected based on the exec platform
-    host_interpreter = ctx.attrs.host_interpreter or _interpreter_for_os(ctx.attrs._exec_os_type[OsLookup].os)
-
     return [
         DefaultInfo(),
         PythonToolchainInfo(
             binary_linker_flags = ctx.attrs.binary_linker_flags,
             linker_flags = ctx.attrs.linker_flags,
-            host_interpreter = RunInfo(args = [host_interpreter]),
+            host_interpreter = RunInfo(args = [ctx.attrs.interpreter]),
             interpreter = RunInfo(args = [ctx.attrs.interpreter]),
             compile = RunInfo(args = ["echo", "COMPILEINFO"]),
             package_style = "inplace",
@@ -148,11 +110,6 @@ system_python_toolchain = rule(
     impl = _system_python_toolchain_impl,
     attrs = {
         "binary_linker_flags": attrs.default_only(attrs.list(attrs.arg(), default = [])),
-        "host_interpreter": attrs.option(
-            attrs.string(),
-            default = None,
-            doc = "Interpreter to run actions on the exec platform. Defaults to the usual interpreter name for the exec platform.",
-        ),
         "interpreter": attrs.string(default = _INTERPRETER),
         "linker_flags": attrs.default_only(attrs.list(attrs.arg(), default = [])),
         "pex_extension": attrs.string(default = ".pex"),
@@ -161,7 +118,6 @@ system_python_toolchain = rule(
             default = None,
             doc = "See `PythonToolchainInfo.type_checker` for the executable contract.",
         ),
-        "_exec_os_type": _EXEC_OS_TYPE,
     },
     is_toolchain_rule = True,
 )
@@ -171,7 +127,7 @@ def python_toolchain_impl(ctx) -> list[Provider]:
         DefaultInfo(),
         PythonToolchainInfo(
             interpreter = ctx.attrs.interpreter[RunInfo],
-            host_interpreter = ctx.attrs.host_interpreter[RunInfo],
+            host_interpreter = ctx.attrs.interpreter[RunInfo],
             compile = ctx.attrs.compile[DefaultInfo].default_outputs[0],
             package_style = "inplace",
             native_link_strategy = "separate",
@@ -183,19 +139,11 @@ def python_toolchain_impl(ctx) -> list[Provider]:
         PythonPlatformInfo(name = "x86_64"),
     ]
 
-_python_toolchain = rule(
+python_toolchain = rule(
     impl = python_toolchain_impl,
     attrs = {
-        "compile": attrs.default_only(attrs.exec_dep(default = "prelude//python/tools:compile.py")),
+        "compile": attrs.default_only(attrs.dep(default = "prelude//python/tools:compile.py")),
         "extension_linker_flags": attrs.list(attrs.arg()),
-        "host_interpreter": attrs.exec_dep(
-            providers = [RunInfo],
-            doc = """
-            Interpreter used to run build-time actions, such as compiling bytecode. Typically the
-            same label as `interpreter` (as defaulted by the python_toolchain wrapper macro), but
-            uses a separate attr to transition to exec configuration.
-            """,
-        ),
         "interpreter": attrs.dep(providers = [RunInfo]),
         "type_checker": attrs.option(
             attrs.exec_dep(providers = [RunInfo]),
@@ -206,14 +154,6 @@ _python_toolchain = rule(
     is_toolchain_rule = True,
     doc = "A Python toolchain that can build Python extensions, given an interpreter and the extra linker flags to use with it. See `remote_python_toolchain` for a toolchain that configures the interpreter and linker flags for you.",
 )
-
-def python_toolchain(name: str, interpreter, host_interpreter = None, **kwargs) -> None:
-    """
-    A Python toolchain that can build Python extensions, given an interpreter and
-    the extra linker flags to use with it. See `remote_python_toolchain` for a
-    toolchain that configures the interpreter and linker flags for you.
-    """
-    _python_toolchain(name = name, interpreter = interpreter, host_interpreter = interpreter if host_interpreter == None else host_interpreter, **kwargs)
 
 # archives for 3.13
 # update this by running `prelude//python/tools:discover_python_archives.sh`

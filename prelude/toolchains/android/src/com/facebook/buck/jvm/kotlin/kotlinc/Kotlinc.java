@@ -23,7 +23,6 @@ import com.google.common.collect.ImmutableSortedSet;
 import java.io.IOException;
 import java.nio.file.Path;
 import java.util.Optional;
-import javax.annotation.Nullable;
 
 /** Interface for a kotlin compiler. */
 public interface Kotlinc {
@@ -38,9 +37,7 @@ public interface Kotlinc {
       Optional<Path> workingDirectory,
       AbsPath ruleCellRoot,
       KotlincMode mode,
-      KotlinCDLoggingContext kotlinCDLoggingContext,
-      AbsPath outputDirectory,
-      @Nullable Path classToSourceMapPath)
+      KotlinCDLoggingContext kotlinCDLoggingContext)
       throws InterruptedException;
 
   String getDescription(

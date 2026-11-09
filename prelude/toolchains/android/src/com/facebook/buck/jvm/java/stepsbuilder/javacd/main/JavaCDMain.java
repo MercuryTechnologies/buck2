@@ -43,7 +43,10 @@ public class JavaCDMain {
                   }));
       CompilerDaemonRunner.run(command);
       logger.info(String.format("Starting JavaCDWorkerTool %s", command));
-      command.postExecute();
+      command.maybeWriteClassAbi();
+      command.maybeWriteAbiDir();
+      command.maybeWriteDepFile();
+      command.maybeWriteUsedJarsFile();
       System.err.println("JavaCDWorkerTool succeeded!");
       System.exit(0);
     } catch (Exception e) {
