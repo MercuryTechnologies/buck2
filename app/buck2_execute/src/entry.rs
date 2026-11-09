@@ -321,5 +321,15 @@ fn create_symlink(
             }
         }
     }
+    // josh: a local action that copied an input link verbatim holds the absolute real path the
+    // materializer wrote for it, which names this checkout. Hash the canonical relative text
+    // instead, so the digest is the one the tree's own home takes for the same output.
+    if symlink_target.is_absolute() {
+        if let Some(text) =
+            buck2_core::josh::canonical_symlink_text(path.as_path(), &symlink_target)
+        {
+            symlink_target = text.into();
+        }
+    }
     new_symlink(symlink_target)
 }

@@ -564,6 +564,28 @@ fn lexical_join<'a>(dir: &[&'a str], text: &'a str) -> Option<Vec<&'a str>> {
     Some(parts)
 }
 
+/// The relative path from directory `from` to `to`, both as components from the project root.
+fn relativize<S: AsRef<str>>(from: &[S], to: &[S]) -> String {
+    let n = from
+        .iter()
+        .zip(to.iter())
+        .take_while(|(a, b)| a.as_ref() == b.as_ref())
+        .count();
+    let mut out: Vec<&str> = std::iter::repeat_n("..", from.len() - n).collect();
+    out.extend(to[n..].iter().map(|c| c.as_ref()));
+    if out.is_empty() {
+        ".".to_owned()
+    } else {
+        out.join("/")
+    }
+}
+
+fn components(p: &str) -> Vec<&str> {
+    p.split('/')
+        .filter(|c| !c.is_empty() && *c != ".")
+        .collect()
+}
+
 impl JoshMap {
     /// The text a relative symlink at project-relative `link` should have on disk, given the
     /// text it has in the canonical view, for a project at absolute path `project_root`. A
@@ -613,6 +635,77 @@ impl JoshMap {
         })
     }
 
+    /// Where an on-disk project-relative path `p` is in the canonical view. A path under the
+    /// on-disk buck-out root `real_buck_out` is under [`CANONICAL_BUCK_OUT`]; one inside the exec
+    /// root (`<real buck-out>/josh/exec`) is already canonical; a source is in the innermost
+    /// cell whose real path holds it. `None` for the rest of `<real buck-out>/josh`, another
+    /// isolation dir, the reserved dir, and an external cell's files (they are under buck-out).
+    fn canonical_of_disk(&self, p: &[&str], real_buck_out: &[&str]) -> Option<Vec<String>> {
+        let owned = |v: &[&str]| v.iter().map(|c| (*c).to_owned()).collect::<Vec<String>>();
+        if p.first() == Some(&"buck-out") {
+            let rest = p.strip_prefix(real_buck_out)?;
+            if let Some(exec) = rest.strip_prefix(&["josh", "exec"][..]) {
+                return Some(owned(exec));
+            }
+            if rest.first() == Some(&"josh") {
+                return None;
+            }
+            let mut v = owned(&components(CANONICAL_BUCK_OUT));
+            v.extend(owned(rest));
+            return Some(v);
+        }
+        if p.first() == Some(&RESERVED_DIR) {
+            return None;
+        }
+        let (n, c) = self
+            .cells
+            .iter()
+            .filter(|c| !c.external)
+            .filter_map(|c| {
+                let rp = components(c.real_path.as_project_relative_path().as_str());
+                p.starts_with(&rp).then_some((rp.len(), c))
+            })
+            .max_by_key(|(n, _)| *n)?;
+        let mut v = owned(&components(
+            c.canonical_path.as_project_relative_path().as_str(),
+        ));
+        v.extend(owned(&p[n..]));
+        Some(v)
+    }
+
+    /// The text to hash for a symlink at on-disk project-relative `link` whose text on disk is
+    /// the absolute `text`, for a project at `project_root` with its buck-out at `real_buck_out`.
+    /// `None` when `text` is not under the project root or names nothing the canonical view has.
+    ///
+    /// [`JoshMap::disk_symlink_text_rel`] writes a link to a source with its absolute real path,
+    /// and a local action that copies such a link verbatim (GNU `cp -R` of a symlinked_dir, for
+    /// one) leaves that text in its output. Hashed as it is, the output digest names
+    /// this checkout, and another checkout that hits the shared key materialises a link into
+    /// this one and reads its current file under its own keys. The canonical relative text from
+    /// the link's canonical place is what the tree's own home writes for the same copy, so the
+    /// digest is layout-invariant again, and every checkout's materializer re-points it at its
+    /// own file.
+    pub fn canonical_symlink_text_rel(
+        &self,
+        link: &str,
+        text: &str,
+        project_root: &str,
+        real_buck_out: &str,
+    ) -> Option<String> {
+        let root = project_root.trim_end_matches('/');
+        let rest = text.strip_prefix(root)?;
+        if !(rest.is_empty() || rest.starts_with('/')) {
+            return None;
+        }
+        let target = lexical_join(&[], rest)?;
+        let link_comps = components(link);
+        let dir = &link_comps[..link_comps.len().checked_sub(1)?];
+        let bo = components(real_buck_out);
+        let cdir = self.canonical_of_disk(dir, &bo)?;
+        let ctarget = self.canonical_of_disk(&target, &bo)?;
+        Some(relativize(&cdir, &ctarget))
+    }
+
     /// One line per fact of the map, for the event log and the build report (design D7).
     pub fn describe(&self) -> Vec<String> {
         let mut v: Vec<String> = self
@@ -642,6 +735,21 @@ pub fn disk_symlink_text(link: &std::path::Path, text: &str) -> Option<String> {
     let d = DISK.get()?;
     let rel = link.strip_prefix(&d.project_root).ok()?.to_str()?;
     josh.disk_symlink_text_rel(rel, text, d.project_root.to_str()?)
+}
+
+/// [`JoshMap::canonical_symlink_text_rel`] for a symlink at absolute path `link` with the
+/// absolute text `text`, read from a local action's output before it is hashed. `None` with
+/// josh off or an identity map, so their digests are taken from the text on disk as before.
+pub fn canonical_symlink_text(link: &std::path::Path, text: &std::path::Path) -> Option<String> {
+    let josh = active()?;
+    let d = DISK.get()?;
+    let rel = link.strip_prefix(&d.project_root).ok()?.to_str()?;
+    josh.canonical_symlink_text_rel(
+        rel,
+        text.to_str()?,
+        d.project_root.to_str()?,
+        d.real_buck_out.as_str(),
+    )
 }
 
 /// The version the daemon's disk state (the materializer's above all) is kept under while the
@@ -1163,6 +1271,100 @@ mod tests {
             .as_deref(),
             Some("/w/lab/pq/x.txt")
         );
+    }
+
+    #[test]
+    fn absolute_link_to_source_hashes_as_canonical_relative_text() {
+        let m = JoshMap::new(&lab_map(), &lab(), &never).unwrap();
+        let bo = "buck-out/v2";
+        // A `cp -R` of a symlinked_dir entry pointing at mwb's pc/x.txt: the copy sits at the
+        // same depth, so the text is what mwb's own checkout writes for the same copy.
+        let link = "buck-out/v2/art/root/c1e23b28eb21d1ae/pc/__cp__/cp/a.txt";
+        let text = m
+            .canonical_symlink_text_rel(link, "/w/lab/services/web-backend/pc/x.txt", ROOT, bo)
+            .unwrap();
+        assert_eq!(text, "../../../../../../../../pc/x.txt");
+        // It round-trips: written on disk again, it is the absolute real path.
+        assert_eq!(
+            m.disk_symlink_text_rel(link, &text, ROOT).as_deref(),
+            Some("/w/lab/services/web-backend/pc/x.txt")
+        );
+        // A lab root source, an inner cell's (ftools under mwb) and a remapped cell's.
+        assert_eq!(
+            m.canonical_symlink_text_rel("buck-out/v2/art/lab/l/__t__/s", "/w/lab/l/f", ROOT, bo)
+                .as_deref(),
+            Some("../../../../../../.josh/lab/l/f")
+        );
+        assert_eq!(
+            m.canonical_symlink_text_rel(
+                "buck-out/v2/x/l",
+                "/w/lab/services/web-backend/ftools/a",
+                ROOT,
+                bo
+            )
+            .as_deref(),
+            Some("../../../ftools/a")
+        );
+        assert_eq!(
+            m.canonical_symlink_text_rel("buck-out/v2/x/l", "/w/lab/tools/./b/../c", ROOT, bo)
+                .as_deref(),
+            Some("../../../.josh/lab_ftools/c")
+        );
+    }
+
+    #[test]
+    fn absolute_link_into_buck_out_or_exec_root_hashes_as_canonical_relative_text() {
+        let m = JoshMap::new(&lab_map(), &lab(), &never).unwrap();
+        // The daemon's isolation dir is `josh-b`; the canonical buck-out is buck-out/v2.
+        let bo = "buck-out/josh-b";
+        let link = "buck-out/josh-b/art/root/h/p/__a__/l";
+        assert_eq!(
+            m.canonical_symlink_text_rel(link, "/w/lab/buck-out/josh-b/art/root/h/q/out", ROOT, bo)
+                .as_deref(),
+            Some("../../q/out")
+        );
+        // `$PWD` inside the exec root is <buck-out>/josh/exec.
+        assert_eq!(
+            m.canonical_symlink_text_rel(
+                link,
+                "/w/lab/buck-out/josh-b/josh/exec/buck-out/v2/art/root/h/q/out",
+                ROOT,
+                bo
+            )
+            .as_deref(),
+            Some("../../q/out")
+        );
+        assert_eq!(
+            m.canonical_symlink_text_rel(
+                link,
+                "/w/lab/buck-out/josh-b/josh/exec/pc/x.txt",
+                ROOT,
+                bo
+            )
+            .as_deref(),
+            Some("../../../../../../../pc/x.txt")
+        );
+    }
+
+    #[test]
+    fn absolute_link_outside_the_canonical_view_keeps_its_text() {
+        let m = JoshMap::new(&lab_map(), &lab(), &never).unwrap();
+        let bo = "buck-out/v2";
+        let link = "buck-out/v2/art/root/h/p/__a__/l";
+        for text in [
+            "/etc/passwd",
+            "/w/labx/pc/x.txt",
+            "/w/lab/../other/x",
+            "/w/lab/buck-out/other-iso/x",
+            "/w/lab/buck-out/v2/josh/exec-skipped.txt",
+            "/w/lab/.josh/lab/x",
+        ] {
+            assert_eq!(
+                m.canonical_symlink_text_rel(link, text, ROOT, bo),
+                None,
+                "{text}"
+            );
+        }
     }
 
     #[test]
