@@ -326,7 +326,14 @@ pub(crate) fn analysis_actions_methods_run(methods: &mut MethodsBuilder) {
             bool,
         >,
         #[starlark(require = named, default = NoneOr::None)] exec_group: NoneOr<ExecutionGroupArg>,
+        // Accepted and ignored. Upstream 70bd3da438 removed eager materialization and this
+        // parameter with it, but mercury-head's prelude (b5d8d9ce, prelude/cxx/link.bzl:472),
+        // which this fork bundles for mercury-web-backend, still passes it, and a call with an
+        // unknown named parameter fails analysis. The flag only ever chose when outputs were
+        // materialized, so ignoring it changes no action's command or digest.
+        #[starlark(require = named, default = false)] eager_materialization_enabled: bool,
     ) -> starlark::Result<NoneType> {
+        let _ = eager_materialization_enabled;
         let exec_group = action_execution_group(exec_group);
         if incremental_remote_outputs && !no_outputs_cleanup {
             // Precaution to make sure content-based paths are not involved.
