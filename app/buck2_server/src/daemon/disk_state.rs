@@ -98,6 +98,11 @@ fn sqlite_db_setup_metadata_and_versions(
     if let Some(hostname) = metadata.get("hostname") {
         versions.insert("hostname".to_owned(), hostname.to_owned());
     }
+    // josh: what the on-disk symlinks to sources were written for. Absent with josh off or an
+    // identity map, so their state is kept exactly as before.
+    if let Some(josh) = buck2_core::josh::disk_state_version() {
+        versions.insert("josh".to_owned(), josh);
+    }
 
     Ok((metadata, versions))
 }
