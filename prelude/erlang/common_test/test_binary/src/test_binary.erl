@@ -241,7 +241,7 @@ list_and_run(Args, OutputDir) ->
     Listing = get_listing(TestInfo, OutputDir),
     Tests = listing_to_testnames(Listing),
     running(Args#{output_dir => OutputDir, tests => Tests}),
-    ResultsFile = test_result_output:output_file(OutputDir),
+    ResultsFile = filename:join(OutputDir, "result_exec.json"),
     print_results(ResultsFile).
 
 -spec listing_to_testnames(#test_spec_test_case{}) -> [string()].
@@ -299,42 +299,38 @@ stdout_streaming(_) -> output_to_stdout.
 -spec print_results(file:filename()) -> boolean().
 print_results(ResultsFile) ->
     {ok, Data} = file:read_file(ResultsFile, [raw]),
-    Events = [json:decode(Line) || Line <- binary:split(Data, <<"\n">>, [global, trim_all])],
-    {Summary, AnyTestFailure} = lists:foldl(fun print_individual_results/2, {#{}, false}, Events),
+    Results = json:decode(Data),
+    {Summary, AnyFailure} = lists:foldl(fun print_individual_results/2, {#{}, false}, Results),
     io:format("~n~10s: ~b~n~n", ["TOTAL", lists:sum(maps:values(Summary))]),
     [
-        io:format("~10ts: ~b~n", [test_result_output:status_name(Result), Amount])
+        io:format("~10ts: ~b~n", [json_interfacer:status_name(Result), Amount])
      || Result := Amount <- Summary
     ],
-    AnyTestFailure.
+    AnyFailure.
 
 -spec print_individual_results(map(), Acc) -> Acc when Acc :: {#{non_neg_integer() => non_neg_integer()}, boolean()}.
-print_individual_results(#{<<"start">> := _}, Acc) ->
-    Acc;
-print_individual_results(#{<<"run_failure">> := #{<<"details">> := Details}}, {Summary, _}) ->
-    print_details(Details),
-    {Summary, true};
-print_individual_results(
-    #{<<"finish">> := #{<<"status">> := Status, <<"message">> := Message}}, {Summary, AnyFailure}
-) ->
+print_individual_results(Result, {Summary, AnyFailure}) ->
+    #{<<"main">> := #{<<"details">> := Details, <<"status">> := Status, <<"std_out">> := StdOut}} = Result,
     NewAnyFailure =
-        case test_result_output:status_name(Status) of
+        case json_interfacer:status_name(Status) of
             passed ->
                 AnyFailure;
             skipped ->
-                print_details(Message),
+                print_details(StdOut, Details),
                 AnyFailure;
             omitted ->
                 AnyFailure;
             _NotPassed ->
-                print_details(Message),
+                print_details(StdOut, Details),
                 true
         end,
     {Summary#{Status => maps:get(Status, Summary, 0) + 1}, NewAnyFailure}.
 
--spec print_details(Details) -> ok when
+-spec print_details(StdOut, Details) -> ok when
+    StdOut :: unicode:chardata(),
     Details :: unicode:chardata().
-print_details(Details) ->
+print_details(StdOut, Details) ->
+    io:format("~ts~n", [StdOut]),
     io:format("~ts~n", [Details]),
     io:format("- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -~n"),
     io:format("- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -~n").

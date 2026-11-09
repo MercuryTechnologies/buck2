@@ -14,10 +14,7 @@ import com.fasterxml.jackson.core.JsonFactory;
 import com.fasterxml.jackson.core.JsonGenerator;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
-import java.util.Collections;
-import java.util.Map;
 import java.util.Optional;
-import java.util.TreeMap;
 
 /**
  * TestResultsOutputEvent implements the following thrift schema.
@@ -178,9 +175,6 @@ public class TestResultsOutputEvent {
     /** A message associated with the test result, or null if there is no message. */
     public String message;
 
-    /** Framework-supplied TestInfra result metadata. */
-    public Map<String, String> metadata;
-
     /**
      * Creates a new finish event with the given parameters.
      *
@@ -192,22 +186,11 @@ public class TestResultsOutputEvent {
      */
     public FinishEvent(
         String name, TestStatus status, long endedTime, long duration, Optional<String> message) {
-      this(name, status, endedTime, duration, message, Collections.emptyMap());
-    }
-
-    public FinishEvent(
-        String name,
-        TestStatus status,
-        long endedTime,
-        long duration,
-        Optional<String> message,
-        Map<String, String> metadata) {
       this.name = name;
       this.status = status;
       this.endedTime = endedTime;
       this.duration = duration;
       this.message = message.orElse(null);
-      this.metadata = metadata;
     }
 
     /**
@@ -228,13 +211,6 @@ public class TestResultsOutputEvent {
           generator.writeStringField("message", message);
         }
         generator.writeNumberField("ended_time", endedTime);
-        if (metadata != null && !metadata.isEmpty()) {
-          generator.writeObjectFieldStart("metadata");
-          for (Map.Entry<String, String> entry : new TreeMap<>(metadata).entrySet()) {
-            generator.writeStringField(entry.getKey(), entry.getValue());
-          }
-          generator.writeEndObject();
-        }
         generator.writeEndObject();
         generator.writeEndObject();
       }

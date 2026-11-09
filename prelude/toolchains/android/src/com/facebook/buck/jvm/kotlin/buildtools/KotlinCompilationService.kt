@@ -32,32 +32,23 @@ internal class KotlinCompilationService(
       arguments: List<String>,
       mode: KotlincMode,
       logger: KotlinLogger? = null,
-      classToSourceMap: KotlinClassToSourceMap? = null,
   ): CompilationResult {
     val compilerExecutionStrategyConfiguration =
         compilationService.makeCompilerExecutionStrategyConfiguration()
 
     val jvmCompilationConfiguration =
-        jvmCompilationConfigurationFactory
-            .create(mode, classToSourceMap?.requiresRebuild ?: false)
-            .apply {
-              if (logger != null) {
-                useLogger(logger)
-              }
-              if (classToSourceMap != null) {
-                useLogger(classToSourceMap.logger(this.logger))
-              }
-            }
+        jvmCompilationConfigurationFactory.create(mode).apply {
+          if (logger != null) {
+            useLogger(logger)
+          }
+        }
 
-    val result =
-        compilationService.compileJvm(
-            projectId,
-            compilerExecutionStrategyConfiguration,
-            jvmCompilationConfiguration,
-            emptyList(),
-            if (classToSourceMap != null) arguments + "-Xreport-output-files" else arguments,
-        )
-    if (result == CompilationResult.COMPILATION_SUCCESS) classToSourceMap?.write()
-    return result
+    return compilationService.compileJvm(
+        projectId,
+        compilerExecutionStrategyConfiguration,
+        jvmCompilationConfiguration,
+        emptyList(),
+        arguments,
+    )
   }
 }

@@ -47,9 +47,7 @@
     trampolines :: [binary()],
     timeout :: timeout(),
     ct_stdout_fingerprint :: ct_stdout:fingerprint(),
-    ct_stdout_streaming :: output_to_stdout | no_output_to_stdout,
-    %% Receives {run_succeed | run_failed, Result, ProgressMarkersOffsets} when the CT run ends
-    result_recipient :: pid()
+    ct_stdout_streaming :: output_to_stdout | no_output_to_stdout
 }).
 
 -record(run_specs, {

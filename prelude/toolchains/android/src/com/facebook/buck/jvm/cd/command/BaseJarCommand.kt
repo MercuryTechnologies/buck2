@@ -20,17 +20,15 @@ import com.facebook.buck.jvm.cd.serialization.java.BuildTargetValueSerializer
 import com.facebook.buck.jvm.cd.serialization.java.CompilerOutputPathsValueSerializer
 import com.facebook.buck.jvm.cd.serialization.java.JarParametersSerializer
 import com.facebook.buck.jvm.cd.serialization.java.ResolvedJavacOptionsSerializer
+import com.facebook.buck.jvm.cd.serialization.java.ResolvedJavacSerializer
 import com.facebook.buck.jvm.core.BuildTargetValue
 import com.facebook.buck.jvm.java.CompilerOutputPathsValue
 import com.facebook.buck.jvm.java.JarParameters
-import com.facebook.buck.jvm.java.JdkProvidedInMemoryJavac
 import com.facebook.buck.jvm.java.ResolvedJavac
 import com.facebook.buck.jvm.java.ResolvedJavacOptions
 import com.google.common.collect.ImmutableList
 import com.google.common.collect.ImmutableMap
 import com.google.common.collect.ImmutableSortedSet
-import java.nio.file.Path
-import java.nio.file.Paths
 import java.util.Optional
 
 class BaseJarCommand(
@@ -49,82 +47,31 @@ class BaseJarCommand(
     val resolvedJavacOptions: ResolvedJavacOptions,
     val buildTargetValue: BuildTargetValue,
     val buckOut: RelPath,
+    val pathToClasses: RelPath?,
     val annotationPath: RelPath?,
-    val jarToJarDirMap: ImmutableMap<Path, Path>,
 ) {
 
   companion object {
     fun fromProto(model: ProtoBaseJarCommand, scratchDir: Optional<RelPath>): BaseJarCommand {
-      val paths = model.compileTimeClasspathAbiAndDirPathsList
-      require(paths.size % 2 == 0) { "Expected alternating ABI jar and directory paths" }
-      require(paths.isEmpty() || model.compileTimeClasspathPathsCount == 0) {
-        "Specify either compileTimeClasspathPaths or compileTimeClasspathAbiAndDirPaths"
-      }
-      val classpath = ImmutableList.builder<RelPath>()
-      val jarToJarDirMap = mutableMapOf<Path, Path>()
-      for (i in paths.indices step 2) {
-        val jar = RelPath.get(paths[i])
-        classpath.add(jar)
-        if (paths[i + 1].isNotEmpty()) {
-          val dir = Paths.get(paths[i + 1])
-          // TODO(ianc) fix this, we shouldn't be adding the same jar to the classpath multiple
-          // times
-          val previous = jarToJarDirMap.putIfAbsent(jar.path, dir)
-          require(previous == null || previous == dir) { "Conflicting ABI directories for $jar" }
-        }
-      }
-      if (paths.isEmpty()) {
-        classpath.addAll(RelPathSerializer.toListOfRelPath(model.compileTimeClasspathPathsList))
-      }
-      val buildTarget = BuildTargetValueSerializer.deserialize(model.buildTargetValue)
-      val outputPathsValue =
-          CompilerOutputPathsValueSerializer.deserialize(model.outputPathsValue, scratchDir)
-      val outputPaths =
-          when {
-            buildTarget.isSourceOnlyAbi -> outputPathsValue.sourceOnlyAbiCompilerOutputPath
-            buildTarget.isSourceAbi -> outputPathsValue.sourceAbiCompilerOutputPath
-            else -> outputPathsValue.libraryCompilerOutputPath
-          }
-      val resources = RelPathSerializer.toResourceMap(model.resourcesMapList)
-      val jarParameters =
-          if (model.hasJarParameters()) {
-            val parameters = JarParametersSerializer.deserialize(model.jarParameters)
-            if (parameters.entriesToJar.isEmpty()) {
-              parameters.copy(
-                  entriesToJar =
-                      ImmutableSortedSet.orderedBy(RelPath.comparator())
-                          .add(outputPaths.classesDir)
-                          .build(),
-              )
-            } else {
-              parameters
-            }
-          } else {
-            null
-          }
       return BaseJarCommand(
-          AbiGenerationMode.CLASS,
+          model.abiCompatibilityMode,
           model.abiGenerationMode,
           model.trackClassUsage,
           model.trackClassUsage,
-          outputPathsValue,
-          classpath.build(),
+          CompilerOutputPathsValueSerializer.deserialize(model.outputPathsValue, scratchDir),
+          RelPathSerializer.toListOfRelPath(model.compileTimeClasspathPathsList),
           RelPathSerializer.toListOfRelPath(model.compileTimeClasspathSnapshotPathsList),
           RelPathSerializer.toSortedSetOfRelPath(model.getJavaSrcsList()),
-          ImmutableMap.copyOf(
-              resources.mapValues { (_, destination) ->
-                outputPaths.classesDir.resolveRel(destination.toString())
-              },
-          ),
-          jarParameters,
+          RelPathSerializer.toResourceMap(model.resourcesMapList),
+          if (model.hasJarParameters()) JarParametersSerializer.deserialize(model.jarParameters)
+          else null,
           AbsPathSerializer.deserialize(""),
-          JdkProvidedInMemoryJavac.createJsr199Javac(),
+          ResolvedJavacSerializer.deserialize(model.resolvedJavac),
           ResolvedJavacOptionsSerializer.deserialize(model.resolvedJavacOptions),
-          buildTarget,
-          RelPath.get("buck-out/v2"),
-          if (model.annotationsPath.isEmpty()) scratchDir.get().resolveRel("__gen__")
-          else RelPathSerializer.deserialize(model.annotationsPath),
-          ImmutableMap.copyOf(jarToJarDirMap),
+          BuildTargetValueSerializer.deserialize(model.buildTargetValue),
+          RelPathSerializer.deserialize(model.configuredBuckOut),
+          RelPathSerializer.deserialize(model.pathToClasses),
+          RelPathSerializer.deserialize(model.annotationsPath),
       )
     }
   }

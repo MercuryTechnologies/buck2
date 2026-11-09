@@ -7,17 +7,17 @@
 -module(test_cli_e2e_SUITE).
 -typing([eqwalizer]).
 
+% elp:ignore WA003 (better_assertions) - Open Source
+-include_lib("stdlib/include/assert.hrl").
+-include_lib("common_test/include/ct.hrl").
+-include_lib("common/include/buck_ct_records.hrl").
+
 -export([suite/0, all/0, init_per_suite/1, end_per_suite/1]).
 
 -export([
     test_list/1,
     test_try_make_path_relative/1
 ]).
-
-% elp:ignore WA003 (better_assertions) - Open Source
--include_lib("stdlib/include/assert.hrl").
--include_lib("common_test/include/ct.hrl").
--include_lib("common/include/buck_ct_records.hrl").
 
 suite() ->
     [{appatic, #{enable_autoclean => true}}].
@@ -26,7 +26,7 @@ all() ->
     [test_list, test_try_make_path_relative].
 
 init_per_suite(Config) ->
-    PrivDir = proplists:get_value(priv_dir, Config),
+    PrivDir = ?config(priv_dir, Config),
     TestInfoFile = filename:join(PrivDir, <<"test_info">>),
 
     {ok, [ErlCmd]} = init:get_argument(progname),
@@ -40,7 +40,7 @@ init_per_suite(Config) ->
         config_files = [],
         providers = [],
         ct_opts = [],
-        erl_cmd = [list_to_binary(Arg) || Arg <:- ErlCmd],
+        erl_cmd = lists:map(fun list_to_binary/1, ErlCmd),
         extra_flags = [],
         artifact_annotation_mfa = fun artifact_annotations:default_annotation/1,
         trampolines = []

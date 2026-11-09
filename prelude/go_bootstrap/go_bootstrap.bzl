@@ -7,15 +7,23 @@
 # above-listed licenses.
 
 load("@prelude//:paths.bzl", "paths")
-load("@prelude//:prelude_rule.bzl", "prelude_rule")
-load("@prelude//decls:common.bzl", "buck")
-load("@prelude//decls:toolchains_common.bzl", "toolchains_common")
-load("@prelude//go:attrs.bzl", "go_common")
-load(":toolchain.bzl", _GoBootstrapDistrInfo = "GoBootstrapDistrInfo", _GoBootstrapToolchainInfo = "GoBootstrapToolchainInfo")
 
-# Re-exported for users that still load the providers from here.
-GoBootstrapDistrInfo = _GoBootstrapDistrInfo
-GoBootstrapToolchainInfo = _GoBootstrapToolchainInfo
+GoBootstrapDistrInfo = provider(
+    # @unsorted-dict-items
+    fields = {
+        "bin_go": provider_field(RunInfo),
+        "go_root": provider_field(Artifact | None),
+    },
+)
+GoBootstrapToolchainInfo = provider(
+    fields = {
+        "env_go_arch": provider_field(str),
+        "env_go_os": provider_field(str),
+        "env_go_root": provider_field(Artifact | None, default = None),
+        "go": provider_field(RunInfo),
+        "go_wrapper": provider_field(RunInfo),
+    },
+)
 
 def go_bootstrap_binary_impl(ctx: AnalysisContext) -> list[Provider]:
     """
@@ -63,27 +71,3 @@ def go_bootstrap_binary_impl(ctx: AnalysisContext) -> list[Provider]:
         DefaultInfo(default_output = output),
         RunInfo(args = [output]),
     ]
-
-go_bootstrap_binary = prelude_rule(
-    name = "go_bootstrap_binary",
-    impl = go_bootstrap_binary_impl,
-    docs = """
-        A `go_bootstrap_binary()` rule builds a minimal Go executable used
-        during bootstrap, where the full `go_binary()` machinery is not yet
-        available. It invokes the Go toolchain directly with the given
-        sources and `build_args`.
-    """,
-    attrs = (
-        go_common.srcs_arg()
-        | {
-            "build_args": attrs.list(attrs.string(), default = [], doc = """Package name, file names and build flags"""),
-            "workdir": attrs.string(default = "", doc = """Change to subdir before running the command"""),
-        }
-        | buck.labels_arg()
-        | buck.contacts_arg()
-        | {
-            "_exec_os_type": buck.exec_os_type_arg(),
-            "_go_bootstrap_toolchain": toolchains_common.go_bootstrap(),
-        }
-    ),
-)

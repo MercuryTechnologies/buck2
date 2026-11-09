@@ -53,7 +53,7 @@ public class ClassNameFilter {
    *
    * <p>patterns are substrings by default, but {@code ^} at the start or end of a pattern anchors
    * it to the start or end of the class name. {@code ^-} at the start of a pattern specifies that
-   * pattern is a regular expression, matched from the start of the class name.
+   * pattern is a regular expression.
    *
    * @param patterns Patterns to include in the filter.
    * @return A new filter.
@@ -96,7 +96,7 @@ public class ClassNameFilter {
     }
 
     for (Pattern pattern : regularExpressions) {
-      if (pattern.matcher(internalClassName).lookingAt()) {
+      if (pattern.matcher(internalClassName).find()) {
         return true;
       }
     }

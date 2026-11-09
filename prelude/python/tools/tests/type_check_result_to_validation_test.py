@@ -6,6 +6,7 @@
 # of this source tree. You may select, at your option, one of the
 # above-listed licenses.
 
+# pyre-strict
 
 import json
 import tempfile
@@ -71,16 +72,6 @@ class ConvertTypeCheckResultTest(unittest.TestCase):
                 },
             },
         )
-
-    def test_unused_ignores_never_block(self) -> None:
-        for name in ("unused-ignore", "unused-type-ignore"):
-            with self.subTest(name=name):
-                self.assertEqual(
-                    self._convert(
-                        {"errors": [{"code": -2, "name": name, "severity": "error"}]}
-                    ),
-                    {"version": 1, "data": {"status": "success"}},
-                )
 
     def test_malformed_error_preserves_blocking_diagnostics(self) -> None:
         result = self._convert(

@@ -48,7 +48,9 @@ import org.jetbrains.annotations.Nullable;
  */
 @Nullsafe(Nullsafe.Mode.LOCAL)
 public class ResourcesXml extends ResChunk {
-  private static final boolean DEBUG = false;
+  private static boolean debugEnabled() {
+    return !ResourceProcessingConfig.areOptimizationsEnabled();
+  }
 
   public static final int HEADER_SIZE = 8;
 
@@ -125,7 +127,7 @@ public class ResourcesXml extends ResChunk {
         int extOffset = offset + nodeHeaderSize;
         int attrStart = extOffset + nodeBuf.getShort(extOffset + 8);
         Preconditions.checkState(attrStart == extOffset + 20);
-        if (DEBUG) {
+        if (debugEnabled()) {
           int attrSize = nodeBuf.getShort(extOffset + 10);
           Preconditions.checkState(attrSize == ATTRIBUTE_SIZE);
         }
@@ -210,17 +212,29 @@ public class ResourcesXml extends ResChunk {
       }
     }
 
-    AttrRef[] refs = new AttrRef[attrCount];
-    for (int i = 0; i < attrCount; i++) {
-      refs[i] = new AttrRef(attrStart + ATTRIBUTE_SIZE * i);
+    if (ResourceProcessingConfig.areOptimizationsEnabled()) {
+      AttrRef[] refs = new AttrRef[attrCount];
+      for (int i = 0; i < attrCount; i++) {
+        refs[i] = new AttrRef(attrStart + ATTRIBUTE_SIZE * i);
+      }
+      Arrays.sort(refs);
+      byte[] newData = new byte[ATTRIBUTE_SIZE * attrCount];
+      ByteBuffer newBuf = wrap(newData);
+      for (AttrRef ref : refs) {
+        newBuf.put(slice(nodeBuf, ref.offset, ATTRIBUTE_SIZE));
+      }
+      slice(nodeBuf, attrStart).put(newData);
+    } else {
+      byte[] newData = new byte[ATTRIBUTE_SIZE * attrCount];
+      ByteBuffer newBuf = wrap(newData);
+      int finalAttrStart = attrStart;
+      int finalAttrCount = attrCount;
+      java.util.stream.IntStream.range(0, finalAttrCount)
+          .mapToObj(i -> new AttrRef(finalAttrStart + ATTRIBUTE_SIZE * i))
+          .sorted()
+          .forEachOrdered(ref -> newBuf.put(slice(nodeBuf, ref.offset, ATTRIBUTE_SIZE)));
+      slice(nodeBuf, attrStart).put(newData);
     }
-    Arrays.sort(refs);
-    byte[] newData = new byte[ATTRIBUTE_SIZE * attrCount];
-    ByteBuffer newBuf = wrap(newData);
-    for (AttrRef ref : refs) {
-      newBuf.put(slice(nodeBuf, ref.offset, ATTRIBUTE_SIZE));
-    }
-    slice(nodeBuf, attrStart).put(newData);
   }
 
   public void visitReferences(RefVisitor visitor) {

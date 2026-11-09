@@ -39,8 +39,7 @@ message PostBuildParams {
   string abiOutputDir = 5;
   repeated string usedClasses = 6;
   string depFile = 7;
-  reserved 8;
-  reserved "jarToJarDirMap";
+  string jarToJarDirMap = 8;
   repeated string optionalDirs = 9;
   string incrementalStateDir = 10;
   bool shouldCreateClassAbi = 11;

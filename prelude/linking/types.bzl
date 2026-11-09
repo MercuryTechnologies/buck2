@@ -15,6 +15,3 @@ Linkage = enum(
     "static",
     "shared",
 )
-
-# How much of the link step may be redone when inputs change.
-LinkPreference = enum("default", "full", "incremental")

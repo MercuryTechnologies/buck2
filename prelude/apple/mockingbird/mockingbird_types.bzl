@@ -12,20 +12,20 @@ MockingbirdTargetType = enum("library", "test")
 
 MockingbirdLibraryInfo = provider(
     fields = {
-        # The Swift module name.
+        # The name of the target.
         "name": provider_field(str),
-        # Contains a tset with this module's MockingbirdLibraryRecord as the value
-        # and all of its dependencies' MockingbirdLibraryRecord in the children.
+        # Contains a tset with this target's MockingbirdLibraryRecord as the value
+        # and all of its dependency's MockingbirdLibraryRecord in the children.
         "tset": provider_field(MockingbirdLibraryInfoTSet),
     },
 )
 
 MockingbirdLibraryRecord = record(
-    # The Swift module names of this module's dependencies.
+    # The names of this target's dependencies.
     dep_names = field(list[str]),
-    # The Swift module names of this module's exported dependencies.
+    # The names of this target's exported dependencies.
     exported_dep_names = field(list[str]),
-    # The Swift module name.
+    # The name of the target.
     name = str,
     # Swift sources in this target.
     srcs = field(list[Artifact]),

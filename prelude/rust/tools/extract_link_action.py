@@ -275,8 +275,6 @@ def archive_objects(
 def main() -> int:
     args = arg_parse()
 
-    if args.out_artifacts.exists():
-        shutil.rmtree(args.out_artifacts)
     os.mkdir(args.out_artifacts)
 
     archiver_argsfile = args.archiver_argsfile

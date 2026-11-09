@@ -10,7 +10,6 @@ import argparse
 import json
 import os
 import pathlib
-import re
 import subprocess
 import sys
 import tempfile
@@ -198,22 +197,12 @@ def _perform_termination(worker):
 
 
 def _maybe_expand_worker_arg(arg, envs) -> str:
-    """Expand `$NAME` and `${NAME}` references in a worker argument.
-
-    `NAME` is a whole identifier (`[A-Za-z_][A-Za-z0-9_]*`), so `$AB` looks up
-    `AB` and is never read as `$A` followed by `B`. Values come from `envs`, the
-    environment prepared for the worker from the env file, not from this
-    process's `os.environ`. A reference to a name that is not in `envs` is left
-    as written.
-    """
-
-    def expand(match):
-        name = match.group(1) or match.group(2)
-        return envs.get(name, match.group(0))
-
-    return re.sub(
-        r"\$([A-Za-z_][A-Za-z0-9_]*)|\$\{([A-Za-z_][A-Za-z0-9_]*)\}", expand, arg
-    )
+    expanded_arg = arg
+    if "$" in arg:
+        for k, v in os.environ.items():
+            expanded_arg = expanded_arg.replace("${}".format(k), v)
+            expanded_arg = expanded_arg.replace("${}{}{}".format("{", k, "}"), v)
+    return expanded_arg
 
 
 def _println(line):
@@ -445,7 +434,6 @@ def main():
             stderr=subprocess.PIPE,
         ) as worker:
             exit_code = None
-            failed_job_command = None
             try:
                 job_command = None
                 message_id = 0
@@ -457,22 +445,15 @@ def main():
                         command_args_file, message_id, tmp_dir
                     )
                     _send_command(job_command, worker)
-                    command_exit_code = _receive_command_reply(worker, message_id)
-                    # The first failure decides the outcome of the whole batch.
-                    if not exit_code:
-                        exit_code = command_exit_code
-                        if command_exit_code:
-                            failed_job_command = job_command
+                    exit_code = _receive_command_reply(worker, message_id)
 
                 _perform_termination(worker)
 
             except Exception:
                 traceback.print_exc()
-                if not exit_code:
-                    exit_code = 1
-                    failed_job_command = job_command
+                exit_code = 1
             finally:
-                _handle_error(exit_code, failed_job_command or job_command)
+                _handle_error(exit_code, job_command)
 
 
 if __name__ == "__main__":

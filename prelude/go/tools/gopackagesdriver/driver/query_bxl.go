@@ -14,13 +14,9 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"log/slog"
-	"maps"
 	"os"
 	"os/exec"
-	"path/filepath"
-	"slices"
 	"strings"
 
 	"golang.org/x/tools/go/packages"
@@ -31,16 +27,11 @@ import (
 // Ideally we should not do this, but it's the only way to support cgo in gopls
 const LoadModeTypecheckCgo = packages.LoadMode(4096)
 
+const cgoGoTypesFileName = "_cgo_gotypes.go"
 const cgoGenFileNameExt = ".cgo1.go"
 
 // queryBXL is a wrapper around query that will use BXL to resolve the targets
-func queryBXL(
-	ctx context.Context,
-	req *packages.DriverRequest,
-	bucker Bucker,
-	patterns []string,
-	files []string,
-) (*packages.DriverResponse, error) {
+func queryBXL(ctx context.Context, req *packages.DriverRequest, bucker Bucker, platform Platform, patterns []string, files []string) (*packages.DriverResponse, error) {
 	if len(patterns) == 0 && len(files) == 0 {
 		return &packages.DriverResponse{}, nil
 	}
@@ -89,57 +80,16 @@ func queryBXL(
 		return nil, err
 	}
 
-	rewrites := make(map[string]string)
+	// Fix CGO paths in compiled Go files
 	for _, pkg := range response.Packages {
-		pkgRewrites, err := cgoPathRewrites(pkg)
-		if err != nil {
-			return nil, err
-		}
-		for generatedFile, sourceFile := range pkgRewrites {
-			if _, ok := rewrites[generatedFile]; ok {
-				return nil, fmt.Errorf("duplicate CGo path rewrite for %q", generatedFile)
+		for _, file := range pkg.CompiledGoFiles {
+			if strings.HasSuffix(file, cgoGoTypesFileName) || strings.HasSuffix(file, cgoGenFileNameExt) {
+				_ = fixRePath(platform, file)
 			}
-			rewrites[generatedFile] = sourceFile
-		}
-	}
-	for generatedFile, sourceFile := range rewrites {
-		if err := fixRePath(generatedFile, sourceFile); err != nil {
-			return nil, fmt.Errorf("rewrite CGo source path for %q: %w", generatedFile, err)
 		}
 	}
 
 	return &response, nil
-}
-
-func cgoPathRewrites(pkg *packages.Package) (map[string]string, error) {
-	sourcesByBase := make(map[string]map[string]struct{})
-	for _, sourceFile := range pkg.GoFiles {
-		sourceBase := filepath.Base(sourceFile)
-		if sourcesByBase[sourceBase] == nil {
-			sourcesByBase[sourceBase] = make(map[string]struct{})
-		}
-		sourcesByBase[sourceBase][sourceFile] = struct{}{}
-	}
-
-	rewrites := make(map[string]string)
-	for _, generatedFile := range pkg.CompiledGoFiles {
-		generatedBase := filepath.Base(generatedFile)
-		if !strings.HasSuffix(generatedBase, cgoGenFileNameExt) {
-			continue
-		}
-
-		sourceBase := strings.TrimSuffix(generatedBase, cgoGenFileNameExt) + ".go"
-		matches := sourcesByBase[sourceBase]
-		if len(matches) != 1 {
-			return nil, fmt.Errorf("package %q: expected exactly one GoFiles source named %q for %q, found %d", pkg.ID, sourceBase, generatedFile, len(matches))
-		}
-		sourceFile := slices.Collect(maps.Keys(matches))[0]
-		if !filepath.IsAbs(sourceFile) {
-			return nil, fmt.Errorf("package %q: GoFiles source %q for %q is not absolute", pkg.ID, sourceFile, generatedFile)
-		}
-		rewrites[generatedFile] = sourceFile
-	}
-	return rewrites, nil
 }
 
 func buildBXLArgs(req *packages.DriverRequest, patterns []string, files []string) []string {
@@ -158,16 +108,15 @@ func buildBXLArgs(req *packages.DriverRequest, patterns []string, files []string
 	if req.Mode&packages.NeedName != 0 {
 		bxlArgs = append(bxlArgs, "--need_name", "true")
 	}
-	// we have to implicitly add some flags if syntax/types requested
+	// we have to implicitely add some flags if syntax/types requested
 	// same as `go list` driver does
 	// todo: add packages.NeedTypesSizes to the query as well, when we fix slow builds
 	// as gopls requires it, but it can't wait very long
 	needTypes := packages.NeedTypes | packages.NeedTypesInfo
-	needCompiledGoFiles := packages.NeedCompiledGoFiles | packages.NeedSyntax | needTypes
-	if req.Mode&(packages.NeedFiles|needCompiledGoFiles) != 0 {
+	if req.Mode&(packages.NeedFiles|packages.NeedSyntax|needTypes) != 0 {
 		bxlArgs = append(bxlArgs, "--need_files", "true")
 	}
-	if req.Mode&needCompiledGoFiles != 0 {
+	if req.Mode&(packages.NeedCompiledGoFiles|packages.NeedSyntax|needTypes) != 0 {
 		bxlArgs = append(bxlArgs, "--need_compiled_go_files", "true")
 	}
 	if req.Mode&(packages.NeedImports|needTypes) != 0 {

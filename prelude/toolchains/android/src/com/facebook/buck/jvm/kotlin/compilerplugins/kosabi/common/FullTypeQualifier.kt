@@ -43,7 +43,7 @@ class FullTypeQualifier : Comparable<FullTypeQualifier> {
     } else {
       pkg = segments.take(firstUpperCaseIndex)
       val lastSegment = segments.last()
-      if (NonConventionalImports.classLikeDeclarations.contains(segments)) {
+      if (NonConventionalImports.interfaces.contains(segments)) {
         names = listOf(lastSegment)
         member = null
       } else if (lastSegment.isStaticConstQualifier() || lastSegment.isStaticMethodQualifier()) {
@@ -78,13 +78,6 @@ class FullTypeQualifier : Comparable<FullTypeQualifier> {
   // TopLevelDeclaration:
   // - com.some.package.method
   fun isTopLevelDeclaration(): Boolean = names.isEmpty()
-
-  /**
-   * Call only with segments from a type slot: there the trailing segment names a type by position,
-   * whatever its case.
-   */
-  fun withMemberAsNestedName(): FullTypeQualifier =
-      if (member == null) this else unsafeBuildQualifier(segments, pkg, names + member)
 
   override fun compareTo(other: FullTypeQualifier): Int {
     val thisSize = this.segments.size

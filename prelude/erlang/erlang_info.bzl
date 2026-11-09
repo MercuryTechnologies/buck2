@@ -9,10 +9,6 @@
 # This file contains the specification for all the providers the Erlang
 # integration uses.
 
-StartTypeValues = ["permanent", "transient", "temporary", "load", "none"]
-
-StartType = enum(*StartTypeValues)
-
 CodePathEntry = record(
     dir = field(Artifact),
     # application directories contribute `<dir>/ebin`, test output directories contribute `<dir>`
@@ -141,22 +137,27 @@ Tools = record(
     escript = field(Tool),
 )
 
+ErtsToolchainApplicationInfo = provider(
+    fields = {
+        "name": provider_field(str),
+        "version": provider_field(str),
+    },
+)
+
 ErtsToolchainInfo = provider(
     fields = {
-        # the directory each OTP application ships as, by application name
-        "applications": provider_field(dict[str, Artifact]),
-        # directory holding `erts-<version>`
-        "erts": provider_field(Artifact),
+        "applications": provider_field(list[ErtsToolchainApplicationInfo]),
+        "erts_version": provider_field(str),
         "headers": provider_field(Artifact),
         "otp_no_dot_erlang_boot": provider_field(Artifact),
         "otp_start_boot": provider_field(Artifact),
-        # json, `{"erts_version": ..., "applications": {<application>: <version>}}`
-        "versions": provider_field(Artifact),
+        "output": provider_field(Artifact),
     },
 )
 
 ErlangErrorHandlers = record(
     erlc = field(typing.Callable[[ActionErrorCtx], list[ActionSubError]]),
+    extract_otp_app = field(typing.Callable[[ActionErrorCtx], list[ActionSubError]]),
 )
 
 # toolchain provider
@@ -193,12 +194,14 @@ ErlangToolchainInfo = provider(
         "boot_script_builder": provider_field(Tool),
         # build release_variables
         "release_variables_builder": provider_field(Tool),
+        # copying erts
+        "extract_from_otp": provider_field(Tool),
         # beams we need for various reasons
         "utility_modules": provider_field(Artifact),
         # env to be set for toolchain invocations
         "env": provider_field(dict[str, str]),
         # Erlang Runtime System (ERTS) toolchain metadata
-        "erts_toolchain_info": provider_field(ErtsToolchainInfo | None, default = None),
+        "erts_toolchain_info": provider_field(ErtsToolchainInfo),
         # error handler
         "error_handler": provider_field(ErlangErrorHandlers),
     },

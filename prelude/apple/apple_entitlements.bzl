@@ -9,7 +9,7 @@
 load("@prelude//utils:arglike.bzl", "ArgLike")  # @unused Used as a type
 load(":apple_bundle_utility.bzl", "get_default_binary_dep")
 load(":apple_code_signing_types.bzl", "AppleEntitlementsInfo", "CodeSignType")
-load(":apple_sdk_metadata.bzl", "IPhoneSimulatorSdkMetadata", "MacOSXCatalystSdkMetadata", "TVSimulatorSdkMetadata")
+load(":apple_sdk_metadata.bzl", "IPhoneSimulatorSdkMetadata", "MacOSXCatalystSdkMetadata")
 load(":apple_toolchain_types.bzl", "AppleToolchainInfo")
 
 def get_entitlements_codesign_args(ctx: AnalysisContext, codesign_type: CodeSignType) -> list[ArgLike]:
@@ -19,10 +19,10 @@ def get_entitlements_codesign_args(ctx: AnalysisContext, codesign_type: CodeSign
     return entitlements_args
 
 def should_include_entitlements(ctx: AnalysisContext, codesign_type: CodeSignType) -> bool:
-    if codesign_type == CodeSignType("distribution"):
+    if codesign_type.value == "distribution":
         return True
 
-    if codesign_type == CodeSignType("adhoc"):
+    if codesign_type.value == "adhoc":
         # The config-based override value takes priority over target value
         if ctx.attrs._use_entitlements_when_adhoc_code_signing != None:
             return ctx.attrs._use_entitlements_when_adhoc_code_signing
@@ -48,7 +48,6 @@ def _entitlements_file(ctx: AnalysisContext) -> Artifact | None:
 _SDK_NAMES_NEED_ENTITLEMENTS_IN_BINARY = [
     IPhoneSimulatorSdkMetadata.name,
     MacOSXCatalystSdkMetadata.name,
-    TVSimulatorSdkMetadata.name,
 ]
 
 def _needs_entitlements_in_binary(ctx: AnalysisContext) -> bool:

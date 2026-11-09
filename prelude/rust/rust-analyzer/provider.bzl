@@ -6,7 +6,6 @@
 # of this source tree. You may select, at your option, one of the
 # above-listed licenses.
 
-load("@prelude//rust:attrs.bzl", "RustAnalyzerTargetKind")
 load("@prelude//rust:build.bzl", "crate_root", "process_env")
 load(
     "@prelude//rust:context.bzl",
@@ -22,6 +21,8 @@ load(
 )
 load("@prelude//rust:link_info.bzl", "attr_crate", "get_available_proc_macros", "resolve_rust_deps")
 
+RustAnalyzerTargetKind = enum("bin", "lib", "test")
+
 RustAnalyzerInfo = provider(
     fields = {
         "available_proc_macros": list[Dependency],
@@ -32,7 +33,7 @@ RustAnalyzerInfo = provider(
         "edition": str,
         # The processed env as produced by the buck build prelude. Some env vars like `OUT_DIR` and `CARGO_MANIFEST_DIR`
         # will be made into absolute paths.
-        "env": dict[str, cmd_args | str | ResolvedStringWithMacros],
+        "env": dict[str, cmd_args],
         "features": list[str],
         # The list of rust deps needed for RustAnalyzer to function. Namely, this excludes things like
         # exec deps used as inputs to genrules and other non-rust dependencies.
@@ -47,24 +48,14 @@ RustAnalyzerInfo = provider(
 )
 
 def _compute_rust_deps(ctx: AnalysisContext, dep_ctx: DepCollectionContext) -> list[Dependency]:
-    # Modeled after https://rust-analyzer.github.io/book/non_cargo_based_projects.html:
-    #
-    # "If provided, rust-analyzer automatically adds dependencies on sysroot crates. Conversely, if
-    # you omit this path, you can specify sysroot dependencies yourself..."
-    #
-    # In the case of buck2, if you do not supply rust.sysroot_src_path, then we will model the sysroot
-    # as explicit dependencies in the crate graph.
-    if read_root_config("rust", "sysroot_src_path"):
-        explicit_sysroot_deps = None
-    else:
-        explicit_sysroot_deps = dep_ctx.explicit_sysroot_deps
-
     dep_ctx = DepCollectionContext(
-        advanced_unstable_linking = dep_ctx.advanced_unstable_linking if explicit_sysroot_deps != None else False,
+        advanced_unstable_linking = False,
         # Include doc deps here for any doctests that may be present in the target.
         include_doc_deps = True,
         is_proc_macro = dep_ctx.is_proc_macro,
-        explicit_sysroot_deps = explicit_sysroot_deps,
+        # Rust Analyzer handles the sysroot separately. We omit the sysroot deps here and will
+        # instead pass a path to the sysroot as a separate config.
+        explicit_sysroot_deps = None,
         panic_runtime = dep_ctx.panic_runtime,
     )
 
@@ -81,7 +72,7 @@ def _compute_transitive_target_set(ctx: AnalysisContext, first_order_deps: list[
             transitive_targets.add(target_set)
     return transitive_targets
 
-def _compute_env(ctx: AnalysisContext, compile_ctx: CompileContext) -> dict[str, cmd_args | str | ResolvedStringWithMacros]:
+def _compute_env(ctx: AnalysisContext, compile_ctx: CompileContext) -> dict[str, cmd_args]:
     # Disable rustc_action processing, as rust-project will handle windows + any escaping necessary.
     plain_env, path_env = process_env(compile_ctx, ctx.attrs.env, False)
     return plain_env | path_env

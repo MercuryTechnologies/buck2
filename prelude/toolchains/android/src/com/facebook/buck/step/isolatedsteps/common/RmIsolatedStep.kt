@@ -18,6 +18,7 @@ import com.facebook.buck.io.filesystem.impl.ProjectFilesystemUtils
 import com.facebook.buck.step.StepExecutionResult
 import com.facebook.buck.step.StepExecutionResults
 import com.facebook.buck.step.isolatedsteps.IsolatedStep
+import com.google.common.base.Preconditions
 import com.google.common.collect.ImmutableSet
 import java.io.IOException
 import java.nio.file.Files
@@ -42,7 +43,10 @@ data class RmIsolatedStep(
       MostFiles.deleteRecursivelyIfExists(absolutePath, getAbsoluteExcludedPaths(context))
     } else {
       // Delete a single file
-      check(excludedPaths.isEmpty()) { "Excluded paths only valid for recursive steps" }
+      Preconditions.checkState(
+          excludedPaths.isEmpty(),
+          "Excluded paths only valid for recursive steps",
+      )
       Files.deleteIfExists(absolutePath.path)
     }
     return StepExecutionResults.SUCCESS

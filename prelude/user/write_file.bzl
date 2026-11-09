@@ -7,6 +7,7 @@
 # above-listed licenses.
 
 load("@prelude//decls:common.bzl", "buck")
+load("@prelude//decls:core_rules.bzl", "core_args")
 load(":rule_spec.bzl", "RuleRegistrationSpec")
 
 _NL = {
@@ -43,7 +44,7 @@ registration_spec = RuleRegistrationSpec(
     impl = _impl,
     attrs = buck.labels_arg()
     | buck.contacts_arg()
-    | buck.has_content_based_path_attr()
+    | core_args.has_content_based_path_attr()
     | {
         # API based on https://github.com/bazelbuild/bazel-skylib/blob/main/docs/write_file_doc.md.
         "content": attrs.list(attrs.string(), default = []),

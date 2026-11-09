@@ -13,11 +13,11 @@ load(
 )
 load(
     "@prelude//cxx:cxx_toolchain_types.bzl",
-    "RuntimeDependencyHandling",
+    "RuntimeDependencyHandling",  # @unused Used as a type
 )
 load(
     "@prelude//cxx:link_groups_types.bzl",
-    "LinkGroupInfo",
+    "LinkGroupInfo",  # @unused Used as a type
 )
 load(
     "@prelude//linking:link_info.bzl",
@@ -30,9 +30,8 @@ load(
 )
 load(
     "@prelude//linking:shared_libraries.bzl",
-    "SharedLibrary",
+    "SharedLibrary",  # @unused Used as a type
 )
-load("@prelude//linking:types.bzl", "LinkPreference")
 load(":argsfiles.bzl", "CompileArgsfiles")
 load(
     ":compile_types.bzl",
@@ -41,7 +40,7 @@ load(
 )
 load(
     ":cxx_sources.bzl",
-    "CxxSrcWithFlags",
+    "CxxSrcWithFlags",  # @unused Used as a type
 )
 load(
     ":headers.bzl",
@@ -49,7 +48,7 @@ load(
 )
 load(
     ":link_groups.bzl",
-    "LinkGroupLibSpec",
+    "LinkGroupLibSpec",  # @unused Used as a type
 )
 load(
     ":linker.bzl",
@@ -64,6 +63,8 @@ load(
     ":xcode.bzl",
     "cxx_populate_xcode_attributes",
 )
+
+LinkPreference = enum("default", "full", "incremental")
 
 CxxLibraryInfo = provider(
     fields = dict(
@@ -83,15 +84,11 @@ CxxRuleSubTargetParams = record(
     headers = field(bool, True),
     link_group_map = field(bool, True),
     link_style_outputs = field(bool, True),
-    xcode_data = field(bool, False),
+    xcode_data = field(bool, True),
     objects = field(bool, True),
     bitcode_bundle = field(bool, True),
     header_unit = field(bool, True),
 )
-
-def xcode_data_enabled() -> bool:
-    # Project generators must manually enable xcode data because it measurably increases memory usage.
-    return read_root_config("cxx", "enable_xcode_data", "false").lower() == "true"
 
 # Parameters to control which providers to define when processing Cxx rules.
 # By default, generates all providers.
@@ -166,8 +163,6 @@ CxxRuleConstructorParams = record(
     # These flags are _not_ propagated up the dep tree.
     extra_link_flags = field(list[typing.Any], []),
     extra_binary_link_flags = field(list[typing.Any], []),
-    # Inputs that invalidate generated build info without becoming inputs to the executable link.
-    generated_build_info_invalidation_inputs = field(list[typing.Any], []),
     # Additional artifacts to be linked together with the cxx compilation output.
     extra_link_input = field(list[Artifact], []),
     # If True the extra_link_input should be considered as external debug info.
@@ -209,7 +204,6 @@ CxxRuleConstructorParams = record(
     # Define which providers to generate.
     generate_providers = field(CxxRuleProviderParams, CxxRuleProviderParams()),
     force_full_hybrid_if_capable = field(bool, False),
-    force_remote_link_if_capable = field(bool, False),
     # Whether shared libs for executables should generate a shared lib link tree.
     exe_shared_libs_link_tree = field(bool, True),
     extra_link_deps = field(list[LinkableProviders], []),
@@ -253,7 +247,6 @@ CxxRuleConstructorParams = record(
     extra_shared_library_interfaces = field([list[Artifact], None], None),
     # Compiler flags
     compiler_flags = field(list[typing.Any], []),
-    cxx_flags = field(list[Dependency], []),
     lang_compiler_flags = field(dict[typing.Any, typing.Any], {}),
     # Preprocessor flags
     preprocessor_flags = field(list[typing.Any], []),
@@ -306,10 +299,4 @@ CxxRuleConstructorParams = record(
     supports_stripping = field(bool, True),
     # Whether to set expect_eligible_for_dedupe on compile actions.
     expect_eligible_for_dedupe = field(bool, False),
-    target_stats_cycle_mode = field(str, "none"),
-    target_stats_extra_srcs = field(dict[str, Artifact], {}),
-    target_stats_swift_dot = field(Artifact | None, None),
-    # The module the cycle tools resolve imports against. Not how the target is
-    # reported -- that stays the target's label.
-    target_stats_module_name = field(str | None, None),
 )

@@ -13,16 +13,8 @@ load(
 )
 load(":apple_asset_catalog_types.bzl", "AppleAssetCatalogSpec")
 load(":apple_core_data_types.bzl", "AppleCoreDataSpec")
-load(
-    ":apple_resource_types.bzl",
-    "AppleResourceSelectionOutput",
-    "AppleResourceSpec",
-    "CxxResourceSpec",
-    "ReachableXcassetsSymbolSpec",
-    "SelectedAppleAssetCatalogSpec",
-)
+load(":apple_resource_types.bzl", "AppleResourceSelectionOutput", "AppleResourceSpec", "CxxResourceSpec")
 load(":scene_kit_assets_types.bzl", "SceneKitAssetsSpec")
-load(":xcassets_asset_symbols.bzl", "MetaXcassetsAssetSymbolSpec")
 
 ResourceGroupInfo = provider(
     # @unsorted-dict-items
@@ -60,9 +52,6 @@ ResourceGraphNode = record(
     scene_kit_assets_spec = field([SceneKitAssetsSpec, None], None),
     # Actual resource data, present when node corresponds to `cxx_library` target containing resources.
     cxx_resource_spec = field([CxxResourceSpec, None], None),
-    # Asset symbol metadata from an asset catalog opted into trimming. Carries the
-    # producer and catalog identity through bundle-level resource selection.
-    xcassets_symbol_spec = field([MetaXcassetsAssetSymbolSpec, None], None),
 )
 
 ResourceGraphTSet = transitive_set()
@@ -86,7 +75,6 @@ def create_resource_graph(
     core_data_spec: [AppleCoreDataSpec, None] = None,
     scene_kit_assets_spec: [SceneKitAssetsSpec, None] = None,
     cxx_resource_spec: [CxxResourceSpec, None] = None,
-    xcassets_symbol_spec: [MetaXcassetsAssetSymbolSpec, None] = None,
     should_propagate: bool = True,
 ) -> ResourceGraphInfo:
     # Collect deps and exported_deps with resources that should propagate.
@@ -113,7 +101,6 @@ def create_resource_graph(
         core_data_spec = core_data_spec,
         scene_kit_assets_spec = scene_kit_assets_spec,
         cxx_resource_spec = cxx_resource_spec,
-        xcassets_symbol_spec = xcassets_symbol_spec,
     )
     children = [child_node.nodes for child_node in dep_graphs + exported_dep_graphs]
     return ResourceGraphInfo(
@@ -181,17 +168,15 @@ def get_filtered_resources(
 
     resource_specs = []
     asset_catalog_specs = []
-    selected_asset_catalog_specs = []
     core_data_specs = []
     scene_kit_assets_specs = []
     cxx_resource_specs = []
-    reachable_xcassets_symbol_specs = []
 
     for target in targets:
         target_resource_group = resource_group_mappings.get(target)
 
         # Ungrouped targets belong to the unlabeled bundle
-        selected = (
+        if (
             (not target_resource_group and not resource_group)
             or
             # Does it match special "MATCH_ALL" mapping?
@@ -199,24 +184,14 @@ def get_filtered_resources(
             or
             # Does it match currently evaluated group?
             target_resource_group == resource_group
-        )
-        node = resource_graph_node_map[target]
-        if node.xcassets_symbol_spec != None:
-            reachable_xcassets_symbol_specs.append(ReachableXcassetsSymbolSpec(spec = node.xcassets_symbol_spec, selected = selected))
-        if selected:
+        ):
+            node = resource_graph_node_map[target]
             resource_spec = node.resource_spec
             if resource_spec:
                 resource_specs.append(resource_spec)
             asset_catalog_spec = node.asset_catalog_spec
             if asset_catalog_spec:
                 asset_catalog_specs.append(asset_catalog_spec)
-                selected_asset_catalog_specs.append(
-                    SelectedAppleAssetCatalogSpec(
-                        asset_catalog_spec = asset_catalog_spec,
-                        xcassets_symbol_spec = node.xcassets_symbol_spec,
-                        target = target,
-                    ),
-                )
             core_data_spec = node.core_data_spec
             if core_data_spec:
                 core_data_specs.append(core_data_spec)
@@ -230,8 +205,6 @@ def get_filtered_resources(
     return AppleResourceSelectionOutput(
         resource_specs = resource_specs,
         asset_catalog_specs = asset_catalog_specs,
-        selected_asset_catalog_specs = selected_asset_catalog_specs,
-        reachable_xcassets_symbol_specs = reachable_xcassets_symbol_specs,
         core_data_specs = core_data_specs,
         scene_kit_assets_spec = scene_kit_assets_specs,
         cxx_resource_specs = cxx_resource_specs,

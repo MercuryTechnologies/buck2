@@ -29,7 +29,6 @@ buck_kotlin_library(
         "ClassUsageTracker.java",
         "ClassUsageURIParser.java",
         "CompileToJarStepFactory.java",
-        "CompilerClassToSourceMap.java",
         "CompilerOutputPaths.kt",
         "CompilerOutputPathsValue.kt",
         "CompilerParameters.kt",

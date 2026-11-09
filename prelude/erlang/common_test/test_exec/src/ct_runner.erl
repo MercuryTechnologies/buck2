@@ -16,6 +16,9 @@ communicates the result to the test runner.
 -behavior(gen_server).
 
 -export([start_link/1]).
+-include_lib("common/include/buck_ct_records.hrl").
+-include_lib("kernel/include/logger.hrl").
+-define(raw_file_access, prim_file).
 
 -export([
     init/1,
@@ -33,13 +36,6 @@ communicates the result to the test runner.
     generate_arg_tuple/2,
     project_root/0
 ]).
-
--export_type([port_settings/0]).
-
--include_lib("common/include/buck_ct_records.hrl").
--include_lib("kernel/include/logger.hrl").
-
--define(raw_file_access, prim_file).
 
 -import(common_util, [unicode_characters_to_binary/1, filename_all_to_filename/1]).
 
@@ -65,6 +61,8 @@ communicates the result to the test runner.
     | {busy_limits_msgq, {non_neg_integer(), non_neg_integer()} | disabled}.
 
 -type port_settings() :: [opt()].
+
+-export_type([port_settings/0]).
 
 -type initial_state() :: #{
     test_env := #test_env{}
@@ -116,7 +114,7 @@ handle_continue({run, PortEpmd}, #{test_env := TestEnv} = State0) ->
                 erl_error:format_exception(Class, Reason, Stack)
             ]),
             ?LOG_ERROR(ErrorMsg),
-            report_result(TestEnv, run_failed, ErrorMsg, #{}),
+            test_runner:mark_failure(ErrorMsg, #{}),
             {stop, ct_runner_failed, State0}
     end.
 
@@ -135,14 +133,14 @@ handle_continue({run, PortEpmd}, #{test_env := TestEnv} = State0) ->
         Port :: erlang:port(),
         Reason :: term().
 
-handle_info({Port, {exit_status, ExitStatus}}, #{port := Port, test_env := TestEnv} = State) ->
+handle_info({Port, {exit_status, ExitStatus}}, #{port := Port} = State) ->
     CtStdoutState = maps:get(ct_stdout_state, State),
     {eof, ProgressMarkersOffsets} = ct_stdout:process_stdout_line(eof, CtStdoutState),
     case ExitStatus of
         0 ->
             ResultMsg = "ct_runner finished successfully with exit status 0",
             ?LOG_DEBUG(ResultMsg),
-            report_result(TestEnv, run_succeed, ResultMsg, ProgressMarkersOffsets);
+            test_runner:mark_success(ResultMsg, ProgressMarkersOffsets);
         _ ->
             ErrorMsg =
                 case ExitStatus of
@@ -158,7 +156,7 @@ handle_info({Port, {exit_status, ExitStatus}}, #{port := Port, test_env := TestE
                         ])
                 end,
             ?LOG_ERROR(ErrorMsg),
-            report_result(TestEnv, run_failed, ErrorMsg, ProgressMarkersOffsets)
+            test_runner:mark_failure(ErrorMsg, ProgressMarkersOffsets)
     end,
     {stop, {ct_run_finished, ExitStatus}, State};
 handle_info({Port, {data, Data}}, State0 = #{port := Port}) ->
@@ -185,15 +183,6 @@ handle_cast(_Request, _State) -> error(not_implemented).
 terminate(_Reason, #{port := Port}) ->
     test_exec:kill_process(Port);
 terminate(_Reason, _State) ->
-    ok.
-
--spec report_result(TestEnv, Outcome, Result, ProgressMarkersOffsets) -> ok when
-    TestEnv :: #test_env{},
-    Outcome :: run_succeed | run_failed,
-    Result :: unicode:chardata(),
-    ProgressMarkersOffsets :: #{ct_stdout:progress_line() => ct_stdout:offset()}.
-report_result(#test_env{result_recipient = Recipient}, Outcome, Result, ProgressMarkersOffsets) ->
-    Recipient ! {Outcome, Result, ProgressMarkersOffsets},
     ok.
 
 -doc """

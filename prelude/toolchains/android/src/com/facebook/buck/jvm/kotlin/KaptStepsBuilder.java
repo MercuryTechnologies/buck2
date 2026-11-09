@@ -22,6 +22,7 @@ import static com.facebook.buck.jvm.kotlin.CompilerPluginUtils.getKotlinCompiler
 import com.facebook.buck.core.filesystems.AbsPath;
 import com.facebook.buck.core.filesystems.RelPath;
 import com.facebook.buck.io.filesystem.CopySourceMode;
+import com.facebook.buck.jvm.cd.command.kotlin.AnnotationProcessingTool;
 import com.facebook.buck.jvm.cd.command.kotlin.KotlinSupportedLanguageVersion;
 import com.facebook.buck.jvm.cd.command.kotlin.LanguageVersion;
 import com.facebook.buck.jvm.core.BuildTargetValue;
@@ -84,6 +85,7 @@ public class KaptStepsBuilder {
    * <p>This method will do nothing if there are no relevant annotation processors to run.
    */
   public static void prepareKaptProcessorsIfNeeded(
+      AnnotationProcessingTool annotationProcessingTool,
       BuildTargetValue invokingRule,
       AbsPath rootCellPath,
       ImmutableList.Builder<IsolatedStep> steps,
@@ -115,6 +117,10 @@ public class KaptStepsBuilder {
       LanguageVersion kotlinLanguageVersion) {
     // We don't need the Kapt processor to run for source-only-abi
     if (invokingRule.isSourceOnlyAbi()) {
+      return;
+    }
+
+    if (!annotationProcessingTool.equals(AnnotationProcessingTool.KAPT)) {
       return;
     }
 

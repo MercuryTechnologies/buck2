@@ -190,26 +190,6 @@ internal class KotlinCDLoggerAnalyticsTest {
     verify(kotlinCDLogger, times(1)).log(expectedEntry)
   }
 
-  @Test
-  fun `when a step duration is set, it is logged`() {
-    val kotlinCDAnalytics = createFakeKotlinCDAnalytics()
-    val expectedEntry = createExpectedKotlinCDLogEntry(durationMs = 1234L)
-
-    kotlinCDAnalytics.log(createKotlinCDLoggingContext(durationMs = 1234L))
-
-    verify(kotlinCDLogger, times(1)).log(expectedEntry)
-  }
-
-  @Test
-  fun `when no step duration is set, none is logged`() {
-    val kotlinCDAnalytics = createFakeKotlinCDAnalytics()
-    val expectedEntry = createExpectedKotlinCDLogEntry()
-
-    kotlinCDAnalytics.log(createKotlinCDLoggingContext())
-
-    verify(kotlinCDLogger, times(1)).log(expectedEntry)
-  }
-
   private fun createKotlinCDLoggingContext(
       step: StepParam = StepParam.KOTLINC,
       languageVersion: String = DEFAULT_LANGUAGE_VERSION,
@@ -218,13 +198,11 @@ internal class KotlinCDLoggerAnalyticsTest {
       extras: Map<String, List<String>> = mapOf(),
       numKotlinTokens: Long = 0L,
       numJavaTokens: Long = 0L,
-      durationMs: Long? = null,
   ): KotlinCDLoggingContext {
     val context = KotlinCDLoggingContext(step, LanguageVersion(languageVersion), kotlincMode)
     extras.forEach { (key, extras) -> extras.forEach { item -> context.addExtras(key, item) } }
     context.numKotlinTokens = numKotlinTokens
     context.numJavaTokens = numJavaTokens
-    context.durationMs = durationMs
     return context
   }
 
@@ -253,7 +231,6 @@ internal class KotlinCDLoggerAnalyticsTest {
       removedFiles: Set<String> = emptySet(),
       numKotlinTokens: Long? = null,
       numJavaTokens: Long? = null,
-      durationMs: Long? = null,
   ) = KotlinCDLogEntry(
       time = Instant.now(clock).epochSecond,
       eventTime = Instant.now(clock).epochSecond.toDouble(),
@@ -273,7 +250,6 @@ internal class KotlinCDLoggerAnalyticsTest {
       removedFiles = removedFiles,
       numKotlinTokens = numKotlinTokens,
       numJavaTokens = numJavaTokens,
-      durationMs = durationMs,
   )
 
   companion object TestParams {

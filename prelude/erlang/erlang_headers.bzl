@@ -9,12 +9,10 @@
 load(":erlang_toolchain.bzl", "get_toolchain")
 
 def _erlang_headers(ctx: AnalysisContext) -> list[Provider]:
-    erts_toolchain_info = get_toolchain(ctx).erts_toolchain_info
-    if erts_toolchain_info == None:
-        fail("%s exposes the ERTS headers, but its toolchain has no `erts_toolchain_info` to take them from" % (str(ctx.label),))
+    headers = get_toolchain(ctx).erts_toolchain_info.headers
     return [
         DefaultInfo(
-            default_outputs = [erts_toolchain_info.headers],
+            default_outputs = [headers],
         ),
     ]
 

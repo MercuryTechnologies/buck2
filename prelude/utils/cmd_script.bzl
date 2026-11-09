@@ -8,12 +8,6 @@
 
 load("@prelude//os_lookup:defs.bzl", "ScriptLanguage")
 
-# The bash that runs a wrapper script, as an argv. The default
-# finds bash on PATH through /usr/bin/env, as upstream does; an execution
-# platform that should take nothing from /usr sets `[prelude] bash`, such as
-# `/bin/bash`. Read here, not in a shared .bzl, so this file gains no load.
-_BASH = read_root_config("prelude", "bash", "/usr/bin/env bash").split(" ")
-
 # Takes a cmd_args containing an executable and zero or more arguments to that
 # executable, and bundles it together into a script that is callable as a single
 # argument.
@@ -45,7 +39,7 @@ def cmd_script(
         wrapper, _ = actions.write(
             actions.declare_output("{}.sh".format(name), has_content_based_path = has_content_based_path),
             [
-                "#!" + " ".join(_BASH),
+                "#!/usr/bin/env bash",
                 cmd_args(cmd_args(shell_quoted, delimiter = " \\\n"), format = '{} "$@"\n'),
             ],
             is_executable = True,

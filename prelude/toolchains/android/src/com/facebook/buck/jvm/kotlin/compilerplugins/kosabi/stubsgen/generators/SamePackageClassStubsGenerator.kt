@@ -10,8 +10,6 @@
 
 package com.facebook.kotlin.compilerplugins.kosabi.stubsgen.generators
 
-import com.facebook.kotlin.compilerplugins.kosabi.common.FullTypeQualifier
-import com.facebook.kotlin.compilerplugins.kosabi.common.outerClassOnlyQualifier
 import com.facebook.kotlin.compilerplugins.kosabi.common.stub.model.KStub
 import com.facebook.kotlin.compilerplugins.kosabi.stubsgen.util.PlainJavaLangTypes
 import com.facebook.kotlin.compilerplugins.kosabi.stubsgen.util.PlainKTBuiltInTypes
@@ -29,7 +27,7 @@ class SamePackageClassStubsGenerator : StubsGenerator {
 
   override fun generateStubs(context: GenerationContext) {
 
-    val modulePkgName = context.packageName()
+    val modulePkgName = context.packageName() ?: return
     val allKnownSymbols = mutableSetOf<String>()
 
     // Kotlin/Java built-in, stdlib types
@@ -48,26 +46,13 @@ class SamePackageClassStubsGenerator : StubsGenerator {
     // to avoid name collisions with non-auto-imported types that have the same simple name.
     // Types like android.*, javax.*, etc. require explicit imports and should not be included here.
     val autoImportedExternalTypes = context.externalTypeReferences.filter { it.isAutoImported() }
-    val generatedTypesInModulePackage =
-        context.knownGeneratedTypes.filter { it.pkgAsString() == modulePkgName }
-    // A qualifier that carries no package (`Outer.Inner`) and whose outer no import,
-    // declaration, or classpath entry owns names a nested type of the module's own
-    // package. FullQualifiedClassStubsGenerator drops it for having no package and
-    // InnerClassStubsGenerator can only reach it through an import, so nothing creates its outer:
-    // counting that outer as known here is what leaves the usage with no stub at all.
-    val nestedSamePackageQualifiers =
-        context.fullQualifierTypes.filter {
-          it.pkg.isEmpty() && it.member == null && it.names.size > 1
-        }
     allKnownSymbols.addAll(
         (context.importedTypes +
                 context.declaredTypes +
                 autoImportedExternalTypes +
-                generatedTypesInModulePackage +
-                (context.fullQualifierTypes - nestedSamePackageQualifiers.toSet()))
+                context.fullQualifierTypes)
             .flatMap { it.segments + it.names },
     )
-    allKnownSymbols.addAll(nestedSamePackageQualifiers.flatMap { it.names.drop(1) })
 
     // Alias & type parameter names
     allKnownSymbols.addAll(context.typeAliasSymbol + context.importAlias + context.parameterNames)
@@ -79,63 +64,17 @@ class SamePackageClassStubsGenerator : StubsGenerator {
             .mapNotNull { it.referencedName },
     )
 
-    // A stub belongs to the package of the file that uses the type: the module's files can span
-    // packages (examples, generated sources), and the first file's package is the wrong owner for
-    // any other file's same-package usages.
-    val maybeUnknownByPkg: Map<String, Set<String>> =
+    val maybeUnknownClasses =
         context.usedUserTypes
-            .groupBy { context.packageSegmentsOf(it.containingKtFile) }
-            .map { (pkgSegments, usages) ->
-              val pkg = pkgSegments.joinToString(".")
-              pkg to
-                  usages
-                      .mapNotNull { userType -> userType.referencedName }
-                      .toSet()
-                      .filterNot { it -> allKnownSymbols.contains(it) }
-                      .filter { it -> it.first().isUpperCase() }
-                      .filterNot { name ->
-                        // A stub shadows the real type (same FQN, sources win), so the ABI
-                        // compiles against the stub: an open stub where the real type is final
-                        // flips generic wildcard elision and corrupts signatures. The match is
-                        // by exact FQN, so same-name types in other packages still stub.
-                        val candidate =
-                            FullTypeQualifier(pkgSegments + name).outerClassOnlyQualifier()
-                        candidate != null && context.externalTypeReferences.contains(candidate)
-                      }
-                      .toSet()
-            }
-            .filter { (pkg, names) -> pkg.isNotEmpty() && names.isNotEmpty() }
-            .toMap()
+            .mapNotNull { userType -> userType.referencedName }
+            .toSet()
+            .filterNot { it -> allKnownSymbols.contains(it) }
+            .filter { it -> it.first().isUpperCase() }
 
-    maybeUnknownByPkg.forEach { (pkg, typeNames) ->
-      typeNames.forEach { typeName ->
-        if (context.stubsContainer.find(pkg, typeName) == null) {
-          context.stubsContainer.add(KStub(pkg, typeName))
-        }
+    maybeUnknownClasses.forEach { typeName ->
+      if (context.stubsContainer.find(modulePkgName, typeName) == null) {
+        context.stubsContainer.add(KStub(modulePkgName, typeName))
       }
-    }
-
-    // The usage is `Outer.Inner`, so the outer stub fabricated above still has to own an Inner for
-    // the reference to resolve. Only outers fabricated here are nested into: an outer resolved any
-    // other way already has its own owner, and its nesting belongs to that owner's generator.
-    context.fullQualifierTypesByFile.forEach { (file, qualifiers) ->
-      val pkg = context.packageSegmentsOf(file).joinToString(".")
-      val fabricated = maybeUnknownByPkg[pkg].orEmpty()
-      qualifiers
-          .filter { it.pkg.isEmpty() && it.member == null && it.names.size > 1 }
-          .filter { it.names.first() in fabricated }
-          .forEach { qualifier ->
-            var stubToEdit =
-                context.stubsContainer.find(pkg, qualifier.names.first()) ?: return@forEach
-            var innerPkg = "$pkg.${stubToEdit.name}"
-            for (innerName in qualifier.names.drop(1)) {
-              val innerStub =
-                  stubToEdit.innerStubs.find { it.name == innerName }
-                      ?: KStub(innerPkg, innerName).also { stubToEdit.innerStubs += it }
-              innerPkg = "$innerPkg.$innerName"
-              stubToEdit = innerStub
-            }
-          }
     }
   }
 }

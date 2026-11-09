@@ -86,8 +86,8 @@ CxxCompileCommand = record(
     base_compile_cmd = field(cmd_args),
     # The argsfile of arguments from the rule and it's dependencies.
     argsfile = field(CompileArgsfile),
-    # The argsfile to use for Xcode integration. Requires xcode_data subtarget.
-    xcode_argsfile = field(CompileArgsfile | None),
+    # The argsfile to use for Xcode integration.
+    xcode_argsfile = field(CompileArgsfile),
     # The argsfile containing header units args.
     header_units_argsfile = field(CompileArgsfile | None),
     # The argsfile containing header unit stubs args.
@@ -137,10 +137,8 @@ CxxSrcCompileCommand = record(
 )
 
 CxxSrcPrecompileCommand = record(
-    # Generated umbrella header used as the precompile input.
+    # Source file to compile.
     src = field(Artifact),
-    # Preserve the include tree for PCM output and action naming.
-    include_dir = field(Artifact),
     # The CxxCompileCommand to use to compile this file.
     cxx_compile_cmd = field(CxxCompileCommand),
     # Arguments specific to the source file.

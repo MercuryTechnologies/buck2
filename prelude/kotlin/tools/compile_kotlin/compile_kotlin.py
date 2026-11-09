@@ -541,8 +541,7 @@ def _zip_recursive(archive_path: pathlib.Path, source_path: pathlib.Path):
         archive_path, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6
     ) as z:
         z.write(source_path)
-        # Listing order differs between file systems, and the archive is content hashed.
-        for f in sorted(source_path.glob("**/*")):
+        for f in source_path.glob("**/*"):
             z.write(f)
 
 

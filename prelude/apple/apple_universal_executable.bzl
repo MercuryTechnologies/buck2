@@ -17,7 +17,6 @@ load(":apple_dsym.bzl", "DSYM_SUBTARGET", "get_apple_dsym_ext")
 load(":apple_universal_binaries.bzl", "create_universal_binary", "get_universal_binary_name")
 load(":debug.bzl", "AppleDebuggableInfo", "DEBUGINFO_SUBTARGET")
 load(":resource_groups.bzl", "ResourceGraphInfo")
-load(":xcassets_asset_symbols.bzl", "xcassets_asset_symbol_usage_from_deps")
 
 _FORWARDED_PROVIDER_TYPES = [
     AppleMinDeploymentVersionInfo,
@@ -102,5 +101,4 @@ def apple_universal_executable_impl(ctx: AnalysisContext) -> list[Provider]:
         ]
         + forwarded_providers
         + merged_providers
-        + xcassets_asset_symbol_usage_from_deps(ctx, all_binarys)
     )

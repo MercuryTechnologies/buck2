@@ -58,7 +58,6 @@ public class BaseJavacToJarStepFactory extends BaseCompileToJarStepFactory<JavaE
             buckOut,
             compilerOutputPathsValue,
             parameters,
-            extraParams.getSkipIfNoCompilationUnits(),
             abiJarParameters,
             null,
             mixedCompilation));

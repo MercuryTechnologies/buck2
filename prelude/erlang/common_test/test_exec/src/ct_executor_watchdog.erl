@@ -18,7 +18,7 @@ this shutdown handled by it.
 """.
 -compile(warn_missing_spec_all).
 
--behaviour(gen_server).
+-include_lib("kernel/include/logger.hrl").
 
 -export([start_link_client/1, start_server/0]).
 
@@ -29,7 +29,7 @@ this shutdown handled by it.
     handle_cast/2
 ]).
 
--include_lib("kernel/include/logger.hrl").
+-behaviour(gen_server).
 
 -record(state, {
     socket :: gen_tcp:socket() | undefined
