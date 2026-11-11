@@ -773,6 +773,14 @@ impl HeapDeserializationState {
         self.serialization_index_dirty.load(Ordering::Acquire)
     }
 
+    /// Build the index and hand it to `register` without clearing the dirty
+    /// flag, for a state that must not hide a later change from the others.
+    pub(crate) fn rebuild_serialization_index(&self, register: impl FnOnce(Vec<ChunkInfo>)) {
+        // SAFETY: `arena` remains valid for this state's lifetime.
+        let arena = unsafe { self.arena.as_ref() };
+        arena.refresh_chunk_index(|| false, register);
+    }
+
     pub(crate) fn refresh_serialization_index(
         &self,
         is_registered: impl Fn() -> bool,

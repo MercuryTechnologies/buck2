@@ -87,6 +87,11 @@ pub(crate) struct StarlarkSerState {
     chunks: RwLock<BTreeMap<usize, Arc<ChunkEntry>>>,
     /// Exact heap registrations used when resolving pointers for serialization.
     registered_heaps: DashMap<FrozenHeapPtr, ResidentHeapEntry>,
+    /// The state content heap ids are digested against, see
+    /// `sealed::content_digest`. It must not consume a restored heap's dirty
+    /// index flag, which every other state shares.
+    #[allocative(skip)]
+    digest_only: bool,
 }
 
 impl StorageState for StarlarkSerState {}
@@ -106,6 +111,14 @@ impl StarlarkSerState {
         Self {
             chunks: RwLock::new(BTreeMap::new()),
             registered_heaps: DashMap::new(),
+            digest_only: false,
+        }
+    }
+
+    pub(crate) fn new_digest_only() -> Self {
+        Self {
+            digest_only: true,
+            ..Self::new()
         }
     }
 
@@ -201,7 +214,15 @@ impl StarlarkSerState {
         }
 
         heap_ref.register_ser_state(self)?;
-        if let Some(deser_state) = deser_state {
+        if let Some(deser_state) = deser_state
+            && self.digest_only
+        {
+            // Rebuilt whenever it is dirty, leaving the flag for the states
+            // that serialize for real.
+            deser_state.rebuild_serialization_index(|entries| {
+                self.register_heap(heap_id, heap_ptr, heap, uses_recipe_indices, entries)
+            });
+        } else if let Some(deser_state) = deser_state {
             deser_state.refresh_serialization_index(
                 || self.registered_heaps.contains_key(&heap_ptr),
                 |entries| self.register_heap(heap_id, heap_ptr, heap, uses_recipe_indices, entries),

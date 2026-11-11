@@ -238,6 +238,15 @@ impl HeapSerializationNonce {
         Self(rand::rng().random())
     }
 
+    /// Stands in for the nonce of a heap whose content digest is being
+    /// computed: its own pointers and header are written against it, so the
+    /// digest does not depend on the digest.
+    const IN_PROGRESS: Self = Self(0);
+
+    fn from_digest(key: DataKey) -> Self {
+        Self(key.get())
+    }
+
     pub(crate) fn to_le_bytes(self) -> [u8; 16] {
         self.0.to_le_bytes()
     }
@@ -252,6 +261,9 @@ struct FrozenFrozenHeap {
     // load-bearing frozen-value pointer identity. Remove this once distinct equal-content
     // allocations are interchangeable; the nonce prevents independent serializations from
     // sharing a `DataKey`.
+    //
+    // With `content_heap_ids_enabled` it is a content digest instead of a random draw, see
+    // `content_digest`, and two equal-content heaps of one name share an identity.
     #[allocative(skip)]
     serialization_nonce: OnceLock<HeapSerializationNonce>,
     arena: Arena<ChunkAllocator>,
@@ -354,8 +366,18 @@ impl FrozenFrozenHeap {
     fn heap_ref_id(&self) -> Option<HeapRefId> {
         Some(HeapRefId::new(
             self.name.get()?,
-            *self.serialization_nonce.get()?,
+            self.nonce_or_in_progress(),
         ))
+    }
+
+    /// The nonce, or `IN_PROGRESS` while `content_digest` computes it at seal.
+    /// Only that seal-time pass, on the thread that sealed the heap and before
+    /// anything else can reach it, sees the heap without one.
+    fn nonce_or_in_progress(&self) -> HeapSerializationNonce {
+        self.serialization_nonce
+            .get()
+            .copied()
+            .unwrap_or(HeapSerializationNonce::IN_PROGRESS)
     }
 
     /// A heap with a known identity and an empty arena, as restored from
@@ -450,11 +472,9 @@ impl FrozenFrozenHeap {
             .expect("The name of the FrozenFrozenHeap should exist in starlark pagable serialize");
         heap_name.pagable_serialize(serializer)?;
         // A restored heap reuses its data key, so only a heap built here -
-        // whose nonce and refs were set at seal - reaches this point.
-        self.serialization_nonce
-            .get()
-            .expect("a heap serialized from its arena was sealed here")
-            .pagable_serialize(serializer)?;
+        // whose nonce and refs were set at seal - reaches this point, or one
+        // whose content digest is being computed.
+        self.nonce_or_in_progress().pagable_serialize(serializer)?;
 
         let refs = self.refs.get();
         refs.len().pagable_serialize(serializer)?;
@@ -693,10 +713,7 @@ impl PagableSerialize for FrozenHeapArc {
             .get()
             .ok_or_else(|| pagable::Error::msg("a serialized frozen heap must have a name"))?
             .pagable_serialize(serializer)?;
-        arc.serialization_nonce
-            .get()
-            .expect("a heap sealed here or bound from a slot knows its nonce")
-            .pagable_serialize(serializer)?;
+        arc.nonce_or_in_progress().pagable_serialize(serializer)?;
         let state = StarlarkSerializerImpl::get_or_create_state(serializer);
         state.ensure_chunk_index_registered(self)?;
         serializer.serialize_arc(arc)
@@ -1087,8 +1104,14 @@ impl FrozenHeapArc {
         name: Option<FrozenHeapName>,
         peak_allocated_bytes: Option<usize>,
     ) -> Self {
-        Self(Some(PartialPagableArc::new(FrozenFrozenHeap {
-            serialization_nonce: OnceLock::from(HeapSerializationNonce::random()),
+        let content_id = name.as_ref().is_some_and(content_digest::applies_to)
+            && content_digest::content_heap_ids_enabled();
+        let heap = Self(Some(PartialPagableArc::new(FrozenFrozenHeap {
+            serialization_nonce: if content_id {
+                OnceLock::new()
+            } else {
+                OnceLock::from(HeapSerializationNonce::random())
+            },
             arena,
             refs: LazyHeapRefs::resident(refs),
             name: name.map_or_else(OnceLock::new, OnceLock::from),
@@ -1096,7 +1119,18 @@ impl FrozenHeapArc {
             peak_allocated_bytes,
             ser_states: Mutex::new(Vec::new()),
             deser_state: OnceLock::new(),
-        })))
+        })));
+        if content_id {
+            let nonce = content_digest::digest(&heap)
+                .map(HeapSerializationNonce::from_digest)
+                .unwrap_or_else(|()| HeapSerializationNonce::random());
+            let inner = heap.0.as_ref().expect("built above");
+            assert!(
+                inner.serialization_nonce.set(nonce).is_ok(),
+                "only the sealing thread sets a new heap's nonce",
+            );
+        }
+        heap
     }
 
     /// Whether this is the empty heap, which keeps nothing alive.
@@ -1418,5 +1452,198 @@ impl FrozenHeapArc {
         self.0
             .as_ref()
             .and_then(|heap| heap.locate_value_for_diagnostic(raw_ptr))
+    }
+}
+
+/// Content-derived heap identities, an opt-in prototype.
+///
+/// With `BUCK2_STARLARK_CONTENT_HEAP_IDS=1` in the environment of the process,
+/// a named heap's nonce is not drawn at random when it is sealed but computed
+/// from what the heap would serialize to: its name, its ref list (each ref by
+/// its own identity, so the digest is a Merkle hash over the heap graph), and
+/// its values, with pointers into the heap itself written against
+/// `HeapSerializationNonce::IN_PROGRESS`. Nested Rust arcs are hashed by
+/// content the way storage keys them. The same evaluation in two daemons then
+/// seals heaps with the same identities, so their serialized bytes agree.
+///
+/// The cost: two equal-content heaps of one name, alive in one process, share
+/// an identity and a `DataKey`, which the random nonce exists to prevent while
+/// frozen-value pointer identity is load-bearing. A page-in can merge them into
+/// one allocation, and a second live allocation bound under one id is refused
+/// as a conflicting binding. A heap whose values cannot be serialized keeps a
+/// random nonce.
+pub(crate) mod content_digest {
+    use std::cell::Cell;
+    use std::sync::LazyLock;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::Ordering;
+
+    use pagable::DataKey;
+    use pagable::PartialPagableArc;
+    use pagable::StorageContext;
+    use pagable::arc_erase::ArcEraseDyn;
+    use pagable::digest::DigestSerializer;
+
+    use super::FrozenFrozenHeap;
+    use super::FrozenHeapArc;
+    use super::FrozenHeapPtr;
+    use crate::pagable::starlark_serialize_context::StarlarkSerState;
+    use crate::pagable::starlark_serialize_context::StarlarkSerializerImpl;
+    use crate::values::layout::heap::name::FrozenHeapName;
+
+    pub(crate) fn content_heap_ids_enabled() -> bool {
+        static ENABLED: LazyLock<bool> = LazyLock::new(|| {
+            std::env::var("BUCK2_STARLARK_CONTENT_HEAP_IDS").is_ok_and(|v| v == "1" || v == "true")
+        });
+        *ENABLED
+    }
+
+    /// One serialization state for every digest, so a dependency's chunk index
+    /// is built once rather than once per heap that refers to it. Heaps
+    /// unregister from it when dropped, as from any storage's state.
+    static CONTEXT: LazyLock<StorageContext> = LazyLock::new(|| {
+        let context = StorageContext::new();
+        context.get_or_init(StarlarkSerState::new_digest_only);
+        context
+    });
+
+    static FALLBACKS: AtomicUsize = AtomicUsize::new(0);
+
+    thread_local! {
+        static IN_DIGEST: Cell<bool> = const { Cell::new(false) };
+        static IN_STATIC_INIT: Cell<usize> = const { Cell::new(0) };
+    }
+
+    /// Run the initializer of a static heap, such as a `globals_static!`. A heap
+    /// sealed inside keeps a random nonce: digesting it would ask the
+    /// static-heap registry for ids, and the registry forces this very static.
+    pub(crate) fn in_static_init<R>(f: impl FnOnce() -> R) -> R {
+        IN_STATIC_INIT.with(|d| d.set(d.get() + 1));
+        let r = f();
+        IN_STATIC_INIT.with(|d| d.set(d.get() - 1));
+        r
+    }
+
+    /// Heaps built at run time. Method heaps, and global heaps built by
+    /// `in_static_init`, are sealed inside the lazy statics the static-heap
+    /// registry forces, and serializing their values asks that registry for
+    /// static ids, so digesting one would re-enter its initialization. They are
+    /// never paged anyway: pointers into them serialize as static ids. A global
+    /// heap built at run time, such as buck2's interpreter globals, is paged.
+    pub(super) fn applies_to(name: &FrozenHeapName) -> bool {
+        match name {
+            FrozenHeapName::User(_) | FrozenHeapName::Singleton(_) => true,
+            FrozenHeapName::Global(_) => IN_STATIC_INIT.with(|d| d.get() == 0),
+            FrozenHeapName::Method(_) => false,
+        }
+    }
+
+    /// Debugging aid: with `BUCK2_STARLARK_CONTENT_HEAP_IDS_DUMP=<file>`, one
+    /// line per digested heap: name, digest, a hash of its bytes, its arcs.
+    fn dump(inner: &FrozenFrozenHeap, key: DataKey, data: &[u8], arcs: &[(&'static str, DataKey)]) {
+        static FILE: LazyLock<Option<std::sync::Mutex<std::fs::File>>> = LazyLock::new(|| {
+            let path = std::env::var_os("BUCK2_STARLARK_CONTENT_HEAP_IDS_DUMP")?;
+            let mut f = std::fs::File::create(path).ok()?;
+            use std::io::Write as _;
+            for (i, t) in crate::pagable::vtable_registry::registered_type_names()
+                .iter()
+                .enumerate()
+            {
+                let _ = writeln!(f, "#TYPE\t{i}\t{t}");
+            }
+            Some(std::sync::Mutex::new(f))
+        });
+        let Some(file) = &*FILE else { return };
+        use std::fmt::Write as _;
+        let mut line = format!(
+            "{}\t{:032x}\t{}\t{}",
+            inner
+                .name
+                .get()
+                .map_or_else(String::new, |n| format!("{n}"))
+                .replace(['\t', '\n'], " "),
+            key.get(),
+            blake3::hash(data).to_hex(),
+            data.len(),
+        );
+        for (t, k) in arcs {
+            let _ = write!(line, "\t{t}={:032x}", k.get());
+        }
+        if let Some(f) = std::env::var_os("BUCK2_STARLARK_CONTENT_HEAP_IDS_RAW") {
+            if line.contains(f.to_str().unwrap_or("\0")) {
+                let _ = write!(line, "\tRAW=");
+                for byte in data {
+                    let _ = write!(line, "{byte:02x}");
+                }
+            }
+        }
+        line.push('\n');
+        use std::io::Write as _;
+        let _ = file.lock().expect("dump lock").write_all(line.as_bytes());
+    }
+
+    /// A dependency heap's identity is already in the stream beside its slot.
+    fn is_heap_arc(arc: &dyn ArcEraseDyn) -> bool {
+        arc.as_arc_any().is::<PartialPagableArc<FrozenFrozenHeap>>()
+    }
+
+    /// The content digest of `heap`, which is newly sealed, not yet shared and
+    /// has no nonce. `Err` when its content cannot be serialized.
+    pub(super) fn digest(heap: &FrozenHeapArc) -> Result<DataKey, ()> {
+        // A heap sealed while another is being digested on this thread keeps a
+        // random nonce rather than nest.
+        if IN_DIGEST.with(|d| d.replace(true)) {
+            FALLBACKS.fetch_add(1, Ordering::Relaxed);
+            return Err(());
+        }
+        let result = digest_inner(heap);
+        IN_DIGEST.with(|d| d.set(false));
+        result
+    }
+
+    fn digest_inner(heap: &FrozenHeapArc) -> Result<DataKey, ()> {
+        let arc = heap.0.as_ref().expect("a sealed heap has an allocation");
+        let inner: &FrozenFrozenHeap = arc;
+        let mut ser = DigestSerializer::new(&CONTEXT, is_heap_arc);
+        let state = StarlarkSerializerImpl::get_or_create_state(&mut ser);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            state
+                .ensure_chunk_index_registered(heap)
+                .map_err(crate::Error::new_other)?;
+            inner.serialize_inner(&mut ser)
+        }));
+        // Registered under its in-progress identity; it registers again under
+        // its real one when something that depends on it is digested.
+        state.unregister_heap(
+            FrozenHeapPtr(inner as *const FrozenFrozenHeap as usize),
+            inner.arena.allocated_chunk_bases(),
+        );
+        let error = match result {
+            Ok(Ok(())) => match ser.finish_parts() {
+                Ok((data, arcs)) => {
+                    let key = DataKey::compute(arcs.len(), &data, &{
+                        let mut more = Vec::with_capacity(arcs.len() * 16);
+                        for (_, k) in &arcs {
+                            more.extend_from_slice(&k.get().to_ne_bytes());
+                        }
+                        more
+                    });
+                    dump(inner, key, &data, &arcs);
+                    return Ok(key);
+                }
+                Err(e) => format!("{e:#}"),
+            },
+            Ok(Err(e)) => format!("{e:#}"),
+            Err(_) => "panic while serializing".to_owned(),
+        };
+        let n = FALLBACKS.fetch_add(1, Ordering::Relaxed);
+        if n < 20 {
+            eprintln!(
+                "starlark content heap id: {} keeps a random nonce: {}",
+                inner.name.get().map_or_else(String::new, |n| n.to_string()),
+                error.lines().next().unwrap_or(""),
+            );
+        }
+        Err(())
     }
 }

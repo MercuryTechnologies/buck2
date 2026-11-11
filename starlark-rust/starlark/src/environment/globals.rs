@@ -586,9 +586,11 @@ impl GlobalsStatic {
     /// Get (or build, on first call) the [`Globals`] value.
     pub fn globals(&'static self) -> &'static Globals {
         self.cell.get_or_init(|| {
-            GlobalsBuilder::new()
-                .with(self.init)
-                .build_named(GlobalFrozenHeapName { name: self.name })
+            crate::values::layout::heap::sealed::content_digest::in_static_init(|| {
+                GlobalsBuilder::new()
+                    .with(self.init)
+                    .build_named(GlobalFrozenHeapName { name: self.name })
+            })
         })
     }
 

@@ -41,6 +41,7 @@ pub mod arc_erase;
 pub mod context;
 mod deferred_value;
 pub mod deser_recipe;
+pub mod digest;
 pub mod flavors;
 mod hashers;
 mod impls;

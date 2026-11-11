@@ -470,3 +470,8 @@ mod tests {
         );
     }
 }
+
+/// Debugging aid: the registered type names, in index order.
+pub(crate) fn registered_type_names() -> Vec<&'static str> {
+    VTABLE_REGISTRY.id_to_type.iter().map(|t| t.0).collect()
+}
