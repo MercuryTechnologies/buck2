@@ -85,6 +85,28 @@ fn next_id() -> u64 {
     *BASE | (LAST_ID.fetch_add(1, atomic::Ordering::Relaxed) + 1)
 }
 
+/// Measurement-only, with `BUCK2_DETERMINISTIC_WORKER_IDS=1`: the id is a hash of
+/// the worker's definition instead of a per-process draw, so two daemons that
+/// analyse the same graph give a worker the same id. Workers with identical
+/// definitions then share an id, and so a pool entry.
+fn deterministic_worker_ids() -> bool {
+    static ENABLED: LazyLock<bool> = LazyLock::new(|| {
+        std::env::var("BUCK2_DETERMINISTIC_WORKER_IDS").is_ok_and(|v| v == "1" || v == "true")
+    });
+    *ENABLED
+}
+
+fn content_id(parts: &[String]) -> u64 {
+    use std::hash::Hash;
+    use std::hash::Hasher;
+    // `DefaultHasher::new` has fixed keys, so the hash is the same in every
+    // process of one binary.
+    #[allow(deprecated)]
+    let mut h = std::hash::SipHasher::new();
+    parts.hash(&mut h);
+    h.finish() | 1
+}
+
 #[starlark_module]
 fn worker_info_creator(globals: &mut GlobalsBuilder) {
     #[starlark(as_type = WorkerInfo<'static>)]
@@ -100,9 +122,22 @@ fn worker_info_creator(globals: &mut GlobalsBuilder) {
         eval: &mut Evaluator<'v, '_, '_>,
     ) -> starlark::Result<WorkerInfo<'v>> {
         let heap = eval.heap();
+        let id = if deterministic_worker_ids() {
+            content_id(&[
+                exe.to_repr(),
+                env.to_repr(),
+                match &concurrency {
+                    NoneOr::None => "None".to_owned(),
+                    NoneOr::Other(c) => c.typed.to_string(),
+                },
+                streaming.to_repr(),
+                supports_bazel_remote_persistent_worker_protocol.to_string(),
+            ])
+        } else {
+            next_id()
+        };
         let valid_exe = StarlarkCmdArgs::try_from_value(exe)?;
         let exe = ValueOfUnchecked::new(heap.alloc(valid_exe));
-        let id = next_id();
         Ok(WorkerInfo {
             exe,
             env: ValueOfUnchecked::new(heap.alloc(env)),
