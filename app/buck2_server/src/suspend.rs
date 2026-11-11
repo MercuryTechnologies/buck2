@@ -254,6 +254,17 @@ fn exe_digest() -> buck2_error::Result<String> {
     buck2_common::suspend_image::exe_digest(&exe)
 }
 
+/// The suspend's environment digests, for the frontier version: `digest` without per-run
+/// variables, `run` over what local actions inherit; credentials are in neither.
+pub(crate) fn frontier_env_digests() -> (String, String) {
+    let d = env_digest(&[]);
+    (d.digest, d.run)
+}
+
+pub(crate) fn frontier_exe_digest() -> buck2_error::Result<String> {
+    exe_digest()
+}
+
 fn uid() -> u32 {
     // SAFETY: getuid cannot fail.
     unsafe { libc::getuid() }

@@ -2862,6 +2862,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "buck2_frontier"
+version = "0.1.0"
+dependencies = [
+ "allocative",
+ "anyhow",
+ "async-trait",
+ "blake3",
+ "buck2_common",
+ "buck2_error",
+ "derive_more 2.1.1",
+ "dice",
+ "dice_futures",
+ "dupe",
+ "pagable",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "buck2_fs"
 version = "0.1.0"
 dependencies = [
@@ -3402,6 +3422,7 @@ dependencies = [
  "buck2_execute_impl",
  "buck2_file_watcher",
  "buck2_forkserver",
+ "buck2_frontier",
  "buck2_fs",
  "buck2_grpc",
  "buck2_hash",
@@ -3746,6 +3767,7 @@ dependencies = [
  "async-trait",
  "buck2_artifact",
  "buck2_build_api",
+ "buck2_common",
  "buck2_core",
  "buck2_error",
  "buck2_execute",
@@ -4774,6 +4796,7 @@ dependencies = [
  "async-trait",
  "bincode",
  "bit-set 0.11.1",
+ "blake3",
  "buck2_hash",
  "cmp_any",
  "dashmap 6.2.1",

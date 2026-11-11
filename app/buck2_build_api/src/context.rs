@@ -82,3 +82,34 @@ impl SetBuildContextData for DiceTransactionUpdater {
         )])?)
     }
 }
+
+impl buck2_common::frontier::FrontierLeaf for BuildData {
+    fn frontier_digest(&self, h: &mut buck2_common::frontier::FrontierHasher) {
+        let BuildData {
+            buck_out_path_resolver,
+        } = self;
+        buck2_common::frontier::digest_str(h, buck_out_path_resolver.root().as_str());
+    }
+}
+
+pub fn frontier_build_data_key_type() -> &'static str {
+    <BuildDataKey as dice::Key>::key_type_name()
+}
+
+pub fn frontier_inspect_build_data(
+    key: &dyn std::any::Any,
+    value: Option<&dyn std::any::Any>,
+) -> Option<buck2_common::frontier::Inspected> {
+    use buck2_common::frontier::Inspected;
+    key.downcast_ref::<BuildDataKey>()?;
+    let key_type = frontier_build_data_key_type();
+    Some(match value.and_then(|v| v.downcast_ref::<BuildData>()) {
+        Some(d) => Inspected::Leaf {
+            id: buck2_common::frontier::LeafId::Injected {
+                key_type: key_type.to_owned(),
+            },
+            canon: Some(buck2_common::frontier::canonical_injected(key_type, d)),
+        },
+        None => Inspected::Barrier("BuildDataKey value unreadable".to_owned()),
+    })
+}

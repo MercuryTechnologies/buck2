@@ -120,6 +120,7 @@ members = [
   "app/buck2_external_cells_bundled",
   "app/buck2_file_watcher",
   "app/buck2_forkserver",
+  "app/buck2_frontier",
   "app/buck2_forkserver_proto",
   "app/buck2_fs",
   "app/buck2_grpc",
@@ -302,6 +303,7 @@ buck2_external_cells = { path = "app/buck2_external_cells" }
 buck2_external_cells_bundled = { path = "app/buck2_external_cells_bundled" }
 buck2_file_watcher = { path = "app/buck2_file_watcher" }
 buck2_forkserver = { path = "app/buck2_forkserver" }
+buck2_frontier = { path = "app/buck2_frontier" }
 buck2_forkserver_proto = { path = "app/buck2_forkserver_proto" }
 buck2_fs = { path = "app/buck2_fs" }
 buck2_grpc = { path = "app/buck2_grpc" }

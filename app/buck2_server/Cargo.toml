@@ -32,6 +32,7 @@ buck2_fs.workspace = true
 buck2_grpc.workspace = true
 buck2_hash.workspace = true
 buck2_http.workspace = true
+buck2_frontier.workspace = true
 buck2_interpreter.workspace = true
 buck2_interpreter_for_build.workspace = true
 buck2_node.workspace = true

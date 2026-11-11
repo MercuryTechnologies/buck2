@@ -177,3 +177,19 @@ impl HostInfo {
         }
     }
 }
+
+impl buck2_common::frontier::FrontierLeaf for HostInfo {
+    /// Exactly what equality compares: the frozen `value` carries a Starlark heap's identity
+    /// and is derived from the other three.
+    fn frontier_digest(&self, h: &mut buck2_common::frontier::FrontierHasher) {
+        let HostInfo {
+            platform,
+            arch,
+            xcode,
+            value: _,
+        } = self;
+        buck2_common::frontier::digest_str(h, &format!("{platform:?}"));
+        buck2_common::frontier::digest_str(h, &format!("{arch:?}"));
+        buck2_common::frontier::digest_str(h, &format!("{xcode:?}"));
+    }
+}

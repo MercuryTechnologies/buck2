@@ -1,0 +1,49 @@
+load(":defs.bzl", "copy", "dyn", "many", "run_sh", "tree", "write_txt")
+
+write_txt(
+    name = "greet",
+    content = read_config("fixture", "greeting", "unset"),
+)
+
+write_txt(
+    name = "aliased",
+    content = "through a cell alias",
+    deps = ["fx//:greet"],
+)
+
+run_sh(
+    name = "ran",
+    mode = select({
+        "//cfg:fast": "fast",
+        "DEFAULT": "slow",
+    }),
+    srcs = glob(["srcs/*.txt"]),
+    tool = "tool.sh",
+)
+
+copy(
+    name = "linked",
+    src = "link.txt",
+)
+
+copy(
+    name = "ignored",
+    src = "ignored.txt",
+)
+
+copy(
+    name = "data",
+    src = "data.txt",
+)
+
+tree(
+    name = "tree",
+    srcs = {
+        "a.txt": "srcs/a.txt",
+        "data.txt": "data.txt",
+    },
+)
+
+dyn(name = "dyn")
+
+many(name = "many")

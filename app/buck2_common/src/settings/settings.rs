@@ -21,6 +21,9 @@ use crate::settings::agent_interactive::AgentInteractiveSettings;
 use crate::settings::agent_materialization::AgentMaterializationSettings;
 pub use crate::settings::analysis::AnalysisSection;
 use crate::settings::analysis::AnalysisSectionData;
+pub use crate::settings::frontier::FrontierMode;
+pub use crate::settings::frontier::FrontierSection;
+use crate::settings::frontier::FrontierSectionData;
 pub use crate::settings::hydration::HydrationSection;
 use crate::settings::hydration::HydrationSectionData;
 pub use crate::settings::log_download::LogDownloadSection;
@@ -34,6 +37,7 @@ pub(crate) static ALL_SECTION_METADATA: &[SectionMetadata] = &[
     AgentInteractiveSettings::METADATA,
     AgentMaterializationSettings::METADATA,
     AnalysisSection::METADATA,
+    FrontierSection::METADATA,
     HydrationSection::METADATA,
     LogDownloadSection::METADATA,
     PackageVisibilitySection::METADATA,
@@ -49,6 +53,8 @@ pub(crate) struct BuckSettingsData {
     agent_materialization: AgentMaterializationSettings,
     #[serde(default)]
     analysis: AnalysisSectionData,
+    #[serde(default)]
+    frontier: FrontierSectionData,
     #[serde(default)]
     hydration: HydrationSectionData,
     #[serde(default)]
@@ -129,6 +135,7 @@ impl InvocationBuckSettings {
 #[serde(default, deny_unknown_fields)]
 pub struct DaemonBuckSettings {
     pub analysis: AnalysisSection,
+    pub frontier: FrontierSection,
     pub hydration: HydrationSection,
     pub log_download: LogDownloadSection,
     pub package_visibility: PackageVisibilitySection,
@@ -149,6 +156,7 @@ impl From<BuckSettingsData> for BuckSettings {
         Self {
             daemon: DaemonBuckSettings {
                 analysis: AnalysisSection(Arc::new(data.analysis)),
+                frontier: FrontierSection(Arc::new(data.frontier)),
                 hydration: HydrationSection(Arc::new(data.hydration)),
                 log_download: LogDownloadSection(Arc::new(data.log_download)),
                 package_visibility: PackageVisibilitySection(Arc::new(data.package_visibility)),

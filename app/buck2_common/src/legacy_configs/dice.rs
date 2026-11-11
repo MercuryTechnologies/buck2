@@ -506,3 +506,214 @@ mod tests {
         Ok(())
     }
 }
+
+/// Some whole sections of a cell's config: for the readers that need a section rather than a
+/// property (the cell and target alias resolvers), so that they depend on those sections and not
+/// on the whole config. Used only with the frontier on.
+#[derive(Debug, Display, Hash, Eq, PartialEq, Clone, Allocative, Pagable)]
+#[display("{}", sections.join(","))]
+#[pagable_typetag(dice::DiceProjectionDyn)]
+struct LegacyBuckConfigSectionsProjectionKey {
+    /// Sorted.
+    sections: Vec<String>,
+}
+
+impl ProjectionKey for LegacyBuckConfigSectionsProjectionKey {
+    type DeriveFromKey = LegacyBuckConfigForCellKey;
+    type Value = LegacyBuckConfig;
+
+    fn compute(
+        &self,
+        config: &buck2_error::Result<LegacyBuckConfig>,
+        _ctx: &DiceProjectionComputations,
+    ) -> LegacyBuckConfig {
+        // See the comment in `LegacyBuckConfigErrorKey` for why this is safe: the accessor
+        // below reads the error projection first.
+        let config = config.as_ref().unwrap();
+        config.filter_values(|k| self.sections.iter().any(|s| s == k.section))
+    }
+
+    fn equality_behavior() -> EqualityBehavior<Self::Value> {
+        EqualityBehavior::Compare(|x, y| x.compare(y))
+    }
+
+    fn value_serialize() -> impl ValueSerialize<Value = Self::Value> {
+        ResidentValueSerialize::new(PagableValueSerialize::<Self::Value>::new())
+    }
+}
+
+/// The named sections of a cell's config, through a projection that depends on them alone.
+pub async fn get_legacy_config_sections(
+    ctx: &mut DiceComputations<'_>,
+    cell_name: CellName,
+    sections: &[&str],
+) -> buck2_error::Result<LegacyBuckConfig> {
+    let config = ctx
+        .compute_opaque(&LegacyBuckConfigForCellKey { cell_name })
+        .await?;
+    if let Some(error) = ctx.projection(&config, &LegacyBuckConfigErrorKey())? {
+        return Err(error);
+    }
+    let mut sections: Vec<String> = sections.iter().map(|s| (*s).to_owned()).collect();
+    sections.sort();
+    sections.dedup();
+    Ok(ctx.projection(&config, &LegacyBuckConfigSectionsProjectionKey { sections })?)
+}
+
+pub fn frontier_config_key_types() -> [&'static str; 5] {
+    [
+        <LegacyBuckConfigPropertyProjectionKey as ProjectionKey>::key_type_name(),
+        <LegacyBuckConfigErrorKey as ProjectionKey>::key_type_name(),
+        <LegacyBuckConfigSectionsProjectionKey as ProjectionKey>::key_type_name(),
+        <LegacyBuckConfigForCellKey as Key>::key_type_name(),
+        <LegacyExternalBuckConfigDataKey as Key>::key_type_name(),
+    ]
+}
+
+/// Config keys as frontier leaves or barriers. A property or section leaf's value is computed
+/// later, with its origin, by [`frontier_config_leaf`].
+pub fn frontier_inspect_config(
+    key: &dyn std::any::Any,
+    base: Option<&dyn std::any::Any>,
+    value: Option<&dyn std::any::Any>,
+) -> Option<crate::frontier::Inspected> {
+    use crate::frontier::Inspected;
+    use crate::frontier::LeafId;
+    let cell = || {
+        base.and_then(|b| b.downcast_ref::<LegacyBuckConfigForCellKey>())
+            .map(|b| b.cell_name.as_str().to_owned())
+    };
+    if let Some(k) = key.downcast_ref::<LegacyBuckConfigPropertyProjectionKey>() {
+        return Some(match cell() {
+            Some(cell) => Inspected::Leaf {
+                id: LeafId::Config {
+                    cell,
+                    section: k.section.clone(),
+                    property: k.property.clone(),
+                },
+                canon: None,
+            },
+            None => Inspected::Barrier("config projection without its cell".to_owned()),
+        });
+    }
+    if let Some(k) = key.downcast_ref::<LegacyBuckConfigSectionsProjectionKey>() {
+        return Some(match cell() {
+            Some(cell) => Inspected::Leaf {
+                id: LeafId::Sections {
+                    cell,
+                    sections: k.sections.clone(),
+                },
+                canon: None,
+            },
+            None => Inspected::Barrier("config projection without its cell".to_owned()),
+        });
+    }
+    if key.downcast_ref::<LegacyBuckConfigErrorKey>().is_some() {
+        let is_error = value
+            .and_then(|v| v.downcast_ref::<Option<buck2_error::Error>>())
+            .map(|e| e.is_some());
+        return Some(match (cell(), is_error) {
+            (Some(cell), Some(is_error)) => Inspected::Leaf {
+                id: LeafId::ConfigError { cell },
+                canon: Some(crate::frontier::canonical_config_error(is_error)),
+            },
+            _ => Inspected::Barrier("config error projection unreadable".to_owned()),
+        });
+    }
+    if key.downcast_ref::<LegacyBuckConfigForCellKey>().is_some() {
+        return Some(Inspected::Barrier(
+            "whole-config premise via LegacyBuckConfigForCellKey".to_owned(),
+        ));
+    }
+    if key.downcast_ref::<LegacyExternalBuckConfigDataKey>().is_some() {
+        return Some(Inspected::Barrier(
+            "whole-config premise via LegacyExternalBuckConfigDataKey".to_owned(),
+        ));
+    }
+    None
+}
+
+/// Where one config value came from.
+pub fn frontier_config_origin(
+    config: &LegacyBuckConfig,
+    section: &str,
+    property: &str,
+) -> crate::frontier::ConfigOrigin {
+    use crate::frontier::ConfigOrigin;
+    let Some(value) = config.get_section(section).and_then(|s| s.get(property)) else {
+        return ConfigOrigin::Absent;
+    };
+    if value.raw_value() != value.as_str() {
+        return ConfigOrigin::Interpolated;
+    }
+    let stack = value.location_stack();
+    if stack.is_empty() {
+        return ConfigOrigin::CommandLine;
+    }
+    let mut files = Vec::new();
+    for loc in stack {
+        match loc {
+            crate::legacy_configs::configs::LegacyBuckConfigLocation::File(f, _) => {
+                files.push(f.to_owned())
+            }
+            crate::legacy_configs::configs::LegacyBuckConfigLocation::CommandLineArgument => {
+                return ConfigOrigin::CommandLine;
+            }
+        }
+    }
+    ConfigOrigin::Files(files)
+}
+
+/// A config leaf's value in this daemon, and whether a record may name it: `Err(property)` when
+/// some value comes from outside the files `tracked` accepts. The canonical value is for
+/// comparison in this process; a primer writes it only when the origin is `Ok`.
+pub async fn frontier_config_leaf(
+    ctx: &mut DiceComputations<'_>,
+    id: &crate::frontier::LeafId,
+    tracked: &(dyn Fn(&str) -> bool + Sync),
+) -> buck2_error::Result<Option<(crate::frontier::Canon, Result<(), String>)>> {
+    use crate::frontier::ConfigOrigin;
+    use crate::frontier::LeafId;
+    let origin_ok = |config: &LegacyBuckConfig, section: &str, property: &str| -> Result<(), String> {
+        match frontier_config_origin(config, section, property) {
+            ConfigOrigin::Absent => Ok(()),
+            ConfigOrigin::Files(files) if files.iter().all(|f| tracked(f)) => Ok(()),
+            _ => Err(format!("{section}.{property}")),
+        }
+    };
+    Ok(match id {
+        LeafId::Config {
+            cell,
+            section,
+            property,
+        } => {
+            let config = ctx
+                .get_legacy_config_for_cell(CellName::unchecked_new(cell)?)
+                .await?;
+            let value = config.get(BuckconfigKeyRef { section, property });
+            Some((
+                crate::frontier::canonical_config_value(value),
+                origin_ok(config, section, property),
+            ))
+        }
+        LeafId::Sections { cell, sections } => {
+            let config = ctx
+                .get_legacy_config_for_cell(CellName::unchecked_new(cell)?)
+                .await?;
+            let mut entries = Vec::new();
+            let mut ok = Ok(());
+            for s in sections {
+                if let Some(sec) = config.get_section(s) {
+                    for (p, v) in sec.iter() {
+                        entries.push((s.as_str(), p, v.as_str()));
+                        if ok.is_ok() {
+                            ok = origin_ok(config, s, p);
+                        }
+                    }
+                }
+            }
+            Some((crate::frontier::canonical_sections(entries), ok))
+        }
+        _ => None,
+    })
+}

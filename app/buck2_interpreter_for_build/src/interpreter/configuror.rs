@@ -170,3 +170,26 @@ impl BuildInterpreterConfiguror {
         self.prelude_import.as_ref()
     }
 }
+
+impl buck2_common::frontier::FrontierLeaf for BuildInterpreterConfiguror {
+    fn frontier_digest(&self, h: &mut buck2_common::frontier::FrontierHasher) {
+        use buck2_common::frontier::digest_str;
+        let BuildInterpreterConfiguror {
+            prelude_import,
+            host_info,
+            record_target_call_stack,
+            skip_targets_with_duplicate_names,
+            infer_target_names,
+            // Compared by pointer and set only by tests: the frontier refuses a value with it.
+            additional_globals,
+        } = self;
+        digest_str(h, &format!("{prelude_import:?}"));
+        host_info.frontier_digest(h);
+        h.update(&[
+            *record_target_call_stack as u8,
+            *skip_targets_with_duplicate_names as u8,
+            additional_globals.is_some() as u8,
+        ]);
+        digest_str(h, &format!("{infer_target_names:?}"));
+    }
+}

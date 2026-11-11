@@ -97,3 +97,35 @@ impl GetStarlarkTypes for DiceComputations<'_> {
         Ok(self.compute(&StarlarkTypesKey).await?.unstable_typecheck)
     }
 }
+
+impl buck2_common::frontier::FrontierLeaf for StarlarkTypesValue {
+    fn frontier_digest(&self, h: &mut buck2_common::frontier::FrontierHasher) {
+        let StarlarkTypesValue {
+            disable_starlark_types,
+            unstable_typecheck,
+        } = self;
+        h.update(&[*disable_starlark_types as u8, *unstable_typecheck as u8]);
+    }
+}
+
+pub fn frontier_starlark_types_key_type() -> &'static str {
+    <StarlarkTypesKey as dice::Key>::key_type_name()
+}
+
+pub fn frontier_inspect_starlark_types(
+    key: &dyn std::any::Any,
+    value: Option<&dyn std::any::Any>,
+) -> Option<buck2_common::frontier::Inspected> {
+    use buck2_common::frontier::Inspected;
+    key.downcast_ref::<StarlarkTypesKey>()?;
+    let key_type = frontier_starlark_types_key_type();
+    Some(match value.and_then(|v| v.downcast_ref::<StarlarkTypesValue>()) {
+        Some(v) => Inspected::Leaf {
+            id: buck2_common::frontier::LeafId::Injected {
+                key_type: key_type.to_owned(),
+            },
+            canon: Some(buck2_common::frontier::canonical_injected(key_type, v)),
+        },
+        None => Inspected::Barrier("StarlarkTypesKey value unreadable".to_owned()),
+    })
+}

@@ -1,0 +1,17 @@
+[cells]
+  root = .
+
+[cell_aliases]
+  fx = root
+
+[buildfile]
+  name = TARGETS.fixture
+
+[build]
+  execution_platforms = root//platforms:platforms
+
+[fixture]
+  greeting = hello
+
+[alias]
+  greet = root//:greet

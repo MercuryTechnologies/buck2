@@ -56,3 +56,25 @@ impl SetEnabledOptionalValidations for DiceTransactionUpdater {
         )])?)
     }
 }
+
+pub fn frontier_validations_key_type() -> &'static str {
+    <EnabledOptionalValidationsKey as dice::Key>::key_type_name()
+}
+
+pub fn frontier_inspect_validations(
+    key: &dyn std::any::Any,
+    value: Option<&dyn std::any::Any>,
+) -> Option<buck2_common::frontier::Inspected> {
+    use buck2_common::frontier::Inspected;
+    key.downcast_ref::<EnabledOptionalValidationsKey>()?;
+    let key_type = frontier_validations_key_type();
+    Some(match value.and_then(|v| v.downcast_ref::<BTreeSet<String>>()) {
+        Some(v) => Inspected::Leaf {
+            id: buck2_common::frontier::LeafId::Injected {
+                key_type: key_type.to_owned(),
+            },
+            canon: Some(buck2_common::frontier::canonical_injected(key_type, v)),
+        },
+        None => Inspected::Barrier("EnabledOptionalValidationsKey unreadable".to_owned()),
+    })
+}

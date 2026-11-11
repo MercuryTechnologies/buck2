@@ -249,3 +249,14 @@ mod tests {
         Ok(())
     }
 }
+
+/// The baseline is skipped by a frontier walk: inside one daemon it stops reuse across file
+/// changes, and across daemons the per-path leaves, which compare content, take that role.
+pub fn frontier_inspect_baseline(key: &dyn std::any::Any) -> Option<crate::frontier::Inspected> {
+    key.downcast_ref::<FileSystemBaselineKey>()
+        .map(|_| crate::frontier::Inspected::Skip)
+}
+
+pub fn frontier_baseline_key_type() -> &'static str {
+    <FileSystemBaselineKey as dice::Key>::key_type_name()
+}

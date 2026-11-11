@@ -1,0 +1,8 @@
+load(":defs.bzl", "constraint_setting", "constraint_value")
+
+constraint_setting(name = "speed")
+
+constraint_value(
+    name = "fast",
+    setting = ":speed",
+)

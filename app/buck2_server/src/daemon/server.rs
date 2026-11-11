@@ -335,6 +335,13 @@ impl TenantStateInitPreferences {
             .startup_options
             .hydration
             .as_ref();
+        buck2_common::frontier::set_frontier_enabled(
+            self.daemon_startup_config
+                .daemon_buck_settings()
+                .frontier
+                .mode()
+                != buck2_common::settings::settings::FrontierMode::Off,
+        );
         configure_dice_for_buck(
             io,
             digest_config,

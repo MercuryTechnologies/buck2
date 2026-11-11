@@ -15,6 +15,7 @@ pub mod agent_materialization;
 mod analysis;
 pub mod args;
 pub mod dice;
+mod frontier;
 mod hydration;
 mod log_download;
 mod metadata;

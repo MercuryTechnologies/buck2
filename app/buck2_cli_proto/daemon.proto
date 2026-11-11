@@ -1081,6 +1081,10 @@ enum HydrationSubcommand {
   SUSPEND = 4;
   // `buck2 resume`: report what this daemon's start did about a suspended image.
   RESUME_STATUS = 5;
+  // Write frontier records of this daemon's graph to a local store.
+  FRONTIER_PRIME = 6;
+  // Check frontier records against this daemon's graph; installs nothing.
+  FRONTIER_SHADOW = 7;
 }
 
 message HydrationRequest {
@@ -1091,6 +1095,10 @@ message HydrationRequest {
   // `suspend --portable`: upload every materialized artifact the CAS cannot already serve, so
   // that a daemon on another machine can resume the image.
   optional bool portable = 4;
+  // `frontier-prime` / `frontier-shadow`: the store directory and the commit, overriding
+  // `frontier.store` and `frontier.base_commit`.
+  optional string frontier_store = 5;
+  optional string frontier_commit = 6;
 }
 
 message HydrationResponse {

@@ -83,6 +83,11 @@ impl DiceData {
         }
     }
 
+    /// The type names of everything [`DiceData::set`] stored: what the frontier classifies.
+    pub fn type_names(&self) -> impl Iterator<Item = &'static str> + '_ {
+        self.1.iter().copied()
+    }
+
     pub fn get<K: Send + Sync + 'static>(&self) -> Result<&K, MissingData> {
         self.0
             .get::<K>()

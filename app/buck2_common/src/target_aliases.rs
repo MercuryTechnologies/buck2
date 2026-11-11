@@ -154,6 +154,17 @@ impl Key for TargetAliasResolverKey {
         _cancellations: &CancellationContext,
     ) -> buck2_error::Result<BuckConfigTargetAliasResolver> {
         let root_cell = ctx.get_cell_resolver().await?.root_cell();
+        // With the frontier on, only `[alias]` is a premise, and only `[alias]` is in the value,
+        // which is all the resolver reads (see its `PartialEq`).
+        if crate::frontier::frontier_enabled() {
+            let alias = crate::legacy_configs::dice::get_legacy_config_sections(
+                ctx,
+                root_cell,
+                &["alias"],
+            )
+            .await?;
+            return Ok(BuckConfigTargetAliasResolver::new(alias));
+        }
         let legacy_configs = ctx.get_legacy_config_for_cell(root_cell).await?;
         Ok(BuckConfigTargetAliasResolver::new(legacy_configs.dupe()))
     }

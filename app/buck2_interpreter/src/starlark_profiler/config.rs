@@ -348,3 +348,36 @@ impl GetStarlarkProfilerInstrumentation for DiceComputations<'_> {
         Ok(self.projection(&cfg, StarlarkProfileModeForKind::ref_cast(eval_kind))??)
     }
 }
+
+pub fn frontier_profiler_key_type() -> &'static str {
+    <StarlarkProfilerConfigurationKey as dice::Key>::key_type_name()
+}
+
+/// Only "no profiling" is a leaf; a profiling run changes what evaluations record, so it is a
+/// barrier.
+pub fn frontier_inspect_profiler(
+    key: &dyn std::any::Any,
+    value: Option<&dyn std::any::Any>,
+) -> Option<buck2_common::frontier::Inspected> {
+    use buck2_common::frontier::Inspected;
+    key.downcast_ref::<StarlarkProfilerConfigurationKey>()?;
+    let key_type = frontier_profiler_key_type();
+    Some(
+        match value.and_then(|v| v.downcast_ref::<StarlarkProfilerConfiguration>()) {
+            Some(StarlarkProfilerConfiguration::None) => {
+                let mut h = buck2_common::frontier::FrontierHasher::new();
+                h.update(b"injected-v1");
+                buck2_common::frontier::digest_str(&mut h, key_type);
+                buck2_common::frontier::digest_str(&mut h, "none");
+                Inspected::Leaf {
+                    id: buck2_common::frontier::LeafId::Injected {
+                        key_type: key_type.to_owned(),
+                    },
+                    canon: Some(buck2_common::frontier::hex(h.finalize().as_bytes())),
+                }
+            }
+            Some(_) => Inspected::Barrier("Starlark profiling is on".to_owned()),
+            None => Inspected::Barrier("StarlarkProfilerConfigurationKey unreadable".to_owned()),
+        },
+    )
+}

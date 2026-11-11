@@ -482,3 +482,119 @@ async fn read_dir_ext(
         },
     }
 }
+
+/// The file-op key types a frontier walk asks to inspect.
+pub fn frontier_file_key_types() -> [&'static str; 4] {
+    [
+        <ReadFileKey as Key>::key_type_name(),
+        <ReadDirKey as Key>::key_type_name(),
+        <ExistsMatchingExactCaseKey as Key>::key_type_name(),
+        <PathMetadataKey as Key>::key_type_name(),
+    ]
+}
+
+/// A file-op key as a frontier leaf. A `ReadFileKey`'s value is a handle, so it names a path leaf
+/// whose value is computed through `PathMetadataKey`, the key that hashes the file.
+pub fn frontier_inspect_file_op(
+    key: &dyn std::any::Any,
+    value: Option<&dyn std::any::Any>,
+) -> Option<crate::frontier::Inspected> {
+    use crate::frontier::Inspected;
+    use crate::frontier::LeafId;
+    use crate::frontier::canonical_exists;
+    use crate::frontier::canonical_listing;
+    use crate::frontier::canonical_path_metadata;
+    if let Some(k) = key.downcast_ref::<PathMetadataKey>() {
+        let (cell, path) = LeafId::path_of(&k.0);
+        let canon = value
+            .and_then(|v| v.downcast_ref::<<PathMetadataKey as Key>::Value>())
+            .map(canonical_path_metadata);
+        return Some(Inspected::Leaf {
+            id: LeafId::Path { cell, path },
+            canon,
+        });
+    }
+    if let Some(k) = key.downcast_ref::<ReadFileKey>() {
+        let (cell, path) = LeafId::path_of(&k.0);
+        return Some(Inspected::Leaf {
+            id: LeafId::Path { cell, path },
+            canon: None,
+        });
+    }
+    if let Some(k) = key.downcast_ref::<ReadDirKey>() {
+        let (cell, path) = LeafId::path_of(&k.path);
+        let canon = value
+            .and_then(|v| v.downcast_ref::<<ReadDirKey as Key>::Value>())
+            .map(canonical_listing);
+        return Some(Inspected::Leaf {
+            id: LeafId::Listing {
+                cell,
+                path,
+                check_ignores: matches!(k.check_ignores, CheckIgnores::Yes),
+            },
+            canon,
+        });
+    }
+    if let Some(k) = key.downcast_ref::<ExistsMatchingExactCaseKey>() {
+        let (cell, path) = LeafId::path_of(&k.0);
+        let canon = value
+            .and_then(|v| v.downcast_ref::<<ExistsMatchingExactCaseKey as Key>::Value>())
+            .map(canonical_exists);
+        return Some(Inspected::Leaf {
+            id: LeafId::Exists { cell, path },
+            canon,
+        });
+    }
+    None
+}
+
+fn frontier_cell_path(cell: &str, path: &str) -> buck2_error::Result<CellPath> {
+    Ok(CellPath::new(
+        CellName::unchecked_new(cell)?,
+        &buck2_core::cells::paths::CellRelativePathBuf::unchecked_new(path.to_owned()),
+    ))
+}
+
+/// Computes a file-op leaf through this daemon's DICE: the same key the writer's leaf came from,
+/// so both sides hash through one function. `None` for a leaf that is not a file-op leaf.
+pub async fn frontier_compute_file_leaf(
+    ctx: &mut DiceComputations<'_>,
+    id: &crate::frontier::LeafId,
+) -> buck2_error::Result<Option<crate::frontier::Canon>> {
+    use crate::frontier::LeafId;
+    use crate::frontier::canonical_exists;
+    use crate::frontier::canonical_listing;
+    use crate::frontier::canonical_path_metadata;
+    Ok(match id {
+        LeafId::Path { cell, path } => {
+            let v = ctx
+                .compute(&PathMetadataKey(frontier_cell_path(cell, path)?))
+                .await?;
+            Some(canonical_path_metadata(&v))
+        }
+        LeafId::Listing {
+            cell,
+            path,
+            check_ignores,
+        } => {
+            let v = ctx
+                .compute(&ReadDirKey {
+                    path: frontier_cell_path(cell, path)?,
+                    check_ignores: if *check_ignores {
+                        CheckIgnores::Yes
+                    } else {
+                        CheckIgnores::No
+                    },
+                })
+                .await?;
+            Some(canonical_listing(&v))
+        }
+        LeafId::Exists { cell, path } => {
+            let v = ctx
+                .compute(&ExistsMatchingExactCaseKey(frontier_cell_path(cell, path)?))
+                .await?;
+            Some(canonical_exists(&v))
+        }
+        _ => None,
+    })
+}

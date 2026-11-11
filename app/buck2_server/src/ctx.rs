@@ -1172,6 +1172,15 @@ impl DiceCommandUpdater<'_, '_> {
         data.init_local_resource_registry();
         data.init_bxl_streaming_tracker();
         initialize_read_dir_cache(&mut data);
+        if buck2_common::frontier::frontier_enabled() {
+            crate::frontier::note_command_data(
+                &data.data,
+                self.skip_cache_read,
+                self.skip_cache_write,
+                format!("{:?}", self.execution_strategy),
+                self.upload_all_actions,
+            );
+        }
         data.spawner = self.cmd_ctx.base_context.daemon.spawner.dupe();
 
         let clean_stale_config = CleanStaleConfig::from_buck_config(root_config)?;

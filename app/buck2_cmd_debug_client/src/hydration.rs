@@ -35,6 +35,24 @@ pub enum HydrationCommand {
     Status(StatusCommand),
     /// Drop the resident DICE values whose rows already hold them, as memory pressure would.
     Evict(EvictCommand),
+    /// Write frontier records of this daemon's graph to a local store (`frontier.mode = prime`).
+    FrontierPrime(FrontierCommand),
+    /// Check frontier records against this daemon's graph, installing none
+    /// (`frontier.mode = shadow`).
+    FrontierShadow(FrontierCommand),
+}
+
+#[derive(Debug, clap::Parser)]
+pub struct FrontierCommand {
+    /// The store directory; defaults to `frontier.store`.
+    #[clap(long)]
+    store: Option<String>,
+    /// The commit to prime, or whose records to check; defaults to `frontier.base_commit`.
+    #[clap(long)]
+    commit: Option<String>,
+
+    #[clap(flatten)]
+    event_log_opts: CommonEventLogOptions,
 }
 
 #[derive(Debug, clap::Parser)]
@@ -72,6 +90,15 @@ impl HydrationCommand {
             HydrationCommand::PageIn(_) => HydrationSubcommand::PageIn,
             HydrationCommand::Status(_) => HydrationSubcommand::Status,
             HydrationCommand::Evict(_) => HydrationSubcommand::Evict,
+            HydrationCommand::FrontierPrime(_) => HydrationSubcommand::FrontierPrime,
+            HydrationCommand::FrontierShadow(_) => HydrationSubcommand::FrontierShadow,
+        }
+    }
+
+    fn frontier(&self) -> Option<&FrontierCommand> {
+        match self {
+            HydrationCommand::FrontierPrime(c) | HydrationCommand::FrontierShadow(c) => Some(c),
+            _ => None,
         }
     }
 
@@ -80,7 +107,9 @@ impl HydrationCommand {
             HydrationCommand::Status(c) => c.wait,
             HydrationCommand::PageOut(_)
             | HydrationCommand::PageIn(_)
-            | HydrationCommand::Evict(_) => false,
+            | HydrationCommand::Evict(_)
+            | HydrationCommand::FrontierPrime(_)
+            | HydrationCommand::FrontierShadow(_) => false,
         }
     }
 }
@@ -109,6 +138,8 @@ impl StreamingCommand for HydrationCommand {
                     subcommand: self.subcommand().into(),
                     wait: self.wait(),
                     portable: None,
+                    frontier_store: self.frontier().and_then(|f| f.store.clone()),
+                    frontier_commit: self.frontier().and_then(|f| f.commit.clone()),
                 },
                 events_ctx,
                 ctx.console_interaction_stream(self.console_opts()),
@@ -139,6 +170,9 @@ impl StreamingCommand for HydrationCommand {
             HydrationCommand::PageIn(c) => &c.event_log_opts,
             HydrationCommand::Status(c) => &c.event_log_opts,
             HydrationCommand::Evict(c) => &c.event_log_opts,
+            HydrationCommand::FrontierPrime(c) | HydrationCommand::FrontierShadow(c) => {
+                &c.event_log_opts
+            }
         }
     }
 

@@ -56,6 +56,9 @@ pub(crate) async fn hydration_command(
             subcommand,
             wait: req.wait,
             portable: req.portable.unwrap_or(false),
+            frontier_store: req.frontier_store,
+            frontier_commit: req.frontier_commit,
+            frontier_settings: ctx.base_context.daemon.daemon_buck_settings().frontier.dupe(),
         },
         ctx,
         partial_result_dispatcher,
@@ -71,6 +74,9 @@ struct HydrationServerCommand {
     wait: bool,
     /// `suspend --portable`.
     portable: bool,
+    frontier_store: Option<String>,
+    frontier_commit: Option<String>,
+    frontier_settings: buck2_common::settings::settings::FrontierSection,
 }
 
 #[async_trait]
@@ -84,7 +90,9 @@ impl ServerCommandTemplate for HydrationServerCommand {
         match self.subcommand {
             HydrationSubcommand::PageOut
             | HydrationSubcommand::PageIn
-            | HydrationSubcommand::Suspend => Some("hydration".to_owned()),
+            | HydrationSubcommand::Suspend
+            | HydrationSubcommand::FrontierPrime
+            | HydrationSubcommand::FrontierShadow => Some("hydration".to_owned()),
             HydrationSubcommand::Status
             | HydrationSubcommand::Evict
             | HydrationSubcommand::ResumeStatus => None,
@@ -128,6 +136,37 @@ impl ServerCommandTemplate for HydrationServerCommand {
                     portable: self.portable,
                 })
                 .await?;
+                Ok(buck2_cli_proto::HydrationResponse {
+                    summary: Some(summary),
+                    ..Default::default()
+                })
+            }
+            HydrationSubcommand::FrontierPrime | HydrationSubcommand::FrontierShadow => {
+                if !is_only_active_command(server_ctx.events().trace_id()) {
+                    return Err(buck2_error::buck2_error!(
+                        ErrorTag::Input,
+                        "the frontier commands cannot run beside another command"
+                    ));
+                }
+                // An idle page-out would race the walk's row writes.
+                cancel_active_page_out();
+                wait_for_idle_page_out().await;
+                let repo = &self.tenant.repo;
+                let inputs = crate::frontier::FrontierInputs {
+                    dice: &self.dice,
+                    transaction: &ctx,
+                    settings: &self.frontier_settings,
+                    project_root: server_ctx.project_root(),
+                    store: self.frontier_store.clone(),
+                    commit: self.frontier_commit.clone(),
+                    log_dir: repo.paths.buck_out_path().as_path().join("log"),
+                    trace_id: server_ctx.events().trace_id().to_string(),
+                };
+                let summary = if self.subcommand == HydrationSubcommand::FrontierPrime {
+                    crate::frontier::prime(inputs).await?
+                } else {
+                    crate::frontier::shadow(inputs).await?
+                };
                 Ok(buck2_cli_proto::HydrationResponse {
                     summary: Some(summary),
                     ..Default::default()

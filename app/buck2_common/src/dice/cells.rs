@@ -134,7 +134,20 @@ impl Key for CellAliasResolverKey {
     ) -> Self::Value {
         let resolver = ctx.get_cell_resolver().await?;
         let root_aliases = resolver.root_cell_cell_alias_resolver();
-        let config = ctx.get_legacy_config_for_cell(self.0).await?;
+        // With the frontier on, only the alias sections are a premise, through a projection:
+        // the whole config (and the credentials it may hold) is not.
+        let sections;
+        let config = if crate::frontier::frontier_enabled() {
+            sections = crate::legacy_configs::dice::get_legacy_config_sections(
+                ctx,
+                self.0,
+                &["cell_aliases", "repository_aliases"],
+            )
+            .await?;
+            &sections
+        } else {
+            ctx.get_legacy_config_for_cell(self.0).await?
+        };
         // Cell alias resolvers that are parsed within dice differ from those outside of dice in
         // that they cannot create new cells, and so respect only their `cell_aliases` section, not
         // their `cells` section. This is the expected behavior for external cells, moving other
@@ -166,4 +179,67 @@ impl SetCellResolver for DiceTransactionUpdater {
     fn set_none_cell_resolver(&mut self) -> buck2_error::Result<()> {
         Ok(self.changed_to(vec![(CellResolverKey, None)])?)
     }
+}
+
+impl crate::frontier::FrontierLeaf for CellResolver {
+    fn frontier_digest(&self, h: &mut blake3::Hasher) {
+        use crate::frontier::digest_str;
+        let mut cells: Vec<_> = self.cells().collect();
+        cells.sort_by_key(|(name, _)| name.as_str());
+        h.update(&(cells.len() as u64).to_le_bytes());
+        for (name, instance) in cells {
+            digest_str(h, name.as_str());
+            digest_str(h, instance.path().as_str());
+            digest_str(h, &format!("{:?}", instance.external()));
+            digest_str(h, &format!("{:?}", instance.nested_cells()));
+        }
+        digest_str(h, self.root_cell().as_str());
+        let mut aliases: Vec<_> = self
+            .root_cell_cell_alias_resolver()
+            .mappings()
+            .map(|(a, c)| (a.as_str().to_owned(), c.as_str().to_owned()))
+            .collect();
+        aliases.sort();
+        for (a, c) in aliases {
+            digest_str(h, &a);
+            digest_str(h, &c);
+        }
+    }
+}
+
+pub fn frontier_cell_key_types() -> [&'static str; 2] {
+    [
+        <CellResolverKey as dice::Key>::key_type_name(),
+        <CellAliasResolverKey as Key>::key_type_name(),
+    ]
+}
+
+/// The cell resolver as an injected leaf.
+pub fn frontier_inspect_cells(
+    key: &dyn std::any::Any,
+    value: Option<&dyn std::any::Any>,
+) -> Option<crate::frontier::Inspected> {
+    use crate::frontier::Inspected;
+    use crate::frontier::LeafId;
+    key.downcast_ref::<CellResolverKey>()?;
+    let key_type = <CellResolverKey as dice::Key>::key_type_name().to_owned();
+    Some(
+        match value.and_then(|v| v.downcast_ref::<Option<CellResolver>>()) {
+            Some(Some(resolver)) => Inspected::Leaf {
+                canon: Some(crate::frontier::canonical_injected(&key_type, resolver)),
+                id: LeafId::Injected { key_type },
+            },
+            Some(None) => Inspected::Barrier("CellResolverKey is unset".to_owned()),
+            None => Inspected::Barrier("CellResolverKey value unreadable".to_owned()),
+        },
+    )
+}
+
+/// This daemon's cell resolver as a leaf value.
+pub async fn frontier_compute_cells_leaf(
+    ctx: &mut DiceComputations<'_>,
+) -> buck2_error::Result<crate::frontier::Canon> {
+    let key_type = <CellResolverKey as dice::Key>::key_type_name();
+    let resolver = ctx.get_cell_resolver().await?;
+    Ok(crate::frontier::canonical_injected(key_type, resolver))
 }
