@@ -162,6 +162,62 @@ pub struct IndexStat {
     pub executable: bool,
 }
 
+/// A revision's files under the project, as its git tree holds them.
+#[derive(Clone, Debug, Default)]
+pub struct RevisionTree {
+    /// Every blob and submodule the tree holds under the project, by project-relative path.
+    pub entries: HashMap<ProjectRelativePathBuf, RevisionEntry>,
+}
+
+/// One entry of a [`RevisionTree`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RevisionEntry {
+    /// A regular file: its blob id, and whether its mode is `100755`.
+    File { blob: [u8; 20], executable: bool },
+    /// A symbolic link, whose blob holds the link's target.
+    Symlink { blob: [u8; 20] },
+    /// A submodule. Its files are no part of the tree, so each one on disk is a change.
+    Submodule,
+}
+
+/// What a watcher asks source control so that its baseline can name a revision, which lets
+/// daemons whose checkouts share that revision share what they read (see
+/// [`buck2_common::file_ops::baseline::FileSystemBaseline`]). The watcher calls each method
+/// after it has statted the files it compares; each returns `None` when git cannot say.
+pub trait RevisionVcs: Send + Sync + 'static {
+    /// The commit `git merge-base HEAD <branch>` names.
+    fn merge_base(&self, branch: &str) -> Option<String>;
+    /// The files of `revision` under the project.
+    fn tree(&self, revision: &str) -> Option<RevisionTree>;
+    /// The index entries git vouches for now, by the rules of [`VcsDelta`].
+    fn index(&self) -> Option<VcsDelta>;
+}
+
+/// The branch whose merge base with `HEAD` a watcher names as its baseline, and how it asks.
+#[derive(Clone)]
+pub struct RevisionSource {
+    /// `project.watchman_merge_base`, which the EdenFS and Watchman watchers read too.
+    pub branch: String,
+    pub vcs: Arc<dyn RevisionVcs>,
+}
+
+impl RevisionSource {
+    /// The source `root_config` asks for, if it names a branch and git can be asked.
+    pub fn from_config(
+        root_config: &LegacyBuckConfig,
+        vcs: Option<Arc<dyn RevisionVcs>>,
+    ) -> Option<Self> {
+        let branch = root_config.get(BuckconfigKeyRef {
+            section: "project",
+            property: "watchman_merge_base",
+        })?;
+        Some(Self {
+            branch: branch.to_owned(),
+            vcs: vcs?,
+        })
+    }
+}
+
 /// What a resumed daemon's watcher compares its files with.
 pub struct ResumeInput<'a> {
     pub image: &'a FileWatcherImage,
@@ -226,7 +282,11 @@ impl dyn FileWatcher {
         ignore_specs: BuckFixedSortedMap<CellName, IgnoreSet>,
         dep_file_cache: Arc<dyn DepFileCache>,
         resume: Option<ResumeInput<'_>>,
+        revision_vcs: Option<Arc<dyn RevisionVcs>>,
     ) -> buck2_error::Result<Arc<dyn FileWatcher>> {
+        // Only the crawler names a revision from git; the EdenFS and Watchman watchers ask their
+        // own services.
+        let revision = RevisionSource::from_config(root_config, revision_vcs);
         if !project_root.root().as_path().exists() {
             return Err(buck2_error!(
                 ErrorTag::MissingProjectRoot,
@@ -295,7 +355,7 @@ impl dyn FileWatcher {
                         .buck_error_context("Resuming notify file watcher")?,
                 )),
                 FileWatcherImageKind::FsHashCrawler => Ok(Arc::new(
-                    FsHashCrawler::resume(project_root, cells, ignore_specs, input)
+                    FsHashCrawler::resume(project_root, cells, ignore_specs, input, revision)
                         .buck_error_context("Resuming fs_crawler file watcher")?,
                 )),
             };
@@ -317,7 +377,7 @@ impl dyn FileWatcher {
                     .buck_error_context("Creating notify file watcher")?,
             )),
             "fs_hash_crawler" => Ok(Arc::new(
-                FsHashCrawler::new(project_root, cells, ignore_specs)
+                FsHashCrawler::new(project_root, cells, ignore_specs, revision)
                     .buck_error_context("Creating fs_crawler file watcher")?,
             )),
             other => Err(buck2_error!(

@@ -27,13 +27,18 @@
 
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::sync::Arc;
 
+use buck2_core::fs::project::ProjectRoot;
 use buck2_core::fs::project_rel_path::ProjectRelativePath;
 use buck2_core::fs::project_rel_path::ProjectRelativePathBuf;
 use buck2_error::ErrorTag;
 use buck2_error::buck2_error;
 use buck2_file_watcher::file_watcher::IndexEntry;
 use buck2_file_watcher::file_watcher::IndexStat;
+use buck2_file_watcher::file_watcher::RevisionEntry;
+use buck2_file_watcher::file_watcher::RevisionTree;
+use buck2_file_watcher::file_watcher::RevisionVcs;
 use buck2_file_watcher::file_watcher::VcsDelta;
 use buck2_file_watcher::file_watcher::VcsImage;
 use buck2_file_watcher::file_watcher::VcsTree;
@@ -125,7 +130,7 @@ pub(crate) fn resume_delta(root: &AbsNormPath, image: &VcsImage) -> VcsDelta {
 /// [`resume_delta`], with `during` run after the index is first statted and before git reads
 /// it, where a test puts a concurrent write of the index.
 fn resume_delta_racing(root: &AbsNormPath, image: &VcsImage, during: impl FnOnce()) -> VcsDelta {
-    match resume_delta_inner(root, image, during) {
+    match index_delta(root, Some(&image.toplevel_to_project), during) {
         Ok(delta) => delta,
         Err(e) => {
             tracing::info!("Resume does not use git, and hashes instead: {e:#}");
@@ -134,17 +139,20 @@ fn resume_delta_racing(root: &AbsNormPath, image: &VcsImage, during: impl FnOnce
     }
 }
 
-fn resume_delta_inner(
+/// The index entries git vouches for, for a project that must sit at `expected_prefix` in the
+/// repository when one is given.
+fn index_delta(
     root: &AbsNormPath,
-    image: &VcsImage,
+    expected_prefix: Option<&str>,
     during: impl FnOnce(),
 ) -> buck2_error::Result<VcsDelta> {
     let prefix = toplevel_to_project(root)?;
-    if prefix != image.toplevel_to_project {
+    if let Some(expected) = expected_prefix
+        && prefix != expected
+    {
         return Err(buck2_error!(
             ErrorTag::Input,
-            "the project is at `{prefix}` in the repository, and was at `{}`",
-            image.toplevel_to_project
+            "the project is at `{prefix}` in the repository, and was at `{expected}`"
         ));
     }
     // Line-ending conversion on checkout makes a file's bytes differ from its blob's.
@@ -317,6 +325,99 @@ fn resume_delta_inner(
     })
 }
 
+/// What the crawler asks git so that its baseline can name the merge base: see
+/// [`RevisionVcs`].
+pub(crate) fn git_revisions(root: ProjectRoot) -> Arc<dyn RevisionVcs> {
+    Arc::new(GitRevisions { root })
+}
+
+struct GitRevisions {
+    root: ProjectRoot,
+}
+
+impl RevisionVcs for GitRevisions {
+    fn merge_base(&self, branch: &str) -> Option<String> {
+        // `--end-of-options` keeps a branch named like an option from being read as one.
+        let merge_base = run_git_blocking(
+            self.root.root(),
+            &["merge-base", "HEAD", "--end-of-options", branch],
+            None,
+        )
+        .and_then(text)
+        .map_err(|e| tracing::info!("git names no merge base with `{branch}`: {e:#}"))
+        .ok()?;
+        let merge_base = merge_base.trim();
+        // A SHA-256 repository's ids are not the sha1 blob ids the crawler computes.
+        (merge_base.len() == 40 && sha1_id(merge_base).is_some()).then(|| merge_base.to_owned())
+    }
+
+    fn tree(&self, revision: &str) -> Option<RevisionTree> {
+        revision_tree(self.root.root(), revision)
+            .map_err(|e| tracing::info!("git cannot list the files of `{revision}`: {e:#}"))
+            .ok()
+    }
+
+    fn index(&self) -> Option<VcsDelta> {
+        index_delta(self.root.root(), None, || {})
+            .map_err(|e| tracing::info!("git vouches for no file: {e:#}"))
+            .ok()
+    }
+}
+
+/// The files `revision` holds under the project, by `git ls-tree`, which reads no file on disk.
+fn revision_tree(root: &AbsNormPath, revision: &str) -> buck2_error::Result<RevisionTree> {
+    let prefix = toplevel_to_project(root)?;
+    let tree = run_git_blocking(
+        root,
+        &[
+            "ls-tree",
+            "-r",
+            "-z",
+            "--full-tree",
+            "--end-of-options",
+            revision,
+        ],
+        None,
+    )?;
+    let mut entries = HashMap::new();
+    for record in records(&tree) {
+        // `<mode> SP <type> SP <object> TAB <path>`
+        let Some((meta, path)) = record.split_once('\t') else {
+            continue;
+        };
+        let mut meta = meta.split(' ');
+        let (Some(mode), Some(_kind), Some(object)) = (meta.next(), meta.next(), meta.next())
+        else {
+            continue;
+        };
+        let Some(path) = project_path(&prefix, path) else {
+            continue;
+        };
+        let entry = match mode {
+            "100644" | "100755" => RevisionEntry::File {
+                blob: sha1_id(object).ok_or_else(|| {
+                    buck2_error!(ErrorTag::Input, "`{object}` is not a sha1 object id")
+                })?,
+                executable: mode == "100755",
+            },
+            "120000" => RevisionEntry::Symlink {
+                blob: sha1_id(object).ok_or_else(|| {
+                    buck2_error!(ErrorTag::Input, "`{object}` is not a sha1 object id")
+                })?,
+            },
+            "160000" => RevisionEntry::Submodule,
+            other => {
+                return Err(buck2_error!(
+                    ErrorTag::Input,
+                    "`{path}` has mode {other}, which a tree does not hold"
+                ));
+            }
+        };
+        entries.insert(path, entry);
+    }
+    Ok(RevisionTree { entries })
+}
+
 /// What a write of the index changes, compared before and after git reads it.
 #[derive(Debug, PartialEq, Eq)]
 struct IndexStamp {
@@ -379,8 +480,7 @@ fn conversions(
         let index = scope.spawn(|| check(true));
         (check(false), index.join())
     });
-    let index =
-        index.map_err(|_| buck2_error!(ErrorTag::Tier0, "the attribute check panicked"))?;
+    let index = index.map_err(|_| buck2_error!(ErrorTag::Tier0, "the attribute check panicked"))?;
     let checked = records(&paths)
         .filter_map(|path| project_path("", path))
         .collect();
@@ -519,6 +619,7 @@ mod tests {
     use std::time::Duration;
     use std::time::SystemTime;
 
+    use buck2_common::file_ops::baseline::FileSystemBaseline;
     use buck2_common::ignores::ignore_set::IgnoreSet;
     use buck2_core::cells::CellResolver;
     use buck2_core::cells::cell_root_path::CellRootPathBuf;
@@ -530,6 +631,7 @@ mod tests {
     use buck2_file_watcher::file_watcher::FsHashCrawler;
     use buck2_file_watcher::file_watcher::ResumeInput;
     use buck2_file_watcher::file_watcher::ResumeScan;
+    use buck2_file_watcher::file_watcher::RevisionSource;
     use buck2_file_watcher::file_watcher::VcsDelta;
     use buck2_file_watcher::file_watcher::resume_scan;
     use buck2_fs::paths::abs_norm_path::AbsNormPathBuf;
@@ -650,7 +752,7 @@ mod tests {
         }
 
         fn crawler(&self) -> FsHashCrawler {
-            FsHashCrawler::new(&self.root, self.cells.dupe(), self.ignores.clone()).unwrap()
+            FsHashCrawler::new(&self.root, self.cells.dupe(), self.ignores.clone(), None).unwrap()
         }
 
         async fn suspend(&self, crawler: &FsHashCrawler) -> FileWatcherImage {
@@ -1299,5 +1401,86 @@ mod tests {
             ..tree.image
         };
         assert!(!resume_delta(sub.root(), &at_top).usable);
+    }
+
+    /// A crawler whose baseline follows the merge base of HEAD with `branch`, asking this
+    /// repository's git.
+    fn git_crawler(repo: &Repo, branch: &str) -> FsHashCrawler {
+        FsHashCrawler::new(
+            &repo.root,
+            repo.cells.dupe(),
+            repo.ignores.clone(),
+            Some(RevisionSource {
+                branch: branch.to_owned(),
+                vcs: git_revisions(repo.root.dupe()),
+            }),
+        )
+        .unwrap()
+    }
+
+    fn revision(commit: &str) -> FileSystemBaseline {
+        FileSystemBaseline::Revision(Arc::from(commit))
+    }
+
+    fn cell_paths(paths: &[&str]) -> Vec<String> {
+        paths.iter().map(|p| format!("root//{p}")).collect()
+    }
+
+    /// At a branch's head with its own commits, an unstaged edit, an untracked file and one git
+    /// ignores, the first sync names the merge base with `main` and dirties exactly the files
+    /// that differ from it, the ignored one included, since buck2 may read it. Moving `main`
+    /// renews the baseline, dirtying what differs from the new merge base.
+    #[test]
+    fn git_baseline_records_the_branch_and_the_edits_since_the_merge_base() {
+        let repo = Repo::new();
+        repo.write(".gitignore", "ignored\n");
+        repo.write("a", "a");
+        repo.write("b", "b");
+        repo.write("c", "c");
+        repo.write("keep/x", "x");
+        let m = repo.commit("M");
+        repo.git(&["checkout", "-q", "-b", "feature"]);
+        repo.write("a", "A!");
+        std::fs::remove_file(repo.dir().join("c")).unwrap();
+        repo.write("e", "e");
+        let d = repo.commit("D");
+        repo.write("b", "B!");
+        repo.write("u", "u");
+        repo.write("ignored", "i");
+
+        let crawler = git_crawler(&repo, "main");
+        let (files, _, baseline) = crawler.testing_sync().unwrap();
+        assert_eq!(baseline, revision(&m));
+        assert_eq!(files, cell_paths(&["a", "b", "c", "e", "ignored", "u"]));
+        let (files, dirs, baseline) = crawler.testing_sync().unwrap();
+        assert_eq!((files, dirs), (vec![], vec![]));
+        assert_eq!(baseline, revision(&m));
+
+        repo.git(&["branch", "-f", "main", &d]);
+        let (files, _, baseline) = crawler.testing_sync().unwrap();
+        assert_eq!(baseline, revision(&d));
+        assert_eq!(files, cell_paths(&["b", "ignored", "u"]));
+    }
+
+    /// Fresh clones of one commit, every index entry racily clean, name that commit and dirty
+    /// nothing: the files git cannot vouch for are read and found to be its blobs. A branch git
+    /// cannot find leaves the baseline equal to no other.
+    #[test]
+    fn fresh_clones_name_the_merge_base_and_dirty_nothing() {
+        let repo = Repo::new();
+        repo.write("a", "a");
+        repo.write("d/b", "b");
+        let m = repo.commit("M");
+        for _ in 0..2 {
+            repo.reclone_raw(&[]);
+            // Past the crawler's own racy window, which reports a file written in the two
+            // seconds before its first walk whatever the baseline; git's index stays racy.
+            std::thread::sleep(Duration::from_millis(2100));
+            let (files, dirs, baseline) = git_crawler(&repo, "origin/main").testing_sync().unwrap();
+            assert_eq!(baseline, revision(&m));
+            assert_eq!((files, dirs), (vec![], vec![]));
+        }
+        let (_, _, baseline) = git_crawler(&repo, "no-such-branch").testing_sync().unwrap();
+        assert!(matches!(baseline, FileSystemBaseline::Unique { .. }));
     }
 }

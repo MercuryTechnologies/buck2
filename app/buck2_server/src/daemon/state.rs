@@ -755,6 +755,7 @@ impl TenantState {
                             ignore_specs,
                             dep_file_cache,
                             Some(image.resume_input(&project_root)),
+                            Some(crate::suspend::vcs::git_revisions(project_root.dupe())),
                         );
                         (watcher, start.elapsed())
                     }
@@ -807,6 +808,18 @@ impl TenantState {
         tracing::info!("Suspended state: {}", resume_outcome.describe());
 
         tracing::info!("Creating file watcher...");
+        // A graph restored without its watcher holds file reads relative to the image's
+        // baseline, made from files as the suspended daemon saw them. A fresh watcher that
+        // named the same merge base would let them stand, though it records only how the files
+        // here differ from the merge base and not how the suspended daemon's did; so it keeps
+        // a baseline equal to no other, which invalidates them.
+        let revision_vcs = if resume_outcome.is_resumed() {
+            None
+        } else {
+            Some(crate::suspend::vcs::git_revisions(
+                paths.project_root().dupe(),
+            ))
+        };
         let file_watcher = match resumed_watcher {
             Some(watcher) => watcher,
             None => <dyn FileWatcher>::new(
@@ -817,6 +830,7 @@ impl TenantState {
                 ignore_specs,
                 dep_file_cache.dupe(),
                 None,
+                revision_vcs,
             )
             .with_buck_error_context(|| {
                 format!(

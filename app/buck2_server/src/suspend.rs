@@ -79,7 +79,7 @@ use serde::Serialize;
 /// coincidence.
 const CLOCK_SKEW_MS: u64 = 5 * 60 * 1000;
 
-mod vcs;
+pub(crate) mod vcs;
 
 /// Environment variables that differ between two runs of the same job and that nothing a daemon
 /// computes depends on, left out of the environment digest. A name ending in `*` is a prefix and a

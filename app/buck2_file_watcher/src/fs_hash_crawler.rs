@@ -8,6 +8,7 @@
  * above-listed licenses.
  */
 
+use std::collections::HashSet;
 use std::fs::Metadata;
 use std::io::Read;
 use std::mem;
@@ -54,6 +55,9 @@ use crate::file_watcher::FileWatcherImage;
 use crate::file_watcher::FileWatcherImageKind;
 use crate::file_watcher::IndexStat;
 use crate::file_watcher::ResumeInput;
+use crate::file_watcher::RevisionEntry;
+use crate::file_watcher::RevisionSource;
+use crate::file_watcher::RevisionTree;
 use crate::file_watcher::SuspendVcs;
 use crate::file_watcher::SyncOutcome;
 use crate::file_watcher::VcsDelta;
@@ -77,18 +81,46 @@ pub struct FsHashCrawler {
     cells: CellResolver,
     ignore_specs: Arc<BuckFixedSortedMap<CellName, IgnoreSet>>,
     snapshot: Arc<Mutex<FsSnapshot>>,
-    /// The crawler never loses track of a change, so one baseline serves for its whole life.
-    baseline: FileSystemBaseline,
+    /// What the changes recorded on DICE are relative to. The crawler never loses track of a
+    /// change, so this moves only to name a new merge base.
+    #[allocative(skip)]
+    baseline: Mutex<FileSystemBaseline>,
     /// For a resumed daemon, what changed while no daemon ran, until the first sync records it.
     #[allocative(skip)]
     pending: Mutex<Option<FileChangeTracker>>,
+    #[allocative(skip)]
+    revision: Option<RevisionSource>,
+    /// The merge base the last sync found, once the baseline follows it.
+    #[allocative(skip)]
+    merge_base: Mutex<MergeBaseState>,
+}
+
+/// Where the crawler stands with the merge base `revision` names.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum MergeBaseState {
+    /// The baseline has not named one yet: the next sync whose merge base git names, and whose
+    /// differences from it the crawler can list, names it.
+    Unnamed,
+    /// A resumed crawler's first sync is still to come. It takes the merge base it finds as
+    /// the one the image's baseline stands for, whatever that baseline is, so that resuming
+    /// at another merge base keeps the restored file reads; a later move of the merge base
+    /// renews the baseline.
+    Resumed,
+    /// The merge base the last sync found. The baseline names it, or the crawler could not
+    /// list the differences and kept the baseline it had.
+    Found(String),
 }
 
 impl FsHashCrawler {
+    /// A crawler for a fresh daemon. With `revision`, its first sync names the merge base as
+    /// the baseline and records every way the files differ from it, so that a daemon in
+    /// another checkout at the same merge base, or a graph built in one, agrees on every file
+    /// neither recorded a change to.
     pub fn new(
         root: &ProjectRoot,
         cells: CellResolver,
         ignore_specs: BuckFixedSortedMap<CellName, IgnoreSet>,
+        revision: Option<RevisionSource>,
     ) -> buck2_error::Result<Self> {
         let snapshot = Arc::new(Mutex::new(FsSnapshot::build(root, &cells, &ignore_specs)?));
         Ok(Self {
@@ -96,8 +128,10 @@ impl FsHashCrawler {
             cells,
             ignore_specs: Arc::new(ignore_specs),
             snapshot,
-            baseline: FileSystemBaseline::unique(),
+            baseline: Mutex::new(FileSystemBaseline::unique()),
             pending: Mutex::new(None),
+            revision,
+            merge_base: Mutex::new(MergeBaseState::Unnamed),
         })
     }
 
@@ -105,12 +139,13 @@ impl FsHashCrawler {
     /// by [`resume_scan`], keeps what changed for its first sync, and takes the files now as
     /// the snapshot that sync compares with, so an edit made after they were statted is
     /// reported too. It keeps the suspended daemon's baseline, which the restored file reads
-    /// are relative to.
+    /// are relative to, until the merge base moves after its first sync.
     pub fn resume(
         root: &ProjectRoot,
         cells: CellResolver,
         ignore_specs: BuckFixedSortedMap<CellName, IgnoreSet>,
         input: ResumeInput<'_>,
+        revision: Option<RevisionSource>,
     ) -> buck2_error::Result<Self> {
         let baseline = FileSystemBaseline::from_image(&input.image.baseline);
         let scan = resume_scan(root, &cells, &ignore_specs, input)?;
@@ -120,8 +155,10 @@ impl FsHashCrawler {
             cells,
             ignore_specs: Arc::new(ignore_specs),
             snapshot: Arc::new(Mutex::new(now)),
-            baseline,
+            baseline: Mutex::new(baseline),
             pending: Mutex::new(Some(changes)),
+            revision,
+            merge_base: Mutex::new(MergeBaseState::Resumed),
         })
     }
 
@@ -134,26 +171,113 @@ impl FsHashCrawler {
         let ignore_specs = self.ignore_specs.dupe();
         let new_snapshot =
             spawn_blocking(move || FsSnapshot::build(&root, &cells, &ignore_specs)).await??;
-        let (stats, changes) = self.take_changes(new_snapshot)?;
+        // Asking git and hashing what it cannot vouch for block, as the walk does.
+        let (stats, changes, baseline) =
+            tokio::task::block_in_place(|| self.take_changes(new_snapshot))?;
         changes.write_to_dice(&mut dice)?;
-        dice.set_file_system_baseline(self.baseline.dupe())?;
+        dice.set_file_system_baseline(baseline)?;
         Ok((stats, dice))
     }
 
     /// What a sync records: the paths whose stat moved since the last snapshot, which
-    /// `new_snapshot` replaces, and on a resumed crawler's first sync what changed while no
-    /// daemon ran.
+    /// `new_snapshot` replaces; on a resumed crawler's first sync what changed while no daemon
+    /// ran; and, when the baseline comes to name a merge base, every way the files differ from
+    /// it. Also the baseline those changes are relative to.
     fn take_changes(
         &self,
         new_snapshot: FsSnapshot,
-    ) -> buck2_error::Result<(buck2_data::FileWatcherStats, FileChangeTracker)> {
+    ) -> buck2_error::Result<(
+        buck2_data::FileWatcherStats,
+        FileChangeTracker,
+        FileSystemBaseline,
+    )> {
         let mut guard = self.snapshot.lock().unwrap();
         let old_snapshot = mem::replace(&mut *guard, new_snapshot);
-        let (stats, mut changes) = old_snapshot.get_updates_for_dice(&guard, &self.ignore_specs)?;
+        let mut events = old_snapshot.get_updates(&guard)?;
+        let mut baseline = self.baseline.lock().unwrap();
+        if let Some(source) = &self.revision
+            && let Some((renewed, differences)) =
+                self.follow_merge_base(source, &guard, &baseline)?
+        {
+            events.extend(differences);
+            *baseline = renewed;
+        }
+        let (stats, mut changes) = events_into_dice(&events, &self.ignore_specs);
         if let Some(pending) = self.pending.lock().unwrap().take() {
             changes.merge(pending);
         }
-        Ok((stats, changes))
+        Ok((stats, changes, baseline.dupe()))
+    }
+
+    /// What a sync records, without DICE: the file contents and directory listings it dirties,
+    /// as sorted path strings, and the baseline.
+    #[doc(hidden)]
+    pub fn testing_sync(
+        &self,
+    ) -> buck2_error::Result<(Vec<String>, Vec<String>, FileSystemBaseline)> {
+        let now = FsSnapshot::build(&self.root, &self.cells, &self.ignore_specs)?;
+        let (_stats, changes, baseline) = self.take_changes(now)?;
+        let (files, dirs) = changes.testing_dirtied();
+        Ok((files, dirs, baseline))
+    }
+
+    /// The baseline to move to, and the differences from the revision it names, when the merge
+    /// base has moved from the one the baseline stands for and git can list how the files in
+    /// `now`, the snapshot just taken, differ from the new one. `None` keeps `current`: every
+    /// change since it was set has been recorded, so it stays true when the merge base moves.
+    fn follow_merge_base(
+        &self,
+        source: &RevisionSource,
+        now: &FsSnapshot,
+        current: &FileSystemBaseline,
+    ) -> buck2_error::Result<Option<(FileSystemBaseline, Vec<FsEvent>)>> {
+        let mut state = self.merge_base.lock().unwrap();
+        let Some(merge_base) = source.vcs.merge_base(&source.branch) else {
+            tracing::info!(
+                "fs_hash_crawler: git names no merge base of HEAD with `{}`; baseline kept",
+                source.branch
+            );
+            return Ok(None);
+        };
+        match &*state {
+            MergeBaseState::Found(found) if *found == merge_base => return Ok(None),
+            MergeBaseState::Resumed => {
+                *state = MergeBaseState::Found(merge_base);
+                return Ok(None);
+            }
+            MergeBaseState::Unnamed | MergeBaseState::Found(_) => {}
+        }
+        if matches!(current, FileSystemBaseline::Revision(r) if **r == *merge_base) {
+            *state = MergeBaseState::Found(merge_base);
+            return Ok(None);
+        }
+        let started = std::time::Instant::now();
+        let differences = source.vcs.tree(&merge_base).and_then(|tree| {
+            let index = source.vcs.index();
+            now.revision_changes(&self.root, &self.cells, &tree, index.as_ref())
+                .map_err(|e| tracing::info!("fs_hash_crawler: comparing with the tree: {e:#}"))
+                .ok()
+        });
+        let Some(scan) = differences else {
+            tracing::info!(
+                "fs_hash_crawler: git cannot list the files of merge base {merge_base}; \
+                 baseline kept"
+            );
+            // Not `Found`, so that the next sync tries again.
+            return Ok(None);
+        };
+        tracing::info!(
+            "fs_hash_crawler: baseline names merge base {merge_base} of HEAD with `{}`: \
+             {} paths differ; {} files vouched by git, {} hashed; {:.3}s",
+            source.branch,
+            scan.events.len(),
+            scan.vouched,
+            scan.hashed,
+            started.elapsed().as_secs_f64(),
+        );
+        let baseline = FileSystemBaseline::Revision(Arc::from(merge_base.as_str()));
+        *state = MergeBaseState::Found(merge_base);
+        Ok(Some((baseline, scan.events)))
     }
 }
 
@@ -176,7 +300,7 @@ impl FileWatcher for FsHashCrawler {
         })?;
         Ok(FileWatcherImage {
             kind: FileWatcherImageKind::FsHashCrawler,
-            baseline: self.baseline.to_image(),
+            baseline: self.baseline.lock().unwrap().to_image(),
             snapshot,
             vcs,
         })
@@ -385,6 +509,25 @@ fn link_leaves_project(root: &ProjectRoot, link: &ProjectRelativePath, target: &
         }
     }
     false
+}
+
+/// What [`FsSnapshot::revision_changes`] found, and how it decided.
+pub(crate) struct RevisionScan {
+    /// Every path that differs from the revision, or may.
+    pub(crate) events: Vec<FsEvent>,
+    /// Files git vouched for.
+    pub(crate) vouched: usize,
+    /// Files read to compare their contents with the revision's blob.
+    pub(crate) hashed: usize,
+}
+
+/// The git blob id of `bytes`: sha1 of `blob <len>\0` and the bytes.
+fn git_blob_id(bytes: &[u8]) -> [u8; 20] {
+    use sha1::Digest;
+    let mut git = sha1::Sha1::new();
+    git.update(format!("blob {}\0", bytes.len()).as_bytes());
+    git.update(bytes);
+    git.finalize().into()
 }
 
 /// What [`resume_scan`] found, and how it decided.
@@ -885,15 +1028,6 @@ impl FsSnapshot {
         Ok(events)
     }
 
-    pub(crate) fn get_updates_for_dice(
-        &self,
-        new_snapshot: &FsSnapshot,
-        ignore_specs: &BuckFixedSortedMap<CellName, IgnoreSet>,
-    ) -> buck2_error::Result<(buck2_data::FileWatcherStats, FileChangeTracker)> {
-        let events = self.get_updates(new_snapshot)?;
-        Ok(events_into_dice(&events, ignore_specs))
-    }
-
     /// [`resume_scan`]'s comparison of this, the suspended snapshot, with `now`.
     fn resume_changes(
         &self,
@@ -1005,6 +1139,146 @@ impl FsSnapshot {
             vouched,
             hashed,
             now,
+        })
+    }
+
+    /// Every way the files in this snapshot differ from `tree`, the files of a revision, as
+    /// changes to record on a graph whose baseline names that revision. A path is changed
+    /// unless proven equal to the revision's, since a false change costs a re-read and a false
+    /// "unchanged" lets another checkout's read stand for a file that differs here:
+    ///
+    /// 1. A path the walk found and the tree lacks, or the tree holds and the walk did not
+    ///    find, is a change, and so is one whose kind differs (file, link, directory). An
+    ///    ignored file git does not track is one: buck2 may read it, and the revision has no
+    ///    such file. A submodule's files are all changes, as the tree holds none of them.
+    /// 2. A file whose executable bit differs from the tree's mode is a change.
+    /// 3. A file git vouches for (its index entry holds the stat this snapshot took, by the
+    ///    rules of [`VcsDelta`]) is unchanged when the index's blob is the tree's, and a change
+    ///    when it is another.
+    /// 4. Any other file is read, unmoved from this snapshot's stat, and is unchanged only when
+    ///    its bytes are the tree's blob. Bytes that a checkout converted (line endings, a
+    ///    filter) differ from the blob, so such a file is a change.
+    /// 5. A link is unchanged when its target is the tree's link's and stays in the project:
+    ///    one that leaves it may read differently in another checkout.
+    pub(crate) fn revision_changes(
+        &self,
+        root: &ProjectRoot,
+        cells: &CellResolver,
+        tree: &RevisionTree,
+        vcs: Option<&VcsDelta>,
+    ) -> buck2_error::Result<RevisionScan> {
+        let vcs = vcs.filter(|vcs| vcs.usable);
+        let mut tree_dirs: HashSet<ProjectRelativePathBuf> = HashSet::new();
+        for path in tree.entries.keys() {
+            let mut dir = path.parent();
+            while let Some(d) = dir {
+                if d.is_empty() || !tree_dirs.insert(d.to_buf()) {
+                    break;
+                }
+                dir = d.parent();
+            }
+        }
+        // What the tree holds at a path, as a watcher kind; a submodule is a directory.
+        let tree_kind = |path: &ProjectRelativePath| -> Option<FileWatcherKind> {
+            match tree.entries.get(path) {
+                Some(RevisionEntry::File { .. }) => Some(FileWatcherKind::File),
+                Some(RevisionEntry::Symlink { .. }) => Some(FileWatcherKind::Symlink),
+                Some(RevisionEntry::Submodule) => Some(FileWatcherKind::Directory),
+                None if tree_dirs.contains(path) => Some(FileWatcherKind::Directory),
+                None => None,
+            }
+        };
+        let mut events = Vec::new();
+        let mut vouched = 0;
+        let mut to_hash = Vec::new();
+        let event = |cell_path: &CellPath, event, kind| FsEvent {
+            cell_path: *cell_path,
+            event,
+            kind,
+        };
+        for (cell_path, info) in self.entries.iter() {
+            let path = cells.resolve_path(*cell_path)?;
+            let kind = info.to_file_watcher_kind();
+            match tree_kind(&path) {
+                None => {
+                    events.push(event(cell_path, FileWatcherEventType::Create, kind));
+                    continue;
+                }
+                Some(was) if was != kind => {
+                    events.push(event(cell_path, FileWatcherEventType::Delete, was));
+                    events.push(event(cell_path, FileWatcherEventType::Create, kind));
+                    continue;
+                }
+                Some(_) => {}
+            }
+            match (info, tree.entries.get(&path)) {
+                (EntryInfo::File(stat), Some(RevisionEntry::File { blob, executable })) => {
+                    if stat.executable() != *executable {
+                        events.push(event(cell_path, FileWatcherEventType::Modify, kind));
+                        continue;
+                    }
+                    if let Some(entry) = vcs
+                        .and_then(|vcs| vcs.clean.get(&path))
+                        .filter(|entry| stat.matches_index(&entry.stat))
+                    {
+                        vouched += 1;
+                        if entry.blob != *blob {
+                            events.push(event(cell_path, FileWatcherEventType::Modify, kind));
+                        }
+                        continue;
+                    }
+                    to_hash.push((*cell_path, *stat, *blob, root.resolve(&path)));
+                }
+                (EntryInfo::Symlink(target), Some(RevisionEntry::Symlink { blob })) => {
+                    let unchanged = match target {
+                        Some(target) => {
+                            git_blob_id(target.as_bytes()) == *blob
+                                && !link_leaves_project(root, &path, target)
+                        }
+                        None => false,
+                    };
+                    if !unchanged {
+                        events.push(event(cell_path, FileWatcherEventType::Modify, kind));
+                    }
+                }
+                // A directory the tree holds files under, or a submodule's.
+                _ => {}
+            }
+        }
+        let mut gone: Vec<(&ProjectRelativePath, FileWatcherKind)> = Vec::new();
+        for path in tree.entries.keys().chain(tree_dirs.iter()) {
+            if let Some(kind) = tree_kind(path) {
+                gone.push((path, kind));
+            }
+        }
+        for (path, kind) in gone {
+            let cell_path = cells.get_cell_path(path);
+            if !self.entries.contains_key(&cell_path) {
+                events.push(event(&cell_path, FileWatcherEventType::Delete, kind));
+            }
+        }
+        let hashed = to_hash.len();
+        let differ = par_map(
+            to_hash,
+            |(cell_path, stat, blob, path): (CellPath, FileStat, [u8; 20], AbsNormPathBuf)| {
+                let same = read_content_ids(path.as_path(), &stat)
+                    .is_some_and(|ids| ids.git_blob == Some(blob));
+                (!same).then_some(cell_path)
+            },
+        );
+        events.extend(differ.into_iter().flatten().map(|cell_path| {
+            event(
+                &cell_path,
+                FileWatcherEventType::Modify,
+                FileWatcherKind::File,
+            )
+        }));
+        events.sort();
+        events.dedup();
+        Ok(RevisionScan {
+            events,
+            vouched,
+            hashed,
         })
     }
 
@@ -1341,6 +1615,10 @@ mod tests {
         use std::collections::BTreeSet;
         use std::collections::HashMap;
         use std::os::unix::fs::PermissionsExt;
+        use std::sync::Arc;
+        use std::sync::Mutex;
+        use std::sync::atomic::AtomicUsize;
+        use std::sync::atomic::Ordering;
         use std::time::Duration;
         use std::time::SystemTime;
 
@@ -1362,6 +1640,10 @@ mod tests {
         use crate::file_watcher::IndexEntry;
         use crate::file_watcher::IndexStat;
         use crate::file_watcher::ResumeInput;
+        use crate::file_watcher::RevisionEntry;
+        use crate::file_watcher::RevisionSource;
+        use crate::file_watcher::RevisionTree;
+        use crate::file_watcher::RevisionVcs;
         use crate::file_watcher::VcsDelta;
         use crate::file_watcher::VcsImage;
         use crate::file_watcher::VcsTree;
@@ -1370,6 +1652,7 @@ mod tests {
         use crate::fs_hash_crawler::FsHashCrawler;
         use crate::fs_hash_crawler::FsSnapshot;
         use crate::fs_hash_crawler::ResumeScan;
+        use crate::fs_hash_crawler::RevisionScan;
         use crate::fs_hash_crawler::resume_scan;
 
         const M: FileWatcherEventType = FileWatcherEventType::Modify;
@@ -1972,6 +2255,7 @@ mod tests {
                     cross_host: true,
                     vcs: Box::new(|| None),
                 },
+                None,
             )?;
             fx.aged("later", "BBBBB")?;
             let sync = || -> buck2_error::Result<Vec<String>> {
@@ -1980,6 +2264,311 @@ mod tests {
             };
             assert_eq!(sync()?, strings(&["root//later", "root//scanned"]));
             assert_eq!(sync()?, Vec::<String>::new());
+            Ok(())
+        }
+
+        /// The revision tests' source control: a merge base and trees a test sets, and no index
+        /// unless one is set.
+        #[derive(Default)]
+        struct FakeVcs {
+            merge_base: Mutex<Option<String>>,
+            trees: Mutex<HashMap<String, RevisionTree>>,
+            index: Mutex<Option<VcsDelta>>,
+            tree_calls: AtomicUsize,
+        }
+
+        impl RevisionVcs for FakeVcs {
+            fn merge_base(&self, _branch: &str) -> Option<String> {
+                self.merge_base.lock().unwrap().clone()
+            }
+            fn tree(&self, revision: &str) -> Option<RevisionTree> {
+                self.tree_calls.fetch_add(1, Ordering::Relaxed);
+                self.trees.lock().unwrap().get(revision).cloned()
+            }
+            fn index(&self) -> Option<VcsDelta> {
+                self.index.lock().unwrap().clone()
+            }
+        }
+
+        impl FakeVcs {
+            fn at(merge_base: &str, tree: RevisionTree) -> Arc<Self> {
+                let vcs = Arc::new(Self::default());
+                vcs.set(merge_base, Some(tree));
+                vcs
+            }
+
+            fn set(&self, merge_base: &str, tree: Option<RevisionTree>) {
+                *self.merge_base.lock().unwrap() = Some(merge_base.to_owned());
+                if let Some(tree) = tree {
+                    self.trees
+                        .lock()
+                        .unwrap()
+                        .insert(merge_base.to_owned(), tree);
+                }
+            }
+
+            fn source(self: &Arc<Self>) -> RevisionSource {
+                RevisionSource {
+                    branch: "main".to_owned(),
+                    vcs: self.clone(),
+                }
+            }
+
+            fn tree_calls(&self) -> usize {
+                self.tree_calls.load(Ordering::Relaxed)
+            }
+        }
+
+        fn file(contents: &str) -> RevisionEntry {
+            RevisionEntry::File {
+                blob: git_blob(contents),
+                executable: false,
+            }
+        }
+
+        fn tree(entries: &[(&str, RevisionEntry)]) -> RevisionTree {
+            RevisionTree {
+                entries: entries.iter().map(|(p, e)| (rel(p), *e)).collect(),
+            }
+        }
+
+        fn revision(name: &str) -> FileSystemBaseline {
+            FileSystemBaseline::Revision(Arc::from(name))
+        }
+
+        fn revision_events(scan: &RevisionScan) -> Events {
+            scan.events
+                .iter()
+                .map(|e| (e.cell_path.path().to_string(), e.event, e.kind))
+                .collect()
+        }
+
+        /// Every kind of difference from the revision is reported, and nothing the revision
+        /// holds as it is on disk. Without the index every file the tree holds is read.
+        #[test]
+        fn revision_changes_report_every_difference_from_the_tree() -> buck2_error::Result<()> {
+            let fx = Fixture::new()?;
+            fx.aged("same", "s")?;
+            fx.aged("edited", "new")?;
+            fx.aged("exec", "x")?;
+            std::fs::set_permissions(fx.path("exec"), std::fs::Permissions::from_mode(0o755))?;
+            fx.aged("untracked", "u")?;
+            fx.aged("dir/kept", "k")?;
+            fs_util::create_dir_all(fx.path("emptydir"))?;
+            std::os::unix::fs::symlink("same", fx.path("link"))?;
+            std::os::unix::fs::symlink("same", fx.path("relink"))?;
+            std::os::unix::fs::symlink("/elsewhere/file", fx.path("outside"))?;
+            fx.aged("typechange", "t")?;
+            fx.aged("sub/f", "f")?;
+            let tree = tree(&[
+                ("same", file("s")),
+                ("edited", file("old")),
+                ("exec", file("x")),
+                ("dir/kept", file("k")),
+                ("gone", file("g")),
+                ("gonedir/f", file("g")),
+                (
+                    "link",
+                    RevisionEntry::Symlink {
+                        blob: git_blob("same"),
+                    },
+                ),
+                (
+                    "relink",
+                    RevisionEntry::Symlink {
+                        blob: git_blob("edited"),
+                    },
+                ),
+                (
+                    "outside",
+                    RevisionEntry::Symlink {
+                        blob: git_blob("/elsewhere/file"),
+                    },
+                ),
+                (
+                    "typechange",
+                    RevisionEntry::Symlink {
+                        blob: git_blob("t"),
+                    },
+                ),
+                ("sub", RevisionEntry::Submodule),
+            ]);
+            let snapshot = FsSnapshot::build(&fx.root, &fx.cells, &fx.ignores)?;
+            let scan = snapshot.revision_changes(&fx.root, &fx.cells, &tree, None)?;
+            assert_eq!(
+                revision_events(&scan),
+                set(&[
+                    ("edited", M, F),
+                    ("exec", M, F),
+                    ("untracked", C, F),
+                    ("emptydir", C, DIR),
+                    ("relink", M, L),
+                    ("outside", M, L),
+                    ("typechange", D, L),
+                    ("typechange", C, F),
+                    ("sub/f", C, F),
+                    ("gone", D, F),
+                    ("gonedir/f", D, F),
+                    ("gonedir", D, DIR),
+                ])
+            );
+            assert_eq!((scan.vouched, scan.hashed), (0, 3));
+            Ok(())
+        }
+
+        /// The index decides a file whose stat it holds, either way, and a file whose stat it
+        /// does not is read.
+        #[test]
+        fn revision_changes_take_the_index_at_its_stat() -> buck2_error::Result<()> {
+            let fx = Fixture::new()?;
+            fx.aged("a", "a")?;
+            fx.aged("b", "b")?;
+            fx.aged("c", "c")?;
+            let tree = tree(&[("a", file("a")), ("b", file("b")), ("c", file("c"))]);
+            let mut stale = index_entry(&fx, "c", git_blob("c"));
+            stale.stat.ino ^= 1;
+            let index = VcsDelta {
+                clean: HashMap::from([
+                    (rel("a"), index_entry(&fx, "a", git_blob("a"))),
+                    // As git would record it after an edit since.
+                    (rel("b"), index_entry(&fx, "b", git_blob("B"))),
+                    (rel("c"), stale),
+                ]),
+                usable: true,
+            };
+            let snapshot = FsSnapshot::build(&fx.root, &fx.cells, &fx.ignores)?;
+            let scan = snapshot.revision_changes(&fx.root, &fx.cells, &tree, Some(&index))?;
+            assert_eq!(revision_events(&scan), set(&[("b", M, F)]));
+            assert_eq!((scan.vouched, scan.hashed), (2, 1));
+            // An index git cannot vouch with is not used.
+            let unusable = VcsDelta {
+                usable: false,
+                ..index
+            };
+            let scan = snapshot.revision_changes(&fx.root, &fx.cells, &tree, Some(&unusable))?;
+            assert_eq!(revision_events(&scan), Events::new());
+            assert_eq!((scan.vouched, scan.hashed), (0, 3));
+            Ok(())
+        }
+
+        /// The first sync names the merge base and records how the files differ from it; a
+        /// local edit is recorded as before; a moved merge base renews the baseline with the
+        /// differences from the new one; when git cannot say, the baseline stays.
+        #[test]
+        fn crawler_baseline_follows_the_merge_base() -> buck2_error::Result<()> {
+            let fx = Fixture::new()?;
+            fx.aged("a", "one")?;
+            fx.aged("b", "two")?;
+            fx.aged("local", "l")?;
+            let vcs = FakeVcs::at(
+                "m1",
+                tree(&[("a", file("one")), ("b", file("two")), ("c", file("c"))]),
+            );
+            let crawler = FsHashCrawler::new(
+                &fx.root,
+                fx.cells.clone(),
+                fx.ignores.clone(),
+                Some(vcs.source()),
+            )?;
+            let (files, dirs, baseline) = crawler.testing_sync()?;
+            assert_eq!(files, strings(&["root//c", "root//local"]));
+            assert_eq!(dirs, strings(&["root//"]));
+            assert_eq!(baseline, revision("m1"));
+
+            let (files, _, baseline) = crawler.testing_sync()?;
+            assert_eq!(files, Vec::<String>::new());
+            assert_eq!(baseline, revision("m1"));
+            assert_eq!(vcs.tree_calls(), 1);
+
+            fx.aged("a", "ONE")?;
+            let (files, _, baseline) = crawler.testing_sync()?;
+            assert_eq!(files, strings(&["root//a"]));
+            assert_eq!(baseline, revision("m1"));
+
+            vcs.set(
+                "m2",
+                Some(tree(&[
+                    ("a", file("ONE")),
+                    ("b", file("TWO")),
+                    ("local", file("l")),
+                ])),
+            );
+            let (files, _, baseline) = crawler.testing_sync()?;
+            assert_eq!(files, strings(&["root//b"]));
+            assert_eq!(baseline, revision("m2"));
+
+            *vcs.merge_base.lock().unwrap() = None;
+            let (files, _, baseline) = crawler.testing_sync()?;
+            assert_eq!(files, Vec::<String>::new());
+            assert_eq!(baseline, revision("m2"));
+
+            // A merge base whose files git cannot list keeps the baseline, and is asked again.
+            vcs.set("m3", None);
+            let calls = vcs.tree_calls();
+            assert_eq!(crawler.testing_sync()?.2, revision("m2"));
+            assert_eq!(crawler.testing_sync()?.2, revision("m2"));
+            assert_eq!(vcs.tree_calls(), calls + 2);
+            Ok(())
+        }
+
+        /// Two checkouts at one merge base name the same baseline; without a branch to merge
+        /// with, or when git names no merge base, a crawler's baseline is equal to no other.
+        #[test]
+        fn crawlers_at_one_merge_base_agree() -> buck2_error::Result<()> {
+            let baseline = |vcs: Option<Arc<FakeVcs>>| -> buck2_error::Result<FileSystemBaseline> {
+                let fx = Fixture::new()?;
+                fx.aged("a", "one")?;
+                let crawler = FsHashCrawler::new(
+                    &fx.root,
+                    fx.cells.clone(),
+                    fx.ignores.clone(),
+                    vcs.map(|vcs| vcs.source()),
+                )?;
+                Ok(crawler.testing_sync()?.2)
+            };
+            let at = || Some(FakeVcs::at("m", tree(&[("a", file("one"))])));
+            assert_eq!(baseline(at())?, revision("m"));
+            assert_eq!(baseline(at())?, baseline(at())?);
+            let unique = baseline(None)?;
+            assert!(matches!(unique, FileSystemBaseline::Unique { .. }));
+            assert_ne!(unique, baseline(None)?);
+            let none = Arc::new(FakeVcs::default());
+            assert!(matches!(
+                baseline(Some(none))?,
+                FileSystemBaseline::Unique { .. }
+            ));
+            Ok(())
+        }
+
+        /// A resumed crawler keeps the image's baseline on its first sync, whatever merge base
+        /// it finds, since the restored file reads are relative to it; a later move of the merge
+        /// base renews it.
+        #[test]
+        fn resumed_crawler_keeps_the_image_baseline_until_the_merge_base_moves()
+        -> buck2_error::Result<()> {
+            let fx = Fixture::new()?;
+            fx.aged("a", "one")?;
+            let mut image = fx.suspend(None)?;
+            image.baseline = revision("m0").to_image();
+            let vcs = FakeVcs::at("m1", tree(&[("a", file("one"))]));
+            let crawler = FsHashCrawler::resume(
+                &fx.root,
+                fx.cells.clone(),
+                fx.ignores.clone(),
+                ResumeInput {
+                    image: &image,
+                    cross_host: false,
+                    vcs: Box::new(|| None),
+                },
+                Some(vcs.source()),
+            )?;
+            assert_eq!(crawler.testing_sync()?.2, revision("m0"));
+            assert_eq!(crawler.testing_sync()?.2, revision("m0"));
+            assert_eq!(vcs.tree_calls(), 0);
+            vcs.set("m2", Some(tree(&[("a", file("one")), ("b", file("b"))])));
+            let (files, _, baseline) = crawler.testing_sync()?;
+            assert_eq!(files, strings(&["root//b"]));
+            assert_eq!(baseline, revision("m2"));
             Ok(())
         }
     }
