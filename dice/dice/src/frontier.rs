@@ -82,6 +82,9 @@ pub struct FrontierNode {
 
 pub struct FrontierGraph {
     pub nodes: Vec<FrontierNode>,
+    /// Keys the head holds as candidates (dirtied, or above something dirtied, and not yet
+    /// recomputed), by type: left out of `nodes`, since they are not valid at the version.
+    pub candidates: std::collections::BTreeMap<&'static str, usize>,
 }
 
 fn row_bytes(key: DataKey) -> [u8; 16] {
@@ -116,8 +119,12 @@ impl Dice {
             injected: bool,
         }
         let mut entries: Vec<Entry> = Vec::new();
+        let mut candidates = std::collections::BTreeMap::new();
         for e in head {
             if matches!(e.source, HeadSource::Candidate { .. }) {
+                *candidates
+                    .entry(self.key_index.get(e.key).key_type_name())
+                    .or_default() += 1;
                 continue;
             }
             entries.push(Entry {
@@ -242,6 +249,6 @@ impl Dice {
         }
         storage.flush()?;
         storage.bind_written(&finished);
-        Ok(FrontierGraph { nodes })
+        Ok(FrontierGraph { nodes, candidates })
     }
 }

@@ -91,10 +91,22 @@ fn command_data() -> CommandData {
 
 /// The command data's part of the version, or why the frontier is off for it.
 fn command_data_digest(c: &CommandData) -> Result<String, String> {
+    let unclassified: Vec<&str> = c
+        .types
+        .iter()
+        .copied()
+        .filter(|t| classify(t).is_none())
+        .collect();
+    if !unclassified.is_empty() {
+        return Err(format!(
+            "unclassified command data: {}",
+            unclassified.join(", ")
+        ));
+    }
     let mut h = blake3::Hasher::new();
     for t in &c.types {
         match classify(t) {
-            None => return Err(format!("unclassified command data: {t}")),
+            None => unreachable!("checked above"),
             Some(DataClass::Version) => {
                 h.update(t.as_bytes());
                 h.update(&[0]);
@@ -210,6 +222,7 @@ struct Walked {
     /// `(kind, key id)` to value row, for local-out leaves.
     rows: HashMap<(String, String), String>,
     keys: usize,
+    candidates: BTreeMap<&'static str, usize>,
 }
 
 async fn walk(dice: &Arc<Dice>, tx: &DiceTransaction) -> buck2_error::Result<Walked> {
@@ -271,6 +284,7 @@ async fn walk(dice: &Arc<Dice>, tx: &DiceTransaction) -> buck2_error::Result<Wal
         to_compute,
         rows,
         keys,
+        candidates: graph.candidates,
     })
 }
 
@@ -386,6 +400,7 @@ async fn version(
     tx: &DiceTransaction,
     project_root: &ProjectRoot,
     command: &Result<String, String>,
+    daemon_settings: &str,
 ) -> buck2_error::Result<Manifest> {
     let mut ctx = tx.ctx();
     let root_cell = ctx.get_cell_resolver().await?.root_cell();
@@ -408,6 +423,7 @@ async fn version(
             Err(e) => format!("off: {e}"),
         },
     );
+    components.insert("daemon_settings".to_owned(), daemon_settings.to_owned());
     components.insert(
         "project_root".to_owned(),
         project_root.root().to_string(),
@@ -436,6 +452,9 @@ pub(crate) struct FrontierInputs<'a> {
     pub(crate) commit: Option<String>,
     pub(crate) log_dir: PathBuf,
     pub(crate) trace_id: String,
+    /// A digest of the daemon's settings other than `frontier` (package visibility and the
+    /// like reach node values through the command data).
+    pub(crate) daemon_settings: String,
 }
 
 fn store_and_commit(inputs: &FrontierInputs<'_>) -> buck2_error::Result<(PathBuf, String)> {
@@ -484,6 +503,24 @@ pub(crate) async fn prime(inputs: FrontierInputs<'_>) -> buck2_error::Result<Str
     let start = Instant::now();
     let walked = walk(inputs.dice, inputs.transaction).await?;
     let walk_time = start.elapsed();
+    // A covered node that is dirty at this version was invalidated after the build (a file or
+    // config change, or a prime run with other `-c` arguments): its record would describe a
+    // graph that no longer stands, so the primer refuses rather than leave it out silently.
+    let narrowed_kinds = inputs.settings.kinds();
+    let dirty: Vec<String> = walked
+        .candidates
+        .iter()
+        .filter(|(k, _)| is_record_kind(k, narrowed_kinds.as_deref()))
+        .map(|(k, n)| format!("{n} {k}"))
+        .collect();
+    if !dirty.is_empty() {
+        return Err(buck2_error!(
+            ErrorTag::Input,
+            "the graph moved since the build (dirty covered nodes: {}); prime right after the \
+             build, with the same config",
+            dirty.join(", ")
+        ));
+    }
     let mut leaves: HashMap<LeafId, LeafValue> = walked
         .leaves
         .iter()
@@ -497,7 +534,13 @@ pub(crate) async fn prime(inputs: FrontierInputs<'_>) -> buck2_error::Result<Str
     )
     .await?;
     leaves.extend(computed);
-    let manifest = version(inputs.transaction, inputs.project_root, &command).await?;
+    let manifest = version(
+        inputs.transaction,
+        inputs.project_root,
+        &command,
+        &inputs.daemon_settings,
+    )
+    .await?;
     let narrowed = inputs.settings.kinds();
     let covered = |k: &str| is_record_kind(k, narrowed.as_deref());
     let exec_class = |n: &Node| {
@@ -597,17 +640,25 @@ pub(crate) async fn shadow(inputs: FrontierInputs<'_>) -> buck2_error::Result<St
         return Ok(format!("frontier shadow: off, {e}\n"));
     }
     let walked = walk(inputs.dice, inputs.transaction).await?;
-    let manifest = version(inputs.transaction, inputs.project_root, &command).await?;
+    let manifest = version(
+        inputs.transaction,
+        inputs.project_root,
+        &command,
+        &inputs.daemon_settings,
+    )
+    .await?;
     let narrowed = inputs.settings.kinds();
     let covered = |k: &str| is_record_kind(k, narrowed.as_deref());
     let reader = StoreReader::open(&store, &manifest.version, &commit)
         .map_err(|e| buck2_error!(ErrorTag::Environment, "opening the store: {e:#}"))?;
     let mut version_note = String::new();
+    let mut version_differs = false;
     if !reader.has_pointer() {
         match StoreReader::primed_manifest(&store, &commit)
             .map_err(|e| buck2_error!(ErrorTag::Environment, "reading the store: {e:#}"))?
         {
             Some(theirs) => {
+                version_differs = true;
                 version_note = format!(
                     "version differs from the primer's in: {}\n",
                     differing_components(&theirs, &manifest).join(", ")
@@ -655,8 +706,16 @@ pub(crate) async fn shadow(inputs: FrontierInputs<'_>) -> buck2_error::Result<St
         rows: walked.rows.clone(),
         version: manifest.version.clone(),
     };
-    let entries = buck2_frontier::walk::shadow(&walked.nodes, &oracle, &covered, &reader)
+    let mut entries = buck2_frontier::walk::shadow(&walked.nodes, &oracle, &covered, &reader)
         .map_err(|e| buck2_error!(ErrorTag::Environment, "shadow pass: {e:#}"))?;
+    if version_differs {
+        // The commit was primed, under another version: every lookup misses for that reason.
+        for e in &mut entries {
+            if e.outcome == buck2_frontier::walk::Outcome::Miss {
+                e.outcome = buck2_frontier::walk::Outcome::Version;
+            }
+        }
+    }
     let summary = buck2_frontier::walk::summarize(&entries);
     std::fs::create_dir_all(&inputs.log_dir)?;
     let report_path = inputs

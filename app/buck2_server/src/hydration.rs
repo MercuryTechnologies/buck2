@@ -59,6 +59,14 @@ pub(crate) async fn hydration_command(
             frontier_store: req.frontier_store,
             frontier_commit: req.frontier_commit,
             frontier_settings: ctx.base_context.daemon.daemon_buck_settings().frontier.dupe(),
+            frontier_daemon_settings: {
+                let mut v = serde_json::to_value(ctx.base_context.daemon.daemon_buck_settings())
+                    .unwrap_or_default();
+                if let Some(o) = v.as_object_mut() {
+                    o.remove("frontier");
+                }
+                blake3::hash(v.to_string().as_bytes()).to_hex().to_string()
+            },
         },
         ctx,
         partial_result_dispatcher,
@@ -77,6 +85,7 @@ struct HydrationServerCommand {
     frontier_store: Option<String>,
     frontier_commit: Option<String>,
     frontier_settings: buck2_common::settings::settings::FrontierSection,
+    frontier_daemon_settings: String,
 }
 
 #[async_trait]
@@ -161,6 +170,7 @@ impl ServerCommandTemplate for HydrationServerCommand {
                     commit: self.frontier_commit.clone(),
                     log_dir: repo.paths.buck_out_path().as_path().join("log"),
                     trace_id: server_ctx.events().trace_id().to_string(),
+                    daemon_settings: self.frontier_daemon_settings.clone(),
                 };
                 let summary = if self.subcommand == HydrationSubcommand::FrontierPrime {
                     crate::frontier::prime(inputs).await?

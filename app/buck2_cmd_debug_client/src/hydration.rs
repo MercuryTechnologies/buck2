@@ -51,6 +51,11 @@ pub struct FrontierCommand {
     #[clap(long)]
     commit: Option<String>,
 
+    /// The build's config flags: the prime must see the graph the build left, so it takes the
+    /// same `-c` and `--config-file` arguments.
+    #[clap(flatten)]
+    config_opts: CommonBuildConfigurationOptions,
+
     #[clap(flatten)]
     event_log_opts: CommonEventLogOptions,
 }
@@ -125,11 +130,16 @@ impl StreamingCommand for HydrationCommand {
     async fn exec_impl(
         self,
         buckd: &mut BuckdClientConnector,
-        _matches: BuckArgMatches<'_>,
+        matches: BuckArgMatches<'_>,
         ctx: &mut ClientCommandContext<'_>,
         events_ctx: &mut EventsCtx,
     ) -> ExitResult {
-        let context = ctx.empty_client_context("debug-hydration")?;
+        let context = if self.frontier().is_some() {
+            // The config flags belong to the `frontier-*` subcommand, not to `hydration`.
+            ctx.client_context(matches.unwrap_subcommand(), &self)?
+        } else {
+            ctx.empty_client_context("debug-hydration")?
+        };
         let response = buckd
             .with_flushing()
             .hydration(
@@ -177,7 +187,10 @@ impl StreamingCommand for HydrationCommand {
     }
 
     fn build_config_opts(&self) -> &CommonBuildConfigurationOptions {
-        CommonBuildConfigurationOptions::default_ref()
+        match self.frontier() {
+            Some(f) => &f.config_opts,
+            None => CommonBuildConfigurationOptions::default_ref(),
+        }
     }
 
     fn starlark_opts(&self) -> &CommonStarlarkOptions {

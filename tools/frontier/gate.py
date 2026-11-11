@@ -140,10 +140,11 @@ class Gate:
         if os.path.exists(store):
             shutil.rmtree(store)
         self.buck2(cwd, iso, ["build", *build_extra, *cfg, "//..."], env, settings, name=f"{arm}-build")
+        # The prime runs with the build's config: another `-c` would move the graph.
         _, out = self.buck2(
             cwd,
             iso,
-            ["debug", "hydration", "frontier-prime", "--store", store, "--commit", sha],
+            ["debug", "hydration", "frontier-prime", *cfg, "--store", store, "--commit", sha],
             env,
             settings,
             name=f"{arm}-prime",
@@ -201,6 +202,7 @@ def compare(base_name, base, other_name, other, expect_injected_diff=()):
         fail(f"{base_name} vs {other_name}: covered keys differ: only {base_name} {only_a}, only {other_name} {only_b}")
     same = diff = 0
     by_kind = {}
+    explained = []
     for k in sorted(set(ra) & set(rb)):
         ok = ra[k][0] == rb[k][0]
         s = by_kind.setdefault(k[0], [0, 0])
@@ -208,11 +210,20 @@ def compare(base_name, base, other_name, other, expect_injected_diff=()):
         s[1] += ok
         if ok:
             same += 1
+            continue
+        diff += 1
+        # A value that differs is sound only if a leaf of its record differs too: then no reader
+        # of one arm's record could take it for the other's. Equal leaves and another value is
+        # the alarm, across daemons.
+        la, lb = ra[k][1], rb[k][1]
+        moved = sorted(l for l in set(la) | set(lb) if la.get(l) != lb.get(l))
+        if not moved:
+            fail(f"{base_name} vs {other_name}: {k} has equal leaves and another value row")
         else:
-            diff += 1
+            explained.append((k[0], moved[0]))
     for kind, (n, ok) in sorted(by_kind.items()):
         if n != ok:
-            fail(f"{base_name} vs {other_name}: {kind} value rows identical for {ok}/{n}")
+            note(f"{base_name} vs {other_name}: {kind} value rows identical for {ok}/{n}; the rest explained by a leaf: {sorted(set(e[1] for e in explained if e[0] == kind))}")
     inj_a, inj_b = {}, {}
     for _, leaves in ra.values():
         inj_a.update(injected(leaves))
@@ -246,8 +257,8 @@ def shadow(g, cwd, sha, iso, store, label):
             report = json.load(open(line[len("report: ") :]))
     if report is None:
         fail(f"shadow {label}: no report")
-        return {}, out
-    return {(e["kind"], e["key_id"]): e for e in report["entries"]}, out
+        return {}, out, {}
+    return {(e["kind"], e["key_id"]): e for e in report["entries"]}, out, report
 
 
 def check_all_hit(entries, label):
@@ -260,8 +271,16 @@ def check_all_hit(entries, label):
         note(f"{label}: all {len(entries)} covered nodes hit")
 
 
-def check_canary(entries, records, label, matches):
-    """matches(leaf json) -> whether the leaf belongs to the mutation."""
+def check_canary(entries, records, label, matches, report=None, version_component=None):
+    """matches(leaf json) -> whether the leaf belongs to the mutation. A mutation that also
+    changes a component of the version (a config edit changes the startup config) is detected
+    there first: every lookup is a version miss naming that component."""
+    if version_component and entries and all(e["outcome"] == "version" for e in entries.values()):
+        if version_component in (report or {}).get("version_note", ""):
+            note(f"{label}: all {len(entries)} records refused by the version ({version_component})")
+            return set()
+        fail(f"{label}: version refusal without {version_component}: {(report or {}).get('version_note')}")
+        return set()
     must = set()
     may = set()
     for k, (_, leaves) in records.items():
@@ -405,18 +424,20 @@ def main():
     note(f"arm F: no sentinel in the store ({len(needles)} needles); unshareable reasons {sorted(unsh_f)}")
 
     # Shadow: a fresh daemon on A's checkout against A's store.
-    s_iso = "fp-gate-shadow"
+    # The primer's isolation dir: it enters every action's key, so another one could share no
+    # BuildKey (arm B shows it).
+    s_iso = main_iso
     records_a = loaded["A"][0]
-    entries, out = shadow(g, a, sha, s_iso, stores["A"], "clean")
+    entries, out, _ = shadow(g, a, sha, s_iso, stores["A"], "clean")
     note(out.rstrip())
     check_all_hit(entries, "shadow clean")
 
-    def mutate(label, do, undo, matches):
+    def mutate(label, do, undo, matches, version_component=None):
         do()
-        entries, out = shadow(g, a, sha, s_iso, stores["A"], label)
-        check_canary(entries, records_a, f"canary {label}", matches)
+        entries, out, report = shadow(g, a, sha, s_iso, stores["A"], label)
+        check_canary(entries, records_a, f"canary {label}", matches, report, version_component)
         undo()
-        entries, _ = shadow(g, a, sha, s_iso, stores["A"], label + "-revert")
+        entries, _, _ = shadow(g, a, sha, s_iso, stores["A"], label + "-revert")
         check_all_hit(entries, f"revert {label}")
 
     p = lambda *x: os.path.join(a, *x)
@@ -471,18 +492,21 @@ def main():
         lambda: write(p(".buckconfig"), orig[".buckconfig"].replace("greeting = hello", "greeting = changed")),
         lambda: write(p(".buckconfig"), orig[".buckconfig"]),
         any_of(leaf_match("Config", section="fixture", prop="greeting"), leaf_match("Path", path=".buckconfig")),
+        version_component="startup_config",
     )
     mutate(
         "cell_aliases",
         lambda: write(p(".buckconfig"), orig[".buckconfig"].replace("  fx = root\n", "  fx = root\n  fx2 = root\n")),
         lambda: write(p(".buckconfig"), orig[".buckconfig"]),
         any_of(leaf_match("Sections", section="cell_aliases"), leaf_match("Path", path=".buckconfig")),
+        version_component="startup_config",
     )
     mutate(
         "buckconfig_local",
         lambda: write(p(".buckconfig.local"), "[fixture]\n  greeting = local\n"),
         lambda: os.remove(p(".buckconfig.local")),
         any_of(leaf_match("Config", section="fixture", prop="greeting"), leaf_match("Path", path=".buckconfig.local")),
+        version_component="startup_config",
     )
     g.kill(a, s_iso)
 

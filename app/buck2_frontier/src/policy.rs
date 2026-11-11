@@ -47,71 +47,72 @@ pub enum DataClass {
     Handle,
 }
 
-/// Every type `ServerCommandDiceContext` puts in a command's data, by the path prefix of its
-/// type name. A type this table does not classify turns the frontier off for the command; the
-/// test in the server builds the data as `ctx.rs` does and fails on any unclassified type, so an
-/// upstream merge that adds one fails in the fork's CI rather than in a job.
+/// Every type `ServerCommandDiceContext` (`buck2_server::ctx`) puts in a command's data, by its
+/// full type name. A type this table does not list turns the frontier off for the command, so an
+/// upstream merge that adds one fails closed; the frontier commands name the type.
 ///
 /// The flags inside `CommandExecutorFactory` (`skip_cache_read`, `skip_cache_write`, the
 /// execution strategy, upload-all) are not types of their own: the server records them beside
-/// the type names (see `buck2_server::frontier::CommandData`).
+/// the type names (`buck2_server::frontier::CommandData`), and `skip_cache_read` turns the shadow
+/// reader off, `skip_cache_write` the primer.
 pub const FRONTIER_DATA_POLICY: &[(&str, DataClass)] = &[
-    // Executor configuration: execution strategy, executor config, upload-all and the cache
-    // flags live here; the flags are recorded separately.
-    ("buck2_execute::execute::dice_data::", DataClass::Version),
-    ("buck2_build_api::actions::execute::dice_data::", DataClass::Version),
-    ("buck2_execute::re::manager::", DataClass::Handle),
-    ("buck2_execute::materialize::", DataClass::Handle),
-    ("buck2_execute::execute::blocking::", DataClass::Handle),
-    ("buck2_common::http::", DataClass::Handle),
-    ("buck2_common::package_listing::", DataClass::Handle),
-    ("buck2_common::dice::", DataClass::Handle),
-    ("buck2_events::", DataClass::Handle),
-    ("buck2_build_signals::", DataClass::Handle),
-    ("buck2_build_api::build_signals::", DataClass::Handle),
-    ("buck2_build_api::keep_going::", DataClass::Version),
-    ("buck2_build_api::actions::execute::", DataClass::Handle),
-    ("buck2_build_api::materialize::", DataClass::Handle),
-    ("buck2_build_api::actions::impls::run::", DataClass::Handle),
-    ("buck2_build_api::deferred::", DataClass::Handle),
-    ("buck2_build_api::bxl::", DataClass::Handle),
-    ("buck2_build_api::interpreter::", DataClass::Handle),
-    ("buck2_build_api::actions::calculation::", DataClass::Handle),
-    ("buck2_build_api::actions::rewind::", DataClass::Handle),
-    ("buck2_build_api::actions::local_actions::", DataClass::Handle),
-    ("buck2_execute::digest_config::", DataClass::Version),
-    ("buck2_interpreter::", DataClass::Handle),
-    ("buck2_node::visibility::", DataClass::Version),
-    ("buck2_critical_path::", DataClass::Handle),
-    ("buck2_server_starlark_debug::", DataClass::Handle),
-    ("buck2_server::", DataClass::Handle),
-    ("buck2_execute::execute::", DataClass::Handle),
-    ("buck2_execute_impl::", DataClass::Handle),
-    ("buck2_common::io::", DataClass::Handle),
-    ("buck2_util::", DataClass::Handle),
-    ("buck2_file_watcher::", DataClass::Handle),
-    ("buck2_common::local_resource_state::", DataClass::Handle),
-    ("buck2_common::starlark_profiler::", DataClass::Handle),
-    ("buck2_common::legacy_configs::", DataClass::Handle),
-    ("buck2_common::file_ops::", DataClass::Handle),
-    ("buck2_common::invocation_paths::", DataClass::Handle),
-    ("buck2_common::memory::", DataClass::Handle),
-    ("buck2_resource_control::", DataClass::Handle),
-    ("buck2_execute::", DataClass::Handle),
-    ("buck2_bxl::", DataClass::Handle),
-    ("buck2_analysis::", DataClass::Handle),
-    ("buck2_test::", DataClass::Handle),
-    ("buck2_core::", DataClass::Handle),
-    ("buck2_build_api::", DataClass::Handle),
-    ("buck2_common::", DataClass::Handle),
-    ("dice::", DataClass::Handle),
-    ("alloc::sync::Arc<buck2_", DataClass::Handle),
+    // The executor factory: its strategy and upload-all are recorded and in the version.
+    (
+        "buck2_build_api::actions::execute::dice_data::HasCommandExecutorHolder",
+        DataClass::Version,
+    ),
+    // The fallback executor config, from the root config: in the startup-config component.
+    (
+        "alloc::sync::Arc<buck2_core::execution_types::executor_config::CommandExecutorConfig>",
+        DataClass::Version,
+    ),
+    ("buck2_build_api::actions::impls::run_action_knobs::RunActionKnobs", DataClass::Version),
+    // From the daemon's settings: in the daemon-settings component.
+    (
+        "buck2_common::settings::package_visibility::PackageVisibilityDefaultIntersection",
+        DataClass::Version,
+    ),
+    // Whether a failure stops the build: not the value of any node that succeeded.
+    ("buck2_build_api::keep_going::KeepGoingHolder", DataClass::Handle),
+    ("buck2_execute::re::invocation_re_settings::InvocationReSettings", DataClass::Handle),
+    ("buck2_execute::re::manager::UnconfiguredRemoteExecutionClient", DataClass::Handle),
+    ("alloc::sync::Arc<buck2_execute::execute::low_pass_filter::LowPassFilter>", DataClass::Handle),
+    ("alloc::sync::Arc<buck2_server_ctx::bxl::BxlStreamingTracker>", DataClass::Handle),
+    (
+        "alloc::sync::Arc<buck2_test::local_resource_registry::LocalResourceRegistry>",
+        DataClass::Handle,
+    ),
+    ("alloc::sync::Arc<dyn buck2_build_api::build_signals::BuildSignals>", DataClass::Handle),
+    (
+        "alloc::sync::Arc<dyn buck2_execute::execute::blocking::BlockingExecutor>",
+        DataClass::Handle,
+    ),
+    (
+        "alloc::sync::Arc<dyn buck2_execute::materialize::materializer::Materializer>",
+        DataClass::Handle,
+    ),
+    // The unhashed-symlink lock.
+    ("alloc::sync::Arc<tokio::sync::mutex::Mutex<()>>", DataClass::Handle),
+    ("buck2_build_api::actions::rewind::ActionRewindTrackerHolder", DataClass::Handle),
+    (
+        "buck2_build_api::build::detailed_aggregated_metrics::events::DetailedAggregatedMetricsPerBuildEventsHolder",
+        DataClass::Handle,
+    ),
+    ("buck2_build_api::materialize::MaterializationQueueTrackerHolder", DataClass::Handle),
+    ("buck2_build_signals::env::CriticalPathBackendName", DataClass::Handle),
+    ("buck2_common::file_ops::io::ReadDirCache", DataClass::Handle),
+    ("buck2_events::dispatch::EventDispatcher", DataClass::Handle),
+    ("buck2_execute::dep_file_state::DepFileStoreHolder", DataClass::Handle),
+    ("buck2_file_watcher::dep_files::DepFileCacheHolder", DataClass::Handle),
+    ("buck2_http::client::HttpClient", DataClass::Handle),
+    ("buck2_interpreter::dice::starlark_debug::StarlarkDebuggerHookHolder", DataClass::Handle),
+    ("buck2_resource_control::HasResourceControl", DataClass::Handle),
 ];
 
 pub fn classify(type_name: &str) -> Option<DataClass> {
     FRONTIER_DATA_POLICY
         .iter()
-        .find(|(prefix, _)| type_name.starts_with(prefix))
+        .find(|(name, _)| *name == type_name)
         .map(|(_, c)| *c)
 }
 

@@ -10,6 +10,9 @@
 [build]
   execution_platforms = root//platforms:platforms
 
+[parser]
+  target_platform_detector_spec = target:root//...->root//platforms:target
+
 [fixture]
   greeting = hello
 

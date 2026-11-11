@@ -1,3 +1,5 @@
-load(":defs.bzl", "execution_platforms")
+load(":defs.bzl", "execution_platforms", "platform")
 
 execution_platforms(name = "platforms")
+
+platform(name = "target")
