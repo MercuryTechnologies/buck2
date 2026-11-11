@@ -614,7 +614,8 @@ mod tests {
         let (nodes, mut m, o) = primed();
         let root = m.records.values().next().unwrap().root.clone();
         let b = m.bodies.get_mut(&root).unwrap();
-        b.leaves.clear();
+        // A substituted body: it no longer hashes to the name it is stored under.
+        b.version = Some("tampered".to_owned());
         let got = outcomes(&nodes, &o, &m);
         assert!(got.contains(&Outcome::Corrupt), "{got:?}");
         assert!(got.contains(&Outcome::Hit), "{got:?}");
