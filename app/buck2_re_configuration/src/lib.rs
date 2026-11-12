@@ -842,18 +842,34 @@ impl Buck2OssReConfiguration {
                 section: BUCK2_RE_CLIENT_CFG_SECTION,
                 property: "remote_cache_chunk_cache_dir",
             })?,
-            retries: legacy_config.parse(BuckconfigKeyRef {
+            // mercury-head's client spells the retry count `max_retries` and the per-request
+            // timeout `grpc_timeout`, and mercury-web-backend's buckconfig and CI set those
+            // names. They mean the same as `retries` and `grpc_request_timeout_secs`, so they
+            // are read when this client's own names are unset.
+            retries: match legacy_config.parse(BuckconfigKeyRef {
                 section: BUCK2_RE_CLIENT_CFG_SECTION,
                 property: "retries",
-            })?,
+            })? {
+                Some(retries) => Some(retries),
+                None => legacy_config.parse(BuckconfigKeyRef {
+                    section: BUCK2_RE_CLIENT_CFG_SECTION,
+                    property: "max_retries",
+                })?,
+            },
             retry_max_delay_ms: legacy_config.parse(BuckconfigKeyRef {
                 section: BUCK2_RE_CLIENT_CFG_SECTION,
                 property: "retry_max_delay_ms",
             })?,
-            grpc_request_timeout_secs: legacy_config.parse(BuckconfigKeyRef {
+            grpc_request_timeout_secs: match legacy_config.parse(BuckconfigKeyRef {
                 section: BUCK2_RE_CLIENT_CFG_SECTION,
                 property: "grpc_request_timeout_secs",
-            })?,
+            })? {
+                Some(secs) => Some(secs),
+                None => legacy_config.parse(BuckconfigKeyRef {
+                    section: BUCK2_RE_CLIENT_CFG_SECTION,
+                    property: "grpc_timeout",
+                })?,
+            },
             bytestream_progress_timeout_secs: legacy_config.parse(BuckconfigKeyRef {
                 section: BUCK2_RE_CLIENT_CFG_SECTION,
                 property: "bytestream_progress_timeout_secs",
@@ -1088,6 +1104,31 @@ mod tests {
         );
         let invalid = parse(&[("config", "[bes]\nretry_window_secs = soon\n")], "config")?;
         assert!(BesReplaySettings::from_legacy_config(&invalid).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn oss_config_reads_mercury_head_retry_and_timeout_names() -> buck2_error::Result<()> {
+        let config = |text: &str| -> buck2_error::Result<Buck2OssReConfiguration> {
+            let legacy_config = parse(&[("config", text)], "config")?;
+            Buck2OssReConfiguration::from_legacy_config(&legacy_config, Vec::new())
+        };
+
+        let unset = config("")?;
+        assert_eq!(unset.retries, None);
+        assert_eq!(unset.grpc_request_timeout_secs, None);
+
+        // mercury-web-backend's names, as its .buckconfig.d and CI set them.
+        let mercury = config("[buck2_re_client]\nmax_retries = 0\ngrpc_timeout = 200\n")?;
+        assert_eq!(mercury.retries, Some(0));
+        assert_eq!(mercury.grpc_request_timeout_secs, Some(200));
+
+        // This client's own names win when both are set.
+        let both = config(
+            "[buck2_re_client]\nretries = 3\nmax_retries = 0\ngrpc_request_timeout_secs = 30\ngrpc_timeout = 200\n",
+        )?;
+        assert_eq!(both.retries, Some(3));
+        assert_eq!(both.grpc_request_timeout_secs, Some(30));
         Ok(())
     }
 
