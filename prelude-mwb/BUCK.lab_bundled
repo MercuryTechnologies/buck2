@@ -1,0 +1,11 @@
+# lab: the source listing that app/buck2_external_cells_bundled:prelude embeds.
+# Every file of mwb's prelude, as cargo's build.rs bundles them, less the two
+# files that make this directory one package (see .buckconfig.local).
+load("@prelude//utils:source_listing.bzl", "source_listing")
+
+source_listing(
+    exclude = [
+        ".buckconfig.local",
+        "BUCK.lab_bundled",
+    ],
+)

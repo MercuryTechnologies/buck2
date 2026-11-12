@@ -26,7 +26,7 @@ fn imp() -> io::Result<()> {
         .unwrap()
         .parent()
         .unwrap()
-        .join("prelude");
+        .join("prelude-mwb");
 
     // Self-check.
     assert!(prelude_path.join("prelude.bzl").exists());
@@ -54,6 +54,16 @@ fn write_include_file(prelude: &Path, mut include_file: impl io::Write) -> io::R
     for res in walkdir::WalkDir::new(prelude) {
         let entry = res.map_err(|e| e.into_io_error().unwrap())?;
         if !entry.file_type().is_file() {
+            continue;
+        }
+        // lab: the two files that make prelude-mwb/ one package for buck2's own
+        // build (prelude-mwb/.buckconfig.local) are not part of mwb's prelude.
+        if entry.depth() == 1
+            && matches!(
+                entry.file_name().to_str(),
+                Some(".buckconfig.local" | "BUCK.lab_bundled")
+            )
+        {
             continue;
         }
 

@@ -11,15 +11,20 @@ load(
     "ArtifactGroupInfo",
     "ArtifactOutputs",  # @unused Used as a type
 )
-load("@prelude//:attrs_validators.bzl", "get_attrs_validation_specs")
+load("@prelude//:attrs_validators.bzl", "get_attrs_validation_specs", "validation_common")
 load("@prelude//:paths.bzl", "paths")
+load("@prelude//:prelude_rule.bzl", "prelude_rule")
 load("@prelude//:resources.bzl", "gather_resources")
+load("@prelude//cxx:attrs.bzl", "cxx_binary_base_attrs")
 load("@prelude//cxx:cxx_context.bzl", "get_opt_cxx_toolchain_info")
 load(
     "@prelude//cxx:cxx_library_utility.bzl",
     "cxx_is_gnu",
 )
 load("@prelude//cxx:cxx_utility.bzl", "cxx_attrs_get_allow_cache_upload")
+load("@prelude//decls:common.bzl", "LinkableDepType", "buck")
+load("@prelude//decls:native_common.bzl", "native_common")
+load("@prelude//decls:toolchains_common.bzl", "toolchains_common")
 load(
     "@prelude//linking:link_info.bzl",
     "LinkArgs",  # @unused Used as a type
@@ -36,6 +41,7 @@ load(
     "traverse_shared_library_info",
 )
 load("@prelude//linking:strip.bzl", "strip_debug_with_gnu_debuglink")
+load("@prelude//python:attrs.bzl", "python_common", "python_executable_attrs", "typing_arg")
 load("@prelude//python:compute_providers.bzl", "ExecutableType", "compute_providers")
 load("@prelude//python:python.bzl", "python_attr_preload_deps")
 load(
@@ -48,6 +54,7 @@ load(
 load("@prelude//python/linking:native.bzl", "process_native_linking")
 load("@prelude//python/linking:native_python_util.bzl", "compute_link_strategy", "merge_native_deps")
 load("@prelude//python/linking:omnibus.bzl", "process_omnibus_linking")
+load("@prelude//transitions:constraint_overrides.bzl", "constraint_overrides")
 load("@prelude//utils:utils.bzl", "value_or")
 load(":compile.bzl", "compile_manifests")
 load(
@@ -70,7 +77,7 @@ load(
     "create_python_library_info",
     "gather_dep_libraries",
     "py_attr_resources",
-    "py_resources",
+    "py_resources_deduped",
     "qualify_srcs",
 )
 load(":python_runtime_bundle.bzl", "PythonRuntimeBundleInfo")
@@ -155,7 +162,7 @@ def python_executable(
         src_manifest = create_manifest_for_source_map(ctx, "srcs", srcs)
 
         python_toolchain = ctx.attrs._python_toolchain[PythonToolchainInfo]
-        if get_package_style(ctx) != PackageStyle("inplace") and python_toolchain.pyc_compilation_enabled:
+        if python_toolchain.pyc_compilation_enabled:
             bytecode_manifest = compile_manifests(ctx, [src_manifest])
 
     all_default_resources = {}
@@ -176,14 +183,23 @@ def python_executable(
     if outplace_resources:
         all_outplace_resources.update(outplace_resources)
 
+    binary_default_resources, binary_standalone_resources, binary_outplace_resources = py_resources_deduped(
+        ctx,
+        [
+            ("", all_default_resources),
+            ("_standalone", all_standalone_resources),
+            ("_outplace", all_outplace_resources),
+        ],
+    )
+
     library_info = create_python_library_info(
         ctx.actions,
         ctx.label,
         srcs = src_manifest,
         src_types = src_manifest,
-        default_resources = py_resources(ctx, all_default_resources) if all_default_resources else None,
-        standalone_resources = py_resources(ctx, all_standalone_resources, "_standalone") if all_standalone_resources else None,
-        outplace_resources = py_resources(ctx, all_outplace_resources, "_outplace") if all_outplace_resources else None,
+        default_resources = binary_default_resources,
+        standalone_resources = binary_standalone_resources,
+        outplace_resources = binary_outplace_resources,
         bytecode = bytecode_manifest,
         deps = python_deps,
         shared_libraries = shared_deps,
@@ -241,7 +257,8 @@ def _add_executable_subtargets(
     })
 
     # Type check
-    type_checker = python_toolchain.type_checker
+    typing_enabled = ctx.attrs.typing != None and ctx.attrs.typing != False
+    type_checker = ctx.attrs.typing[RunInfo] if typing_enabled and ctx.attrs.typing != True else python_toolchain.type_checker
     validation_output = None
 
     if type_checker != None:
@@ -252,12 +269,12 @@ def _add_executable_subtargets(
             python_deps,
             typeshed = python_toolchain.typeshed_stubs,
             py_version = ctx.attrs.py_version_for_type_checking,
-            typing_enabled = ctx.attrs.typing,
+            typing_enabled = typing_enabled,
             sharding_enabled = ctx.attrs.shard_typing,
         )
         exe.sub_targets.update({"typecheck": [type_check_info]})
 
-        if ctx.attrs.typing and ctx.attrs.typing_validation:
+        if typing_enabled and ctx.attrs.typing_validation:
             validation_output = create_type_check_validation(ctx, type_check_info.default_outputs[0])
 
     return exe, validation_output
@@ -280,6 +297,7 @@ def _compute_pex_providers(
     linker_map_data = None,
     gc_sections_data = None,
     native_runtime_files = [],
+    build_info_manifest_entries = None,
 ) -> list[Provider] | Promise:
     dbg_source_db_output = ctx.actions.declare_output("dbg-db.json", has_content_based_path = True)
     dbg_source_db = create_dbg_source_db(ctx, dbg_source_db_output, src_manifest, python_deps)
@@ -460,6 +478,7 @@ def _compute_pex_providers(
         allow_cache_upload = allow_cache_upload,
         debuginfo_files = debuginfo_files,
         link_args = link_args,
+        manifest_entries_overlay = build_info_manifest_entries,
     )
 
     pex.sub_targets.update(extra)
@@ -543,6 +562,12 @@ def _convert_python_library_to_executable(
     native_runtime_files = []
 
     if link_strategy == NativeLinkStrategy("native"):
+        invalidate_build_info_on_python_sources = getattr(ctx.attrs, "_generated_build_info_enabled", False) and ctx.attrs._generated_build_info_mode == "full"
+        generated_build_info_invalidation_deps = deps if invalidate_build_info_on_python_sources else []
+        generated_build_info_invalidation_sources = (
+            [artifact for artifact, _ in src_manifest.artifacts] if invalidate_build_info_on_python_sources and src_manifest != None else []
+        )
+
         use_anon_target = getattr(ctx.attrs, "use_anon_target_for_analysis", False)
         if use_anon_target:
             native_deps = {}
@@ -557,8 +582,10 @@ def _convert_python_library_to_executable(
                 "allow_cache_upload": allow_cache_upload,
                 "deps": list(native_deps.values()),
                 "dlopen_deps": list(dlopen_deps.values()),
+                "generated_build_info_invalidation_deps": generated_build_info_invalidation_deps,
+                "generated_build_info_invalidation_sources": generated_build_info_invalidation_sources,
                 "name": "python_linking:" + ctx.attrs.name,
-                "package_style": package_style,
+                "package_style": package_style.value,
                 "rpath": ctx.attrs.name,
                 "shared_only_deps": list(shared_only_deps.values()),
                 "static_extension_utils": ctx.attrs.static_extension_utils,
@@ -592,16 +619,21 @@ def _convert_python_library_to_executable(
                     providers[LinkProviders].linker_map_data,
                     providers[LinkProviders].gc_sections_data,
                     native_runtime_files = providers[LinkProviders].runtime_files,
+                    build_info_manifest_entries = providers[LinkProviders].build_info_manifest_entries,
                 )
             )
         else:
-            shared_libs, extensions, link_args, extra, extra_artifacts, linker_map_data, gc_sections_data, native_runtime_files = process_native_linking(
-                ctx,
-                deps,
-                python_toolchain,
-                python_internal_tools,
-                package_style,
-                allow_cache_upload,
+            shared_libs, extensions, link_args, extra, extra_artifacts, linker_map_data, gc_sections_data, native_runtime_files, build_info_manifest_entries = (
+                process_native_linking(
+                    ctx,
+                    deps,
+                    python_toolchain,
+                    python_internal_tools,
+                    package_style,
+                    allow_cache_upload,
+                    generated_build_info_invalidation_deps = generated_build_info_invalidation_deps,
+                    generated_build_info_invalidation_sources = generated_build_info_invalidation_sources,
+                )
             )
             if ctx.attrs.runtime_bundle:
                 runtime_bundle = ctx.attrs.runtime_bundle[PythonRuntimeBundleInfo]
@@ -624,6 +656,7 @@ def _convert_python_library_to_executable(
                     )
 
     else:
+        build_info_manifest_entries = None
         linker_map_data = None
         gc_sections_data = None
         extensions = {}
@@ -660,6 +693,7 @@ def _convert_python_library_to_executable(
         linker_map_data = linker_map_data if link_strategy == NativeLinkStrategy("native") else None,
         gc_sections_data = gc_sections_data if link_strategy == NativeLinkStrategy("native") else None,
         native_runtime_files = native_runtime_files,
+        build_info_manifest_entries = build_info_manifest_entries,
     )
 
 def python_binary_impl(ctx: AnalysisContext) -> list[Provider] | Promise:
@@ -702,3 +736,109 @@ def python_binary_impl(ctx: AnalysisContext) -> list[Provider] | Promise:
         allow_cache_upload = cxx_attrs_get_allow_cache_upload(ctx.attrs, toolchain_allow_cache_upload),
         executable_type = ExecutableType("binary"),
     )
+
+def _package_python_binary_remotely():
+    return select({
+        "DEFAULT": False,
+        "config//os/constraints:android": True,
+    })
+
+python_binary = prelude_rule(
+    name = "python_binary",
+    impl = python_binary_impl,
+    docs = """
+        A `python_binary()` rule is used to build an executable Python package
+        that includes Python sources and resources from all transitive
+        dependencies.
+    """,
+    examples = """
+        Build an executable from the Python files in the BUCK directory.
+
+        ```
+        # BUCK
+
+        python_binary(
+          name = 'tailer',
+          main_module = 'tailer',
+          deps = [
+            ':tailerutils',
+          ],
+        )
+
+        python_library(
+          name = 'tailerutils',
+          # The main module, tailer.py, is specified here.
+          # (Separated out from the glob pattern for clarity.)
+          srcs = glob(['tailer.py', '*.py']),
+        )
+        ```
+    """,
+    further = None,
+    attrs = (
+        # @unsorted-dict-items
+        {k: attrs.default_only(v) for k, v in cxx_binary_base_attrs().items()}
+        | buck.labels_arg()
+        | {
+            "base_module": attrs.option(
+                attrs.string(),
+                default = None,
+                doc = """
+                The package in which the main module should reside in its final
+                 location in the binary. If unset, Buck uses the project-relative directory
+                 that contains the BUCK file.
+            """,
+            ),
+            "main": attrs.option(
+                attrs.source(),
+                default = None,
+                doc = """
+                The Python file which serves as the entry point for the binary.
+                 The interpreter initiates execution of the binary with the code in this file.
+            """,
+            ),
+            "main_module": attrs.option(
+                attrs.string(),
+                default = None,
+                doc = """
+                The python module that should be the entry point of the binary. This should be
+                 a module name within a `python_library` that this binary depends on. Note that
+                 module names take `base_module` of the library into account.
+                 This property is mutually exclusive with `main`, and should be preferred to `main`, which is deprecated.
+            """,
+            ),
+        }
+        | python_common.deps_arg()
+        | python_common.version_selections_arg()
+        | python_common.preload_deps_arg()
+        | python_common.package_style_arg()
+        | python_common.linker_flags_arg()
+        | python_common.deduplicate_merged_link_roots()
+        | python_common.executable_deps_arg()
+        | native_common.link_group_deps()
+        | native_common.transformation_spec_arg()
+        | native_common.link_group_public_deps_label()
+        | {
+            "build_args": attrs.list(attrs.arg(), default = []),
+            "compile": attrs.option(attrs.bool(), default = None),
+            "dummy_omnibus": attrs.option(attrs.dep(), default = None),
+            "extension": attrs.option(attrs.string(), default = None),
+            "prefer_stripped_native_objects": attrs.bool(default = False),
+            "repl_main": attrs.option(attrs.string(), default = None),
+            "repl_only_deps": attrs.list(attrs.dep(), default = []),
+            "zip_safe": attrs.option(attrs.bool(), default = None),
+        }
+        | buck.licenses_arg()
+        | buck.contacts_arg()
+        | buck.allow_cache_upload_arg()
+        | typing_arg()
+        | python_executable_attrs()
+        | {
+            "link_style": attrs.enum(LinkableDepType, default = "static"),
+            "_package_remotely": attrs.bool(default = _package_python_binary_remotely()),
+            "_python_internal_tools": python_common.internal_tools_arg(),
+            "_python_toolchain": toolchains_common.python(),
+        }
+        | validation_common.attrs_validators_arg()
+    ),
+    cfg = constraint_overrides.python_transition,
+)

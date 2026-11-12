@@ -20,6 +20,7 @@ load(
 GraphQLiOSInfo = record(
     header_path_prefix = str | None,
     force_export_fragment_headers = bool,
+    fragment_models_use_classes = bool,
     use_implicit_codegen = bool,
 )
 
@@ -59,6 +60,12 @@ GraphQLMobileConfigInput = provider(
     },
 )
 
+GraphQLMockDataInput = provider(
+    fields = {
+        "artifacts": provider_field(ArtifactTSet),
+    },
+)
+
 def _graphql_info_provider(label: Label, deps: list[Dependency]) -> list[Provider]:
     return [dep[GraphQLInfo] for dep in deps if GraphQLInfo in dep and dep[GraphQLInfo].target == label]
 
@@ -67,6 +74,9 @@ def graphql_codegen_sets(deps: list[Dependency]) -> list[ArtifactTSet]:
 
 def graphql_mobileconfig_sets(deps: list[Dependency]) -> list[ArtifactTSet]:
     return [dep[GraphQLMobileConfigInput].artifacts for dep in deps if GraphQLMobileConfigInput in dep]
+
+def graphql_mock_data_sets(deps: list[Dependency]) -> list[ArtifactTSet]:
+    return [dep[GraphQLMockDataInput].artifacts for dep in deps if GraphQLMockDataInput in dep]
 
 def graphql_providers(ctx: AnalysisContext) -> list[Provider]:
     deps = cxx_attr_deps(ctx)
@@ -88,6 +98,14 @@ def graphql_providers(ctx: AnalysisContext) -> list[Provider]:
         providers.append(
             GraphQLMobileConfigInput(
                 artifacts = make_artifact_tset(actions = ctx.actions, children = mobileconfig_sets),
+            ),
+        )
+
+    mock_data_sets = graphql_mock_data_sets(all_deps)
+    if mock_data_sets:
+        providers.append(
+            GraphQLMockDataInput(
+                artifacts = make_artifact_tset(actions = ctx.actions, children = mock_data_sets),
             ),
         )
 

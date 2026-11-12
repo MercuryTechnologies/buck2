@@ -7,6 +7,9 @@
 # above-listed licenses.
 
 load("@prelude//:paths.bzl", "paths")
+load("@prelude//:prelude_rule.bzl", "prelude_rule")
+load("@prelude//tests:re_utils.bzl", "get_re_executors_from_props")
+load(":attrs.bzl", "erlang_rule_attributes")
 load(
     ":erlang_build.bzl",
     "erlang_build",
@@ -188,16 +191,22 @@ def _build_erlang_test(ctx: AnalysisContext, dep_info: ErlangDependencyInfo, bin
         additional_args = additional_shell_args,
     )
 
-    re_executor = get_re_executor_from_props(ctx)
+    # Setup RE executors based on the `remote_execution` param.
+    re_executors = get_re_executors_from_props(ctx)
     external_runner_info = ExternalRunnerTestInfo(
         type = "erlang_test",
         command = [cmd],
         env = ctx.attrs.env,
-        labels = ctx.attrs.labels,
+        labels = ctx.attrs.labels
+        + [
+            "tpx:supports-test-result-output-spec",
+            "tpx:bundled-tests-have-per-test-details",
+        ],
         contacts = ctx.attrs.contacts,
         run_from_project_root = True,
         use_project_relative_paths = True,
-        default_executor = re_executor,
+        default_executor = re_executors.default_executor,
+        executor_overrides = re_executors.executor_overrides,
     )
     test_info = ErlangTestInfo(
         name = suite_name,
@@ -287,7 +296,12 @@ def link_output(ctx: AnalysisContext, beam: Artifact, data_dir: [Artifact, None]
     }
     if data_dir:
         link_spec[data_dir.basename] = data_dir
-    return ctx.actions.symlinked_dir(ctx.attrs.name, link_spec, has_content_based_path = False)
+
+    # Keep this name short. Common Test names each run's log directory after the last two
+    # components of this path (`ct_run:get_name/1`, here `__<target>__.suite`), followed by the
+    # suite, the group and, for a single-case run, the case name. That name must fit the 255-byte
+    # file name limit, or CT cannot create the log directory and runs nothing.
+    return ctx.actions.symlinked_dir("suite", link_spec, has_content_based_path = False)
 
 def generate_file_map_target(suite: str, prefix: str | None, dir_name: str) -> str | None:
     suite_dir = paths.dirname(suite)
@@ -324,29 +338,65 @@ def is_target(suite: str) -> bool:
         return True
     return False
 
-def get_re_executor_from_props(ctx: AnalysisContext) -> [CommandExecutorConfig, None]:
-    """
-    Convert the `remote_execution` properties param into a `CommandExecutorConfig`
-    to use with test providers.
-    """
+erlang_test = prelude_rule(
+    name = "erlang_test",
+    impl = erlang_test_impl,
+    docs = """
+        The `erlang_test` ruls defines a test target for a single test suite. In most cases you
+        want to define multiple suites in one go. The `erlang_tests` macro allows users to generate
+        `erlang_test` targets for multiple test suites. Each suite `<name>_SUITE.erl` will have a
+        generated hidden `erlang_test` target whose name is `<name>_SUITE`.
 
-    re_props = ctx.attrs.remote_execution
-    if re_props == None:
-        return None
+        Each `erlang_test` target implements tests using the Common Test library
+        [OTP documentation](https://www.erlang.org/doc/man/common_test.html). They can,
+        although **it is not recommended**, also act as dependencies of other tests. The
+        default output of this rule is a "test_folder", consisting of the compiled test suite
+        and the data directory.
 
-    re_props_copy = dict(re_props)
-    capabilities = re_props_copy.pop("capabilities")
-    use_case = re_props_copy.pop("use_case")
-    remote_cache_enabled = re_props_copy.pop("remote_cache_enabled", None)
-    if re_props_copy:
-        unexpected_props = ", ".join(re_props_copy.keys())
-        fail("found unexpected re props: " + unexpected_props)
+        For each suite  `<name>_SUITE.erl`, if a data_dir `<name>_SUITE_data` is present along the suite,
+        (as per [the data_dir naming scheme for ct](https://www.erlang.org/doc/apps/common_test/write_test_chapter.html#data-and-private-directories)),
+        it will automatically adds the corresponding resource target to the generated test target of the suite.
+        Resources will be placed in the [Data directory (data_dir)](https://www.erlang.org/doc/apps/common_test/write_test_chapter.html#data_priv_dir)
+        of each of the suite.
 
-    return CommandExecutorConfig(
-        local_enabled = False,
-        remote_enabled = True,
-        remote_execution_properties = capabilities,
-        remote_execution_use_case = use_case or "tpx-default",
-        remote_cache_enabled = remote_cache_enabled,
-        remote_execution_action_key = None,
-    )
+        It allows the writer of the rule to add global configuration files and global default
+        dependencies (e.g `meck`). These ones should be specified using global
+        variables `erlang.erlang_tests_default_apps` and `erlang.erlang_tests_default_config`
+        respectively.
+
+        The `erlang_tests` macro forwards all attributes to the `erlang_test`. It defines some attributes
+        that control how the targets get generated:
+        - `srcs` ([source]): Set of files that the suites might depend on and that are not part of any specific application.
+          A "meta" application having those files as sources will automatically be created, and included in the dependencies
+          of the tests.
+
+        One can call
+        - `buck2 build //my_app:test_SUITE` to compile the test files together with its dependencies.
+        - `buck2 test //my_app:other_test_SUITE` to run the test.
+        - `buck2 run //my_app:other_test_SUITE` to open an interactive test shell, where tests can be run iteratively.
+
+        buck2 test will rely on tpx to run the suite. To get access to tpx commands, add `--` after the
+        target. For example:
+
+        - `buck2 test //my_app:other_test_SUITE -- --help` will print the list of tpx available
+        command line parameters.
+        - `buck2 test //my_app:other_test_SUITE -- group.mycase` will only run those test cases
+        that match the pattern `group.mycase`
+    """,
+    examples = """
+        erlang_test(
+            name = "unit_test_SUITE",
+            suite = "unit_test_SUTIE.erl",
+            deps = [":my_other_app"],
+            contacts = ["author@email.com"],
+        )
+
+        erlang_tests(
+            suites = ["test_SUITE.erl", "other_test_SUITE".erl],
+            deps = [":my_app"],
+            contacts = ["author@email.com"],
+        )
+    """,
+    further = None,
+    attrs = erlang_rule_attributes["erlang_test"],
+)

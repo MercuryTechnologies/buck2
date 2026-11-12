@@ -11,12 +11,13 @@ load(
     "ArtifactOutputs",  # @unused Used as a type
     "unpack_artifact_map",
 )
-load("@prelude//:attrs_validators.bzl", "get_attrs_validation_specs")
+load("@prelude//:attrs_validators.bzl", "get_attrs_validation_specs", "validation_common")
 load("@prelude//:paths.bzl", "paths")
+load("@prelude//:prelude_rule.bzl", "prelude_rule")
 load(
     "@prelude//:resources.bzl",
-    "ResourceInfo",
     "gather_resources",
+    "make_resource_info",
 )
 load("@prelude//cxx:cxx_link_utility.bzl", "shared_libs_symlink_tree_name")
 load(
@@ -24,6 +25,9 @@ load(
     "get_excluded",
     "get_roots",
 )
+load("@prelude//decls:common.bzl", "buck")
+load("@prelude//decls:third_party_common.bzl", "third_party_common")
+load("@prelude//decls:toolchains_common.bzl", "toolchains_common")
 load(
     "@prelude//linking:link_info.bzl",
     "LinkedObject",  # @unused Used as a type
@@ -35,7 +39,7 @@ load(
     "create_linkable_graph_node",
 )
 load("@prelude//linking:shared_libraries.bzl", "SharedLibraryInfo", "merge_shared_libraries")
-load("@prelude//linking:stamp_build_info.bzl", "PRE_STAMPED_SUFFIX")
+load("@prelude//python:attrs.bzl", "create_manifest_for_source_dir_attr", "python_common", "typing_arg")
 load(
     "@prelude//python/linking:native_python_util.bzl",
     "merge_cxx_extension_info",
@@ -51,7 +55,7 @@ load("@prelude//unix:providers.bzl", "UnixEnv", "create_unix_env_info")
 load("@prelude//utils:arglike.bzl", "ArgLike")  # @unused Used as a type
 load("@prelude//utils:expect.bzl", "expect")
 load("@prelude//utils:utils.bzl", "from_named_set")
-load(":compile.bzl", "PycInvalidationMode", "compile_manifests")
+load(":compile.bzl", "compile_manifests")
 load(":lazy_imports.bzl", "get_lazy_imports_analyzer", "run_lazy_imports_library_analyzer")
 load(
     ":manifest.bzl",
@@ -116,7 +120,7 @@ def create_python_library_info(
     is_native_dep: bool,
     srcs: [ManifestInfo, None] = None,
     src_types: [ManifestInfo, None] = None,
-    bytecode: [dict[PycInvalidationMode, ManifestInfo], None] = None,
+    bytecode: [ManifestInfo, None] = None,
     default_resources: [(ManifestInfo, list[ArgLike]), None] = None,
     standalone_resources: [(ManifestInfo, list[ArgLike]), None] = None,
     outplace_resources: [(ManifestInfo, list[ArgLike]), None] = None,
@@ -266,6 +270,37 @@ def py_attr_resources(ctx: AnalysisContext) -> (dict[str, ArtifactOutputs], dict
 
     return default_resources, standalone_resources, outplace_resources
 
+def py_resources_deduped(ctx: AnalysisContext, keyed_resources: list[(str, dict[str, ArtifactOutputs])]) -> list[[(ManifestInfo, list[ArgLike]), None]]:
+    """
+    Build one resource manifest per entry, aliasing entries whose resource
+    maps are identical to a single manifest (the maps only diverge when a
+    resource dep exposes style-specific subtargets). Returns one result per
+    entry, None for empty maps.
+    """
+    built = []
+    results = []
+    for suffix, resources in keyed_resources:
+        if not resources:
+            results.append(None)
+            continue
+        result = None
+        for seen_resources, seen_result in built:
+            if resources == seen_resources:
+                result = seen_result
+                break
+        if result == None:
+            result = py_resources(ctx, resources, suffix)
+            built.append((resources, result))
+        results.append(result)
+    return results
+
+def _is_shared_libs_symlink_tree_of(o: Artifact, binary: Artifact) -> bool:
+    # The tree is named after the linker output, which carries a suffix for
+    # each post-link stage (BOLT, build info stamping, etc.) that later renames
+    # the binary. See `get_cxx_post_link_suffix`.
+    prefix, _, suffix = shared_libs_symlink_tree_name(binary.short_path).partition(binary.short_path)
+    return o.basename.startswith(prefix + binary.short_path) and o.basename.endswith(suffix)
+
 def py_resources(ctx: AnalysisContext, resources: dict[str, ArtifactOutputs], suffix: str = "") -> (ManifestInfo, list[ArgLike]):
     """
     Generate a manifest to wrap this rules resources.
@@ -275,24 +310,7 @@ def py_resources(ctx: AnalysisContext, resources: dict[str, ArtifactOutputs], su
     for name, resource in resources.items():
         for o in resource.nondebug_runtime_files:
             # HACK: this is a heuristic to detect shared libs emitted from cpp_binary rules.
-            if isinstance(o, Artifact) and (
-                (
-                    o.basename
-                    == (
-                        shared_libs_symlink_tree_name(
-                            resource.default_output.short_path,
-                        )
-                    )
-                )
-                or (
-                    o.basename
-                    == (
-                        shared_libs_symlink_tree_name(
-                            resource.default_output.short_path + PRE_STAMPED_SUFFIX,
-                        )
-                    )
-                )
-            ):
+            if isinstance(o, Artifact) and _is_shared_libs_symlink_tree_of(o, resource.default_output):
                 # Package the binary's shared libs next to the binary
                 # (the path is stored in RPATH relative to the binary).
                 d[paths.join(paths.dirname(name), o.basename)] = o
@@ -342,19 +360,32 @@ def python_library_impl(ctx: AnalysisContext) -> list[Provider]:
 
     src_manifest = create_manifest_for_source_map(ctx, "srcs", qualified_srcs) if qualified_srcs else None
     python_toolchain = ctx.attrs._python_toolchain[PythonToolchainInfo]
-    src_type_manifest = create_manifest_for_source_map(ctx, "type_stubs", src_types) if src_types else None
+
+    # For the common all-`.py`, no-stub-override case the type manifest lists
+    # exactly the srcs, so reuse that manifest instead of writing a copy.
+    if src_types == qualified_srcs:
+        src_type_manifest = src_manifest
+    elif src_types:
+        src_type_manifest = create_manifest_for_source_map(ctx, "type_stubs", src_types)
+    else:
+        src_type_manifest = None
 
     # Compile bytecode.
     bytecode = None
     if src_manifest != None and python_toolchain.pyc_compilation_enabled:
         bytecode = compile_manifests(ctx, [src_manifest])
-        sub_targets["compile"] = [DefaultInfo(default_output = bytecode[PycInvalidationMode("unchecked_hash")].artifacts[0][0])]
+        sub_targets["compile"] = [DefaultInfo(default_output = bytecode.artifacts[0][0])]
         sub_targets["src-manifest"] = [DefaultInfo(default_output = src_manifest.manifest, other_outputs = [a for a, _ in src_manifest.artifacts])]
 
     raw_deps = ctx.attrs.deps
-    default_resource_manifest = py_resources(ctx, default_resources) if default_resources else None
-    standalone_resource_manifest = py_resources(ctx, standalone_resources, "_standalone") if standalone_resources else None
-    outplace_resource_manifest = py_resources(ctx, outplace_resources, "_outplace") if outplace_resources else None
+    default_resource_manifest, standalone_resource_manifest, outplace_resource_manifest = py_resources_deduped(
+        ctx,
+        [
+            ("", default_resources),
+            ("_standalone", standalone_resources),
+            ("_outplace", outplace_resources),
+        ],
+    )
     deps, shared_libraries = gather_dep_libraries(raw_deps, resolve_versioned_deps = False)
     providers.append(gather_versioned_dependencies(raw_deps))
 
@@ -381,7 +412,6 @@ def python_library_impl(ctx: AnalysisContext) -> list[Provider]:
         lazy_imports_cache = lazy_imports_cache_output,
     )
     providers.append(library_info)
-
     providers.append(
         create_unix_env_info(
             actions = ctx.actions,
@@ -452,7 +482,8 @@ def python_library_impl(ctx: AnalysisContext) -> list[Provider]:
         sub_targets["lazy-import-cache"] = [DefaultInfo(default_output = lazy_imports_cache_output)]
 
     # Type check
-    type_checker = python_toolchain.type_checker
+    typing_enabled = ctx.attrs.typing != None and ctx.attrs.typing != False
+    type_checker = ctx.attrs.typing[RunInfo] if typing_enabled and ctx.attrs.typing != True else python_toolchain.type_checker
     pyre_validation_spec = None
     if type_checker != None:
         type_check_info = create_per_target_type_check(
@@ -462,13 +493,13 @@ def python_library_impl(ctx: AnalysisContext) -> list[Provider]:
             deps,
             typeshed = python_toolchain.typeshed_stubs,
             py_version = ctx.attrs.py_version_for_type_checking,
-            typing_enabled = ctx.attrs.typing,
+            typing_enabled = typing_enabled,
             sharding_enabled = ctx.attrs.shard_typing,
         )
         sub_targets["typecheck"] = [type_check_info]
 
         # Build-time type check validation (separate action for sole-output constraint)
-        if ctx.attrs.typing and ctx.attrs.typing_validation:
+        if typing_enabled and ctx.attrs.typing_validation:
             validation_output = create_type_check_validation(ctx, type_check_info.default_outputs[0])
             pyre_validation_spec = ValidationSpec(name = "pyre", validation_result = validation_output)
 
@@ -508,12 +539,12 @@ def python_library_impl(ctx: AnalysisContext) -> list[Provider]:
 
     # C++ resources.
     providers.append(
-        ResourceInfo(
-            resources = gather_resources(
+        make_resource_info(
+            gather_resources(
                 label = ctx.label,
                 deps = raw_deps,
-            )
-        )
+            ),
+        ),
     )
 
     # Attrs validators (combined with optional pyre type-check validation spec).
@@ -524,3 +555,78 @@ def python_library_impl(ctx: AnalysisContext) -> list[Provider]:
         providers.append(ValidationInfo(validations = attr_validation_specs))
 
     return providers
+
+python_library = prelude_rule(
+    name = "python_library",
+    impl = python_library_impl,
+    docs = """
+        A `python_library()` rule is used to group together Python
+        source files and resources to be passed together in as a `dep` of other rules.
+    """,
+    examples = """
+        Include Python source files and resource files.
+
+        ```
+        # BUCK
+
+        # A rule that includes a single Python file.
+        python_library(
+          name = 'fileutil',
+          srcs = ['fileutil.py'],
+          deps = [
+            '//third_party/python-magic:python-magic',
+          ],
+        )
+
+        # A rule that uses glob() to include all Python source files in the
+        # directory in which the rule is defined. The rule also specifies a
+        # resource file that gets packaged with the source file.
+        python_library(
+          name = 'testutil',
+          srcs = glob(['testutil/**/*.py']),
+          resources = [
+            'testdata.dat',
+          ],
+        )
+        ```
+    """,
+    further = None,
+    attrs = (
+        # @unsorted-dict-items
+        buck.labels_arg()
+        | python_common.srcs_arg()
+        | python_common.resources_arg()
+        | python_common.base_module_arg()
+        | python_common.deps_arg()
+        | python_common.exclude_deps_from_merged_linking_arg()
+        | third_party_common.create_third_party_build_root_attrs()
+        | {
+            "ignore_compile_errors": attrs.bool(default = False),
+            "lazy_imports_analyzer": attrs.option(attrs.exec_dep(providers = [RunInfo]), default = None),
+            "resources": attrs.named_set(
+                attrs.one_of(attrs.dep(), attrs.source(allow_directory = True)),
+                sorted = True,
+                default = [],
+                doc = """
+                Static files to be packaged along with the Python sources.
+                 These resources can be accessed at runtime using
+                 the [importlib.resources](https://docs.python.org/3/library/importlib.resources.html) module
+                 from the Python standard library.
+            """,
+            ),
+            "type_stubs": attrs.named_set(attrs.source(), sorted = True, default = []),
+            "use_lifeguard_incremental": attrs.bool(default = False),
+            "versioned_resources": attrs.option(attrs.versioned(attrs.named_set(attrs.source(), sorted = True)), default = None),
+            "versioned_srcs": attrs.option(attrs.versioned(attrs.named_set(attrs.source(), sorted = True)), default = None),
+            "zip_safe": attrs.option(attrs.bool(), default = None),
+            "_create_manifest_for_source_dir": create_manifest_for_source_dir_attr(),
+            "_cxx_toolchain": toolchains_common.cxx(),
+            "_python_internal_tools": python_common.internal_tools_arg(),
+            "_python_toolchain": toolchains_common.python(),
+        }
+        | buck.licenses_arg()
+        | buck.contacts_arg()
+        | typing_arg()
+        | validation_common.attrs_validators_arg()
+    ),
+)

@@ -7,7 +7,6 @@
 # of this source tree. You may select, at your option, one of the
 # above-listed licenses.
 
-# pyre-strict
 
 import argparse
 import json
@@ -44,7 +43,7 @@ def convert_type_check_result(input_path: Path, output_path: Path) -> None:
                 continue
             if (
                 error["code"] == 0
-                or error.get("name") == "unused-ignore"
+                or error.get("name") in ("unused-ignore", "unused-type-ignore")
                 or error.get("severity") in ("info", "ignore", "warn")
             ):
                 continue

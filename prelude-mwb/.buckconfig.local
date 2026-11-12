@@ -1,0 +1,7 @@
+# lab: prelude-mwb/ is mwb's prelude, carried as data for the bundled cell
+# (app/buck2_external_cells_bundled), not a prelude this tree builds with.
+# One build file for the whole directory means mercury-head's own BUCK files
+# are never evaluated against the tree's prelude/, which is the lab line's.
+# BUCK.lab_bundled and this file are lab's and are left out of the bundle.
+[buildfile]
+  name_v2 = BUCK.lab_bundled

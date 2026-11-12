@@ -79,6 +79,12 @@ public class TestAndroidDevice implements AndroidDevice {
   }
 
   @Override
+  public InstalledApk compareInstalledApk(String packageName, File apk, boolean exact)
+      throws Exception {
+    throw new UnsupportedOperationException();
+  }
+
+  @Override
   public ImmutableSortedSet<Path> listDirRecursive(Path dirPath) throws Exception {
     throw new UnsupportedOperationException();
   }
@@ -90,11 +96,6 @@ public class TestAndroidDevice implements AndroidDevice {
 
   @Override
   public void rmStaleFiles(String packageName) {
-    throw new UnsupportedOperationException();
-  }
-
-  @Override
-  public AutoCloseable createForward() throws Exception {
     throw new UnsupportedOperationException();
   }
 
@@ -161,7 +162,7 @@ public class TestAndroidDevice implements AndroidDevice {
   }
 
   @Override
-  public List<String> getDiskSpace(boolean humanReadable) {
+  public List<String> getDiskSpace() {
     return Arrays.asList("_", "_", "_");
   }
 

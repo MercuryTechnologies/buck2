@@ -7,7 +7,7 @@ oncall("build_infra")
 bundled_cell(
     name = "prelude",
     include_from_file = "src/lib.rs",
-    source_listing = "prelude//:source_listing",
+    source_listing = "prelude_mwb//:source_listing",
 )
 
 rust_library(

@@ -7,6 +7,7 @@
 # above-listed licenses.
 
 load("@prelude//:paths.bzl", "paths")
+load(":package_root.bzl", "strip_package_root")
 load(":toolchain.bzl", "GoToolchainInfo", "get_toolchain_env_vars")
 
 GoListError = record(
@@ -18,6 +19,7 @@ GoListOut = record(
     name = field(str),
     imports = field(list[str], default = []),
     test_imports = field(list[str], default = []),
+    x_test_imports = field(list[str], default = []),
     go_files = field(list[Artifact], default = []),
     h_files = field(list[Artifact], default = []),
     c_files = field(list[Artifact], default = []),
@@ -33,7 +35,14 @@ GoListOut = record(
     cgo_cppflags = field(list[str], default = []),
     embed_patterns = field(list[str], default = []),
     test_embed_patterns = field(list[str], default = []),
+    x_test_embed_patterns = field(list[str], default = []),
     error = field(GoListError | None, default = None),
+)
+
+GoListDynamicValue = provider(
+    fields = {
+        "go_list_out": provider_field(GoListOut),
+    },
 )
 
 def go_list(
@@ -45,14 +54,14 @@ def go_list(
     build_tags: list[str],
     cgo_enabled: bool,
     with_tests: bool,
-) -> Artifact:
+) -> DynamicValue:
     env = get_toolchain_env_vars(go_toolchain)
 
     go_list_out = actions.declare_output(paths.basename(pkg_import_path) + "_go_list.json", has_content_based_path = True)
 
     srcs_dir = actions.symlinked_dir(
         "__{}_srcs_dir__".format(paths.basename(pkg_import_path)),
-        {src.short_path.removeprefix(package_root).lstrip("/"): src for src in srcs},
+        {strip_package_root(src.short_path, package_root): src for src in srcs},
         has_content_based_path = True,
     )
     all_tags = [] + go_toolchain.build_tags + build_tags
@@ -73,9 +82,17 @@ def go_list(
     identifier = paths.basename(pkg_import_path)
     actions.run(go_list_args, env = env, category = "go_list", identifier = identifier, allow_cache_upload = go_toolchain.allow_cache_upload)
 
-    return go_list_out
+    return actions.dynamic_output_new(
+        _parse_go_list(
+            srcs = srcs,
+            package_root = package_root,
+            go_list_out = go_list_out,
+        )
+    )
 
-def parse_go_list_out(srcs: list[Artifact], package_root: str, go_list_out: ArtifactValue) -> GoListOut:
+# buildifier: disable=unused-variable
+def _parse_go_list_impl(actions: AnalysisActions, srcs: list[Artifact], package_root: str, go_list_out: ArtifactValue) -> list[Provider]:
+    _ = actions
     go_list = go_list_out.read_json()
     go_files, cgo_files, h_files, c_files, cxx_files, s_files, syso_files, test_go_files, x_test_go_files, ignored_go_files, ignored_other_files = (
         [],
@@ -93,7 +110,7 @@ def parse_go_list_out(srcs: list[Artifact], package_root: str, go_list_out: Arti
 
     for src in srcs:
         # remove package_root prefix from src artifact path to match `go list` output format
-        src_path = src.short_path.removeprefix(package_root).lstrip("/")
+        src_path = strip_package_root(src.short_path, package_root)
         if src_path in go_list.get("GoFiles", []):
             go_files.append(src)
         if src_path in go_list.get("CgoFiles", []):
@@ -120,16 +137,19 @@ def parse_go_list_out(srcs: list[Artifact], package_root: str, go_list_out: Arti
     name = go_list.get("Name", "")
     imports = go_list.get("Imports", [])
     test_imports = go_list.get("TestImports", [])
+    x_test_imports = go_list.get("XTestImports", [])
     cgo_cflags = go_list.get("CgoCFLAGS", [])
     cgo_cppflags = go_list.get("CgoCPPFLAGS", [])
     embed_patterns = go_list.get("EmbedPatterns", [])
     test_embed_patterns = go_list.get("TestEmbedPatterns", [])
+    x_test_embed_patterns = go_list.get("XTestEmbedPatterns", [])
     error = _parse_error(go_list.get("Error", None))
 
-    return GoListOut(
+    go_list = GoListOut(
         name = name,
         imports = imports,
         test_imports = test_imports,
+        x_test_imports = x_test_imports,
         go_files = go_files,
         h_files = h_files,
         c_files = c_files,
@@ -145,8 +165,19 @@ def parse_go_list_out(srcs: list[Artifact], package_root: str, go_list_out: Arti
         ignored_other_files = ignored_other_files,
         embed_patterns = embed_patterns,
         test_embed_patterns = test_embed_patterns,
+        x_test_embed_patterns = x_test_embed_patterns,
         error = error,
     )
+    return [GoListDynamicValue(go_list_out = go_list)]
+
+_parse_go_list = dynamic_actions(
+    impl = _parse_go_list_impl,
+    attrs = {
+        "go_list_out": dynattrs.artifact_value(),
+        "package_root": dynattrs.value(str),
+        "srcs": dynattrs.value(list[Artifact]),
+    },
+)
 
 def _parse_error(error: dict | None) -> GoListError | None:
     if error == None:

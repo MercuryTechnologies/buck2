@@ -9,12 +9,16 @@
 # Implementation of the `genrule` build rule.
 
 load("@prelude//:cache_mode.bzl", "CacheModeInfo")
-load("@prelude//:genrule_local_labels.bzl", "genrule_labels_require_local")
-load("@prelude//:genrule_prefer_local_labels.bzl", "genrule_labels_prefer_local")
+load("@prelude//:genrule_local_labels.bzl", "resolved_genrule_labels_require_local")
+load("@prelude//:genrule_prefer_local_labels.bzl", "resolved_genrule_labels_prefer_local")
 load("@prelude//:genrule_toolchain.bzl", "GenruleToolchainInfo")
 load("@prelude//:is_full_meta_repo.bzl", "is_full_meta_repo")
+load("@prelude//:prelude_rule.bzl", "prelude_rule")
 load("@prelude//android:build_only_native_code.bzl", "is_build_only_native_code")
+load("@prelude//decls:common.bzl", "buck")
+load("@prelude//decls:genrule_common.bzl", "genrule_common")
 load("@prelude//os_lookup:defs.bzl", "Os", "OsLookup")
+load("@prelude//transitions:constraint_overrides.bzl", "constraint_overrides")
 load("@prelude//utils:expect.bzl", "expect")
 load("@prelude//utils:utils.bzl", "flatten", "value_or")
 
@@ -32,11 +36,7 @@ _BUILD_ROOT_LABELS = set([
     "haskell_hsc",
     "cql_cxx_genrule",
     "clang-module",
-    "cuda_build_root",
     "bundle_pch_genrule",  # Compiles C++, and so need to run from build root
-    "lpm_package",
-    "haskell_dll",
-    "fnlc_build",
     "udf_sql",
     "redex_genrule",  # T148016945
     "pxl",  # T151533831
@@ -71,10 +71,10 @@ def _requires_build_root(ctx: AnalysisContext) -> bool:
     return False
 
 def _requires_local(ctx: AnalysisContext) -> bool:
-    return genrule_labels_require_local(ctx.attrs.labels)
+    return resolved_genrule_labels_require_local(ctx.attrs.labels)
 
 def _prefers_local(ctx: AnalysisContext) -> bool:
-    return genrule_labels_prefer_local(ctx.attrs.labels)
+    return resolved_genrule_labels_prefer_local(ctx.attrs.labels)
 
 def _ignore_artifacts(ctx: AnalysisContext) -> bool:
     return "buck2_ignore_artifacts" in ctx.attrs.labels
@@ -84,6 +84,12 @@ def _requires_no_srcs_environment(ctx: AnalysisContext) -> bool:
 
 # We don't want to use cache mode in open source because the config keys that drive it aren't wired up
 _USE_CACHE_MODE = is_full_meta_repo()
+
+# The bash that runs a genrule's script, as an argv. The default
+# finds bash on PATH through /usr/bin/env, as upstream does; an execution
+# platform that should take nothing from /usr sets `[prelude] bash`, such as
+# `/bin/bash`. Read here, not in a shared .bzl, so this file gains no load.
+_BASH = read_root_config("prelude", "bash", "/usr/bin/env bash").split(" ")
 
 # Extra attributes required by every genrule based on genrule_impl
 def genrule_attributes() -> dict[str, Attr]:
@@ -166,6 +172,7 @@ _HEADER_EXTENSIONS = [
     ".hxx",
     ".cuh",
     ".inc",
+    ".tcc",
 ]
 
 def _is_header(path: str) -> bool:
@@ -308,15 +315,17 @@ def process_genrule(
         delimiter = " "
 
     # Setup environment variables.
-    srcs = cmd_args(delimiter = delimiter)
-    for symlink in symlinks:
-        srcs.add(cmd_args(srcs_artifact, format = path_sep.join([".", "{}", symlink.replace("/", path_sep)])))
+    no_srcs_environment = _requires_no_srcs_environment(ctx)
     env_vars = {
-        "GEN_DIR": "GEN_DIR_DEPRECATED",
         "OUT": out_env.as_output(),
         "SRCDIR": cmd_args(srcs_artifact, format = path_sep.join([".", "{}"])),
-        "SRCS": srcs,
-    } | {k: cmd_args(v) for k, v in getattr(ctx.attrs, "env", {}).items()}
+    }
+    if not no_srcs_environment:
+        srcs = cmd_args(delimiter = delimiter)
+        for symlink in symlinks:
+            srcs.add(cmd_args(srcs_artifact, format = path_sep.join([".", "{}", symlink.replace("/", path_sep)])))
+        env_vars["SRCS"] = srcs
+    env_vars |= {k: cmd_args(v) for k, v in getattr(ctx.attrs, "env", {}).items()}
 
     # RE will cache successful actions that don't produce the desired outptuts,
     # so if that happens and _then_ we add a local-only label, we'll get a
@@ -335,9 +344,6 @@ def process_genrule(
 
     if cacheable and cache_bust:
         env_vars["__BUCK2_ALLOW_CACHE_UPLOADS_CACHE_BUSTER"] = ""
-
-    if _requires_no_srcs_environment(ctx):
-        env_vars.pop("SRCS")
 
     for key, value in extra_env_vars.items():
         env_vars[key] = value
@@ -430,7 +436,7 @@ def process_genrule(
     if is_windows:
         script_args = ["cmd.exe", "/v:off", "/c", sh_script]
     else:
-        script_args = ["/usr/bin/env", "bash", "-e", sh_script]
+        script_args = _BASH + ["-e", sh_script]
 
     # Only set metadata arguments when they are non-null
     metadata_args = {}
@@ -491,3 +497,226 @@ def process_genrule(
     if getattr(ctx.attrs, "executable", False):
         providers.append(RunInfo(args = cmd_args(default_outputs)))
     return providers
+
+genrule = prelude_rule(
+    name = "genrule",
+    impl = genrule_impl,
+    docs = """
+        A `genrule()` is used to generate files from a shell
+         command. It must produce a single output file or folder.
+    """,
+    examples = """
+        This genrule() uses a Python script to derive a new
+         `AndroidManifest.xml` from an
+         `AndroidManifest.xml` in the source tree.
+        Note you don't need to prepend execution commands with
+         `python`: Buck knows how to execute different
+        kinds of binaries using `$(exe)` command.
+
+        ```
+        genrule(
+          name = 'generate_manifest',
+          srcs = [
+            'AndroidManifest.xml',
+          ],
+          bash = '$(exe //python/android:basic_to_full) ' \
+              '$SRCDIR/AndroidManifest.xml > $OUT',
+          cmd_exe = '$(exe //python/android:basic_to_full) ' \
+              '%SRCDIR%\\AndroidManifest.xml > %OUT%',
+          out = 'AndroidManifest.xml',
+        )
+        ```
+
+        ```
+        genrule(
+          name = 'generate_manifest_with_named_outputs',
+          srcs = [
+            'AndroidManifest.xml',
+          ],
+          bash = '$(exe //python/android:basic_to_full) ' \
+              '$SRCDIR/AndroidManifest.xml > $OUT/AndroidManifest.xml',
+          cmd_exe = '$(exe //python/android:basic_to_full) ' \
+              '%SRCDIR%\\AndroidManifest.xml > %OUT%\\AndroidManifest.xml',
+          outs =  {
+            "manifest": [ "AndroidManifest.xml" ],
+          },
+          default_outs = [ "AndroidManifest.xml" ],
+        )
+        ```
+
+        For named outputs, build with any of the following:
+
+        ```
+          buck build //:generate_manifest_with_named_outputs
+        ```
+
+        ```
+          buck build //:generate_manifest_with_named_outputs[manifest]
+        ```
+
+        Consume in `srcs` with:
+
+        ```
+        export_file(
+            name = "magic1",
+            src = ":generate_manifest_with_named_outputs",
+            out = "some_dir_to_copy_to/AndroidManifest.xml",
+        )
+        ```
+
+        ```
+        export_file(
+            name = "magic2",
+            src = ":generate_manifest_with_named_outputs[manifest]",
+            out = "some_dir_to_copy_to/AndroidManifest.xml",
+        )
+        ```
+
+        Note that `magic1` consumes `generate_manifest_with_named_outputs`'s default
+        output. `magic2` consumes `generate_manifest_with_named_outputs`'s named
+        output "manifest," which happen to be pointing to the same output as the default output in this
+        case, but they do not have to point to the same output.
+    """,
+    further = None,
+    attrs = (
+        # @unsorted-dict-items
+        genrule_common.srcs_arg()
+        | genrule_common.cmd_arg()
+        | genrule_common.bash_arg()
+        | genrule_common.cmd_exe_arg()
+        | genrule_common.type_arg()
+        | genrule_common.weight_arg()
+        | {
+            "default_outs": attrs.option(
+                attrs.set(attrs.string(), sorted = False),
+                default = None,
+                doc = """
+                Default output which must be present if the `outs` arg is present. Otherwise does not apply.
+
+                 If a rule with `outs` is consumed without an output label, the default output is returned. The
+                 default output does not need to be present in any of the named outputs defined in `outs`.
+
+                 Note that a maximum of one value may be present in this list. For example:
+
+                ```
+                default_outs = [ "output_one", ]
+                ```
+                is valid, whereas
+
+                ```
+                default_outs = [ "output_one", "output_two", ]
+                ```
+                is not.
+            """,
+            ),
+            "executable_outs": attrs.option(
+                attrs.set(attrs.string(), sorted = False),
+                default = None,
+                doc = """
+                Only valid if the `outs` arg is present. Dictates which of those named outputs are marked as
+                executable.
+            """,
+            ),
+            "out": attrs.option(
+                attrs.string(),
+                default = None,
+                doc = """
+                The name of the output file or directory. The complete path to this
+                 argument is provided to the shell command through
+                 the `OUT` environment variable. Only one of `out`
+                 or `outs` may be present.
+            """,
+            ),
+            "outs": attrs.option(
+                attrs.dict(key = attrs.string(), value = attrs.set(attrs.string(), sorted = False), sorted = False),
+                default = None,
+                doc = """
+                Mapping defining `named outputs`
+                  to output paths relative to the rule's output directory. Only one of
+                  `out` or `outs` may be present.
+
+                 Example:
+
+                ```
+                genrule(
+                  name = "named_outputs",
+                  outs = {
+                    "output1": [
+                      "out1.txt",
+                    ],
+                    "output2": [
+                      "out2.txt",
+                    ],
+                  },
+                  default_outs = [ "out1.txt" ],
+                  cmd = "echo something> $OUT/out1.txt && echo another> $OUT/out2.txt",
+                )
+                ```
+
+                 Note that a maximum of one value may be present in the list in this map. For example:
+
+                ```
+                outs = {
+                  "output1": [
+                    "out1.txt",
+                  ],
+                },
+                ```
+                is valid, whereas
+
+                ```
+                outs = {
+                  "output1": [
+                    "out1.txt",
+                    "out2.txt",
+                  ],
+                },
+                ```
+                is not.
+            """,
+            ),
+        }
+        | buck.optional_has_content_based_path_attr()
+        | genrule_common.env_arg()
+        | genrule_common.environment_expansion_separator()
+        | {
+            "cacheable": attrs.option(attrs.bool(), default = None),
+            "enable_sandbox": attrs.option(
+                attrs.bool(),
+                default = None,
+                doc = """
+                Whether this target should be executed in a sandbox or not.
+            """,
+            ),
+            "executable": attrs.option(
+                attrs.bool(),
+                default = None,
+                doc = """
+                Whether the output of the genrule is itself executable. Marking an output as
+                 executable makes `buck run` and `$(exe ...)` macro
+                 expansion work with this target.
+            """,
+            ),
+            "remote": attrs.option(
+                attrs.bool(),
+                default = None,
+                doc = """
+                Opts this genrule in to remote execution. Note that it is only safe to
+                 execute a genrule remotely if it is completely hermetic and completely
+                 and correctly describes its dependencies. Defaults to false. This parameter
+                 is unstable. It is subject to removal, default reversal, and other arbitrary
+                 changes in the future.
+            """,
+            ),
+            "_exec_os_type": buck.exec_os_type_arg(),
+        }
+        | genrule_common.error_handler_arg()
+        | genrule_common.allow_offline_output_cache_arg()
+        | buck.licenses_arg()
+        | buck.labels_arg()
+        | buck.contacts_arg()
+        | genrule_attributes()
+        | constraint_overrides.attributes
+    ),
+    cfg = constraint_overrides.transition,
+)

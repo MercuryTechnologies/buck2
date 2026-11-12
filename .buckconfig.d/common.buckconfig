@@ -1,5 +1,6 @@
 [cells]
 prelude = prelude
+prelude_mwb = prelude-mwb
 none = none
 buildbuddy_toolchains = buildbuddy/toolchains
 namespace = namespace

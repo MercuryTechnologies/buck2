@@ -9,12 +9,14 @@
 -module(ct_daemon_node).
 -compile(warn_missing_spec_all).
 
--include_lib("kernel/include/logger.hrl").
-
 %% Public API
 -export([start/1, start/2, stop/0, alive/0, get_node/0]).
 
 -export([node_main/1, get_domain_type/0]).
+
+-export_type([config/0]).
+
+-include_lib("kernel/include/logger.hrl").
 
 -import(common_util, [unicode_characters_to_binary/1, filename_all_to_filename/1]).
 
@@ -31,8 +33,6 @@
     {multiply_timetraps, number() | infinity}
     | {ct_hooks, [atom() | {atom(), [term()]}]}
     | {output_dir, file:filename_all()}.
-
--export_type([config/0]).
 
 -doc """
 start node for running tests in isolated way and keep state
@@ -225,8 +225,10 @@ ensure_distribution(Type, RandomName, Cookie) ->
             ok;
         _ ->
             %% check that the domain is correct
-            Type = get_domain_type(),
-            ok
+            case get_domain_type() of
+                Type -> ok;
+                Other -> error({distribution_type_mismatch, Type, Other})
+            end
     end,
     true = erlang:set_cookie(Cookie),
     ok.

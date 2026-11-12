@@ -48,7 +48,45 @@ def archive_type(url_or_path: str, typ: str | None) -> str:
 #
 # 1. The cmd_args with the unarchive command
 # 2. A bool indicating whether the prefix still needs to be stripped (in cases where the tool used to uncompress does not support this feature).
-def _unarchive_cmd(ext_type: str, archive: Artifact, strip_prefix: [str, None]) -> (cmd_args, bool):
+def _unarchive_cmd(
+        ext_type: str,
+        exec_is_windows: bool,
+        archive,
+        strip_prefix: [str, None]) -> (cmd_args, bool):
+    if exec_is_windows:
+        # So many hacks.
+        if ext_type == "tar.zst":
+            # tar that ships with windows is bsdtar
+            # bsdtar seems to not properly interop with zstd and hangs instead of
+            # exiting with an error. Manually decompressing with zstd and piping to
+            # tar seems to work fine though.
+            return cmd_args(
+                "zstd",
+                "-d",
+                archive,
+                "--stdout",
+                "|",
+                "%WINDIR%\\System32\\tar.exe",
+                "-x",
+                "-P",
+                "-f",
+                "-",
+                _tar_strip_prefix_flags(strip_prefix),
+            ), False
+        elif ext_type == "zip":
+            # unzip and zip are not cli commands available on windows. however, the
+            # bsdtar that ships with windows has builtin support for zip
+            return cmd_args(
+                "%WINDIR%\\System32\\tar.exe",
+                "-x",
+                "-P",
+                "-f",
+                archive,
+                _tar_strip_prefix_flags(strip_prefix),
+            ), False
+
+        # Else hope for the best
+
     if ext_type in _TAR_FLAGS:
         return cmd_args(
             "tar",
@@ -60,7 +98,7 @@ def _unarchive_cmd(ext_type: str, archive: Artifact, strip_prefix: [str, None]) 
         ), False
     elif ext_type == "zip":
         # gnutar does not intrinsically support zip
-        return cmd_args(archive, format = "unzip {}"), bool(strip_prefix)
+        return cmd_args("unzip", archive), bool(strip_prefix)
     else:
         fail()
 
@@ -71,60 +109,51 @@ def _tar_strip_prefix_flags(strip_prefix: [str, None]) -> list[str]:
         return ["--strip-components=" + str(count), strip_prefix]
     return []
 
-# buck-out on Windows on eden is a symlink. bsdtar which ships with Windows will
-# not extract files when the cwd contains a path segment that is a symlink (as
-# a side effect of or excessively cautious against wild writes to the system).
-# Powershell lets us 'dereference' that symlink to get the physical path to the
-# output folder we tell tar to unpack into while preserving security, instead of
-# passing -P.
-def _windows_unpack_ps1(out: OutputArtifact, archive: Artifact, ext_type: str, strip_prefix: [str, None], exclude_flags: list) -> list:
-    tar = '"$env:SystemRoot\\System32\\tar.exe"'
-    quoted_archive = cmd_args(archive, format = "'{}'")
-    strip = _tar_strip_prefix_flags(strip_prefix)
+def _shell_quote(value: str) -> str:
+    return "'" + value.replace("'", "'\"'\"'") + "'"
 
-    lines = [
-        "$ErrorActionPreference = 'Stop'",
-        cmd_args(out, format = "$out = '{}'"),
-        "New-Item -ItemType Directory -Force -Path $out | Out-Null",
-        "$link = (Get-Item -LiteralPath 'buck-out').Target",
-        "if ($link) { $real = Join-Path @($link)[0] $out.Substring('buck-out'.Length).TrimStart('\\', '/') } else { $real = $out }",
-    ]
-
-    if ext_type == "tar.zst":
-        # bsdtar cannot invoke zstd itself, and a PowerShell native pipe would
-        # corrupt the binary stream, so decompress to a scratch file first.
-        return lines + [
-            "$scratch = $env:BUCK_SCRATCH_PATH",
-            "if (-not $scratch) { $scratch = [System.IO.Path]::GetTempPath() }",
-            "$tmp = Join-Path $scratch 'http_archive_unpack.tar'",
-            cmd_args("zstd", "-d", "-f", quoted_archive, "-o", '"$tmp"', delimiter = " "),
-            cmd_args("&", tar, "-x", "-C", '"$real"', "-f", '"$tmp"', strip, exclude_flags, delimiter = " "),
-            "Remove-Item -LiteralPath $tmp -Force",
-        ]
-    elif ext_type == "zip":
-        return lines + [
-            cmd_args("&", tar, "-x", "-C", '"$real"', "-f", quoted_archive, strip, delimiter = " "),
-        ]
-    elif ext_type in _TAR_FLAGS:
-        return lines + [
-            cmd_args("&", tar, _TAR_FLAGS[ext_type], "-x", "-C", '"$real"', "-f", quoted_archive, strip, exclude_flags, delimiter = " "),
-        ]
-    else:
-        fail("unsupported archive type on Windows: {}".format(ext_type))
-
+# Upstream's parameters come first, in upstream's order, so a rule written
+# against upstream's prelude (mercury-web-backend's toolchains/downloader)
+# still analyses. The remote-download and patch parameters this fork adds
+# default to what upstream's unarchive does: a local archive, no download,
+# no patches.
 def unarchive(
-    ctx: AnalysisContext,
-    archive: Artifact,
-    output_name: str,
-    ext_type,
-    excludes,
-    strip_prefix,
-    exec_deps: HttpArchiveExecDeps,
-    prefer_local: bool,
-    sub_targets: list[str] | dict[str, list[str]],
-    has_content_based_path: bool = False,
-):
+        ctx: AnalysisContext,
+        archive: Artifact | None,
+        output_name: str,
+        ext_type,
+        excludes,
+        strip_prefix,
+        exec_deps: HttpArchiveExecDeps,
+        prefer_local: bool,
+        sub_targets: list[str] | dict[str, list[str]],
+        has_content_based_path: bool = False,
+        download_urls: list[str] = [],
+        remote_download: bool = False,
+        sha1: str | None = None,
+        sha256: str | None = None,
+        size_bytes: int | None = None,
+        patch_args: list[str] = [],
+        patches: list[Artifact] = [],
+        resolve_static_crates: bool = False):
     exec_is_windows = exec_deps.exec_os_type[OsLookup].os == Os("windows")
+    if remote_download and exec_is_windows:
+        fail("remote_download is not supported for Windows http_archive actions")
+    if remote_download and excludes:
+        fail("remote_download does not support excludes")
+    if exec_is_windows and patches:
+        fail("http_archive patches are not supported on Windows actions")
+
+    if exec_is_windows:
+        ext = "bat"
+        mkdir = "md {}"
+        interpreter = []
+        first_param = "%1"
+    else:
+        ext = "sh"
+        mkdir = "mkdir -p {}"
+        interpreter = ["/bin/sh"]
+        first_param = '"$1"'
 
     # The excludes listing runs `tar --list` and redirects it to a file; keep it
     # in the shell whose redirect writes raw bytes (cmd on Windows, sh else).
@@ -187,31 +216,67 @@ def unarchive(
         exclude_flags.append(cmd_args(exclusions, format = "--exclude-from={}"))
         exclude_hidden.append(exclusions)
 
-    unarchive_cmd = None  # unused on Windows (see _windows_unpack_ps1)
-    if exec_is_windows:
-        needs_strip_prefix = False
-        unpack_ext = "ps1"
-        unpack_interpreter = ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File"]
-    else:
-        unarchive_cmd, needs_strip_prefix = _unarchive_cmd(ext_type, archive, strip_prefix)
-        unpack_ext = "sh"
-        unpack_interpreter = ["/bin/sh"]
+    archive_path = "__downloaded_archive." + ext_type if remote_download else archive
+    unarchive_cmd, needs_strip_prefix = _unarchive_cmd(ext_type, exec_is_windows, archive_path, strip_prefix)
 
     output = ctx.actions.declare_output(output_name, dir = True, has_content_based_path = has_content_based_path)
     script_output = ctx.actions.declare_output(output_name + "_tmp", dir = True, has_content_based_path = False) if needs_strip_prefix else output
-
-    if exec_is_windows:
-        script_lines = _windows_unpack_ps1(script_output.as_output(), archive, ext_type, strip_prefix, exclude_flags)
-    else:
-        script_lines = [
-            cmd_args(script_output.as_output(), format = "mkdir -p {}"),
-            cmd_args(script_output.as_output(), format = "cd {}"),
-            cmd_args([unarchive_cmd] + exclude_flags, delimiter = " ", relative_to = script_output.as_output()),
+    download = []
+    if remote_download:
+        static_crates_resolve = "static.crates.io:443:151.101.2.137,151.101.66.137,151.101.130.137,151.101.194.137"
+        download = [
+            "archive=\"{}\"".format(archive_path),
+            "downloaded=\"\"",
+            "curl_common=\"-fsSL --retry 5 --retry-all-errors --retry-delay 1 --connect-timeout 20\"",
+            "static_crates_resolve=\"{}\"".format(static_crates_resolve if resolve_static_crates else ""),
+            "for url in \"$@\"; do",
+            "  if curl $curl_common \"$url\" -o \"$archive\"; then",
+            "    downloaded=1",
+            "    break",
+            "  fi",
+            "  if [ -n \"$static_crates_resolve\" ] && [ \"${url#https://static.crates.io/}\" != \"$url\" ]; then",
+            "    if curl $curl_common --resolve \"$static_crates_resolve\" \"$url\" -o \"$archive\"; then",
+            "      downloaded=1",
+            "      break",
+            "    fi",
+            "  fi",
+            "done",
+            "if [ -z \"$downloaded\" ]; then",
+            "  echo \"failed to download archive\" >&2",
+            "  exit 1",
+            "fi",
         ]
+        if sha256 != None:
+            download.append("echo \"{}  $archive\" | sha256sum -c -".format(sha256))
+        if sha1 != None:
+            download.append("echo \"{}  $archive\" | sha1sum -c -".format(sha1))
+        if size_bytes != None:
+            download.extend([
+                "actual_size=$(wc -c < \"$archive\" | tr -d ' ')",
+                "if [ \"$actual_size\" != \"{}\" ]; then".format(size_bytes),
+                "  echo \"archive size mismatch: expected {}, got $actual_size\" >&2".format(size_bytes),
+                "  exit 1",
+                "fi",
+            ])
+
+    patch_commands = []
+    if patches:
+        patch_root = strip_prefix if needs_strip_prefix else "."
+        patch_commands.append("cd " + _shell_quote(patch_root))
+        for patch in patches:
+            patch_commands.append(cmd_args(["patch", "--batch"] + patch_args + ["-i", cmd_args(patch, format = "\"$project_root\"/{}")], delimiter = " "))
 
     script, _ = ctx.actions.write(
-        "{}_unpack.{}".format(output_name, unpack_ext),
-        script_lines,
+        "{}_unpack.{}".format(output_name, ext),
+        [
+            cmd_args(script_output.as_output(), format = mkdir),
+            "project_root=\"$PWD\"",
+            cmd_args(script_output.as_output(), format = "cd {}"),
+        ] + download + [
+            # cmd's quoting is not the shell's, and the Windows tar.zst command pipes through `|`,
+            # so only the sh script quotes each argument.
+            cmd_args([unarchive_cmd] + exclude_flags, delimiter = " ", relative_to = script_output.as_output()) if exec_is_windows else cmd_args([unarchive_cmd] + exclude_flags, delimiter = " ", quote = "shell", relative_to = script_output.as_output()),
+        ] + (["rm -f \"$archive\""] if remote_download else []) + patch_commands,
         is_executable = True,
         allow_args = True,
         has_content_based_path = False,
@@ -219,12 +284,13 @@ def unarchive(
 
     ctx.actions.run(
         cmd_args(
-            unpack_interpreter + [script],
-            hidden = exclude_hidden + [archive, script_output.as_output()],
+            interpreter + [script] + download_urls,
+            hidden = exclude_hidden + patches + ([archive] if archive != None else []) + [script_output.as_output()],
         ),
         category = "http_archive",
         identifier = output_name,
         prefer_local = prefer_local,
+        prefer_remote = remote_download,
     )
 
     if needs_strip_prefix:

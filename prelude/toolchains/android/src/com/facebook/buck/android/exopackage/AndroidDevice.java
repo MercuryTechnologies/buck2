@@ -119,6 +119,21 @@ public interface AndroidDevice {
 
   String getContentHash(String path) throws Exception;
 
+  /** How the apk installed for a package compares with a local apk. */
+  enum InstalledApk {
+    ABSENT,
+    SAME,
+    DIFFERENT
+  }
+
+  /**
+   * Compares the apk installed for {@code packageName} with {@code apk}. With {@code exact}, the
+   * comparison is byte-for-byte (MD5 of the whole apk); otherwise it compares the apks' signature
+   * manifest digests, falling back to MD5 whenever either digest cannot be read. Throws {@link
+   * AdbCommandFailedException} if the installed apk cannot be read.
+   */
+  InstalledApk compareInstalledApk(String packageName, File apk, boolean exact) throws Exception;
+
   ImmutableSortedSet<Path> listDirRecursive(Path dirPath) throws Exception;
 
   void rmFiles(String dirPath, Iterable<String> filesToDelete);
@@ -129,8 +144,16 @@ public interface AndroidDevice {
    */
   void rmStaleFiles(String packageName) throws Exception;
 
-  AutoCloseable createForward() throws Exception;
-
+  /**
+   * Pushes {@code installPaths}, a map of device destination to local source.
+   *
+   * <p>Called concurrently for the same package: an install pushes its payload as several shards at
+   * once. Whatever an implementation stages under has to be unique per call, or concurrent shards
+   * overwrite each other on the way in.
+   *
+   * @param packageName the app these files belong to. Scopes whatever scratch the device needs, so
+   *     that installs of different apps cannot disturb each other's transfers.
+   */
   void installFiles(String filesType, Map<Path, Path> installPaths, String packageName)
       throws Exception;
 
@@ -158,13 +181,10 @@ public interface AndroidDevice {
   boolean uninstallApkFromDevice(String packageName, boolean keepData) throws Exception;
 
   /**
-   * Size, used and available space on the data partition, or {@code "_"} for each if it cannot be
-   * read.
-   *
-   * @param humanReadable values suffixed for display, e.g. {@code 17G}. Otherwise they are plain
-   *     counts of 1K blocks, which is what arithmetic wants.
+   * Size, used and available space on the data partition, suffixed for display (e.g. {@code 17G}),
+   * or {@code "_"} for each if it cannot be read.
    */
-  default List<String> getDiskSpace(boolean humanReadable) {
+  default List<String> getDiskSpace() {
     return Arrays.asList("_", "_", "_");
   }
 

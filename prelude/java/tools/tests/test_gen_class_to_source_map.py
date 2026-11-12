@@ -378,3 +378,62 @@ class GenClassToSourceMapTest(unittest.TestCase):
                 "ownerTarget": "cell//package:library",
             },
         )
+
+    def test_real_class_with_kt_suffix_keeps_its_source_next_to_a_file_facade(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            directory = pathlib.Path(temp_dir)
+            package_dir = directory / "com" / "example"
+            package_dir.mkdir(parents=True)
+            facade_source = package_dir / "Foo.kt"
+            facade_source.write_text("fun foo() = 1\n")
+            class_source = package_dir / "FooKt.kt"
+            class_source.write_text("class FooKt\n")
+            sources_jar = directory / "library-sources.jar"
+            classes = self._generate(
+                directory,
+                jar_classes=["com.example.Foo", "com.example.FooKt"],
+                sources=[facade_source, class_source],
+                debuginfo=None,
+                sources_jar=str(sources_jar),
+            )
+            with zipfile.ZipFile(sources_jar) as jar:
+                entries = jar.namelist()
+
+        self.assertEqual(
+            classes,
+            [
+                {"className": "com.example.Foo", "srcPath": str(facade_source)},
+                {"className": "com.example.FooKt", "srcPath": str(class_source)},
+            ],
+        )
+        self.assertEqual(entries, ["com/example/Foo.kt", "com/example/FooKt.kt"])
+
+    def test_repeated_include_prefix_flags_accumulate(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            jar_path = pathlib.Path(temp_dir) / "library.jar"
+            with zipfile.ZipFile(jar_path, "w") as jar:
+                jar.writestr("androidx/databinding/DataBinderMapperImpl.class", b"")
+                jar.writestr("com/generated/Generated.class", b"")
+
+            output = io.StringIO()
+            with redirect_stdout(output):
+                main(
+                    [
+                        "gen_class_to_source_map",
+                        str(jar_path),
+                        "-i",
+                        "androidx.databinding",
+                        "-i",
+                        "com.generated",
+                    ]
+                )
+
+        self.assertEqual(
+            json.loads(output.getvalue())["classes"],
+            [
+                {"className": "androidx.databinding.DataBinderMapperImpl"},
+                {"className": "com.generated.Generated"},
+            ],
+        )

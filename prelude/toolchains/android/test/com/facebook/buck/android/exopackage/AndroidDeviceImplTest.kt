@@ -15,6 +15,7 @@ import com.facebook.buck.installer.android.AndroidInstallErrorTag
 import com.facebook.buck.installer.android.AndroidInstallException
 import java.io.File
 import java.nio.file.Files
+import java.nio.file.Paths
 import java.security.MessageDigest
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -30,6 +31,7 @@ import org.mockito.kotlin.eq
 import org.mockito.kotlin.inOrder
 import org.mockito.kotlin.mock
 import org.mockito.kotlin.never
+import org.mockito.kotlin.times
 import org.mockito.kotlin.verify
 import org.mockito.kotlin.whenever
 
@@ -56,12 +58,12 @@ class AndroidDeviceImplTest {
   private fun stubInstallVerified() {
     whenever(mockAdbUtils.executeAdbShellCommand("pm path $packageName", serialNumber))
         .thenReturn("package:$onDeviceApkPath")
-    whenever(mockAdbUtils.executeAdbShellCommand("sha256sum $onDeviceApkPath", serialNumber))
-        .thenReturn("${sha256Hex(apkFile)}  $onDeviceApkPath")
+    whenever(mockAdbUtils.executeAdbShellCommand("md5sum $onDeviceApkPath", serialNumber))
+        .thenReturn("${md5Hex(apkFile)}  $onDeviceApkPath")
   }
 
-  private fun sha256Hex(file: File): String =
-      MessageDigest.getInstance("SHA-256").digest(file.readBytes()).joinToString("") {
+  private fun md5Hex(file: File): String =
+      MessageDigest.getInstance("MD5").digest(file.readBytes()).joinToString("") {
         "%02x".format(it.toInt() and 0xFF)
       }
 
@@ -132,6 +134,13 @@ class AndroidDeviceImplTest {
     )
         .thenReturn("Android\nDownload\nPictures")
 
+    whenever(
+        mockAdbUtils.executeAdbCommand(
+            "install --apex --force-non-staged /path/to/test.apex",
+            serialNumber,
+        ),
+    )
+        .thenReturn("Success")
     val result = androidDevice.installApexOnDevice(apexFile, false, true, true, true)
 
     verify(mockAdbUtils)
@@ -159,6 +168,13 @@ class AndroidDeviceImplTest {
     whenever(apexFile.name).thenReturn("test.apex")
     whenever(apexFile.length()).thenReturn(1024L)
 
+    whenever(
+        mockAdbUtils.executeAdbCommand(
+            "install --apex --force-non-staged /path/to/test.apex",
+            serialNumber,
+        ),
+    )
+        .thenReturn("Success")
     val result = androidDevice.installApexOnDevice(apexFile, false, true, true, false)
 
     verify(mockAdbUtils)
@@ -187,6 +203,13 @@ class AndroidDeviceImplTest {
     whenever(apexFile.name).thenReturn("test.apex")
     whenever(apexFile.length()).thenReturn(1024L)
 
+    whenever(
+        mockAdbUtils.executeAdbCommand(
+            "install --apex --force-non-staged /path/to/test.apex",
+            serialNumber,
+        ),
+    )
+        .thenReturn("Success")
     val result = androidDevice.installApexOnDevice(apexFile, false, false, true, false)
 
     verify(mockAdbUtils)
@@ -207,6 +230,125 @@ class AndroidDeviceImplTest {
     androidDevice.stopPackage("com.test.app")
 
     verify(mockAdbUtils).executeAdbShellCommand("am force-stop com.test.app", serialNumber)
+  }
+
+  private val debugAppQuery = "settings get global debug_app"
+  private val waitForDebuggerQuery = "settings get global wait_for_debugger"
+  private val setDebugApp = "am set-debug-app --persistent com.test.app "
+
+  private fun stubDebugAppSettings(debugApp: String, waitForDebugger: String) {
+    whenever(mockAdbUtils.getAmSetDebugAppCommand("com.test.app")).thenReturn(setDebugApp)
+    whenever(mockAdbUtils.executeAdbShellCommand(debugAppQuery, serialNumber)).thenReturn(debugApp)
+    whenever(mockAdbUtils.executeAdbShellCommand(waitForDebuggerQuery, serialNumber))
+        .thenReturn(waitForDebugger)
+  }
+
+  @Test
+  fun testSetDebugAppSkippedWhenAlreadyTheDebugApp() {
+    stubDebugAppSettings("com.test.app\n", "0\n")
+
+    androidDevice.setDebugAppPackageName("com.test.app")
+
+    verify(mockAdbUtils, never()).executeAdbShellCommand(setDebugApp, serialNumber)
+  }
+
+  @Test
+  fun testSetDebugAppRunsWhenTheSettingOutputIsUnexpected() {
+    stubDebugAppSettings("\ncom.test.app\n0\n", "0\n")
+
+    androidDevice.setDebugAppPackageName("com.test.app")
+
+    verify(mockAdbUtils).executeAdbShellCommand(setDebugApp, serialNumber)
+  }
+
+  @Test
+  fun testSetDebugAppRunsWhenAnotherAppIsTheDebugApp() {
+    stubDebugAppSettings("com.other.app\n", "0\n")
+
+    androidDevice.setDebugAppPackageName("com.test.app")
+
+    verify(mockAdbUtils).executeAdbShellCommand(setDebugApp, serialNumber)
+    verify(mockAdbUtils, never()).executeAdbShellCommand(waitForDebuggerQuery, serialNumber)
+  }
+
+  @Test
+  fun testSetDebugAppRunsWhenWaitingForADebugger() {
+    stubDebugAppSettings("com.test.app\n", "1\n")
+
+    androidDevice.setDebugAppPackageName("com.test.app")
+
+    verify(mockAdbUtils).executeAdbShellCommand(setDebugApp, serialNumber)
+  }
+
+  @Test
+  fun testSetDebugAppRunsWhenTheSettingsCannotBeRead() {
+    stubDebugAppSettings("", "")
+    doAnswer { throw AdbCommandFailedException("settings: not found") }
+        .whenever(mockAdbUtils)
+        .executeAdbShellCommand(debugAppQuery, serialNumber)
+
+    androidDevice.setDebugAppPackageName("com.test.app")
+
+    verify(mockAdbUtils).executeAdbShellCommand(setDebugApp, serialNumber)
+  }
+
+  private val unzipList = "unzip -l $onDeviceApkPath | grep -E -o 'META-INF/[A-Z]+\\.SF'"
+
+  @Test
+  fun testCompareInstalledApkReportsAnAbsentPackage() {
+    whenever(mockAdbUtils.executeAdbShellCommand("pm path $packageName", serialNumber))
+        .thenReturn("")
+
+    assertEquals(
+        AndroidDevice.InstalledApk.ABSENT,
+        androidDevice.compareInstalledApk(packageName, apkFile, false),
+    )
+  }
+
+  @Test
+  fun testCompareInstalledApkExactComparesContentHashOnly() {
+    stubInstallVerified()
+
+    assertEquals(
+        AndroidDevice.InstalledApk.SAME,
+        androidDevice.compareInstalledApk(packageName, apkFile, true),
+    )
+    verify(mockAdbUtils, never()).executeAdbShellCommand(unzipList, serialNumber)
+  }
+
+  @Test
+  fun testCompareInstalledApkFallsBackToContentHashWhenTheLocalApkHasNoSignatureFile() {
+    stubInstallVerified()
+    whenever(mockAdbUtils.executeAdbShellCommand(unzipList, serialNumber))
+        .thenReturn("META-INF/CERT.SF")
+    whenever(
+        mockAdbUtils.executeAdbShellCommand(
+            "unzip -p $onDeviceApkPath META-INF/CERT.SF | grep -E " +
+                "'SHA1-Digest-Manifest:|SHA-256-Digest-Manifest:'",
+            serialNumber,
+        ),
+    )
+        .thenReturn("SHA-256-Digest-Manifest: aGFzaA==")
+
+    assertEquals(
+        AndroidDevice.InstalledApk.SAME,
+        androidDevice.compareInstalledApk(packageName, apkFile, false),
+    )
+  }
+
+  @Test
+  fun testCompareInstalledApkFallsBackToContentHashWithoutUnzip() {
+    whenever(mockAdbUtils.executeAdbShellCommand("pm path $packageName", serialNumber))
+        .thenReturn("package:$onDeviceApkPath")
+    whenever(mockAdbUtils.executeAdbShellCommand(unzipList, serialNumber))
+        .thenReturn("/system/bin/sh: unzip: not found")
+    whenever(mockAdbUtils.executeAdbShellCommand("md5sum $onDeviceApkPath", serialNumber))
+        .thenReturn("${"0".repeat(32)}  $onDeviceApkPath")
+
+    assertEquals(
+        AndroidDevice.InstalledApk.DIFFERENT,
+        androidDevice.compareInstalledApk(packageName, apkFile, false),
+    )
   }
 
   @Test
@@ -251,28 +393,96 @@ class AndroidDeviceImplTest {
   }
 
   @Test
+  fun testGetApkManifestDigestWithTwoDigests() {
+    val packagePath = "/data/app/com.test.app-1/base.apk"
+    whenever(
+        mockAdbUtils.executeAdbShellCommand(
+            "unzip -l $packagePath | grep -E -o 'META-INF/[A-Z]+\\.SF'",
+            serialNumber,
+        ),
+    )
+        .thenReturn("META-INF/CERT.SF")
+    whenever(
+        mockAdbUtils.executeAdbShellCommand(
+            "unzip -p $packagePath META-INF/CERT.SF | grep -E 'SHA1-Digest-Manifest:|SHA-256-Digest-Manifest:'",
+            serialNumber,
+        ),
+    )
+        .thenReturn("SHA1-Digest-Manifest: abcd1234=\nSHA-256-Digest-Manifest: efgh5678+/==\n")
+
+    assertEquals("abcd1234=", androidDevice.getApkManifestDigest(packagePath))
+  }
+
+  /** API 27 and below ship no `unzip`; the shell's complaint must not pass for a digest. */
+  @Test
+  fun testGetApkManifestDigestWithoutUnzip() {
+    val packagePath = "/data/app/com.test.app-1/base.apk"
+    whenever(
+        mockAdbUtils.executeAdbShellCommand(
+            "unzip -l $packagePath | grep -E -o 'META-INF/[A-Z]+\\.SF'",
+            serialNumber,
+        ),
+    )
+        .thenReturn("/system/bin/sh: unzip: not found")
+
+    try {
+      androidDevice.getApkManifestDigest(packagePath)
+      fail("Expected AdbCommandFailedException")
+    } catch (e: AdbCommandFailedException) {
+      assertTrue(e.message!!.contains("unzip: not found"))
+    }
+  }
+
+  @Test
   fun testGetSerialNumber() {
     assertEquals(serialNumber, androidDevice.getSerialNumber())
   }
 
   @Test
   fun testIsEmulator() {
+    // A device caches the read-only properties it reads, so each case needs its own instance.
     // Setup for non-emulator
     whenever(mockAdbUtils.executeAdbShellCommand("getprop ro.kernel.qemu", serialNumber))
         .thenReturn("0")
 
-    assertFalse(androidDevice.isEmulator)
+    assertFalse(AndroidDeviceImpl(serialNumber, mockAdbUtils).isEmulator)
 
     // Setup for emulator
     whenever(mockAdbUtils.executeAdbShellCommand("getprop ro.kernel.qemu", serialNumber))
         .thenReturn("1")
 
-    assertTrue(androidDevice.isEmulator)
+    assertTrue(AndroidDeviceImpl(serialNumber, mockAdbUtils).isEmulator)
 
     // Setup for Genymotion device
     whenever(mockAdbUtils.executeAdbShellCommand("getprop ro.kernel.qemu", serialNumber))
         .thenReturn("0")
     assertTrue(AndroidDeviceImpl("192.168.57.101:5555", mockAdbUtils).isEmulator)
+  }
+
+  @Test
+  fun testReadOnlyPropertiesAreOnlyQueriedOnce() {
+    whenever(mockAdbUtils.executeAdbShellCommand("getprop ro.product.cpu.abilist", serialNumber))
+        .thenReturn("arm64-v8a")
+
+    androidDevice.getDeviceAbis()
+    androidDevice.getDeviceAbis()
+    androidDevice.getProperty("ro.product.cpu.abilist")
+
+    verify(mockAdbUtils, times(1))
+        .executeAdbShellCommand("getprop ro.product.cpu.abilist", serialNumber)
+  }
+
+  /** Anything outside `ro.` can change mid-install, so it must be read through every time. */
+  @Test
+  fun testMutablePropertiesAreNotCached() {
+    whenever(mockAdbUtils.executeAdbShellCommand("getprop sys.boot_completed", serialNumber))
+        .thenReturn("1")
+
+    androidDevice.getProperty("sys.boot_completed")
+    androidDevice.getProperty("sys.boot_completed")
+
+    verify(mockAdbUtils, times(2))
+        .executeAdbShellCommand("getprop sys.boot_completed", serialNumber)
   }
 
   @Test
@@ -289,31 +499,34 @@ class AndroidDeviceImplTest {
   fun testGetDiskSpace() {
     whenever(
         mockAdbUtils.executeAdbShellCommand(
-            "df -h /data | awk '{print $2, $3, $4}'",
+            "df -h /data",
             serialNumber,
         ),
     )
-        .thenReturn("Size Used Available\n64G 32G 32G")
+        .thenReturn(
+            "Filesystem Size Used Avail Use% Mounted on\n/dev/block/dm-0 64G 32G 32G 50% /data",
+        )
 
-    val result = androidDevice.getDiskSpace(humanReadable = true)
+    val result = androidDevice.getDiskSpace()
 
     assertEquals(listOf("64G", "32G", "32G"), result)
   }
 
-  /** Unsuffixed, the values are 1K blocks and can be used as numbers. */
+  /**
+   * Toolbox `df` of API 23 and below treats `-h` as a path and prints an error ahead of the row.
+   */
   @Test
-  fun testGetDiskSpaceUnsuffixed() {
-    whenever(
-        mockAdbUtils.executeAdbShellCommand(
-            "df -k /data | awk '{print $2, $3, $4}'",
-            serialNumber,
-        ),
-    )
-        .thenReturn("1K-blocks Used Available\n32911312 14799512 17964344")
+  fun testGetDiskSpaceToolboxDf() {
+    whenever(mockAdbUtils.executeAdbShellCommand("df -h /data", serialNumber))
+        .thenReturn(
+            "Filesystem Size Used Free Blksize\n" +
+                "-h: No such file or directory\n" +
+                "/data 3.9G 187.5M 3.7G 4096\n",
+        )
 
-    val result = androidDevice.getDiskSpace(humanReadable = false)
+    val result = androidDevice.getDiskSpace()
 
-    assertEquals(listOf("32911312", "14799512", "17964344"), result)
+    assertEquals(listOf("3.9G", "187.5M", "3.7G"), result)
   }
 
   @Test
@@ -490,6 +703,96 @@ class AndroidDeviceImplTest {
   }
 
   @Test
+  fun testInstallApkFailsWhenThePackageManagerReportsFailureButAdbExitsZero() {
+    val installCommand = "install -r -d ${apkFile.absolutePath}"
+    whenever(mockAdbUtils.executeAdbCommand(installCommand, serialNumber))
+        .thenReturn(
+            "Performing Streamed Install\nFailure [INSTALL_FAILED_INSUFFICIENT_STORAGE]\n",
+        )
+
+    try {
+      androidDevice.installApkOnDevice(apkFile, false, false, false, false, packageName)
+      fail("Expected AndroidInstallException")
+    } catch (e: AndroidInstallException) {
+      assertTrue(e.message!!.contains("Failed to install test.apk"))
+      assertEquals(setOf(AndroidInstallErrorTag.NO_SPACE_LEFT_ON_DEVICE), e.installError.tags)
+    }
+    verify(mockAdbUtils, never()).executeAdbShellCommand("md5sum $onDeviceApkPath", serialNumber)
+    verify(mockAdbUtils, never())
+        .executeAdbCommand(argThat { startsWith("uninstall") }, eq(serialNumber), any())
+  }
+
+  @Test
+  fun testInstallApkSucceedsWhenAdbFallsBackFromARefusedIncrementalInstall() {
+    val installCommand = "install -r -d ${apkFile.absolutePath}"
+    whenever(mockAdbUtils.executeAdbCommand(installCommand, serialNumber))
+        .thenReturn(
+            "Serving...\nPerforming Incremental Install\n" +
+                "Failure [INSTALL_FAILED_SESSION_INVALID: Incremental installation of this " +
+                "package is not allowed.]\nPerforming Streamed Install\nSuccess\n",
+        )
+    stubInstallVerified()
+
+    assertTrue(
+        androidDevice.installApkOnDevice(apkFile, false, false, false, false, packageName),
+    )
+  }
+
+  @Test
+  fun testInstallApkFailsWhenTheStreamedFallbackAlsoFails() {
+    val installCommand = "install -r -d ${apkFile.absolutePath}"
+    whenever(mockAdbUtils.executeAdbCommand(installCommand, serialNumber))
+        .thenReturn(
+            "Performing Incremental Install\n" +
+                "Failure [INSTALL_FAILED_SESSION_INVALID: Incremental installation of this " +
+                "package is not allowed.]\nPerforming Streamed Install\n" +
+                "Failure [INSTALL_FAILED_INSUFFICIENT_STORAGE]\n",
+        )
+
+    try {
+      androidDevice.installApkOnDevice(apkFile, false, false, false, false, packageName)
+      fail("Expected AndroidInstallException")
+    } catch (e: AndroidInstallException) {
+      assertEquals(setOf(AndroidInstallErrorTag.NO_SPACE_LEFT_ON_DEVICE), e.installError.tags)
+    }
+  }
+
+  @Test
+  fun testInstallApkRecoversFromSignatureMismatchReportedWithExitZero() {
+    val installCommand = "install -r -d ${apkFile.absolutePath}"
+    whenever(mockAdbUtils.executeAdbCommand(installCommand, serialNumber))
+        .thenReturn(
+            "Failure [INSTALL_FAILED_UPDATE_INCOMPATIBLE: Package com.meta.ar.helixserver " +
+                "signatures do not match previously installed version; ignoring!]",
+            "Success",
+        )
+    doReturn("Success")
+        .whenever(mockAdbUtils)
+        .executeAdbCommand(eq("uninstall com.meta.ar.helixserver"), eq(serialNumber), any())
+    stubInstallVerified()
+
+    assertTrue(
+        androidDevice.installApkOnDevice(apkFile, false, false, false, false, packageName),
+    )
+    verify(mockAdbUtils)
+        .executeAdbCommand(eq("uninstall com.meta.ar.helixserver"), eq(serialNumber), any())
+  }
+
+  @Test
+  fun testInstallApkWithoutAVerdictLineIsCheckedByVerification() {
+    val installCommand = "install -r -d ${apkFile.absolutePath}"
+    whenever(mockAdbUtils.executeAdbCommand(installCommand, serialNumber))
+        .thenReturn(
+            "pkg: /data/local/tmp/Failure [not a verdict].apk\nPerforming Streamed Install\n",
+        )
+    stubInstallVerified()
+
+    assertTrue(
+        androidDevice.installApkOnDevice(apkFile, false, false, false, false, packageName),
+    )
+  }
+
+  @Test
   fun testInstallApkRecoversFromSignatureMismatch() {
     val installCommand = "install -r -d ${apkFile.absolutePath}"
 
@@ -563,6 +866,18 @@ class AndroidDeviceImplTest {
   }
 
   @Test
+  fun testClassifiesQuotaExceededAsInsufficientStorage() {
+    val error =
+        AndroidInstallErrorClassifier.fromErrorMessage(
+            "ADB_COMMAND_FAILED: Failed to create dir /data/local/tmp/exopackage/com.whatsapp..\n" +
+                "mkdir: '/data/local/tmp/exopackage/com.whatsapp': Quota exceeded",
+        )
+
+    assertEquals(setOf(AndroidInstallErrorTag.NO_SPACE_LEFT_ON_DEVICE), error.tags)
+    assertTrue(error.message.contains("/data/local/tmp/exopackage"))
+  }
+
+  @Test
   fun testInstallApkUsesFastdeployOnModernSdk() {
     whenever(mockAdbUtils.executeAdbShellCommand("getprop ro.build.version.sdk", serialNumber))
         .thenReturn("29")
@@ -600,9 +915,9 @@ class AndroidDeviceImplTest {
     whenever(mockAdbUtils.executeAdbShellCommand("pm path $packageName", serialNumber))
         .thenReturn("package:$onDeviceApkPath")
     // First read (after --fastdeploy) is stale; second read (after plain install) matches.
-    whenever(mockAdbUtils.executeAdbShellCommand("sha256sum $onDeviceApkPath", serialNumber))
+    whenever(mockAdbUtils.executeAdbShellCommand("md5sum $onDeviceApkPath", serialNumber))
         .thenReturn("stalehash  $onDeviceApkPath")
-        .thenReturn("${sha256Hex(apkFile)}  $onDeviceApkPath")
+        .thenReturn("${md5Hex(apkFile)}  $onDeviceApkPath")
 
     val result = androidDevice.installApkOnDevice(apkFile, false, false, false, false, packageName)
     assertTrue(result)
@@ -625,9 +940,9 @@ class AndroidDeviceImplTest {
     // adb reports success but the on-device apk never matches the local apk.
     whenever(mockAdbUtils.executeAdbShellCommand("pm path $packageName", serialNumber))
         .thenReturn("package:$onDeviceApkPath")
-    whenever(mockAdbUtils.executeAdbShellCommand("sha256sum $onDeviceApkPath", serialNumber))
+    whenever(mockAdbUtils.executeAdbShellCommand("md5sum $onDeviceApkPath", serialNumber))
         .thenReturn(
-            "0000000000000000000000000000000000000000000000000000000000000000  $onDeviceApkPath",
+            "00000000000000000000000000000000  $onDeviceApkPath",
         )
 
     try {
@@ -670,8 +985,8 @@ class AndroidDeviceImplTest {
         .thenReturn(
             "package:$onDeviceApkPath\npackage:/data/app/com.test.app-1/split_config.arm64_v8a.apk",
         )
-    whenever(mockAdbUtils.executeAdbShellCommand("sha256sum $onDeviceApkPath", serialNumber))
-        .thenReturn("${sha256Hex(apkFile)}  $onDeviceApkPath")
+    whenever(mockAdbUtils.executeAdbShellCommand("md5sum $onDeviceApkPath", serialNumber))
+        .thenReturn("${md5Hex(apkFile)}  $onDeviceApkPath")
 
     assertTrue(androidDevice.installApkOnDevice(apkFile, false, false, false, false, packageName))
   }
@@ -684,10 +999,10 @@ class AndroidDeviceImplTest {
         .thenReturn("Success")
     whenever(mockAdbUtils.executeAdbShellCommand("pm path $packageName", serialNumber))
         .thenReturn("package:$onDeviceApkPath")
-    // sha256sum reports an error on stdout while adb still exits 0, so the first token is not a
+    // md5sum reports an error on stdout while adb still exits 0, so the first token is not a
     // digest. This must be classified as a read failure, not an apk mismatch.
-    whenever(mockAdbUtils.executeAdbShellCommand("sha256sum $onDeviceApkPath", serialNumber))
-        .thenReturn("sha256sum: $onDeviceApkPath: No such file or directory")
+    whenever(mockAdbUtils.executeAdbShellCommand("md5sum $onDeviceApkPath", serialNumber))
+        .thenReturn("md5sum: $onDeviceApkPath: No such file or directory")
 
     try {
       androidDevice.installApkOnDevice(apkFile, false, false, false, false, packageName)
@@ -758,7 +1073,7 @@ class AndroidDeviceImplTest {
         .thenReturn("Performing Streamed Install")
     whenever(mockAdbUtils.executeAdbShellCommand("pm path $packageName", serialNumber))
         .thenReturn("package:$onDeviceApkPath")
-    whenever(mockAdbUtils.executeAdbShellCommand("sha256sum $onDeviceApkPath", serialNumber))
+    whenever(mockAdbUtils.executeAdbShellCommand("md5sum $onDeviceApkPath", serialNumber))
         .thenReturn("stalehash  $onDeviceApkPath")
     doAnswer {
           throw AdbCommandFailedException(
@@ -817,9 +1132,9 @@ class AndroidDeviceImplTest {
     whenever(mockAdbUtils.executeAdbShellCommand("pm path $packageName", serialNumber))
         .thenReturn("package:$onDeviceApkPath")
     // Stale after --fastdeploy (triggers fallback); matches after the plain reinstall.
-    whenever(mockAdbUtils.executeAdbShellCommand("sha256sum $onDeviceApkPath", serialNumber))
+    whenever(mockAdbUtils.executeAdbShellCommand("md5sum $onDeviceApkPath", serialNumber))
         .thenReturn("stalehash  $onDeviceApkPath")
-        .thenReturn("${sha256Hex(apkFile)}  $onDeviceApkPath")
+        .thenReturn("${md5Hex(apkFile)}  $onDeviceApkPath")
 
     val result = androidDevice.installApkOnDevice(apkFile, false, false, false, false, packageName)
     assertTrue(result)
@@ -833,5 +1148,44 @@ class AndroidDeviceImplTest {
         .verify(mockAdbUtils)
         .executeAdbCommand(eq("uninstall com.meta.ar.helixserver"), eq(serialNumber), any())
     inOrder.verify(mockAdbUtils).executeAdbCommand(eq(plainInstall), eq(serialNumber), any())
+  }
+
+  @Test
+  fun testInstallBuildUuidFileSetsTheUmaskInTheShellThatWritesTheFile() {
+    val result =
+        androidDevice.installBuildUuidFile(
+            Paths.get("/data/local/tmp/build_metadata"),
+            packageName,
+            "some-build-uuid",
+        )
+
+    // One command, not two: `umask` is per-process, so one set in its own `adb shell` is gone by
+    // the time a second shell's redirect creates the file, which then takes adbd's default mode
+    // rather than 0644. Pinning the single chained command is what holds that.
+    assertTrue(result)
+    verify(mockAdbUtils)
+        .executeAdbShellCommand(
+            "umask 022 && mkdir -p /data/local/tmp/build_metadata/$packageName && " +
+                "echo some-build-uuid > /data/local/tmp/build_metadata/$packageName/build_uuid.txt",
+            serialNumber,
+            false,
+        )
+  }
+
+  @Test
+  fun testInstallBuildUuidFileDoesNotFailTheInstallWhenTheDeviceRefusesTheWrite() {
+    // doAnswer, not thenThrow: Kotlin emits no `throws` clause, so Mockito rejects a checked
+    // exception as a stubbed one even though the code under test can observe it.
+    doAnswer { throw AdbCommandFailedException("read-only file system") }
+        .whenever(mockAdbUtils)
+        .executeAdbShellCommand(any(), eq(serialNumber), any())
+
+    assertTrue(
+        androidDevice.installBuildUuidFile(
+            Paths.get("/data/local/tmp/build_metadata"),
+            packageName,
+            "some-build-uuid",
+        ),
+    )
   }
 }

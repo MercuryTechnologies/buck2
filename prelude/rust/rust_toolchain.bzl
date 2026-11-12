@@ -28,6 +28,8 @@ RustExplicitSysrootDeps = record(
     others = list[Dependency],
 )
 
+RustSysrootInfo = provider(fields = {"sysroot_deps": RustExplicitSysrootDeps | None})
+
 PanicRuntime = enum("unwind", "abort", "none")
 
 RustSanitizer = enum("address", "cfi", "hwaddress", "kcfi", "leak", "memory", "memtag", "safestack", "shadow-call-stack", "thread")
@@ -45,6 +47,8 @@ rust_toolchain_attrs = {
     "rustc_env": provider_field(dict[str, typing.Any], default = {}),
     # Baseline compiler config
     "rustc_flags": provider_field(list[typing.Any], default = []),
+    # Extra rustc flags applied only while compiling a proc-macro crate.
+    "rustc_proc_macro_flags": provider_field(list[typing.Any], default = []),
     # Rustc flags, except that they are applied on the command line after the
     # target's rustc flags
     "extra_rustc_flags": provider_field(list[typing.Any], default = []),
@@ -66,6 +70,9 @@ rust_toolchain_attrs = {
     "rustdoc_flags": provider_field(list[typing.Any], default = []),
     # Extra flags to pass to the linker
     "linker_flags": provider_field(list[typing.Any], default = []),
+    # Native dependencies added to every crate, and therefore to every link
+    # that includes Rust code
+    "linker_deps": provider_field(list[Dependency], default = []),
     # When you `buck test` a library, also compile and run example code in its
     # documentation comments.
     "doctests": provider_field(bool, default = False),
@@ -75,6 +82,19 @@ rust_toolchain_attrs = {
     "rustdoc": provider_field(RunInfo | None, default = None),
     # Clippy (linter) version of the compiler
     "clippy_driver": provider_field(RunInfo | None, default = None),
+    # The Miri driver. Compiles `miri`-kind dependency rlibs (running as rustc
+    # via `MIRI_BE_RUSTC=target`) and interprets `[miri]` sub-targets, so it
+    # must be exec-configured like `compiler`.
+    "miri_driver": provider_field(RunInfo | None, default = None),
+    # Default Miri flags (e.g. ["-Zmiri-disable-isolation"])
+    "miri_flags": provider_field(list[typing.Any], default = []),
+    # Extra rustc flags for `miri`-kind compiles, on top of the defaults the
+    # driver applies itself (`--cfg=miri`, `-Zalways-encode-mir`, ...). Never
+    # seen by native compiles; `miri_flags` is for interpreter execution.
+    "miri_rustc_flags": provider_field(list[typing.Any], default = []),
+    # Miri flags from configuration, applied to override the toolchain's
+    # and target's flags
+    "extra_miri_flags": provider_field(list[typing.Any], default = []),
     # The default edition to use, if not specified.
     "default_edition": provider_field(str | None, default = None),
     # Lints
@@ -158,6 +178,10 @@ rust_toolchain_attrs = {
     # Suffix to append onto all -Cmetadata arguments to differentiate the same
     # crate in different configurations
     "configuration_hash": provider_field(str | None, default = None),
+    # Optional configuration hash used only for proc-macro crates. Toolchains
+    # may remove execution-only constraints here without weakening identity for
+    # ordinary target crates.
+    "proc_macro_configuration_hash": provider_field(str | None, default = None),
     # Error handler used to categorize rust errors encountered by users
     "rust_error_handler": provider_field(typing.Any, default = None),
     # LLVM remarks filter (e.g., "all", "inline") - used with -Cremark flag
@@ -176,6 +200,25 @@ rust_toolchain_attrs = {
     # "target-feature" will block both "-Ctarget-feature=..." and the split
     # form "-C" followed by "target-feature=...".
     "restricted_rustc_flags": provider_field(list[typing.Any], default = []),
+    # Under `-Csplit-debuginfo=unpacked`, which the rules pass for the cxx
+    # toolchain's `single` and `split` debug modes, rustc writes each codegen
+    # unit's `.dwo` to `--out-dir` and also packs a copy of it into the rlib or
+    # staticlib, so that a downstream `-Csplit-debuginfo=packed` link could
+    # build a dwp from the archive alone. The rules never link that way: `dwp`
+    # reads the `--out-dir` files, which are tracked as external debug info,
+    # and linkers never pull archive members that define no symbols. The
+    # copies only add to what every dependent compile downloads and every
+    # link materializes, and in debug-heavy builds they are a large share of
+    # rlib bytes. When set, the compile action deletes the `.dwo` members from
+    # rlibs and staticlibs right after rustc writes them, using the cxx
+    # toolchain's archiver (`gnu`, `llvm` or `bsd` archiver types; others keep
+    # the members). No effect when the cxx toolchain's split debug mode is
+    # `none`, or for Apple and Windows targets, whose archives never carry
+    # `.dwo` members.
+    "strip_dwo_from_rlibs": provider_field(bool, default = False),
 }
 
 RustToolchainInfo = provider(fields = rust_toolchain_attrs)
+
+def toolchain_supports_miri(toolchain_info: RustToolchainInfo) -> bool:
+    return toolchain_info.miri_driver != None

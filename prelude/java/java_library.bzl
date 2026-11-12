@@ -6,11 +6,17 @@
 # of this source tree. You may select, at your option, one of the
 # above-listed licenses.
 
-load("@prelude//:attrs_validators.bzl", "get_attrs_validation_specs")
+load("@prelude//:attrs_validators.bzl", "get_attrs_validation_specs", "validation_common")
 load("@prelude//:paths.bzl", "paths")
-load("@prelude//:validation_deps.bzl", "get_validation_deps_outputs")
+load("@prelude//:prelude_rule.bzl", "prelude_rule")
+load("@prelude//:validation_deps.bzl", "VALIDATION_DEPS_ATTR_NAME", "get_validation_deps_outputs")
 load("@prelude//android:android_providers.bzl", "merge_android_packageable_info")
+load("@prelude//android:build_only_native_code.bzl", "is_build_only_native_code")
+load("@prelude//android:configuration.bzl", "is_building_android_binary_attr")
+load("@prelude//decls:common.bzl", "buck")
+load("@prelude//decls:toolchains_common.bzl", "toolchains_common")
 load("@prelude//graphql:graphql.bzl", "graphql_providers")
+load("@prelude//java:compiler_depth.bzl", "compiler_depth_for_action")
 load(
     "@prelude//java:java_providers.bzl",
     "ClasspathSnapshotGranularity",
@@ -22,8 +28,8 @@ load(
     "create_abi",
     "create_java_library_providers",
     "create_native_providers",
-    "derive_compiling_deps",
     "generate_java_classpath_snapshot",
+    "get_compiling_deps_tset",
     "make_compile_outputs",
     "to_list",
 )
@@ -49,9 +55,12 @@ load(
     "get_java_version_attributes",
     "to_java_version",
 )
+load("@prelude//jvm:attrs.bzl", "dex_min_sdk_version", "jvm_common")
 load("@prelude//jvm:cd_jar_creator_util.bzl", "postprocess_jar")
 load("@prelude//jvm:nullsafe.bzl", "get_nullsafe_info")
 load("@prelude//linking:shared_libraries.bzl", "SharedLibraryInfo")
+load("@prelude//target_stats:target_stats.bzl", "CycleMode", "target_stats_providers_and_subtargets")
+load("@prelude//target_stats:target_stats_config.bzl", "TARGET_STATS_ENABLED")
 load("@prelude//utils:expect.bzl", "expect")
 load("@prelude//utils:label_provider.bzl", "LabelInfo")
 
@@ -165,7 +174,7 @@ def _build_classpath(
     classpath_args_projection: str,
     additional_classpath_entries_list: list[Artifact],
 ) -> [cmd_args, None]:
-    compiling_deps_tset = derive_compiling_deps(actions, None, deps)
+    compiling_deps_tset = get_compiling_deps_tset(actions, deps)
 
     if additional_classpath_entries or compiling_deps_tset or additional_classpath_entries_list:
         args = cmd_args()
@@ -562,6 +571,12 @@ def _create_jar_artifact(
     jar_snapshot = generate_java_classpath_snapshot(
         ctx.actions, java_toolchain.cp_snapshot_generator, ClasspathSnapshotGranularity("CLASS_MEMBER_LEVEL"), abi or final_jar, actions_identifier
     )
+    # Classic javac is not counted, but preserve compiler depth through its inputs.
+    compiler_depth = compiler_depth_for_action(
+        label,
+        "javac_and_jar",
+        get_compiling_deps_tset(ctx.actions, deps, [additional_classpath_entries] if additional_classpath_entries else []) if not skip_javac else None,
+    )
     return make_compile_outputs(
         full_library = final_jar,
         preprocessed_library = jar_out,
@@ -569,6 +584,8 @@ def _create_jar_artifact(
         required_for_source_only_abi = required_for_source_only_abi,
         annotation_processor_output = generated_sources_dir,
         abi_jar_snapshot = jar_snapshot,
+        full_library_compiler_depth = compiler_depth,
+        abi_compiler_depth = compiler_depth,
     )
 
 def _check_dep_types(deps: list[Dependency]):
@@ -598,6 +615,28 @@ def _check_exported_deps(exported_deps: list[Dependency], attr_name: str):
 # TODO(T145137403) remove need for this
 def _skip_java_library_dep_checks(ctx: AnalysisContext) -> bool:
     return "skip_buck2_java_library_dep_checks" in ctx.attrs.labels
+
+def jvm_target_stats(ctx: AnalysisContext) -> (list[Provider], dict[str, list[Provider]]):
+    """target_stats for a JVM library rule (java_library, kotlin_library).
+
+    JVM sources get package cycles, as android_library does; the tools come from
+    the java toolchain, which is the one both rules have. A no-op unless the
+    config is enabled and that toolchain carries the tools.
+    """
+    if not TARGET_STATS_ENABLED:
+        return [], {}
+    tools = ctx.attrs._java_toolchain[JavaToolchainInfo].target_stats_tools
+    if tools == None:
+        return [], {}
+    return target_stats_providers_and_subtargets(
+        ctx,
+        tools = tools,
+        srcs = {src.short_path: src for src in ctx.attrs.srcs},
+        # Target stats cover the compile graph, including non-packaged provided deps.
+        deps = (ctx.attrs.deps + ctx.attrs.exported_deps + ctx.attrs.runtime_deps + ctx.attrs.provided_deps + ctx.attrs.exported_provided_deps),
+        cycle_mode = CycleMode("package"),
+        module_name = ctx.label.name,
+    )
 
 def java_library_impl(ctx: AnalysisContext) -> list[Provider]:
     """
@@ -635,13 +674,16 @@ def java_library_impl(ctx: AnalysisContext) -> list[Provider]:
         _check_dep_types(ctx.attrs.exported_provided_deps)
         _check_dep_types(ctx.attrs.runtime_deps)
 
+    target_stats_providers, target_stats_subtargets = jvm_target_stats(ctx)
+
     java_providers = build_java_library(
         ctx = ctx,
         srcs = ctx.attrs.srcs,
         validation_deps_outputs = get_validation_deps_outputs(ctx),
+        extra_sub_targets = target_stats_subtargets,
     )
 
-    return to_list(java_providers) + [android_packageable_info] + [LabelInfo(labels = ctx.attrs.labels)] + graphql_providers(ctx)
+    return to_list(java_providers) + [android_packageable_info] + [LabelInfo(labels = ctx.attrs.labels)] + graphql_providers(ctx) + target_stats_providers
 
 def build_java_library(
     ctx: AnalysisContext,
@@ -870,3 +912,165 @@ def _semanticdb_subtarget(ctx: AnalysisContext, extra_sub_targets: dict, java_to
         ]
     }
     return extra_sub_targets
+
+java_library = prelude_rule(
+    name = "java_library",
+    impl = java_library_impl,
+    docs = """
+        A `java_library()` rule defines a set of Java
+        files that can be compiled together. The main output of a
+         `java_library()` rule is a single JAR file containing all
+        of the compiled class files, as well as the static files specified in
+        the `resources` argument.
+    """,
+    examples = """
+        ```
+        # A rule that compiles a single .java file.
+        java_library(
+          name = 'JsonUtil',
+          srcs = ['JsonUtil.java'],
+          deps = [
+            '//third_party/guava:guava',
+            '//third_party/jackson:jackson',
+          ],
+        )
+
+        # A rule that compiles all of the .java files under the directory in
+        # which the rule is defined using glob(). It also excludes an
+        # individual file that may have additional dependencies, so it is
+        # compiled by a separate rule.
+        java_library(
+          name = 'messenger',
+          srcs = glob(['**/*.java'], excludes = ['MessengerModule.java']),
+          deps = [
+            '//src/com/facebook/base:base',
+            '//third_party/guava:guava',
+          ],
+        )
+
+        java_library(
+          name = 'MessengerModule',
+          srcs = ['MessengerModule.java'],
+          deps = [
+            '//src/com/facebook/base:base',
+            '//src/com/google/inject:inject',
+            '//third_party/guava:guava',
+            '//third_party/jsr-330:jsr-330',
+          ],
+        )
+
+        # A rule that builds a library with both relative and
+        # fully-qualified deps.
+        java_library(
+          name = 'testutil',
+          srcs = glob(['tests/**/*.java'], excludes = 'tests/**/*Test.java'),
+          deps = [
+            ':lib-fb4a',
+            '//java/com/facebook/base:base',
+          ],
+        )
+        ```
+    """,
+    further = None,
+    attrs = (
+        # @unsorted-dict-items
+        {
+            "srcs": attrs.list(
+                attrs.source(),
+                default = [],
+                doc = """
+                The set of `.java` files to compile for this rule.
+                 If any of the files in this list end in `.src.zip`,
+                 then the entries in the ZIP file that end in `.java` will be
+                 included as ordinary inputs to compilation. This is common when using
+                 a `genrule()` to auto-generate some Java source code that
+                 needs to be compiled with some hand-written Java code.
+            """,
+            ),
+        }
+        | jvm_common.resources_arg()
+        | {
+            "concat_resources": attrs.bool(
+                default = False,
+                doc = """
+                Use parallel compression and concatenation of intermediary jars to speed up jar time generation.
+            """,
+            ),
+            "deps": attrs.list(
+                attrs.dep(),
+                default = [],
+                doc = """
+                Rules (usually other `java_library` rules) that are used to
+                 generate the classpath required to compile this `java_library`.
+            """,
+            ),
+            "extra_arguments": attrs.list(
+                attrs.string(),
+                default = [],
+                doc = """
+                List of additional arguments to pass into the Java compiler. These
+                 arguments follow the ones specified in `.buckconfig`.
+            """,
+            ),
+            "java_version": attrs.option(
+                attrs.string(),
+                default = None,
+                doc = """
+                Equivalent to setting both `source` and `target`  to the given value. Setting this and `source` or `target` (or both!) is an error.
+            """,
+            ),
+            "source": attrs.option(
+                attrs.string(),
+                default = None,
+                doc = """
+                Specifies the version of Java (as a string) to interpret source
+                 files as.
+                 Overrides the value in "source\\_level" in the "java" section
+                 of `.buckconfig`.
+            """,
+            ),
+            "target": attrs.option(
+                attrs.string(),
+                default = None,
+                doc = """
+                Specifies the version of Java (as a string) for which to
+                 generate code.
+                 Overrides the value in "target\\_level" in the "java" section
+                 of `.buckconfig`.
+            """,
+            ),
+        }
+        | jvm_common.annotation_processors()
+        | jvm_common.remove_classes_arg()
+        | jvm_common.exported_deps()
+        | jvm_common.provided_deps()
+        | jvm_common.exported_provided_deps()
+        | jvm_common.abi_generation_mode()
+        | jvm_common.source_only_abi_deps()
+        | jvm_common.required_for_source_only_abi()
+        | jvm_common.plugins()
+        | jvm_common.multi_release_jar()
+        | jvm_common.javac()
+        | jvm_common.classic_java_content_based_paths()
+        | {
+            "class_to_src_map_deps": attrs.list(attrs.dep(), default = []),
+            "jar_postprocessor": attrs.option(attrs.exec_dep(), default = None),
+            "manifest_file": attrs.option(attrs.source(), default = None),
+            "maven_coords": attrs.option(attrs.string(), default = None),
+            "proguard_config": attrs.option(attrs.source(), default = None),
+            "resources_root": attrs.option(attrs.string(), default = None),
+            "runtime_deps": attrs.list(attrs.dep(), default = []),
+            VALIDATION_DEPS_ATTR_NAME: attrs.set(attrs.dep(), sorted = True, default = []),
+            "_build_only_native_code": attrs.default_only(attrs.bool(default = is_build_only_native_code())),
+            "_dex_min_sdk_version": attrs.option(attrs.int(), default = dex_min_sdk_version()),
+            "_dex_toolchain": toolchains_common.dex(),
+            "_exec_os_type": buck.exec_os_type_arg(),
+            "_is_building_android_binary": is_building_android_binary_attr(),
+            "_java_toolchain": toolchains_common.java(),
+        }
+        | buck.licenses_arg()
+        | buck.labels_arg()
+        | buck.contacts_arg()
+        | validation_common.attrs_validators_arg()
+    ),
+)
