@@ -933,6 +933,39 @@ fn push_snapshot(a: &mut Attrs, prefix: &str, s: &buck2_data::Snapshot) {
         k("re_get_digest_expirations_finished_with_error"),
         s.re_get_digest_expirations_finished_with_error,
     );
+    a.int(k("re_presence_check_rpcs"), s.re_presence_check_rpcs);
+    a.int(
+        k("re_presence_check_digests_queried"),
+        s.re_presence_check_digests_queried,
+    );
+    a.int(
+        k("re_presence_check_digest_answers"),
+        s.re_presence_check_digest_answers,
+    );
+    a.int(
+        k("re_presence_check_largest_batch"),
+        s.re_presence_check_largest_batch,
+    );
+    a.int(k("re_cas_batch_update_rpcs"), s.re_cas_batch_update_rpcs);
+    a.int(k("re_cas_batch_update_bytes"), s.re_cas_batch_update_bytes);
+    a.int(
+        k("re_cas_bytestream_write_rpcs"),
+        s.re_cas_bytestream_write_rpcs,
+    );
+    a.int(
+        k("re_cas_bytestream_write_bytes"),
+        s.re_cas_bytestream_write_bytes,
+    );
+    a.int(k("re_cas_batch_read_rpcs"), s.re_cas_batch_read_rpcs);
+    a.int(k("re_cas_batch_read_bytes"), s.re_cas_batch_read_bytes);
+    a.int(
+        k("re_cas_bytestream_read_rpcs"),
+        s.re_cas_bytestream_read_rpcs,
+    );
+    a.int(
+        k("re_cas_bytestream_read_bytes"),
+        s.re_cas_bytestream_read_bytes,
+    );
 
     a.int(k("io_in_flight_copy"), s.io_in_flight_copy);
     a.int(k("io_in_flight_symlink"), s.io_in_flight_symlink);
@@ -1417,6 +1450,23 @@ mod tests {
                 buck2_max_rss: 42,
                 ..Default::default()
             }),
+            // Each remote-cache counter gets its own value, so a counter exported under another
+            // counter's name fails below.
+            last_snapshot: Some(buck2_data::Snapshot {
+                re_presence_check_rpcs: 1,
+                re_presence_check_digests_queried: 2,
+                re_presence_check_digest_answers: 3,
+                re_presence_check_largest_batch: 4,
+                re_cas_batch_update_rpcs: 5,
+                re_cas_batch_update_bytes: 6,
+                re_cas_bytestream_write_rpcs: 7,
+                re_cas_bytestream_write_bytes: 8,
+                re_cas_batch_read_rpcs: 9,
+                re_cas_batch_read_bytes: 10,
+                re_cas_bytestream_read_rpcs: 11,
+                re_cas_bytestream_read_bytes: 12,
+                ..Default::default()
+            }),
             // Nested sub-message carrying a semantic-convention field (`branched_from_revision`).
             file_watcher_stats: Some(buck2_data::FileWatcherStats {
                 branched_from_revision: Some("cafef00d".to_owned()),
@@ -1485,6 +1535,26 @@ mod tests {
 
         assert_eq!(string(&attrs, "buck2.outcome").as_deref(), Some("Success"));
         assert_eq!(int(&attrs, "buck2.first_snapshot.buck2_max_rss"), Some(42));
+        for (name, value) in [
+            ("re_presence_check_rpcs", 1),
+            ("re_presence_check_digests_queried", 2),
+            ("re_presence_check_digest_answers", 3),
+            ("re_presence_check_largest_batch", 4),
+            ("re_cas_batch_update_rpcs", 5),
+            ("re_cas_batch_update_bytes", 6),
+            ("re_cas_bytestream_write_rpcs", 7),
+            ("re_cas_bytestream_write_bytes", 8),
+            ("re_cas_batch_read_rpcs", 9),
+            ("re_cas_batch_read_bytes", 10),
+            ("re_cas_bytestream_read_rpcs", 11),
+            ("re_cas_bytestream_read_bytes", 12),
+        ] {
+            assert_eq!(
+                int(&attrs, &format!("buck2.last_snapshot.{name}")),
+                Some(value),
+                "{name}"
+            );
+        }
 
         assert_eq!(
             string(&attrs, "buck2.metadata.flavor").as_deref(),

@@ -391,6 +391,15 @@ impl SnapshotCollector {
             snapshot.re_presence_check_digests_queried = stats.presence.digests_queried;
             snapshot.re_presence_check_digest_answers = stats.presence.digest_answers;
             snapshot.re_presence_check_largest_batch = stats.presence.largest_batch;
+            let cas = &stats.cas_transport;
+            snapshot.re_cas_batch_update_rpcs = cas.batch_update_blobs.rpcs;
+            snapshot.re_cas_batch_update_bytes = cas.batch_update_blobs.bytes;
+            snapshot.re_cas_bytestream_write_rpcs = cas.bytestream_write.rpcs;
+            snapshot.re_cas_bytestream_write_bytes = cas.bytestream_write.bytes;
+            snapshot.re_cas_batch_read_rpcs = cas.batch_read_blobs.rpcs;
+            snapshot.re_cas_batch_read_bytes = cas.batch_read_blobs.bytes;
+            snapshot.re_cas_bytestream_read_rpcs = cas.bytestream_read.rpcs;
+            snapshot.re_cas_bytestream_read_bytes = cas.bytestream_read.bytes;
 
             snapshot.zdb_download_queries = stats.download_stats.zdb.queries;
             snapshot.zdb_download_bytes = stats.download_stats.zdb.bytes;

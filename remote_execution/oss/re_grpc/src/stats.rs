@@ -11,6 +11,7 @@
 use std::io;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 use std::task::Context;
 use std::task::Poll;
@@ -25,6 +26,87 @@ use tower::Service;
 
 use crate::NetworkStatisticsGlobal;
 use crate::get_network_stats_global;
+
+/// The RPC that carries blobs to or from the CAS. Small blobs travel in batches and large ones
+/// as a ByteStream each, so the counts of the two show what a build's cache traffic is made of.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum CasTransport {
+    BatchUpdateBlobs,
+    ByteStreamWrite,
+    BatchReadBlobs,
+    ByteStreamRead,
+}
+
+#[derive(Default, Debug)]
+struct TransferCounters {
+    rpcs: AtomicU64,
+    bytes: AtomicU64,
+}
+
+impl TransferCounters {
+    fn counts(&self) -> CasTransfers {
+        CasTransfers {
+            rpcs: self.rpcs.load(Ordering::Relaxed),
+            bytes: self.bytes.load(Ordering::Relaxed),
+        }
+    }
+}
+
+/// The RPCs issued on each CAS transport, retries included, and the blob bytes the successful
+/// ones moved, as sent or received (compressed, when the transfer is).
+#[derive(Default, Debug)]
+pub(crate) struct CasTransportStats {
+    batch_update_blobs: TransferCounters,
+    bytestream_write: TransferCounters,
+    batch_read_blobs: TransferCounters,
+    bytestream_read: TransferCounters,
+}
+
+impl CasTransportStats {
+    fn counters(&self, transport: CasTransport) -> &TransferCounters {
+        match transport {
+            CasTransport::BatchUpdateBlobs => &self.batch_update_blobs,
+            CasTransport::ByteStreamWrite => &self.bytestream_write,
+            CasTransport::BatchReadBlobs => &self.batch_read_blobs,
+            CasTransport::ByteStreamRead => &self.bytestream_read,
+        }
+    }
+
+    pub(crate) fn rpc_issued(&self, transport: CasTransport) {
+        self.counters(transport)
+            .rpcs
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn bytes_moved(&self, transport: CasTransport, bytes: usize) {
+        self.counters(transport)
+            .bytes
+            .fetch_add(u64::try_from(bytes).unwrap_or(u64::MAX), Ordering::Relaxed);
+    }
+
+    pub(crate) fn counts(&self) -> CasTransportCounts {
+        CasTransportCounts {
+            batch_update_blobs: self.batch_update_blobs.counts(),
+            bytestream_write: self.bytestream_write.counts(),
+            batch_read_blobs: self.batch_read_blobs.counts(),
+            bytestream_read: self.bytestream_read.counts(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+pub struct CasTransfers {
+    pub rpcs: u64,
+    pub bytes: u64,
+}
+
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+pub struct CasTransportCounts {
+    pub batch_update_blobs: CasTransfers,
+    pub bytestream_write: CasTransfers,
+    pub batch_read_blobs: CasTransfers,
+    pub bytestream_read: CasTransfers,
+}
 
 /// An IO wrapper that implements AsyncRead and AsyncWrite and increments the
 /// global counters

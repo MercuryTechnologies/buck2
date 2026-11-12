@@ -355,6 +355,7 @@ pub struct NetworkStatisticsResponse {
     pub downloaded: i64,
     pub download_storage_stats: TStorageStats,
     pub upload_storage_stats: TStorageStats,
+    pub cas_transport: crate::stats::CasTransportCounts,
     // Compatibility with the Thrift structs
     pub _dot_dot_default: (),
 }

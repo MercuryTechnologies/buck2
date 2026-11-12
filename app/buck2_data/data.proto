@@ -1308,6 +1308,16 @@ message Snapshot {
   uint64 re_presence_check_digests_queried = 1068;
   uint64 re_presence_check_digest_answers = 1069;
   uint64 re_presence_check_largest_batch = 1070;
+  // CAS blob transfers by transport: RPCs issued, retries included, and the
+  // bytes the successful ones carried, compressed when the transfer is.
+  uint64 re_cas_batch_update_rpcs = 1071;
+  uint64 re_cas_batch_update_bytes = 1072;
+  uint64 re_cas_bytestream_write_rpcs = 1073;
+  uint64 re_cas_bytestream_write_bytes = 1074;
+  uint64 re_cas_batch_read_rpcs = 1075;
+  uint64 re_cas_batch_read_bytes = 1076;
+  uint64 re_cas_bytestream_read_rpcs = 1077;
+  uint64 re_cas_bytestream_read_bytes = 1078;
 
   // Write actions served from the action cache (`buck2.write_action_cache`).
   uint64 write_action_cache_hits = 1209;

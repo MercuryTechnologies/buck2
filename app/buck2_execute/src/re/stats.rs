@@ -45,6 +45,8 @@ pub struct RemoteExecutionClientStats {
     pub upload_stats: PerBackendRemoteExecutionClientStats,
     pub download_stats: PerBackendRemoteExecutionClientStats,
 
+    pub cas_transport: CasTransportStats,
+
     // Per per-operation stats tracked below.
     pub uploads: RemoteExecutionClientOpStats,
     pub downloads: RemoteExecutionClientOpStats,
@@ -58,6 +60,38 @@ pub struct RemoteExecutionClientStats {
 
     // Local cache hits and misses stats
     pub local_cache: LocalCacheRemoteExecutionClientStats,
+}
+
+/// CAS RPCs by the transport that carried the blobs. They come from RE and, like `uploaded` and
+/// `downloaded`, count the whole process rather than the current connection.
+#[derive(Default)]
+pub struct CasTransportStats {
+    pub batch_update_blobs: CasTransferStats,
+    pub bytestream_write: CasTransferStats,
+    pub batch_read_blobs: CasTransferStats,
+    pub bytestream_read: CasTransferStats,
+}
+
+#[derive(Default)]
+pub struct CasTransferStats {
+    pub rpcs: u64,
+    /// In bytes, of the RPCs that succeeded.
+    pub bytes: u64,
+}
+
+impl From<remote_execution::CasTransportCounts> for CasTransportStats {
+    fn from(counts: remote_execution::CasTransportCounts) -> CasTransportStats {
+        let transfer = |transfers: remote_execution::CasTransfers| CasTransferStats {
+            rpcs: transfers.rpcs,
+            bytes: transfers.bytes,
+        };
+        CasTransportStats {
+            batch_update_blobs: transfer(counts.batch_update_blobs),
+            bytestream_write: transfer(counts.bytestream_write),
+            batch_read_blobs: transfer(counts.batch_read_blobs),
+            bytestream_read: transfer(counts.bytestream_read),
+        }
+    }
 }
 
 #[derive(Default, Allocative)]

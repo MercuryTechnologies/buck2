@@ -254,10 +254,11 @@ impl ReConnectionManager {
             .map_err(|e| from_any_with_tag(e, buck2_error::ErrorTag::Tier0))
             .buck_error_context("Error getting RE network stats")?;
 
-        // Those two fields come from RE and are always available.
+        // These fields come from RE and are always available.
         let mut res = RemoteExecutionClientStats {
             uploaded: client_stats.uploaded as _,
             downloaded: client_stats.downloaded as _,
+            cas_transport: client_stats.cas_transport.into(),
             ..Default::default()
         };
 

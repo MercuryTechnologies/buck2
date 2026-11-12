@@ -132,11 +132,14 @@ use uuid::Uuid;
 use crate::casd_autostart::CheckedConnector;
 use crate::casd_autostart::DaemonAddress;
 use crate::error::*;
+use crate::get_network_stats_global;
 use crate::metadata::*;
 use crate::request::*;
 use crate::response::*;
 use crate::shared_cache::SharedCacheCounters;
 use crate::shared_cache::SharedCasCache;
+use crate::stats::CasTransport;
+use crate::stats::CasTransportStats;
 use crate::stats::CountingConnector;
 use crate::unix_socket::UnixConnector;
 
@@ -1752,9 +1755,11 @@ impl StalledReexecute<'_> {
                 let grpc_clients = self.grpc_clients.clone();
                 let read = read.clone();
                 async move {
-                    Ok(grpc_clients
-                        .cas_client()
-                        .await?
+                    let mut cas_client = grpc_clients.cas_client().await?;
+                    grpc_clients
+                        .cas_transport
+                        .rpc_issued(CasTransport::BatchReadBlobs);
+                    let response = cas_client
                         .batch_read_blobs(with_re_metadata_timeout(
                             read,
                             self.metadata.clone(),
@@ -1763,7 +1768,12 @@ impl StalledReexecute<'_> {
                             self.grpc_request_timeout,
                         ))
                         .await?
-                        .into_inner())
+                        .into_inner();
+                    grpc_clients.cas_transport.bytes_moved(
+                        CasTransport::BatchReadBlobs,
+                        batch_read_response_bytes(&response),
+                    );
+                    Ok(response)
                 }
             },
         )
@@ -1807,9 +1817,12 @@ impl StalledReexecute<'_> {
                 let grpc_clients = self.grpc_clients.clone();
                 let update = update.clone();
                 async move {
-                    Ok(grpc_clients
-                        .cas_client()
-                        .await?
+                    let bytes = batch_update_request_bytes(&update);
+                    let mut cas_client = grpc_clients.cas_client().await?;
+                    grpc_clients
+                        .cas_transport
+                        .rpc_issued(CasTransport::BatchUpdateBlobs);
+                    let response = cas_client
                         .batch_update_blobs(with_re_metadata_timeout(
                             update,
                             self.metadata.clone(),
@@ -1818,7 +1831,11 @@ impl StalledReexecute<'_> {
                             self.grpc_request_timeout,
                         ))
                         .await?
-                        .into_inner())
+                        .into_inner();
+                    grpc_clients
+                        .cas_transport
+                        .bytes_moved(CasTransport::BatchUpdateBlobs, bytes);
+                    Ok(response)
                 }
             },
         )
@@ -2327,6 +2344,22 @@ async fn remote_request_span<T>(
         (result, end)
     })
     .await
+}
+
+fn batch_update_request_bytes(request: &BatchUpdateBlobsRequest) -> usize {
+    request
+        .requests
+        .iter()
+        .map(|request| request.data.len())
+        .sum()
+}
+
+fn batch_read_response_bytes(response: &BatchReadBlobsResponse) -> usize {
+    response
+        .responses
+        .iter()
+        .map(|response| response.data.len())
+        .sum()
 }
 
 fn request_stats_for_grpc_digests<'a>(digests: impl IntoIterator<Item = &'a Digest>) -> (u64, u64) {
@@ -3300,6 +3333,16 @@ pub struct REClientBuilder;
 
 impl REClientBuilder {
     pub async fn build_and_connect(opts: &Buck2OssReConfiguration) -> anyhow::Result<REClient> {
+        Self::build_and_connect_counting(opts, get_network_stats_global().cas_transport.clone())
+            .await
+    }
+
+    /// `build_and_connect`, counting the client's CAS transfers in `cas_transport` rather than
+    /// in the process's network stats, so a test can read its own client's counts.
+    async fn build_and_connect_counting(
+        opts: &Buck2OssReConfiguration,
+        cas_transport: Arc<CasTransportStats>,
+    ) -> anyhow::Result<REClient> {
         let request_metadata_tool_name = request_metadata_tool_name_from_options(opts)?;
         let invocation_env_override = invocation_env_override_from_options(opts)?;
         let tls_config = Arc::new(tokio::sync::OnceCell::new());
@@ -3661,6 +3704,7 @@ impl REClientBuilder {
             credential_helper,
             cas_daemon,
             invocation_env_override,
+            cas_transport,
         };
 
         Ok(REClient::new(
@@ -4327,6 +4371,7 @@ pub struct GRPCClients {
     cas_daemon: Option<Arc<CasDaemonLauncher>>,
     /// See `with_invocation_env_override`; read where Execute is sent.
     invocation_env_override: Option<String>,
+    cas_transport: Arc<CasTransportStats>,
 }
 
 impl GRPCClients {
@@ -4995,15 +5040,10 @@ impl CasCallContext {
         metadata: RemoteExecutionMetadata,
         re_request: BatchUpdateBlobsRequest,
     ) -> anyhow::Result<BatchUpdateBlobsResponse> {
+        let bytes = batch_update_request_bytes(&re_request);
         let mut start = remote_request_start("CAS", "BatchUpdateBlobs", &metadata, None);
         start.digest_count = Some(re_request.requests.len() as u64);
-        start.bytes = Some(
-            re_request
-                .requests
-                .iter()
-                .map(|request| request.data.len() as u64)
-                .sum(),
-        );
+        start.bytes = Some(bytes as u64);
         remote_request_span(
             start,
             retry_idempotent_with_client_reconnect(
@@ -5017,7 +5057,9 @@ impl CasCallContext {
                     let context = self.clone();
                     async move {
                         let mut cas_client = context.grpc_clients.cas_client().await?;
-                        Ok(cas_client
+                        let cas_transport = &context.grpc_clients.cas_transport;
+                        cas_transport.rpc_issued(CasTransport::BatchUpdateBlobs);
+                        let response = cas_client
                             .batch_update_blobs(with_re_metadata_timeout(
                                 re_request,
                                 metadata,
@@ -5026,7 +5068,9 @@ impl CasCallContext {
                                 context.grpc_request_timeout,
                             ))
                             .await?
-                            .into_inner())
+                            .into_inner();
+                        cas_transport.bytes_moved(CasTransport::BatchUpdateBlobs, bytes);
+                        Ok(response)
                     }
                 },
             ),
@@ -5059,7 +5103,9 @@ impl CasCallContext {
                     let context = self.clone();
                     async move {
                         let mut client = context.grpc_clients.cas_client().await?;
-                        Ok(client
+                        let cas_transport = &context.grpc_clients.cas_transport;
+                        cas_transport.rpc_issued(CasTransport::BatchReadBlobs);
+                        let response = client
                             .batch_read_blobs(with_re_metadata_timeout(
                                 re_request,
                                 metadata,
@@ -5068,7 +5114,12 @@ impl CasCallContext {
                                 context.grpc_request_timeout,
                             ))
                             .await?
-                            .into_inner())
+                            .into_inner();
+                        cas_transport.bytes_moved(
+                            CasTransport::BatchReadBlobs,
+                            batch_read_response_bytes(&response),
+                        );
+                        Ok(response)
                     }
                 },
             ),
@@ -6811,8 +6862,13 @@ impl REClient {
                                             return Ok(WriteResponse { committed_size });
                                         }
                                     };
+                                    let bytes =
+                                        segments.iter().map(|segment| segment.data.len()).sum();
                                     let requests = futures::stream::iter(segments);
-                                    Ok(bytestream_client
+                                    grpc_clients
+                                        .cas_transport
+                                        .rpc_issued(CasTransport::ByteStreamWrite);
+                                    let response = bytestream_client
                                         .write(with_re_metadata(
                                             requests,
                                             &metadata,
@@ -6820,7 +6876,11 @@ impl REClient {
                                             self.runtime_opts.request_metadata_tool_name.as_str(),
                                         ))
                                         .await?
-                                        .into_inner())
+                                        .into_inner();
+                                    grpc_clients
+                                        .cas_transport
+                                        .bytes_moved(CasTransport::ByteStreamWrite, bytes);
+                                    Ok(response)
                                 }
                             },
                         ),
@@ -7374,6 +7434,9 @@ impl REClient {
                                 let read_request = read_request.clone();
                                 async move {
                                     let mut client = grpc_clients.bytestream_client().await?;
+                                    grpc_clients
+                                        .cas_transport
+                                        .rpc_issued(CasTransport::ByteStreamRead);
                                     Ok(client
                                         .read(with_re_metadata(
                                             read_request,
@@ -7388,7 +7451,13 @@ impl REClient {
                         ),
                     )
                     .await?;
-                    Ok(Box::pin(response.into_stream()))
+                    let cas_transport = self.grpc_clients.cas_transport.clone();
+                    Ok(Box::pin(response.into_stream().inspect(move |message| {
+                        if let Ok(message) = message {
+                            cas_transport
+                                .bytes_moved(CasTransport::ByteStreamRead, message.data.len());
+                        }
+                    })))
                 }
             },
             || {
@@ -12514,16 +12583,33 @@ mod tests {
         address: String,
         opts: Buck2OssReConfiguration,
     ) -> anyhow::Result<REClient> {
-        REClientBuilder::build_and_connect(&Buck2OssReConfiguration {
-            cas_address: Some(address.clone()),
-            engine_address: Some(address.clone()),
-            action_cache_address: Some(address),
-            tls: Some(false),
-            capabilities: Some(false),
-            engine_connection_count: Some(1),
-            retry_max_delay_ms: Some(10),
-            ..opts
-        })
+        raw_h2_client_counting(
+            address,
+            opts,
+            get_network_stats_global().cas_transport.clone(),
+        )
+        .await
+    }
+
+    /// `raw_h2_client_with`, counting its CAS transfers in `cas_transport`.
+    async fn raw_h2_client_counting(
+        address: String,
+        opts: Buck2OssReConfiguration,
+        cas_transport: Arc<CasTransportStats>,
+    ) -> anyhow::Result<REClient> {
+        REClientBuilder::build_and_connect_counting(
+            &Buck2OssReConfiguration {
+                cas_address: Some(address.clone()),
+                engine_address: Some(address.clone()),
+                action_cache_address: Some(address),
+                tls: Some(false),
+                capabilities: Some(false),
+                engine_connection_count: Some(1),
+                retry_max_delay_ms: Some(10),
+                ..opts
+            },
+            cas_transport,
+        )
         .await
     }
 
@@ -14658,6 +14744,99 @@ mod tests {
         Ok((raw_h2_client_with(address, opts).await?, server))
     }
 
+    /// Blobs a ByteStream service stores and serves, by hash, for the blobs too large to batch.
+    #[derive(Default)]
+    struct FakeByteStream(Arc<Mutex<HashMap<String, Vec<u8>>>>);
+
+    /// The hash in a ByteStream resource name, `[{instance}/]blobs/{hash}/{size}` for a read and
+    /// `[{instance}/]uploads/{uuid}/blobs/{hash}/{size}` for a write.
+    fn resource_hash(resource_name: &str) -> String {
+        resource_name.rsplit('/').nth(1).unwrap().to_owned()
+    }
+
+    #[tonic::async_trait]
+    impl re_grpc_proto::google::bytestream::byte_stream_server::ByteStream for FakeByteStream {
+        type ReadStream = futures::stream::BoxStream<'static, Result<ReadResponse, tonic::Status>>;
+
+        async fn read(
+            &self,
+            request: tonic::Request<ReadRequest>,
+        ) -> Result<tonic::Response<Self::ReadStream>, tonic::Status> {
+            let request = request.into_inner();
+            let data = self
+                .0
+                .lock()
+                .unwrap()
+                .get(&resource_hash(&request.resource_name))
+                .cloned()
+                .ok_or_else(|| tonic::Status::not_found(request.resource_name))?;
+            let data = data[request.read_offset as usize..].to_vec();
+            Ok(tonic::Response::new(
+                futures::stream::once(async move { Ok(ReadResponse { data }) }).boxed(),
+            ))
+        }
+
+        async fn write(
+            &self,
+            request: tonic::Request<tonic::Streaming<WriteRequest>>,
+        ) -> Result<tonic::Response<WriteResponse>, tonic::Status> {
+            let mut stream = request.into_inner();
+            let mut resource_name = String::new();
+            let mut data = Vec::new();
+            while let Some(segment) = stream.message().await? {
+                if !segment.resource_name.is_empty() {
+                    resource_name = segment.resource_name;
+                }
+                data.extend_from_slice(&segment.data);
+            }
+            let committed_size = data.len() as i64;
+            self.0
+                .lock()
+                .unwrap()
+                .insert(resource_hash(&resource_name), data);
+            Ok(tonic::Response::new(WriteResponse { committed_size }))
+        }
+
+        async fn query_write_status(
+            &self,
+            _request: tonic::Request<QueryWriteStatusRequest>,
+        ) -> Result<
+            tonic::Response<re_grpc_proto::google::bytestream::QueryWriteStatusResponse>,
+            tonic::Status,
+        > {
+            Err(tonic::Status::unimplemented("not used by these tests"))
+        }
+    }
+
+    /// A client of a `FakeCas` with `state` and a `FakeByteStream`, counting its CAS transfers
+    /// in `cas_transport`.
+    async fn fake_cas_and_bytestream_client(
+        state: Arc<FakeCasState>,
+        cas_transport: Arc<CasTransportStats>,
+    ) -> anyhow::Result<(REClient, tokio::task::JoinHandle<()>)> {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let address = format!("grpc://{}", listener.local_addr()?);
+        let server = tokio::spawn(async move {
+            let _unused = tonic::transport::Server::builder()
+                .add_service(
+                    re_grpc_proto::build::bazel::remote::execution::v2::content_addressable_storage_server::ContentAddressableStorageServer::new(
+                        FakeCas(state),
+                    ),
+                )
+                .add_service(
+                    re_grpc_proto::google::bytestream::byte_stream_server::ByteStreamServer::new(
+                        FakeByteStream::default(),
+                    ),
+                )
+                .serve_with_incoming(TcpListenerStream::new(listener))
+                .await;
+        });
+        Ok((
+            raw_h2_client_counting(address, Default::default(), cas_transport).await?,
+            server,
+        ))
+    }
+
     fn small_blob_upload(data: &[u8]) -> UploadRequest {
         UploadRequest {
             inlined_blobs_with_digest: Some(vec![InlinedBlobWithDigest {
@@ -15224,6 +15403,84 @@ mod tests {
             .into_iter()
             .map(|blob| blob.blob)
             .collect())
+    }
+
+    /// A blob within the batch limit travels in BatchUpdateBlobs and BatchReadBlobs, and one
+    /// beyond it in a ByteStream Write and Read, and each transport counts only its own.
+    #[tokio::test]
+    async fn cas_transfers_are_counted_by_transport() -> anyhow::Result<()> {
+        use crate::stats::CasTransfers;
+
+        let state = Arc::new(FakeCasState::default());
+        let cas_transport = Arc::new(CasTransportStats::default());
+        let (client, _server) =
+            fake_cas_and_bytestream_client(state.clone(), cas_transport.clone()).await?;
+        let metadata = RemoteExecutionMetadata::default();
+        let small = b"a blob small enough to batch".to_vec();
+        let large = vec![7u8; DEFAULT_MAX_TOTAL_BATCH_SIZE + 1];
+
+        client
+            .upload(
+                metadata.clone(),
+                UploadRequest {
+                    inlined_blobs_with_digest: Some(
+                        [&small, &large]
+                            .into_iter()
+                            .map(|data| InlinedBlobWithDigest {
+                                blob: data.clone(),
+                                digest: digest_for_test_data(data),
+                                ..Default::default()
+                            })
+                            .collect(),
+                    ),
+                    ..Default::default()
+                },
+            )
+            .await?;
+        let uploaded = cas_transport.counts();
+        assert_eq!(
+            uploaded.batch_update_blobs,
+            CasTransfers {
+                rpcs: 1,
+                bytes: small.len() as u64,
+            }
+        );
+        assert_eq!(
+            uploaded.bytestream_write,
+            CasTransfers {
+                rpcs: 1,
+                bytes: large.len() as u64,
+            }
+        );
+
+        state.holds(&small);
+        let blobs = read_blobs(
+            client
+                .download(
+                    &metadata,
+                    inlined_read(&[digest_for_test_data(&small), digest_for_test_data(&large)]),
+                )
+                .await,
+        )?;
+        assert_eq!(blobs, [small.clone(), large.clone()]);
+        let counts = cas_transport.counts();
+        assert_eq!(
+            counts.batch_read_blobs,
+            CasTransfers {
+                rpcs: 1,
+                bytes: small.len() as u64,
+            }
+        );
+        assert_eq!(
+            counts.bytestream_read,
+            CasTransfers {
+                rpcs: 1,
+                bytes: large.len() as u64,
+            }
+        );
+        assert_eq!(counts.batch_update_blobs, uploaded.batch_update_blobs);
+        assert_eq!(counts.bytestream_write, uploaded.bytestream_write);
+        Ok(())
     }
 
     #[tokio::test]

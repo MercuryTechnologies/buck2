@@ -41,12 +41,17 @@ pub use request::*;
 pub use response::*;
 pub use shared_cache::SharedCasCache;
 pub use shared_cache::probe_reflink;
+pub use stats::CasTransfers;
+pub use stats::CasTransportCounts;
+
+use crate::stats::CasTransportStats;
 
 /// The global version of the network stats full of atomics
 #[derive(Default, Debug)]
 struct NetworkStatisticsGlobal {
     uploaded: AtomicI64,
     downloaded: AtomicI64,
+    cas_transport: Arc<CasTransportStats>,
 }
 
 static NETWORK_STATS: OnceLock<Arc<NetworkStatisticsGlobal>> = OnceLock::new();
@@ -60,6 +65,7 @@ pub fn get_network_stats() -> anyhow::Result<NetworkStatisticsResponse> {
     Ok(NetworkStatisticsResponse {
         uploaded: g.uploaded.load(Ordering::Relaxed),
         downloaded: g.downloaded.load(Ordering::Relaxed),
+        cas_transport: g.cas_transport.counts(),
         ..Default::default()
     })
 }
