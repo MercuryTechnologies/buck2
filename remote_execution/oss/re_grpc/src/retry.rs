@@ -130,9 +130,15 @@ fn is_retryable(err: &anyhow::Error, retry_not_found: bool) -> Retryable {
 ///
 /// Items from the stream are yielded progressively to the caller (preserving streaming progress
 /// updates), so this is a drop-in replacement for `retry(make_stream) + try_unfold(try_next)`.
-pub fn retrying_stream<F, Fut, S, T>(
+///
+/// `is_progress(item, index)` says whether the item at `index` in the current stream (0 for the
+/// first one after it was opened or reopened) is progress. Progress restores the retry budget and
+/// the delay, so `max_retries` bounds the breaks in a row with no progress between them, not the
+/// breaks over the stream's whole life.
+pub fn retrying_stream<F, Fut, S, T, P>(
     method: &'static str,
     make_stream: F,
+    is_progress: P,
     max_retries: usize,
     initial_delay: Duration,
     max_delay: Duration,
@@ -143,21 +149,30 @@ where
     Fut: Future<Output = anyhow::Result<S>> + Send + 'static,
     S: futures::TryStream<Ok = T, Error = tonic::Status> + Send + Unpin + 'static,
     T: Send + 'static,
+    P: Fn(&T, usize) -> bool + Send + Sync + 'static,
 {
-    struct RetryState<F, S> {
+    struct RetryState<F, S, P> {
         make_stream: Arc<F>,
+        is_progress: Arc<P>,
         stream: Option<S>,
+        items_since_open: usize,
         retries_left: usize,
+        max_retries: usize,
         delay: Duration,
+        initial_delay: Duration,
         max_delay: Duration,
         retry_not_found: bool,
     }
 
     let state = RetryState {
         make_stream: Arc::new(make_stream),
+        is_progress: Arc::new(is_progress),
         stream: None,
+        items_since_open: 0,
         retries_left: max_retries,
+        max_retries,
         delay: initial_delay,
+        initial_delay,
         max_delay,
         retry_not_found,
     };
@@ -169,6 +184,7 @@ where
                 match (state.make_stream)().await {
                     Ok(s) => {
                         state.stream = Some(s);
+                        state.items_since_open = 0;
                     }
                     Err(err) => {
                         if is_retryable(&err, state.retry_not_found) != Retryable::No
@@ -193,7 +209,14 @@ where
 
             // Read the next message from the stream.
             match state.stream.as_mut().unwrap().try_next().await {
-                Ok(Some(item)) => return Ok(Some((item, state))),
+                Ok(Some(item)) => {
+                    if (state.is_progress)(&item, state.items_since_open) {
+                        state.retries_left = state.max_retries;
+                        state.delay = state.initial_delay;
+                    }
+                    state.items_since_open += 1;
+                    return Ok(Some((item, state)));
+                }
                 Ok(None) => return Ok(None),
                 Err(status) => {
                     let err = anyhow::Error::from(status);
