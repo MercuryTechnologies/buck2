@@ -201,6 +201,9 @@ const DEFAULT_QUEUED_OPERATION_TIMEOUT_SECS: u64 = 900;
 /// updates BuildBuddy publishes every 60 s for a running task.
 const DEFAULT_STALLED_OPERATION_TIMEOUT_SECS: u64 = 600;
 
+/// The default for [buck2_re_client] execute_response_timeout_secs.
+const DEFAULT_EXECUTE_RESPONSE_TIMEOUT_SECS: u64 = 60;
+
 #[derive(Clone, Copy)]
 pub struct RERuntimeOpts {
     /// Use the Meta version of the request metadata
@@ -222,6 +225,8 @@ pub struct RERuntimeOpts {
     /// How long a claimed operation may go without news before its action is executed again,
     /// uncached; None is off.
     stalled_operation_timeout: Option<Duration>,
+    /// How long an Execute may wait for its response headers before it is sent again; None is off.
+    execute_response_timeout: Option<Duration>,
 }
 
 #[derive(Clone)]
@@ -405,6 +410,13 @@ impl REClientBuilder {
                 stalled_operation_timeout: match opts
                     .stalled_operation_timeout_secs
                     .unwrap_or(DEFAULT_STALLED_OPERATION_TIMEOUT_SECS)
+                {
+                    0 => None,
+                    secs => Some(Duration::from_secs(secs)),
+                },
+                execute_response_timeout: match opts
+                    .execute_response_timeout_secs
+                    .unwrap_or(DEFAULT_EXECUTE_RESPONSE_TIMEOUT_SECS)
                 {
                     0 => None,
                     secs => Some(Duration::from_secs(secs)),
@@ -746,6 +758,12 @@ where
 enum OperationCall {
     /// Submit the action.
     Execute,
+    /// Submit the action again, before the server ever named an operation for it, as its Action
+    /// with `do_not_cache` set. The first Execute may have left a task behind that BuildBuddy
+    /// fails without publishing anything, and a plain re-Execute merges into it by action digest
+    /// and waits for ever (BuildBuddy action_merger, execution_server); an Action with
+    /// `do_not_cache` is never merged.
+    ExecuteUncached,
     /// Resume the named operation the server already has for it.
     Wait(String),
 }
@@ -778,15 +796,22 @@ where
     let reopens: Arc<std::sync::Mutex<(usize, Option<String>)>> =
         Arc::new(std::sync::Mutex::new((0, None)));
     let opened = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    // Whether the server has named an operation for the action at all; a name it later lost
+    // still means the first Execute got as far as an operation.
+    let ever_named = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let open = Arc::new(open);
     retrying_stream(
         "Execute",
         move || {
+            let reopen = opened.swap(true, std::sync::atomic::Ordering::SeqCst);
             let call = match operation_name.lock().unwrap().clone() {
                 Some(name) => OperationCall::Wait(name),
+                None if reopen && !ever_named.load(std::sync::atomic::Ordering::SeqCst) => {
+                    OperationCall::ExecuteUncached
+                }
                 None => OperationCall::Execute,
             };
-            if opened.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            if reopen {
                 let mut reopens = reopens.lock().unwrap();
                 reopens.0 += 1;
                 warn_operation_reopen(&reopen_message(
@@ -800,6 +825,7 @@ where
             let open = open.dupe();
             let operation_name = operation_name.dupe();
             let reopens = reopens.dupe();
+            let ever_named = ever_named.dupe();
             async move {
                 let resuming = matches!(call, OperationCall::Wait(_));
                 let stream = match open(call).await {
@@ -817,6 +843,7 @@ where
                     .inspect_ok(move |operation| {
                         if !operation.name.is_empty() {
                             *named.lock().unwrap() = Some(operation.name.clone());
+                            ever_named.store(true, std::sync::atomic::Ordering::SeqCst);
                         }
                     })
                     .inspect_err(move |status| {
@@ -852,6 +879,9 @@ fn reopen_message(
             format!("Resuming RE operation `{name}` of action {action} with WaitExecution")
         }
         OperationCall::Execute => format!("Executing RE action {action} again"),
+        OperationCall::ExecuteUncached => format!(
+            "Executing RE action {action} again with do_not_cache set, since the server named no operation for it"
+        ),
     };
     format!(
         "{what} (retry {reopen}/{max_retries}): its stream failed: {}",
@@ -1097,7 +1127,12 @@ impl REClient {
         let cas_pool = self.pool.clone();
         let cas_address = self.cas_address.clone();
         let open_call = Arc::new(move |call: OperationCall, uncached: bool| {
-            let uncached_action = uncached.then(|| uncached_action.clone()).flatten();
+            let use_uncached = match call {
+                OperationCall::ExecuteUncached => true,
+                OperationCall::Execute => uncached,
+                OperationCall::Wait(_) => false,
+            };
+            let uncached_action = use_uncached.then(|| uncached_action.clone()).flatten();
             let cas_pool = cas_pool.clone();
             let cas_address = cas_address.clone();
             let execution_pool = execution_pool.clone();
@@ -1110,7 +1145,7 @@ impl REClient {
                 // The uncached Action is uploaded when it is first needed: an execution stalls
                 // rarely, and the Action is never read otherwise.
                 let (action_digest, skip_cache_lookup) = match &uncached_action {
-                    Some(uncached) if call == OperationCall::Execute => {
+                    Some(uncached) => {
                         let channel = cas_pool.get(&cas_address).await?;
                         ContentAddressableStorageClient::new(InterceptedService::new(
                             channel,
@@ -1138,8 +1173,8 @@ impl REClient {
                 let mut client =
                     ExecutionClient::new(InterceptedService::new(channel, interceptor));
                 let stream = match call {
-                    OperationCall::Execute => client
-                        .execute(with_re_metadata(
+                    OperationCall::Execute | OperationCall::ExecuteUncached => {
+                        let execute = client.execute(with_re_metadata(
                             GExecuteRequest {
                                 instance_name,
                                 skip_cache_lookup,
@@ -1150,10 +1185,23 @@ impl REClient {
                             },
                             &metadata,
                             runtime_opts,
-                        ))
-                        .await?
-                        .into_inner()
-                        .boxed(),
+                        ));
+                        // The server sends the response headers with its first Operation, as soon
+                        // as it has dispatched or merged the action; an Execute still waiting for
+                        // them is treated as a broken connection and sent again.
+                        let response = match runtime_opts.execute_response_timeout {
+                            Some(timeout) => tokio::time::timeout(timeout, execute)
+                                .await
+                                .map_err(|_| {
+                                    tonic::Status::deadline_exceeded(format!(
+                                        "the Execute response did not arrive within {}s",
+                                        timeout.as_secs()
+                                    ))
+                                })??,
+                            None => execute.await?,
+                        };
+                        response.into_inner().boxed()
+                    }
                     OperationCall::Wait(name) => client
                         .wait_execution(with_re_metadata(
                             WaitExecutionRequest { name },
@@ -2360,6 +2408,7 @@ mod tests {
             batch_read_zstd: false,
             queued_operation_timeout: None,
             stalled_operation_timeout: None,
+            execute_response_timeout: None,
         }
     }
 
@@ -3714,7 +3763,7 @@ mod tests {
         assert!(operations.last().unwrap().done);
         assert_eq!(
             server.calls(),
-            vec![OperationCall::Execute, OperationCall::Execute]
+            vec![OperationCall::Execute, OperationCall::ExecuteUncached]
         );
         Ok(())
     }
@@ -3821,6 +3870,22 @@ mod tests {
                 OperationCall::Execute,
                 OperationCall::Wait("operations/10".to_owned())
             ]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_an_execute_call_that_fails_before_a_name_is_sent_again_uncached()
+    -> anyhow::Result<()> {
+        let server = ScriptedServer::new(vec![
+            Err(tonic::Status::unavailable("connection reset").into()),
+            Ok(vec![Ok(operation("operations/11", true))]),
+        ]);
+        let operations: Vec<_> = server.stream().try_collect().await?;
+        assert!(operations.last().unwrap().done);
+        assert_eq!(
+            server.calls(),
+            vec![OperationCall::Execute, OperationCall::ExecuteUncached]
         );
         Ok(())
     }
