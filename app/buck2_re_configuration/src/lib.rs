@@ -491,6 +491,10 @@ pub struct Buck2OssReConfiguration {
     /// the server merges a new Execute onto a queued operation of the same action, or the new
     /// Execute joins the operation that is stuck.
     pub queued_operation_timeout_secs: Option<u64>,
+    /// Time in seconds a claimed operation may go without a new message on its stream before the
+    /// action is executed once more, as an Action the server neither merges nor caches. A second
+    /// such stall fails the action. 0 turns it off; unset is 600.
+    pub stalled_operation_timeout_secs: Option<u64>,
 }
 
 #[derive(Clone, Debug, Default, Allocative)]
@@ -647,6 +651,10 @@ impl Buck2OssReConfiguration {
             queued_operation_timeout_secs: legacy_config.parse(BuckconfigKeyRef {
                 section: BUCK2_RE_CLIENT_CFG_SECTION,
                 property: "queued_operation_timeout_secs",
+            })?,
+            stalled_operation_timeout_secs: legacy_config.parse(BuckconfigKeyRef {
+                section: BUCK2_RE_CLIENT_CFG_SECTION,
+                property: "stalled_operation_timeout_secs",
             })?,
         })
     }
