@@ -10,6 +10,7 @@ license.workspace = true
 [dependencies]
 anyhow.workspace = true
 async-compression.workspace = true
+buck2_events.workspace = true
 buck2_re_configuration.workspace = true
 buck2_util.workspace = true
 dupe.workspace = true

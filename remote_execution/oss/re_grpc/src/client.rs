@@ -728,6 +728,7 @@ enum OperationCall {
 /// forgotten and the next reopen is an Execute, which the server answers from its action cache if
 /// the first run finished.
 fn resuming_operation_stream<F, Fut>(
+    action: String,
     open: F,
     max_retries: usize,
     initial_delay: Duration,
@@ -741,6 +742,10 @@ where
 {
     let operation_name: Arc<std::sync::Mutex<Option<String>>> =
         Arc::new(std::sync::Mutex::new(None));
+    // How many times the stream has been reopened, and the error that broke it last.
+    let reopens: Arc<std::sync::Mutex<(usize, Option<String>)>> =
+        Arc::new(std::sync::Mutex::new((0, None)));
+    let opened = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let open = Arc::new(open);
     retrying_stream(
         "Execute",
@@ -749,8 +754,20 @@ where
                 Some(name) => OperationCall::Wait(name),
                 None => OperationCall::Execute,
             };
+            if opened.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                let mut reopens = reopens.lock().unwrap();
+                reopens.0 += 1;
+                warn_operation_reopen(&reopen_message(
+                    &call,
+                    &action,
+                    reopens.0,
+                    max_retries,
+                    reopens.1.as_deref(),
+                ));
+            }
             let open = open.dupe();
             let operation_name = operation_name.dupe();
+            let reopens = reopens.dupe();
             async move {
                 let resuming = matches!(call, OperationCall::Wait(_));
                 let stream = match open(call).await {
@@ -759,6 +776,7 @@ where
                         if resuming && is_not_found(&err) {
                             *operation_name.lock().unwrap() = None;
                         }
+                        reopens.lock().unwrap().1 = Some(format!("{err:#}"));
                         return Err(err);
                     }
                 };
@@ -773,6 +791,7 @@ where
                         if resuming && status.code() == tonic::Code::NotFound {
                             *operation_name.lock().unwrap() = None;
                         }
+                        reopens.lock().unwrap().1 = Some(status.to_string());
                     })
                     .boxed();
                 anyhow::Ok(EndAtDone::new(stream))
@@ -783,6 +802,36 @@ where
         max_delay,
         true,
     )
+}
+
+/// What a reopen of an action's operation stream does, and why, in words for the console.
+fn reopen_message(
+    call: &OperationCall,
+    action: &str,
+    reopen: usize,
+    max_retries: usize,
+    error: Option<&str>,
+) -> String {
+    let what = match call {
+        OperationCall::Wait(name) => {
+            format!("Resuming RE operation `{name}` of action {action} with WaitExecution")
+        }
+        OperationCall::Execute => format!("Executing RE action {action} again"),
+    };
+    format!(
+        "{what} (retry {reopen}/{max_retries}): its stream failed: {}",
+        error.unwrap_or("unknown error")
+    )
+}
+
+/// Puts a resumed or re-executed remote action on the console. Retries inside one call stay in
+/// the debug log, so an action warns once for each time its stream starts over. The BES sink
+/// sends console warnings to the build event stream as stderr, so they show on the Build URL too.
+fn warn_operation_reopen(message: &str) {
+    tracing::warn!("{message}");
+    if let Some(dispatcher) = buck2_events::dispatch::get_dispatcher_opt() {
+        dispatcher.console_warning(message.to_owned());
+    }
 }
 
 fn is_not_found(err: &anyhow::Error) -> bool {
@@ -1009,6 +1058,7 @@ impl REClient {
         // Once the server has named the action's operation, a retry resumes it with
         // WaitExecution instead of submitting the action again.
         let stream = resuming_operation_stream(
+            format!("{}:{}", action_digest.hash, action_digest.size_bytes),
             move |call| {
                 let execution_pool = execution_pool.clone();
                 let engine_address = engine_address.clone();
@@ -3519,6 +3569,7 @@ mod tests {
         ) -> impl Stream<Item = anyhow::Result<Operation>> + Send + 'static {
             let server = self.dupe();
             resuming_operation_stream(
+                "test-action".to_owned(),
                 move |call| {
                     server.calls.lock().unwrap().push(call);
                     let reply = server
@@ -3623,6 +3674,24 @@ mod tests {
             ]
         );
         Ok(())
+    }
+
+    #[test]
+    fn test_a_reopen_says_what_it_does_and_why() {
+        assert_eq!(
+            reopen_message(
+                &OperationCall::Wait("operations/7".to_owned()),
+                "abc:12",
+                1,
+                5,
+                Some("status: Unavailable, message: \"connection reset\""),
+            ),
+            "Resuming RE operation `operations/7` of action abc:12 with WaitExecution (retry 1/5): its stream failed: status: Unavailable, message: \"connection reset\""
+        );
+        assert_eq!(
+            reopen_message(&OperationCall::Execute, "abc:12", 2, 5, None),
+            "Executing RE action abc:12 again (retry 2/5): its stream failed: unknown error"
+        );
     }
 
     #[tokio::test]
