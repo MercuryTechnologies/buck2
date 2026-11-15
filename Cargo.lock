@@ -7676,6 +7676,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-compression",
+ "buck2_events",
  "buck2_re_configuration",
  "buck2_util",
  "dupe",
