@@ -624,7 +624,8 @@ impl BatchUploadReqAggregator {
 /// open longer keeps one of the server's concurrent streams.
 const DRAIN_AFTER_DONE: Duration = Duration::from_secs(2);
 
-/// An Execute stream that ends at the action's done Operation.
+/// An Execute stream that ends at the action's done Operation, and fails, so that it is reopened,
+/// if the server ends it before then.
 ///
 /// Whoever reads the stream drops it once the done Operation is in, and h2 resets a dropped stream
 /// with CANCEL while the server's trailers are still on the way. h2 keeps only a bounded set of
@@ -680,7 +681,11 @@ where
             }
             std::task::Poll::Ready(None) => {
                 self.inner = None;
-                std::task::Poll::Ready(None)
+                // A server may end an operation's stream before the operation is done; the
+                // operation goes on, and reopening the stream resumes it.
+                std::task::Poll::Ready(Some(Err(tonic::Status::unavailable(
+                    "the operation stream ended before the operation was done",
+                ))))
             }
             other => other,
         }
@@ -797,6 +802,9 @@ where
                 anyhow::Ok(EndAtDone::new(stream))
             }
         },
+        // On a reopened stream the first Operation is the operation's current status again
+        // (REAPI remote_execution.proto, WaitExecution); anything after it is news.
+        |_, index| index >= 1,
         max_retries,
         initial_delay,
         max_delay,
@@ -3567,6 +3575,13 @@ mod tests {
         fn stream(
             self: &Arc<Self>,
         ) -> impl Stream<Item = anyhow::Result<Operation>> + Send + 'static {
+            self.stream_with_retries(5)
+        }
+
+        fn stream_with_retries(
+            self: &Arc<Self>,
+            max_retries: usize,
+        ) -> impl Stream<Item = anyhow::Result<Operation>> + Send + 'static {
             let server = self.dupe();
             resuming_operation_stream(
                 "test-action".to_owned(),
@@ -3580,7 +3595,7 @@ mod tests {
                         .expect("no more scripted replies");
                     async move { reply.map(|items| futures::stream::iter(items).boxed()) }
                 },
-                5,
+                max_retries,
                 Duration::from_millis(1),
                 Duration::from_millis(1),
             )
@@ -3671,6 +3686,65 @@ mod tests {
                 OperationCall::Execute,
                 OperationCall::Wait("operations/5".to_owned()),
                 OperationCall::Execute
+            ]
+        );
+        Ok(())
+    }
+
+    fn broken() -> Result<Operation, tonic::Status> {
+        Err(tonic::Status::unavailable("connection reset"))
+    }
+
+    #[tokio::test]
+    async fn test_an_action_that_progresses_between_breaks_keeps_its_retries() -> anyhow::Result<()>
+    {
+        // One retry, three breaks: each reopened stream says something new before it breaks.
+        let server = ScriptedServer::new(vec![
+            Ok(vec![Ok(operation("operations/8", false)), broken()]),
+            Ok(vec![
+                Ok(operation("operations/8", false)),
+                Ok(operation("operations/8", false)),
+                broken(),
+            ]),
+            Ok(vec![
+                Ok(operation("operations/8", false)),
+                Ok(operation("operations/8", false)),
+                broken(),
+            ]),
+            Ok(vec![Ok(operation("operations/8", true))]),
+        ]);
+        let operations: Vec<_> = server.stream_with_retries(1).try_collect().await?;
+        assert!(operations.last().unwrap().done);
+        assert_eq!(server.calls().len(), 4);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_an_operation_that_keeps_breaking_without_progress_fails() {
+        // Two retries; every reopened stream repeats the status and breaks.
+        let server = ScriptedServer::new(vec![
+            Ok(vec![Ok(operation("operations/9", false)), broken()]),
+            Ok(vec![Ok(operation("operations/9", false)), broken()]),
+            Ok(vec![Ok(operation("operations/9", false)), broken()]),
+        ]);
+        let result: anyhow::Result<Vec<_>> = server.stream_with_retries(2).try_collect().await;
+        assert!(result.is_err());
+        assert_eq!(server.calls().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn test_a_stream_the_server_ends_before_done_is_resumed() -> anyhow::Result<()> {
+        let server = ScriptedServer::new(vec![
+            Ok(vec![Ok(operation("operations/10", false))]),
+            Ok(vec![Ok(operation("operations/10", true))]),
+        ]);
+        let operations: Vec<_> = server.stream().try_collect().await?;
+        assert!(operations.last().unwrap().done);
+        assert_eq!(
+            server.calls(),
+            vec![
+                OperationCall::Execute,
+                OperationCall::Wait("operations/10".to_owned())
             ]
         );
         Ok(())
