@@ -14,6 +14,7 @@ mod error;
 mod grpc;
 mod metadata;
 mod pool;
+mod queued_deadline;
 mod request;
 mod response;
 mod retry;
