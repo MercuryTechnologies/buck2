@@ -74,6 +74,7 @@ use re_grpc_proto::google::bytestream::WriteRequest;
 use re_grpc_proto::google::bytestream::WriteResponse;
 use re_grpc_proto::google::bytestream::byte_stream_client::ByteStreamClient;
 use re_grpc_proto::google::longrunning::Operation;
+use re_grpc_proto::build::bazel::remote::execution::v2::WaitExecutionRequest;
 use re_grpc_proto::google::longrunning::operation::Result as OpResult;
 use re_grpc_proto::google::rpc::Code;
 use re_grpc_proto::google::rpc::Status;
@@ -708,6 +709,93 @@ where
     }
 }
 
+/// The call that opens an action's operation stream: the first one, or one after the stream broke.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum OperationCall {
+    /// Submit the action.
+    Execute,
+    /// Resume the named operation the server already has for it.
+    Wait(String),
+}
+
+/// An action's operation stream that is resumed, not submitted again, when it breaks.
+///
+/// `retrying_stream` reopens a broken stream within the retry budget. Before the server has
+/// named the operation there is nothing to resume, so the reopen is another Execute. After it,
+/// the reopen is a WaitExecution for that operation, so an action that was queued or running is
+/// not queued or run a second time, and its progress carries on. A server that no longer has the
+/// operation answers WaitExecution with NOT_FOUND, on the call or on the stream; the name is then
+/// forgotten and the next reopen is an Execute, which the server answers from its action cache if
+/// the first run finished.
+fn resuming_operation_stream<F, Fut>(
+    open: F,
+    max_retries: usize,
+    initial_delay: Duration,
+    max_delay: Duration,
+) -> impl Stream<Item = anyhow::Result<Operation>> + Send + 'static
+where
+    F: Fn(OperationCall) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = anyhow::Result<BoxStream<'static, Result<Operation, tonic::Status>>>>
+        + Send
+        + 'static,
+{
+    let operation_name: Arc<std::sync::Mutex<Option<String>>> =
+        Arc::new(std::sync::Mutex::new(None));
+    let open = Arc::new(open);
+    retrying_stream(
+        "Execute",
+        move || {
+            let call = match operation_name.lock().unwrap().clone() {
+                Some(name) => OperationCall::Wait(name),
+                None => OperationCall::Execute,
+            };
+            let open = open.dupe();
+            let operation_name = operation_name.dupe();
+            async move {
+                let resuming = matches!(call, OperationCall::Wait(_));
+                let stream = match open(call).await {
+                    Ok(stream) => stream,
+                    Err(err) => {
+                        if resuming && is_not_found(&err) {
+                            *operation_name.lock().unwrap() = None;
+                        }
+                        return Err(err);
+                    }
+                };
+                let named = operation_name.dupe();
+                let stream = stream
+                    .inspect_ok(move |operation| {
+                        if !operation.name.is_empty() {
+                            *named.lock().unwrap() = Some(operation.name.clone());
+                        }
+                    })
+                    .inspect_err(move |status| {
+                        if resuming && status.code() == tonic::Code::NotFound {
+                            *operation_name.lock().unwrap() = None;
+                        }
+                    })
+                    .boxed();
+                anyhow::Ok(EndAtDone::new(stream))
+            }
+        },
+        max_retries,
+        initial_delay,
+        max_delay,
+        true,
+    )
+}
+
+fn is_not_found(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| {
+        cause
+            .downcast_ref::<tonic::Status>()
+            .is_some_and(|status| status.code() == tonic::Code::NotFound)
+            || cause
+                .downcast_ref::<REClientError>()
+                .is_some_and(|err| err.code == TCode::NOT_FOUND)
+    })
+}
+
 fn process_operation_message(msg: Operation) -> anyhow::Result<ExecuteWithProgressResponse> {
     debug!(?msg, "RE ACTION RESPONSE");
 
@@ -918,9 +1006,10 @@ impl REClient {
         // retrying_stream covers both stream establishment and stream reading, so errors like
         // h2 GOAWAY (ENHANCE_YOUR_CALM / "too_many_internal_resets") that surface during
         // stream reading are retried and cause tonic to reconnect with a fresh h2 connection.
-        let stream = retrying_stream(
-            "Execute",
-            move || {
+        // Once the server has named the action's operation, a retry resumes it with
+        // WaitExecution instead of submitting the action again.
+        let stream = resuming_operation_stream(
+            move |call| {
                 let execution_pool = execution_pool.clone();
                 let engine_address = engine_address.clone();
                 let interceptor = interceptor.dupe();
@@ -931,28 +1020,39 @@ impl REClient {
                     let channel = execution_pool.get(&engine_address).await?;
                     let mut client =
                         ExecutionClient::new(InterceptedService::new(channel, interceptor));
-                    let stream = client
-                        .execute(with_re_metadata(
-                            GExecuteRequest {
-                                instance_name,
-                                skip_cache_lookup,
-                                execution_policy: Some(ExecutionPolicy { priority }),
-                                results_cache_policy: Some(ResultsCachePolicy { priority: 0 }),
-                                action_digest: Some(action_digest),
-                                ..Default::default()
-                            },
-                            &metadata,
-                            runtime_opts,
-                        ))
-                        .await?
-                        .into_inner();
-                    anyhow::Ok(EndAtDone::new(stream))
+                    let stream = match call {
+                        OperationCall::Execute => client
+                            .execute(with_re_metadata(
+                                GExecuteRequest {
+                                    instance_name,
+                                    skip_cache_lookup,
+                                    execution_policy: Some(ExecutionPolicy { priority }),
+                                    results_cache_policy: Some(ResultsCachePolicy { priority: 0 }),
+                                    action_digest: Some(action_digest),
+                                    ..Default::default()
+                                },
+                                &metadata,
+                                runtime_opts,
+                            ))
+                            .await?
+                            .into_inner()
+                            .boxed(),
+                        OperationCall::Wait(name) => client
+                            .wait_execution(with_re_metadata(
+                                WaitExecutionRequest { name },
+                                &metadata,
+                                runtime_opts,
+                            ))
+                            .await?
+                            .into_inner()
+                            .boxed(),
+                    };
+                    anyhow::Ok(stream)
                 }
             },
             self.runtime_opts.max_retries,
             INITIAL_DELAY,
             MAX_DELAY,
-            true,
         );
 
         let stream = stream.and_then(|msg| async move { process_operation_message(msg) });
@@ -3396,6 +3496,133 @@ mod tests {
             done,
             ..Default::default()
         }
+    }
+
+    /// Scripted operation streams, one per call, and the calls that were made.
+    struct ScriptedServer {
+        calls: std::sync::Mutex<Vec<OperationCall>>,
+        replies: std::sync::Mutex<std::collections::VecDeque<anyhow::Result<Vec<Result<Operation, tonic::Status>>>>>,
+    }
+
+    impl ScriptedServer {
+        fn new(
+            replies: Vec<anyhow::Result<Vec<Result<Operation, tonic::Status>>>>,
+        ) -> Arc<Self> {
+            Arc::new(Self {
+                calls: std::sync::Mutex::new(Vec::new()),
+                replies: std::sync::Mutex::new(replies.into()),
+            })
+        }
+
+        fn stream(
+            self: &Arc<Self>,
+        ) -> impl Stream<Item = anyhow::Result<Operation>> + Send + 'static {
+            let server = self.dupe();
+            resuming_operation_stream(
+                move |call| {
+                    server.calls.lock().unwrap().push(call);
+                    let reply = server
+                        .replies
+                        .lock()
+                        .unwrap()
+                        .pop_front()
+                        .expect("no more scripted replies");
+                    async move { reply.map(|items| futures::stream::iter(items).boxed()) }
+                },
+                5,
+                Duration::from_millis(1),
+                Duration::from_millis(1),
+            )
+        }
+
+        fn calls(&self) -> Vec<OperationCall> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+
+    #[tokio::test]
+    async fn test_a_broken_execute_stream_is_resumed_with_wait_execution() -> anyhow::Result<()> {
+        let server = ScriptedServer::new(vec![
+            Ok(vec![
+                Ok(operation("operations/1", false)),
+                Err(tonic::Status::unavailable("connection reset")),
+            ]),
+            Ok(vec![Ok(operation("operations/1", true))]),
+        ]);
+        let operations: Vec<_> = server.stream().try_collect().await?;
+        assert_eq!(operations.len(), 2);
+        assert!(operations[1].done);
+        assert_eq!(
+            server.calls(),
+            vec![
+                OperationCall::Execute,
+                OperationCall::Wait("operations/1".to_owned())
+            ]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_a_stream_that_breaks_before_its_operation_is_named_is_executed_again()
+    -> anyhow::Result<()> {
+        let server = ScriptedServer::new(vec![
+            Ok(vec![Err(tonic::Status::unavailable("connection reset"))]),
+            Ok(vec![Ok(operation("operations/2", true))]),
+        ]);
+        let operations: Vec<_> = server.stream().try_collect().await?;
+        assert!(operations.last().unwrap().done);
+        assert_eq!(
+            server.calls(),
+            vec![OperationCall::Execute, OperationCall::Execute]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_an_operation_the_server_lost_is_executed_again() -> anyhow::Result<()> {
+        let server = ScriptedServer::new(vec![
+            Ok(vec![
+                Ok(operation("operations/3", false)),
+                Err(tonic::Status::unavailable("connection reset")),
+            ]),
+            Err(tonic::Status::not_found("no such operation").into()),
+            Ok(vec![Ok(operation("operations/4", true))]),
+        ]);
+        let operations: Vec<_> = server.stream().try_collect().await?;
+        assert!(operations.last().unwrap().done);
+        assert_eq!(
+            server.calls(),
+            vec![
+                OperationCall::Execute,
+                OperationCall::Wait("operations/3".to_owned()),
+                OperationCall::Execute
+            ]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_a_wait_execution_stream_that_says_not_found_is_executed_again()
+    -> anyhow::Result<()> {
+        let server = ScriptedServer::new(vec![
+            Ok(vec![
+                Ok(operation("operations/5", false)),
+                Err(tonic::Status::unavailable("connection reset")),
+            ]),
+            Ok(vec![Err(tonic::Status::not_found("operation expired"))]),
+            Ok(vec![Ok(operation("operations/6", true))]),
+        ]);
+        let operations: Vec<_> = server.stream().try_collect().await?;
+        assert!(operations.last().unwrap().done);
+        assert_eq!(
+            server.calls(),
+            vec![
+                OperationCall::Execute,
+                OperationCall::Wait("operations/5".to_owned()),
+                OperationCall::Execute
+            ]
+        );
+        Ok(())
     }
 
     #[tokio::test]
