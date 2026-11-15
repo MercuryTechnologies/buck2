@@ -197,6 +197,10 @@ pub struct RECapabilities {
 /// QUEUED operation is more likely lost than waiting.
 const DEFAULT_QUEUED_OPERATION_TIMEOUT_SECS: u64 = 900;
 
+/// The default for [buck2_re_client] stalled_operation_timeout_secs: 10 minutes, ten of the
+/// updates BuildBuddy publishes every 60 s for a running task.
+const DEFAULT_STALLED_OPERATION_TIMEOUT_SECS: u64 = 600;
+
 #[derive(Clone, Copy)]
 pub struct RERuntimeOpts {
     /// Use the Meta version of the request metadata
@@ -215,6 +219,9 @@ pub struct RERuntimeOpts {
     batch_read_zstd: bool,
     /// How long an operation may stay QUEUED before its action is executed again; None is off.
     queued_operation_timeout: Option<Duration>,
+    /// How long a claimed operation may go without news before its action is executed again,
+    /// uncached; None is off.
+    stalled_operation_timeout: Option<Duration>,
 }
 
 #[derive(Clone)]
@@ -391,6 +398,13 @@ impl REClientBuilder {
                 queued_operation_timeout: match opts
                     .queued_operation_timeout_secs
                     .unwrap_or(DEFAULT_QUEUED_OPERATION_TIMEOUT_SECS)
+                {
+                    0 => None,
+                    secs => Some(Duration::from_secs(secs)),
+                },
+                stalled_operation_timeout: match opts
+                    .stalled_operation_timeout_secs
+                    .unwrap_or(DEFAULT_STALLED_OPERATION_TIMEOUT_SECS)
                 {
                     0 => None,
                     secs => Some(Duration::from_secs(secs)),
@@ -1079,7 +1093,13 @@ impl REClient {
         // Once the server has named the action's operation, a retry resumes it with
         // WaitExecution instead of submitting the action again.
         let action = format!("{}:{}", action_digest.hash, action_digest.size_bytes);
-        let open_call = Arc::new(move |call: OperationCall| {
+        let uncached_action = execute_request.uncached_action.take();
+        let cas_pool = self.pool.clone();
+        let cas_address = self.cas_address.clone();
+        let open_call = Arc::new(move |call: OperationCall, uncached: bool| {
+            let uncached_action = uncached.then(|| uncached_action.clone()).flatten();
+            let cas_pool = cas_pool.clone();
+            let cas_address = cas_address.clone();
             let execution_pool = execution_pool.clone();
             let engine_address = engine_address.clone();
             let interceptor = interceptor.dupe();
@@ -1087,6 +1107,33 @@ impl REClient {
             let action_digest = action_digest.clone();
             let metadata = metadata.clone();
             async move {
+                // The uncached Action is uploaded when it is first needed: an execution stalls
+                // rarely, and the Action is never read otherwise.
+                let (action_digest, skip_cache_lookup) = match &uncached_action {
+                    Some(uncached) if call == OperationCall::Execute => {
+                        let channel = cas_pool.get(&cas_address).await?;
+                        ContentAddressableStorageClient::new(InterceptedService::new(
+                            channel,
+                            interceptor.dupe(),
+                        ))
+                        .batch_update_blobs(with_re_metadata(
+                            BatchUpdateBlobsRequest {
+                                instance_name: instance_name.clone(),
+                                requests: vec![Request {
+                                    digest: Some(tdigest_to(uncached.action_digest.clone())),
+                                    data: uncached.action.clone(),
+                                    compressor: compressor::Value::Identity as i32,
+                                }],
+                                ..Default::default()
+                            },
+                            &metadata,
+                            runtime_opts,
+                        ))
+                        .await?;
+                        (tdigest_to(uncached.action_digest.clone()), true)
+                    }
+                    _ => (action_digest, skip_cache_lookup),
+                };
                 let channel = execution_pool.get(&engine_address).await?;
                 let mut client =
                     ExecutionClient::new(InterceptedService::new(channel, interceptor));
@@ -1121,12 +1168,12 @@ impl REClient {
             }
         });
         let max_retries = self.runtime_opts.max_retries;
-        let stream = crate::queued_deadline::with_queued_deadline(
-            move || {
+        let stream = crate::queued_deadline::with_deadlines(
+            move |uncached| {
                 let open_call = open_call.dupe();
                 resuming_operation_stream(
                     action.clone(),
-                    move |call| open_call(call),
+                    move |call| open_call(call, uncached),
                     max_retries,
                     INITIAL_DELAY,
                     MAX_DELAY,
@@ -1134,6 +1181,7 @@ impl REClient {
                 .boxed()
             },
             runtime_opts.queued_operation_timeout,
+            runtime_opts.stalled_operation_timeout,
             max_retries,
             |message| warn_operation_reopen(&message),
         );
@@ -2311,6 +2359,7 @@ mod tests {
             batch_compression_threshold: DEFAULT_BATCH_COMPRESSION_THRESHOLD,
             batch_read_zstd: false,
             queued_operation_timeout: None,
+            stalled_operation_timeout: None,
         }
     }
 

@@ -7,7 +7,8 @@
  * of this source tree.
  */
 
-//! An action whose operation stays QUEUED past a deadline is executed again.
+//! An action whose operation stays QUEUED past a deadline is executed again, and so, once and
+//! uncached, is one whose claimed operation stops making progress.
 //!
 //! BuildBuddy sends one QUEUED Operation on the Execute stream and then nothing until an executor
 //! claims the task, and HTTP/2 pings keep the stream open, so a task the scheduler lost and a long
@@ -16,6 +17,15 @@
 //! read. Whichever attempt an executor claims first, or that finishes first with an OK response,
 //! is the one the action takes; the others are dropped. An attempt that finishes with an error
 //! while another is still waiting is dropped too, because the other may still succeed.
+//!
+//! A claimed operation has no QUEUED deadline, but it can still stall: an execution that lost its
+//! task after EXECUTING, with its failure never published, keeps a stream open that says nothing
+//! more. A live executor is never that quiet; BuildBuddy republishes a running task's state every
+//! 60 s with a new timestamp. So a claimed attempt that sends no new message for the stall deadline
+//! is replaced by an attempt with the Action's `do_not_cache` set, which the server never merges
+//! with the stalled execution; from then on every attempt is uncached. A second stall fails the
+//! action with DEADLINE_EXCEEDED. A message equal to the one before it, which is what a resumed
+//! stream sends first, does not count as progress.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -30,6 +40,10 @@ use re_grpc_proto::build::bazel::remote::execution::v2::ExecuteResponse as GExec
 use re_grpc_proto::build::bazel::remote::execution::v2::execution_stage;
 use re_grpc_proto::google::longrunning::Operation;
 use re_grpc_proto::google::longrunning::operation::Result as OpResult;
+
+use crate::error::REClientError;
+use crate::error::TCode;
+use crate::error::TCodeReasonGroup;
 
 /// Where an attempt's operation is, from the Operations it has sent.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -80,23 +94,28 @@ fn deadline_after(period: Duration, requeue: usize, jitter: f64) -> Duration {
     base + base.mul_f64(jitter.clamp(0.0, 1.0) * 0.25)
 }
 
-/// Runs `open`'s attempts at an action under a QUEUED deadline. `open` starts one attempt: an
-/// Execute, with its own resumption. `period` is the deadline (None turns it off); `max_requeues`
-/// bounds the re-Executes, after which buck2 warns and keeps waiting, since a long legitimate
-/// queue looks the same as a lost task. `warn` puts a re-Execute on the console.
-pub(crate) fn with_queued_deadline<F, W>(
+/// Runs `open`'s attempts at an action under a QUEUED deadline and a stall deadline. `open(uncached)`
+/// starts one attempt: an Execute, of the Action with `do_not_cache` set when `uncached`, with its
+/// own resumption. `queued` is the QUEUED deadline and `stalled` the stall deadline (None turns
+/// either off); `max_requeues` bounds the re-Executes after QUEUED deadlines, after which buck2
+/// warns and keeps waiting, since a long legitimate queue looks the same as a lost task. `warn`
+/// puts a re-Execute on the console.
+pub(crate) fn with_deadlines<F, W>(
     open: F,
-    period: Option<Duration>,
+    queued: Option<Duration>,
+    stalled: Option<Duration>,
     max_requeues: usize,
     warn: W,
 ) -> BoxStream<'static, anyhow::Result<Operation>>
 where
-    F: Fn() -> BoxStream<'static, anyhow::Result<Operation>> + Send + Sync + 'static,
+    F: Fn(bool) -> BoxStream<'static, anyhow::Result<Operation>> + Send + Sync + 'static,
     W: Fn(String) + Send + Sync + 'static,
 {
-    let Some(period) = period.filter(|period| !period.is_zero()) else {
-        return open();
-    };
+    let queued = queued.filter(|period| !period.is_zero());
+    let stalled = stalled.filter(|period| !period.is_zero());
+    if queued.is_none() && stalled.is_none() {
+        return open(false);
+    }
 
     struct State<F, W> {
         open: Arc<F>,
@@ -109,21 +128,33 @@ where
         timer: Option<std::pin::Pin<Box<tokio::time::Sleep>>>,
         requeues: usize,
         max_requeues: usize,
-        period: Duration,
+        queued: Option<Duration>,
+        /// The last message of each attempt, encoded, to tell news from a repeat.
+        last: Vec<Option<Vec<u8>>>,
+        stall_timer: Option<std::pin::Pin<Box<tokio::time::Sleep>>>,
+        stalled: Option<Duration>,
+        uncached: bool,
         operation_name: String,
     }
 
     impl<F, W> State<F, W>
     where
-        F: Fn() -> BoxStream<'static, anyhow::Result<Operation>> + Send + Sync + 'static,
+        F: Fn(bool) -> BoxStream<'static, anyhow::Result<Operation>> + Send + Sync + 'static,
     {
         fn start(&mut self) {
             let id = self.handles.len();
-            let (stream, handle) = futures::stream::abortable((self.open)());
+            let (stream, handle) = futures::stream::abortable((self.open)(self.uncached));
             self.attempts.push(stream.map(move |item| (id, item)).boxed());
             self.handles.push(handle);
             self.states.push(AttemptState::default());
             self.live.push(true);
+            self.last.push(None);
+        }
+
+        fn restart_stall_timer(&mut self) {
+            self.stall_timer = self
+                .stalled
+                .map(|stalled| Box::pin(tokio::time::sleep(stalled)));
         }
 
         fn live_count(&self) -> usize {
@@ -138,6 +169,7 @@ where
         fn take(&mut self, id: usize) {
             self.winner = Some(id);
             self.timer = None;
+            self.restart_stall_timer();
             for other in 0..self.handles.len() {
                 if other != id && self.live[other] {
                     self.drop_attempt(other);
@@ -157,7 +189,11 @@ where
         timer: None,
         requeues: 0,
         max_requeues,
-        period,
+        queued,
+        last: Vec::new(),
+        stall_timer: None,
+        stalled,
+        uncached: false,
         operation_name: String::new(),
     };
     state.start();
@@ -166,6 +202,12 @@ where
         loop {
             let timer = async {
                 match state.timer.as_mut() {
+                    Some(timer) => timer.await,
+                    None => futures::future::pending().await,
+                }
+            };
+            let stall_timer = async {
+                match state.stall_timer.as_mut() {
                     Some(timer) => timer.await,
                     None => futures::future::pending().await,
                 }
@@ -188,6 +230,12 @@ where
                                 state.operation_name = operation.name.clone();
                             }
                             state.states[id].observe(&operation);
+                            let encoded = operation.encode_to_vec();
+                            let news = state.last[id].as_ref() != Some(&encoded);
+                            state.last[id] = Some(encoded);
+                            if state.winner == Some(id) && news {
+                                state.restart_stall_timer();
+                            }
                             if state.winner.is_none() {
                                 if operation.done
                                     && !finished_ok(&operation)
@@ -198,9 +246,12 @@ where
                                 }
                                 if state.states[id].claimed {
                                     state.take(id);
-                                } else if state.states[id].queued && state.timer.is_none() {
+                                } else if let Some(period) = state.queued
+                                    && state.states[id].queued
+                                    && state.timer.is_none()
+                                {
                                     let deadline =
-                                        deadline_after(state.period, state.requeues, rand::random());
+                                        deadline_after(period, state.requeues, rand::random());
                                     state.timer = Some(Box::pin(tokio::time::sleep(deadline)));
                                 }
                             }
@@ -208,8 +259,37 @@ where
                         }
                     }
                 }
+                _ = stall_timer => {
+                    let stalled = state.stalled.unwrap_or_default().as_secs();
+                    if state.uncached {
+                        let err = REClientError {
+                            code: TCode::DEADLINE_EXCEEDED,
+                            message: format!(
+                                "RE operation `{}` made no progress for {stalled}s, after the action had already been executed again uncached for the same reason",
+                                state.operation_name
+                            ),
+                            group: TCodeReasonGroup::UNKNOWN,
+                        };
+                        return Some((Err(err.into()), state));
+                    }
+                    (state.warn)(format!(
+                        "Executing RE action again with do_not_cache set: its operation `{}` made no progress for {stalled}s. The server does not merge this Execute into the stalled operation, and does not cache its result",
+                        state.operation_name,
+                    ));
+                    for id in 0..state.handles.len() {
+                        if state.live[id] {
+                            state.drop_attempt(id);
+                        }
+                    }
+                    state.winner = None;
+                    state.stall_timer = None;
+                    state.timer = None;
+                    state.uncached = true;
+                    state.start();
+                }
                 _ = timer => {
-                    let waited = deadline_after(state.period, state.requeues, 0.0);
+                    let period = state.queued.unwrap_or_default();
+                    let waited = deadline_after(period, state.requeues, 0.0);
                     if state.requeues < state.max_requeues {
                         state.requeues += 1;
                         (state.warn)(format!(
@@ -220,8 +300,7 @@ where
                             waited.as_secs(),
                         ));
                         state.start();
-                        let deadline =
-                            deadline_after(state.period, state.requeues, rand::random());
+                        let deadline = deadline_after(period, state.requeues, rand::random());
                         state.timer = Some(Box::pin(tokio::time::sleep(deadline)));
                     } else {
                         (state.warn)(format!(
@@ -271,20 +350,35 @@ mod tests {
     fn scripted(
         scripts: Vec<Vec<anyhow::Result<Operation>>>,
     ) -> (
-        impl Fn() -> BoxStream<'static, anyhow::Result<Operation>> + Send + Sync + 'static,
+        impl Fn(bool) -> BoxStream<'static, anyhow::Result<Operation>> + Send + Sync + 'static,
         Arc<Mutex<usize>>,
     ) {
+        let (open, opened, _) = scripted_with_flags(scripts);
+        (open, opened)
+    }
+
+    /// Like `scripted`, also recording whether each attempt was uncached.
+    fn scripted_with_flags(
+        scripts: Vec<Vec<anyhow::Result<Operation>>>,
+    ) -> (
+        impl Fn(bool) -> BoxStream<'static, anyhow::Result<Operation>> + Send + Sync + 'static,
+        Arc<Mutex<usize>>,
+        Arc<Mutex<Vec<bool>>>,
+    ) {
         let opened = Arc::new(Mutex::new(0));
+        let flags = Arc::new(Mutex::new(Vec::new()));
         let scripts = Arc::new(Mutex::new(std::collections::VecDeque::from(scripts)));
         let counter = opened.clone();
-        let open = move || {
+        let recorded = flags.clone();
+        let open = move |uncached: bool| {
             *counter.lock().unwrap() += 1;
+            recorded.lock().unwrap().push(uncached);
             let script = scripts.lock().unwrap().pop_front().unwrap_or_default();
             futures::stream::iter(script)
                 .chain(futures::stream::pending())
                 .boxed()
         };
-        (open, opened)
+        (open, opened, flags)
     }
 
     fn take_until_done(
@@ -307,7 +401,7 @@ mod tests {
         ]);
         let warnings = Arc::new(Mutex::new(Vec::new()));
         let seen = warnings.clone();
-        let stream = with_queued_deadline(open, Some(Duration::from_secs(900)), 5, move |w| {
+        let stream = with_deadlines(open, Some(Duration::from_secs(900)), None, 5, move |w| {
             seen.lock().unwrap().push(w)
         });
         let mut stream = stream;
@@ -333,7 +427,7 @@ mod tests {
             Ok(staged(execution_stage::Value::Queued, false)),
             Ok(staged(execution_stage::Value::Executing, false)),
         ]]);
-        let stream = with_queued_deadline(open, Some(Duration::from_secs(900)), 5, |_| {});
+        let stream = with_deadlines(open, Some(Duration::from_secs(900)), None, 5, |_| {});
         let result =
             tokio::time::timeout(Duration::from_secs(100_000), take_until_done(stream)).await;
         assert!(result.is_err(), "the stream should still be waiting");
@@ -350,19 +444,19 @@ mod tests {
         let (tx, rx) = futures::channel::mpsc::unbounded();
         let rx = Arc::new(Mutex::new(Some(rx)));
         let first = Arc::new(Mutex::new(true));
-        let open = move || {
+        let open = move |uncached: bool| {
             if std::mem::replace(&mut *first.lock().unwrap(), false) {
                 let rx = rx.lock().unwrap().take().unwrap();
                 // Counts the call; this attempt is scripted through the channel instead.
-                drop(open());
+                drop(open(uncached));
                 futures::stream::iter(vec![Ok(staged(execution_stage::Value::Queued, false))])
                     .chain(rx)
                     .boxed()
             } else {
-                open()
+                open(uncached)
             }
         };
-        let mut stream = with_queued_deadline(open, Some(Duration::from_secs(900)), 5, |_| {});
+        let mut stream = with_deadlines(open, Some(Duration::from_secs(900)), None, 5, |_| {});
         assert!(!stream.try_next().await?.unwrap().done);
         // Past the deadline, a second attempt starts and says QUEUED.
         assert!(!stream.try_next().await?.unwrap().done);
@@ -391,7 +485,7 @@ mod tests {
         ]);
         let warnings = Arc::new(Mutex::new(Vec::new()));
         let seen = warnings.clone();
-        let stream = with_queued_deadline(open, Some(Duration::from_secs(900)), 1, move |w| {
+        let stream = with_deadlines(open, Some(Duration::from_secs(900)), None, 1, move |w| {
             seen.lock().unwrap().push(w)
         });
         let result =
@@ -401,6 +495,98 @@ mod tests {
         let warnings = warnings.lock().unwrap();
         assert_eq!(warnings.len(), 2, "{warnings:?}");
         assert!(warnings[1].contains("still QUEUED"), "{warnings:?}");
+    }
+
+    fn executing(step: &str) -> Operation {
+        Operation {
+            name: "operations/s".to_owned(),
+            done: false,
+            metadata: Some(Any {
+                type_url: String::new(),
+                value: ExecuteOperationMetadata {
+                    stage: execution_stage::Value::Executing as i32,
+                    stdout_stream_name: step.to_owned(),
+                    ..Default::default()
+                }
+                .encode_to_vec(),
+            }),
+            result: None,
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_claimed_operation_that_stalls_is_executed_again_uncached() -> anyhow::Result<()> {
+        let (open, opened, flags) = scripted_with_flags(vec![
+            vec![Ok(executing("a"))],
+            vec![
+                Ok(executing("a")),
+                Ok(staged(execution_stage::Value::Completed, true)),
+            ],
+        ]);
+        let warnings = Arc::new(Mutex::new(Vec::new()));
+        let seen = warnings.clone();
+        let mut stream = with_deadlines(
+            open,
+            None,
+            Some(Duration::from_secs(600)),
+            5,
+            move |w| seen.lock().unwrap().push(w),
+        );
+        let mut last = None;
+        while let Some(operation) = stream.try_next().await? {
+            let done = operation.done;
+            last = Some(operation);
+            if done {
+                break;
+            }
+        }
+        assert!(last.unwrap().done);
+        assert_eq!(*opened.lock().unwrap(), 2);
+        assert_eq!(*flags.lock().unwrap(), vec![false, true]);
+        assert!(warnings.lock().unwrap()[0].contains("do_not_cache"));
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_second_stall_fails_the_action() {
+        let (open, opened) = scripted(vec![vec![Ok(executing("a"))], vec![Ok(executing("a"))]]);
+        let result = with_deadlines(open, None, Some(Duration::from_secs(600)), 5, |_| {})
+            .try_collect::<Vec<_>>()
+            .await;
+        let err = result.expect_err("the second stall should fail");
+        assert!(format!("{err:#}").contains("made no progress"), "{err:#}");
+        assert_eq!(*opened.lock().unwrap(), 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn news_restarts_the_stall_clock_and_a_repeat_does_not() -> anyhow::Result<()> {
+        let (tx, rx) = futures::channel::mpsc::unbounded();
+        let rx = Arc::new(Mutex::new(Some(rx)));
+        let opened = Arc::new(Mutex::new(0));
+        let counter = opened.clone();
+        let open = move |_uncached: bool| {
+            *counter.lock().unwrap() += 1;
+            match rx.lock().unwrap().take() {
+                Some(rx) => rx.boxed(),
+                None => futures::stream::pending().boxed(),
+            }
+        };
+        let mut stream = with_deadlines(open, None, Some(Duration::from_secs(600)), 5, |_| {});
+        tx.unbounded_send(Ok(executing("a"))).unwrap();
+        stream.try_next().await?;
+        tokio::time::sleep(Duration::from_secs(500)).await;
+        tx.unbounded_send(Ok(executing("b"))).unwrap();
+        stream.try_next().await?;
+        tokio::time::sleep(Duration::from_secs(500)).await;
+        // 1000 s since the start, 500 s since the news: no re-Execute yet.
+        tx.unbounded_send(Ok(executing("b"))).unwrap();
+        stream.try_next().await?;
+        assert_eq!(*opened.lock().unwrap(), 1);
+        // The repeat at 1000 s did not restart the clock: the deadline is 600 s after the news.
+        let next = tokio::time::timeout(Duration::from_secs(150), stream.try_next()).await;
+        assert!(next.is_err(), "no attempt should report anything");
+        assert_eq!(*opened.lock().unwrap(), 2);
+        Ok(())
     }
 
     #[test]
@@ -417,7 +603,7 @@ mod tests {
             execution_stage::Value::Completed,
             true,
         ))]]);
-        let stream = with_queued_deadline(open, None, 5, |_| {});
+        let stream = with_deadlines(open, None, None, 5, |_| {});
         let operations: Vec<_> = stream.take(1).collect().await;
         assert!(operations[0].as_ref().unwrap().done);
         assert_eq!(*opened.lock().unwrap(), 1);

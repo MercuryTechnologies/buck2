@@ -269,6 +269,30 @@ impl CommandExecutor {
     }
 }
 
+/// `action` with `do_not_cache` set, encoded and digested as the Action itself is, or None when it
+/// has it already. RE executes it instead when an execution of `action` stalls.
+fn uncached_action(
+    action: &RE::Action,
+    digest_config: DigestConfig,
+) -> Option<crate::execute::prepared::UncachedAction> {
+    if action.do_not_cache {
+        return None;
+    }
+    let uncached = RE::Action {
+        do_not_cache: true,
+        ..action.clone()
+    };
+    let blob = crate::execute::request::ActionMetadataBlobData::from_message(&uncached).0;
+    let digest = buck2_common::file_ops::metadata::TrackedFileDigest::from_content(
+        &blob,
+        digest_config.cas_digest_config(),
+    );
+    Some(crate::execute::prepared::UncachedAction {
+        digest: digest.data().dupe().coerce(),
+        blob,
+    })
+}
+
 fn re_create_action(
     args: Vec<String>,
     all_args: Vec<String>,
@@ -475,10 +499,12 @@ fn re_create_action(
         let _unused = network_access;
     }
 
+    let uncached_action = uncached_action(&action, digest_config);
     let action_and_blobs = action_and_blobs.build(&action);
 
     Ok(PreparedAction {
         action_and_blobs,
+        uncached_action,
         #[allow(deprecated)]
         platform: command
             .platform
@@ -507,4 +533,42 @@ fn set_action_network_access(
         ExecutorNetworkAccess::Loopback => RE::NetworkIsolationType::Loopback,
         ExecutorNetworkAccess::Private => RE::NetworkIsolationType::Private,
     } as i32;
+}
+
+#[cfg(test)]
+mod uncached_action_tests {
+    use prost::Message;
+
+    use super::*;
+    use crate::execute::action_digest_and_blobs::ActionDigestAndBlobsBuilder;
+
+    #[test]
+    fn the_uncached_action_is_the_action_with_do_not_cache_under_its_own_digest() {
+        let digest_config = DigestConfig::testing_default();
+        let action = RE::Action {
+            timeout: Some(prost_types::Duration {
+                seconds: 7,
+                nanos: 0,
+            }),
+            ..Default::default()
+        };
+        let cached = ActionDigestAndBlobsBuilder::new(digest_config).build(&action);
+        let uncached = uncached_action(&action, digest_config).expect("an uncached action");
+
+        let decoded = RE::Action::decode(&uncached.blob[..]).unwrap();
+        assert!(decoded.do_not_cache);
+        assert_eq!(decoded.timeout, action.timeout);
+        assert_ne!(uncached.digest, cached.action);
+        let built = ActionDigestAndBlobsBuilder::new(digest_config).build(&decoded);
+        assert_eq!(uncached.digest, built.action);
+    }
+
+    #[test]
+    fn an_action_that_is_not_cached_already_has_no_uncached_copy() {
+        let action = RE::Action {
+            do_not_cache: true,
+            ..Default::default()
+        };
+        assert!(uncached_action(&action, DigestConfig::testing_default()).is_none());
+    }
 }
