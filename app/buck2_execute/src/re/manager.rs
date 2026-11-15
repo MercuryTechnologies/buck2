@@ -350,6 +350,25 @@ impl UnconfiguredRemoteExecutionClient {
     }
 }
 
+/// Puts an action-cache lookup that failed and was taken as a miss on the console, which the BES
+/// sink carries to the build event stream too, rather than only in the daemon's log.
+fn warn_skipped_cache_lookup(action_digest: &ActionDigest, error: &buck2_error::Error) {
+    tracing::info!(
+        "Ignoring failed remote cache lookup for action `{}` and executing it: {:#}",
+        action_digest,
+        error
+    );
+    if let Some(dispatcher) = buck2_events::dispatch::get_dispatcher_opt() {
+        dispatcher.console_warning(skipped_cache_lookup_message(action_digest, error));
+    }
+}
+
+fn skipped_cache_lookup_message(action_digest: &ActionDigest, error: &buck2_error::Error) -> String {
+    format!(
+        "Remote cache lookup skipped for action {action_digest}: the lookup failed, so the action is executed instead ({error:#})"
+    )
+}
+
 impl ManagedRemoteExecutionClient {
     pub async fn get_session_id(&self) -> buck2_error::Result<String> {
         self.inner.get_session_id().await
@@ -365,14 +384,22 @@ impl ManagedRemoteExecutionClient {
         platform: &RE::Platform,
         identity: Option<&ReActionIdentity<'_>>,
     ) -> buck2_error::Result<Option<ActionResultResponse>> {
-        Ok(self
+        // A lookup that fails, after the client's retries, is a miss: the action runs. A cache
+        // that stopped answering then costs a slower, costlier build rather than a failed one,
+        // and the warning is what says so.
+        match self
             .lock()?
             .get()
             .await?
-            .action_cache(action_digest, self.use_case, platform, identity)
+            .action_cache(action_digest.dupe(), self.use_case, platform, identity)
             .await
-            .ok()
-            .flatten())
+        {
+            Ok(response) => Ok(response),
+            Err(error) => {
+                warn_skipped_cache_lookup(&action_digest, &error);
+                Ok(None)
+            }
+        }
     }
 
     pub async fn upload(
@@ -557,5 +584,46 @@ impl ManagedRemoteExecutionClient {
                 )
                 .await
         }
+    }
+}
+
+#[cfg(test)]
+mod skipped_cache_lookup_tests {
+    use buck2_events::Event;
+    use buck2_events::create_source_sink_pair;
+    use buck2_events::daemon_id::DaemonId;
+    use buck2_events::dispatch::EventDispatcher;
+    use buck2_events::dispatch::with_dispatcher;
+    use buck2_wrapper_common::invocation_id::TraceId;
+
+    use super::*;
+    use crate::digest_config::DigestConfig;
+
+    #[test]
+    fn a_skipped_lookup_warns_once_with_its_action_and_error() {
+        let digest = ActionDigest::empty(DigestConfig::testing_default().cas_digest_config());
+        let error = buck2_error::buck2_error!(
+            buck2_error::ErrorTag::Tier0,
+            "status: Cancelled, message: \"Timeout expired\""
+        );
+        let (mut events, sink) = create_source_sink_pair();
+        let dispatcher = EventDispatcher::new(TraceId::new(), DaemonId::new(), sink);
+        with_dispatcher(dispatcher, || warn_skipped_cache_lookup(&digest, &error));
+
+        let mut warnings = Vec::new();
+        while let Some(event) = events.try_receive() {
+            if let Event::Buck(event) = event {
+                if let buck2_data::buck_event::Data::Instant(instant) = event.data() {
+                    if let Some(buck2_data::instant_event::Data::ConsoleWarning(warning)) =
+                        &instant.data
+                    {
+                        warnings.push(warning.message.clone());
+                    }
+                }
+            }
+        }
+        assert_eq!(warnings, vec![skipped_cache_lookup_message(&digest, &error)]);
+        assert!(warnings[0].starts_with(&format!("Remote cache lookup skipped for action {digest}: ")));
+        assert!(warnings[0].contains("Timeout expired"));
     }
 }
