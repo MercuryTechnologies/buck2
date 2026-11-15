@@ -486,6 +486,11 @@ pub struct Buck2OssReConfiguration {
     pub max_retries: usize,
     /// Timeout for RPC requests in seconds. Defaults to 60s.
     pub grpc_timeout: u64,
+    /// Time in seconds an operation may stay QUEUED after its Execute before the action is
+    /// executed again, within `max_retries`. 0 turns it off; unset is 900. Must exceed the time
+    /// the server merges a new Execute onto a queued operation of the same action, or the new
+    /// Execute joins the operation that is stuck.
+    pub queued_operation_timeout_secs: Option<u64>,
 }
 
 #[derive(Clone, Debug, Default, Allocative)]
@@ -639,6 +644,10 @@ impl Buck2OssReConfiguration {
                     property: "grpc_timeout",
                 })?
                 .unwrap_or(60),
+            queued_operation_timeout_secs: legacy_config.parse(BuckconfigKeyRef {
+                section: BUCK2_RE_CLIENT_CFG_SECTION,
+                property: "queued_operation_timeout_secs",
+            })?,
         })
     }
 }
@@ -766,6 +775,29 @@ mod tests {
     use buck2_common::legacy_configs::configs::testing::parse;
 
     use super::*;
+
+    #[test]
+    fn oss_config_parses_queued_operation_timeout_secs() -> buck2_error::Result<()> {
+        let unset = parse(&[("config", "")], "config")?;
+        let set = parse(
+            &[(
+                "config",
+                "[buck2_re_client]\nqueued_operation_timeout_secs = 0\n",
+            )],
+            "config",
+        )?;
+        assert_eq!(
+            Buck2OssReConfiguration::from_legacy_config(&unset)?
+                .queued_operation_timeout_secs,
+            None
+        );
+        assert_eq!(
+            Buck2OssReConfiguration::from_legacy_config(&set)?
+                .queued_operation_timeout_secs,
+            Some(0)
+        );
+        Ok(())
+    }
 
     #[test]
     fn bes_replay_settings_read_the_bes_keys() -> buck2_error::Result<()> {

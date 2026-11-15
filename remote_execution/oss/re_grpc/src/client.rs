@@ -193,6 +193,10 @@ pub struct RECapabilities {
 }
 
 /// Contains runtime options for the remote execution client as set under `buck2_re_client`
+/// The default for [buck2_re_client] queued_operation_timeout_secs: 15 minutes, past which a
+/// QUEUED operation is more likely lost than waiting.
+const DEFAULT_QUEUED_OPERATION_TIMEOUT_SECS: u64 = 900;
+
 #[derive(Clone, Copy)]
 pub struct RERuntimeOpts {
     /// Use the Meta version of the request metadata
@@ -209,6 +213,8 @@ pub struct RERuntimeOpts {
     batch_compression_threshold: usize,
     /// Whether to request zstd-compressed `BatchReadBlobs` responses (server supports zstd).
     batch_read_zstd: bool,
+    /// How long an operation may stay QUEUED before its action is executed again; None is off.
+    queued_operation_timeout: Option<Duration>,
 }
 
 #[derive(Clone)]
@@ -382,6 +388,13 @@ impl REClientBuilder {
                 batch_read_zstd: capabilities
                     .supported_compressors
                     .contains(&Compressor::Zstd),
+                queued_operation_timeout: match opts
+                    .queued_operation_timeout_secs
+                    .unwrap_or(DEFAULT_QUEUED_OPERATION_TIMEOUT_SECS)
+                {
+                    0 => None,
+                    secs => Some(Duration::from_secs(secs)),
+                },
             },
             capabilities,
             instance_name,
@@ -1065,52 +1078,64 @@ impl REClient {
         // stream reading are retried and cause tonic to reconnect with a fresh h2 connection.
         // Once the server has named the action's operation, a retry resumes it with
         // WaitExecution instead of submitting the action again.
-        let stream = resuming_operation_stream(
-            format!("{}:{}", action_digest.hash, action_digest.size_bytes),
-            move |call| {
-                let execution_pool = execution_pool.clone();
-                let engine_address = engine_address.clone();
-                let interceptor = interceptor.dupe();
-                let instance_name = instance_name.clone();
-                let action_digest = action_digest.clone();
-                let metadata = metadata.clone();
-                async move {
-                    let channel = execution_pool.get(&engine_address).await?;
-                    let mut client =
-                        ExecutionClient::new(InterceptedService::new(channel, interceptor));
-                    let stream = match call {
-                        OperationCall::Execute => client
-                            .execute(with_re_metadata(
-                                GExecuteRequest {
-                                    instance_name,
-                                    skip_cache_lookup,
-                                    execution_policy: Some(ExecutionPolicy { priority }),
-                                    results_cache_policy: Some(ResultsCachePolicy { priority: 0 }),
-                                    action_digest: Some(action_digest),
-                                    ..Default::default()
-                                },
-                                &metadata,
-                                runtime_opts,
-                            ))
-                            .await?
-                            .into_inner()
-                            .boxed(),
-                        OperationCall::Wait(name) => client
-                            .wait_execution(with_re_metadata(
-                                WaitExecutionRequest { name },
-                                &metadata,
-                                runtime_opts,
-                            ))
-                            .await?
-                            .into_inner()
-                            .boxed(),
-                    };
-                    anyhow::Ok(stream)
-                }
+        let action = format!("{}:{}", action_digest.hash, action_digest.size_bytes);
+        let open_call = Arc::new(move |call: OperationCall| {
+            let execution_pool = execution_pool.clone();
+            let engine_address = engine_address.clone();
+            let interceptor = interceptor.dupe();
+            let instance_name = instance_name.clone();
+            let action_digest = action_digest.clone();
+            let metadata = metadata.clone();
+            async move {
+                let channel = execution_pool.get(&engine_address).await?;
+                let mut client =
+                    ExecutionClient::new(InterceptedService::new(channel, interceptor));
+                let stream = match call {
+                    OperationCall::Execute => client
+                        .execute(with_re_metadata(
+                            GExecuteRequest {
+                                instance_name,
+                                skip_cache_lookup,
+                                execution_policy: Some(ExecutionPolicy { priority }),
+                                results_cache_policy: Some(ResultsCachePolicy { priority: 0 }),
+                                action_digest: Some(action_digest),
+                                ..Default::default()
+                            },
+                            &metadata,
+                            runtime_opts,
+                        ))
+                        .await?
+                        .into_inner()
+                        .boxed(),
+                    OperationCall::Wait(name) => client
+                        .wait_execution(with_re_metadata(
+                            WaitExecutionRequest { name },
+                            &metadata,
+                            runtime_opts,
+                        ))
+                        .await?
+                        .into_inner()
+                        .boxed(),
+                };
+                anyhow::Ok(stream)
+            }
+        });
+        let max_retries = self.runtime_opts.max_retries;
+        let stream = crate::queued_deadline::with_queued_deadline(
+            move || {
+                let open_call = open_call.dupe();
+                resuming_operation_stream(
+                    action.clone(),
+                    move |call| open_call(call),
+                    max_retries,
+                    INITIAL_DELAY,
+                    MAX_DELAY,
+                )
+                .boxed()
             },
-            self.runtime_opts.max_retries,
-            INITIAL_DELAY,
-            MAX_DELAY,
+            runtime_opts.queued_operation_timeout,
+            max_retries,
+            |message| warn_operation_reopen(&message),
         );
 
         let stream = stream.and_then(|msg| async move { process_operation_message(msg) });
@@ -2285,6 +2310,7 @@ mod tests {
             max_retries: 0,
             batch_compression_threshold: DEFAULT_BATCH_COMPRESSION_THRESHOLD,
             batch_read_zstd: false,
+            queued_operation_timeout: None,
         }
     }
 
