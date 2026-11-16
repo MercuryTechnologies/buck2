@@ -19,6 +19,20 @@ git_fetch(
 )
 
 git_fetch(
+    name = "grpc-rust-300f37145319b96d.git",
+    repo = "https://github.com/MercuryTechnologies/grpc-rust.git",
+    rev = "590fab574c57d80b2c83f7aca30a63942401beae",
+    visibility = [],
+)
+
+git_fetch(
+    name = "hyper-325facbb82c056ec.git",
+    repo = "https://github.com/MercuryTechnologies/hyper.git",
+    rev = "d3ab1825c70def6bd79ef08daa5195badb074cd0",
+    visibility = [],
+)
+
+git_fetch(
     name = "perf-event-7610c6bfd3fa18f3.git",
     repo = "https://github.com/Nero5023/perf-event.git",
     rev = "6dae86b6d4807acec081e6dc0a53167f57f8c0f4",
@@ -9840,19 +9854,11 @@ third_party_rust_alias(
     visibility = ["PUBLIC"],
 )
 
-http_archive(
-    name = "hyper-1.12.0.crate",
-    sha256 = "2c3e324da4c95177d6291d4c8730197c0d1822f8a9766814a4a44fa5ab797c9c",
-    strip_prefix = "hyper-1.12.0",
-    urls = ["https://static.crates.io/crates/hyper/1.12.0/download"],
-    visibility = [],
-)
-
 third_party_rust_library(
     name = "hyper-1",
-    srcs = [":hyper-1.12.0.crate"],
+    srcs = [":hyper-325facbb82c056ec.git"],
     crate = "hyper",
-    crate_root = "hyper-1.12.0.crate/src/lib.rs",
+    crate_root = "hyper-325facbb82c056ec/src/lib.rs",
     edition = "2021",
     features = [
         "client",
@@ -25851,35 +25857,27 @@ third_party_rust_alias(
     visibility = ["PUBLIC"],
 )
 
-http_archive(
-    name = "tonic-0.14.9.crate",
-    sha256 = "e2cdfc673aabd30fe8fee92e65837b644c37c5d47f0f97ae6d5e0f1237d15e1b",
-    strip_prefix = "tonic-0.14.9",
-    urls = ["https://static.crates.io/crates/tonic/0.14.9/download"],
-    visibility = [],
-)
-
 third_party_rust_library(
     name = "tonic-0.14",
-    srcs = [":tonic-0.14.9.crate"],
+    srcs = [":grpc-rust-300f37145319b96d.git"],
     crate = "tonic",
-    crate_root = "tonic-0.14.9.crate/src/lib.rs",
+    crate_root = "grpc-rust-300f37145319b96d/tonic/src/lib.rs",
     edition = "2024",
     env = {
         "CARGO_BIN_NAME": "tonic",
         "CARGO_CRATE_NAME": "tonic",
-        "CARGO_MANIFEST_DIR": "tonic-0.14.9.crate",
-        "CARGO_PKG_AUTHORS": "gRPC authors",
+        "CARGO_MANIFEST_DIR": "grpc-rust-300f37145319b96d",
+        "CARGO_PKG_AUTHORS": "Lucio Franco <luciofranco14@gmail.com>",
         "CARGO_PKG_DESCRIPTION": "A gRPC over HTTP/2 implementation focused on high performance, interoperability, and flexibility.\n",
-        "CARGO_PKG_HOMEPAGE": "https://github.com/grpc/grpc-rust",
+        "CARGO_PKG_HOMEPAGE": "https://github.com/hyperium/tonic",
         "CARGO_PKG_NAME": "tonic",
-        "CARGO_PKG_README": "README.md",
-        "CARGO_PKG_REPOSITORY": "https://github.com/grpc/grpc-rust",
+        "CARGO_PKG_README": "../README.md",
+        "CARGO_PKG_REPOSITORY": "https://github.com/hyperium/tonic",
         "CARGO_PKG_RUST_VERSION": "1.88",
-        "CARGO_PKG_VERSION": "0.14.9",
+        "CARGO_PKG_VERSION": "0.14.6",
         "CARGO_PKG_VERSION_MAJOR": "0",
         "CARGO_PKG_VERSION_MINOR": "14",
-        "CARGO_PKG_VERSION_PATCH": "9",
+        "CARGO_PKG_VERSION_PATCH": "6",
         "CARGO_PKG_VERSION_PRE": "",
     },
     features = [
@@ -25888,7 +25886,6 @@ third_party_rust_library(
         "codegen",
         "default",
         "gzip",
-        "h2",
         "router",
         "server",
         "tls-connect-info",
@@ -25927,7 +25924,6 @@ third_party_rust_library(
         ":tokio-1",
         ":tokio-rustls-0.26",
         ":tokio-stream-0.1",
-        ":tokio-util-0.7",
         ":tower-0.5",
         ":tower-layer-0.3",
         ":tower-service-0.3",
@@ -25950,19 +25946,11 @@ third_party_rust_alias(
     visibility = ["PUBLIC"],
 )
 
-http_archive(
-    name = "tonic-build-0.14.9.crate",
-    sha256 = "ac6d916d206ed7bdda1778ddff9bda43303789c258877e7bc22fb44ee5c984b4",
-    strip_prefix = "tonic-build-0.14.9",
-    urls = ["https://static.crates.io/crates/tonic-build/0.14.9/download"],
-    visibility = [],
-)
-
 third_party_rust_library(
     name = "tonic-build-0.14",
-    srcs = [":tonic-build-0.14.9.crate"],
+    srcs = [":grpc-rust-300f37145319b96d.git"],
     crate = "tonic_build",
-    crate_root = "tonic-build-0.14.9.crate/src/lib.rs",
+    crate_root = "grpc-rust-300f37145319b96d/tonic-build/src/lib.rs",
     edition = "2024",
     features = [
         "default",
@@ -25999,19 +25987,11 @@ third_party_rust_alias(
     visibility = ["PUBLIC"],
 )
 
-http_archive(
-    name = "tonic-prost-0.14.9.crate",
-    sha256 = "eba464054e2226f182a34489b8b079bf4c6e3e7ab5fd7fc30e024f24aa92a484",
-    strip_prefix = "tonic-prost-0.14.9",
-    urls = ["https://static.crates.io/crates/tonic-prost/0.14.9/download"],
-    visibility = [],
-)
-
 third_party_rust_library(
     name = "tonic-prost-0.14",
-    srcs = [":tonic-prost-0.14.9.crate"],
+    srcs = [":grpc-rust-300f37145319b96d.git"],
     crate = "tonic_prost",
-    crate_root = "tonic-prost-0.14.9.crate/src/lib.rs",
+    crate_root = "grpc-rust-300f37145319b96d/tonic-prost/src/lib.rs",
     edition = "2024",
     platform = {
         "linux-arm64": dict(),
@@ -26043,19 +26023,11 @@ third_party_rust_alias(
     visibility = ["PUBLIC"],
 )
 
-http_archive(
-    name = "tonic-prost-build-0.14.9.crate",
-    sha256 = "2ea216ddc448e08e7839ab09e20e60b06b6a1c32745ccb212c0ebd161c199f1b",
-    strip_prefix = "tonic-prost-build-0.14.9",
-    urls = ["https://static.crates.io/crates/tonic-prost-build/0.14.9/download"],
-    visibility = [],
-)
-
 third_party_rust_library(
     name = "tonic-prost-build-0.14",
-    srcs = [":tonic-prost-build-0.14.9.crate"],
+    srcs = [":grpc-rust-300f37145319b96d.git"],
     crate = "tonic_prost_build",
-    crate_root = "tonic-prost-build-0.14.9.crate/src/lib.rs",
+    crate_root = "grpc-rust-300f37145319b96d/tonic-prost-build/src/lib.rs",
     edition = "2024",
     features = [
         "cleanup-markdown",
@@ -27596,18 +27568,18 @@ third_party_rust_library(
 )
 
 http_archive(
-    name = "want-0.3.2.crate",
-    sha256 = "ec4cdd0dd910afe868b7ef477227d8d538b46b3075031afee8a9f2acb0a2ed0b",
-    strip_prefix = "want-0.3.2",
-    urls = ["https://static.crates.io/crates/want/0.3.2/download"],
+    name = "want-0.3.1.crate",
+    sha256 = "bfa7760aed19e106de2c7c0b581b509f2f25d3dacaf737cb82ac61bc6d760b0e",
+    strip_prefix = "want-0.3.1",
+    urls = ["https://static.crates.io/crates/want/0.3.1/download"],
     visibility = [],
 )
 
 third_party_rust_library(
     name = "want-0.3",
-    srcs = [":want-0.3.2.crate"],
+    srcs = [":want-0.3.1.crate"],
     crate = "want",
-    crate_root = "want-0.3.2.crate/src/lib.rs",
+    crate_root = "want-0.3.1.crate/src/lib.rs",
     edition = "2018",
     platform = {
         "linux-arm64": dict(),
@@ -27705,18 +27677,18 @@ third_party_rust_library(
 )
 
 http_archive(
-    name = "webpki-roots-1.0.12.crate",
-    sha256 = "7265c9301c16a8711c992c2d8da90ee77ef54b1ed51482d6dfeb00dc756b1297",
-    strip_prefix = "webpki-roots-1.0.12",
-    urls = ["https://static.crates.io/crates/webpki-roots/1.0.12/download"],
+    name = "webpki-roots-1.0.6.crate",
+    sha256 = "22cfaf3c063993ff62e73cb4311efde4db1efb31ab78a3e5c457939ad5cc0bed",
+    strip_prefix = "webpki-roots-1.0.6",
+    urls = ["https://static.crates.io/crates/webpki-roots/1.0.6/download"],
     visibility = [],
 )
 
 third_party_rust_library(
     name = "webpki-roots-1",
-    srcs = [":webpki-roots-1.0.12.crate"],
+    srcs = [":webpki-roots-1.0.6.crate"],
     crate = "webpki_roots",
-    crate_root = "webpki-roots-1.0.12.crate/src/lib.rs",
+    crate_root = "webpki-roots-1.0.6.crate/src/lib.rs",
     edition = "2021",
     named_deps = {
         "pki_types": ":rustls-pki-types-1",
