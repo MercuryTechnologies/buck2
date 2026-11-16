@@ -69,6 +69,9 @@ def sh_test_impl(ctx: AnalysisContext) -> list[Provider]:
             run_from_project_root = run_from_project_root,
             use_project_relative_paths = use_project_relative_paths,
             supports_test_execution_caching = ctx.attrs.supports_test_execution_caching,
+            # lab: the bundled prelude must pass a test rule's timeout too, as lab's own prelude does
+            # (496fa8e574). Passed only when set, so a buck2 from before timeout_ms still loads it.
+            **({"timeout_ms": ctx.attrs.test_rule_timeout_ms} if ctx.attrs.test_rule_timeout_ms != None else {})
         ),
     ) + [
         DefaultInfo(),
