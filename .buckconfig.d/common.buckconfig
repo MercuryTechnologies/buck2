@@ -3,6 +3,7 @@ prelude = prelude
 none = none
 release_toolchains = release_toolchains
 release_platforms = release_platforms
+hub_re = hub_re
 
 [cell_aliases]
 config = prelude
