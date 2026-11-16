@@ -263,6 +263,14 @@ windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Globa
 winver = "1"
 
 [patch.crates-io]
+# The root Cargo.toml follows the hyper and grpc-rust forks by branch; the shim pins
+# the revs the root Cargo.lock resolved, so the buck-built and cargo-built buck2 link
+# the same hyper and tonic. Move these with the root Cargo.lock.
+hyper = { git = "https://github.com/MercuryTechnologies/hyper.git", rev = "d3ab1825c70def6bd79ef08daa5195badb074cd0" }
+tonic = { git = "https://github.com/MercuryTechnologies/grpc-rust.git", rev = "590fab574c57d80b2c83f7aca30a63942401beae" }
+tonic-build = { git = "https://github.com/MercuryTechnologies/grpc-rust.git", rev = "590fab574c57d80b2c83f7aca30a63942401beae" }
+tonic-prost = { git = "https://github.com/MercuryTechnologies/grpc-rust.git", rev = "590fab574c57d80b2c83f7aca30a63942401beae" }
+tonic-prost-build = { git = "https://github.com/MercuryTechnologies/grpc-rust.git", rev = "590fab574c57d80b2c83f7aca30a63942401beae" }
 perf-event = { version = "0.4", git = "https://github.com/Nero5023/perf-event.git", rev = "6dae86b6d4807acec081e6dc0a53167f57f8c0f4" }
 perf-event-open-sys = { version = "5.0", git = "https://github.com/Nero5023/perf-event.git", rev = "6dae86b6d4807acec081e6dc0a53167f57f8c0f4" }
 
