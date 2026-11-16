@@ -39,6 +39,12 @@ system_cxx_toolchain(
     visibility = ["PUBLIC"],
 )
 
+alias(
+    name = "cxx_no_default_deps",
+    actual = ":cxx",
+    visibility = ["PUBLIC"],
+)
+
 system_genrule_toolchain(
     name = "genrule",
     visibility = ["PUBLIC"],
