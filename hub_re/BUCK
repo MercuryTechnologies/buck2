@@ -1,0 +1,160 @@
+load("@release_platforms//:defs.bzl", "buildbuddy_remote_execution_platform")
+
+oncall("build_infra")
+
+# Where an action's tools come from, as a constraint an execution platform
+# carries so that a select in an exec_dep or a toolchain can read it.
+# `nix_daemon` promises that the executor bind-mounts a nix store at
+# /nix/store with its daemon's socket at /nix/var/nix/daemon-socket/socket,
+# and that the daemon substitutes paths signed by cache.mercury.com or
+# cache.nixos.org for a client it does not trust. Hub's executors do: every
+# action container gets the nix-daemon sidecar's store read-only at
+# /nix/store and its socket directory read-write (kosmic-kube
+# charts/buck2-remote-execution values.yaml:909-935), and the daemon's
+# substituters are those two caches with an empty trusted-users
+# (files/nix.conf:14-17, 53-56). `image` is everything else: tools come from
+# the container image alone.
+constraint(
+    name = "exec_store",
+    default = "image",
+    values = [
+        "image",
+        "nix_daemon",
+    ],
+    visibility = ["PUBLIC"],
+)
+
+config_setting(
+    name = "nix_daemon",
+    constraint_values = [
+        ":exec_store[nix_daemon]",
+    ],
+    visibility = ["PUBLIC"],
+)
+
+# Mercury's hub remote execution, the backend .buckconfig.hub selects. The
+# release build's target platforms, release_platforms//:linux-x86_64-musl and
+# :linux-aarch64-musl, name no backend; both execute here, on x86_64
+# executors, so aarch64 is a cross-compile.
+#
+# The properties are exactly those of mwb's own linux-x86_64 build row
+# (mercury-web-backend platforms/BUCK:52-57 at master 36189092c4), so these
+# actions land where mwb's build actions land: hub's general pool, which takes
+# actions with no Pool property, in the chart's default image. Neither a Pool
+# nor a container-image is named. The default image is today the one at
+# sha256:695b9940ed4e… (charts/buck2-remote-execution values.yaml:904 at
+# kosmic-kube main c972626bd2); pinning it here by digest
+# is a follow-on, so that a chart change of the default cannot change this
+# build's environment without changing its keys.
+#
+# What the build takes from the image: /bin (bash, coreutils, curl, tar with
+# gzip and xz, unzip, git, sed, grep, python3, nix-store), whose links resolve
+# through the sidecar's pre-warmed roots; /lib64/ld-linux-x86-64.so.2, the
+# loader of every exec-side program, which finds glibc in the sidecar's store;
+# /usr/bin/env for the prelude's `/usr/bin/env bash`; and SSL_CERT_FILE.
+# Every compiler, library and source is pinned in this tree, by sha256 or by
+# commit, except the gnu link sysroot, which :gnu-exec-sysroot-x86_64 builds
+# from pinned store paths through the executor's nix daemon.
+#
+# The local executor is on under limited hybrid, as in mwb's own rows
+# (platforms/buildbuddy.bzl:37-40), so it runs only the actions that cannot
+# run remotely: the copy behind the root rust-toolchain export_file and the
+# git_fetch actions, which the carry's prelude marks local_only
+# (prelude/git/git_fetch.bzl:62). Every other action goes to hub; the job
+# proves that from --build-report and `buck2 log what-ran`, not from
+# --remote-only, which would refuse those actions. Running git_fetch on the
+# runner also keeps github.com out of the executors' egress. [buck2_re_client] comes from the untracked .buckconfig.local
+# (tools/hub/buckconfig.local.template), because the daemon reads it with no
+# arguments and neither -c nor --config-file reaches it.
+buildbuddy_remote_execution_platform(
+    name = "hub_x86_64",
+    arch = "amd64",
+    constraints = ["hub_re//:nix_daemon"],
+    cpu_configuration = "prelude//cpu:x86_64",
+    os_configuration = "prelude//os:linux",
+    os_family = "Linux",
+    local_enabled = True,
+    use_limited_hybrid = True,
+    remote_execution_properties = {
+        # mwb's rows pass these as booleans, which buck2 sends as "True".
+        "nonroot-workspace": "True",
+        "recycle-runner": "True",
+    },
+    visibility = ["PUBLIC"],
+)
+
+# The gnu link sysroot for build scripts and proc macros, which the
+# execution platform builds for x86_64-unknown-linux-gnu and runs under the
+# image's loader. It comes from four store paths of the nixpkgs hub's default
+# image is built from: glibc (the image loader's own), gcc for
+# crtbegin/crtend and libgcc, xgcc-libgcc for libgcc_s (on the loader's
+# search path), and zlib for the host rustc's libLLVM and rust-lld
+# (`rustc-libs`). The executor's nix daemon substitutes them from
+# cache.mercury.com, and the script copies the files the links need into this
+# action's output, checked against gnu-exec-sysroot-x86_64.sha256, so every
+# other action takes them by digest and names no store path. A path bump goes
+# with a bump of hub's default image; :gnu-exec-sysroot-x86_64-manifest prints
+# the new manifest.
+genrule(
+    name = "gnu-exec-sysroot-x86_64",
+    outs = {
+        "rustc-libs": ["rustc-libs"],
+        "sysroot": ["sysroot"],
+    },
+    cmd = "sh $SRCDIR/gnu_exec_sysroot.sh $OUT $SRCDIR/gnu-exec-sysroot-x86_64.sha256 /nix/store/q4wq65gl3r8fy746v9bbwgx4gzn0r2kl-glibc-2.40-66 /nix/store/sa7j7cddyblhcb3ch3ds10w7nw75yjj1-gcc-14.3.0 /nix/store/j4kybm2h5l6ing0i494zwdswp672pmgv-xgcc-14.3.0-libgcc /nix/store/vx438ll7xvv9q5ns8mqpphsg2dxg9yi9-zlib-1.3.1",
+    srcs = [
+        "gnu-exec-sysroot-x86_64.sha256",
+        "gnu_exec_sysroot.sh",
+    ],
+    target_compatible_with = [
+        "hub_re//:nix_daemon",
+        "prelude//cpu:x86_64",
+        "prelude//os:linux",
+    ],
+    visibility = ["PUBLIC"],
+)
+
+genrule(
+    name = "gnu-exec-sysroot-x86_64-manifest",
+    out = "gnu-exec-sysroot-x86_64.sha256",
+    cmd = "sh $SRCDIR/gnu_exec_sysroot.sh $TMP/layout --print /nix/store/q4wq65gl3r8fy746v9bbwgx4gzn0r2kl-glibc-2.40-66 /nix/store/sa7j7cddyblhcb3ch3ds10w7nw75yjj1-gcc-14.3.0 /nix/store/j4kybm2h5l6ing0i494zwdswp672pmgv-xgcc-14.3.0-libgcc /nix/store/vx438ll7xvv9q5ns8mqpphsg2dxg9yi9-zlib-1.3.1 > $OUT",
+    srcs = ["gnu_exec_sysroot.sh"],
+    target_compatible_with = [
+        "hub_re//:nix_daemon",
+        "prelude//cpu:x86_64",
+        "prelude//os:linux",
+    ],
+)
+
+# Links and runs a C program against the sysroot as the cxx toolchain links
+# a build script, and fails if the linker opened a file outside the sysroot
+# and the LLVM tree. A check for the first job on hub, not on the release
+# build's path.
+genrule(
+    name = "gnu-exec-sysroot-x86_64-selftest",
+    out = "trace.txt",
+    cmd = "sh $SRCDIR/gnu_exec_sysroot_selftest.sh $(location release_toolchains//:llvm_dist) $(location hub_re//:gnu-exec-sysroot-x86_64[sysroot]) $OUT",
+    srcs = ["gnu_exec_sysroot_selftest.sh"],
+    target_compatible_with = [
+        "hub_re//:nix_daemon",
+        "prelude//cpu:x86_64",
+        "prelude//os:linux",
+    ],
+)
+
+# The host rustc's extra runtime libraries for the execution platform, as
+# release_toolchains//:rust's host_runtime_libs. An alias, so the select
+# reads the execution platform's constraints.
+filegroup(
+    name = "no-rustc-runtime-libs",
+    srcs = [],
+)
+
+alias(
+    name = "rustc-runtime-libs",
+    actual = select({
+        "DEFAULT": "hub_re//:no-rustc-runtime-libs",
+        "hub_re//:nix_daemon": "hub_re//:gnu-exec-sysroot-x86_64[rustc-libs]",
+    }),
+    visibility = ["PUBLIC"],
+)
