@@ -15,7 +15,12 @@ shim = gh_facebook_buck2_shims_meta
 toolchains = gh_facebook_buck2_shims_meta
 
 [external_cells]
-prelude = bundled
+# Use the checkout prelude, so prelude/ changes are visible before a buck2 binary
+# that bundles them has been bootstrapped. It also makes a buck-built buck2 embed
+# this checkout's prelude/: app/buck2_external_cells_bundled bundles
+# prelude//:source_listing, which under `bundled` would be the bootstrap's copy.
+# The cargo and nix builds embed prelude/ by path (build.rs) either way.
+prelude = disabled
 
 [build]
 execution_platforms = prelude//platforms:default
