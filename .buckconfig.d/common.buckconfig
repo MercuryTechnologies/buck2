@@ -1,6 +1,8 @@
 [cells]
 prelude = prelude
 none = none
+release_toolchains = release_toolchains
+release_platforms = release_platforms
 
 [cell_aliases]
 config = prelude
