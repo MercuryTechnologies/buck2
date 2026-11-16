@@ -1,0 +1,19 @@
+# The client side of Mercury's hub remote execution, for a job that builds
+# buck2 with .buckconfig.hub. Copy it to the checkout's .buckconfig.local,
+# which is untracked, and start the buck2 daemon with BUILDBUDDY_API_KEY set
+# in its environment: the key stays a reference here and is never written
+# out. There is no tls_ca_certs key, as in mwb's own reference config for hub
+# (tools/buck2/reference_buckconfigs/hub-remote-execution).
+
+[buck2_re_client]
+engine_address       = grpc://buck2-remote-execution.hub.internal.mercury.com:443
+action_cache_address = grpc://buck2-remote-execution.hub.internal.mercury.com:443
+cas_address          = grpc://buck2-remote-execution.hub.internal.mercury.com:443
+tls                  = true
+http_headers         = x-buildbuddy-api-key:$BUILDBUDDY_API_KEY
+
+# The build's events, to hub's BuildBuddy, through the same connection and
+# credential, so the invocation shows at re.hub.internal.
+[bes]
+connection  = re_client
+results_url = https://re.hub.internal/invocation/
