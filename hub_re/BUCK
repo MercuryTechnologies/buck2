@@ -1,0 +1,76 @@
+load("@release_platforms//:defs.bzl", "buildbuddy_remote_execution_platform")
+
+oncall("build_infra")
+
+# Where an action's tools come from, as a constraint an execution platform
+# carries so that a select in an exec_dep or a toolchain can read it.
+# `nix_daemon` promises that the executor bind-mounts a nix store at
+# /nix/store with its daemon's socket at /nix/var/nix/daemon-socket/socket,
+# and that the daemon substitutes paths signed by cache.mercury.com or
+# cache.nixos.org for a client it does not trust. Hub's executors do: every
+# action container gets the nix-daemon sidecar's store read-only at
+# /nix/store and its socket directory read-write (kosmic-kube
+# charts/buck2-remote-execution values.yaml:909-935), and the daemon's
+# substituters are those two caches with an empty trusted-users
+# (files/nix.conf:14-17, 53-56). `image` is everything else: tools come from
+# the container image alone.
+constraint(
+    name = "exec_store",
+    default = "image",
+    values = [
+        "image",
+        "nix_daemon",
+    ],
+    visibility = ["PUBLIC"],
+)
+
+config_setting(
+    name = "nix_daemon",
+    constraint_values = [
+        ":exec_store[nix_daemon]",
+    ],
+    visibility = ["PUBLIC"],
+)
+
+# Mercury's hub remote execution, the backend .buckconfig.hub selects. The
+# release build's target platforms, release_platforms//:linux-x86_64-musl and
+# :linux-aarch64-musl, name no backend; both execute here, on x86_64
+# executors, so aarch64 is a cross-compile.
+#
+# The properties are exactly those of mwb's own linux-x86_64 build row
+# (mercury-web-backend platforms/BUCK:52-57 at master 36189092c4), so these
+# actions land where mwb's build actions land: hub's general pool, which takes
+# actions with no Pool property, in the chart's default image. Neither a Pool
+# nor a container-image is named. The default image is today
+# lab-re-worker-thin@sha256:695b9940ed4e… (charts/buck2-remote-execution
+# values.yaml:904 at kosmic-kube main c972626bd2); pinning it here by digest
+# is a follow-on, so that a chart change of the default cannot change this
+# build's environment without changing its keys.
+#
+# What the build takes from the image: /bin (bash, coreutils, curl, tar with
+# gzip and xz, unzip, git, sed, grep, python3, nix-store), whose links resolve
+# through the sidecar's pre-warmed roots; /lib64/ld-linux-x86-64.so.2, the
+# loader of every exec-side program, which finds glibc in the sidecar's store;
+# /usr/bin/env for the prelude's `/usr/bin/env bash`; and SSL_CERT_FILE.
+# Every compiler, library and source is pinned in this tree, by sha256 or by
+# commit, except the gnu link sysroot, which :gnu-exec-sysroot-x86_64 builds
+# from pinned store paths through the executor's nix daemon.
+#
+# There is no local executor, so --remote-only proves every action ran
+# remotely. [buck2_re_client] comes from the untracked .buckconfig.local
+# (tools/hub/buckconfig.local.template), because the daemon reads it with no
+# arguments and neither -c nor --config-file reaches it.
+buildbuddy_remote_execution_platform(
+    name = "hub_x86_64",
+    arch = "amd64",
+    constraints = ["hub_re//:nix_daemon"],
+    cpu_configuration = "prelude//cpu:x86_64",
+    os_configuration = "prelude//os:linux",
+    os_family = "Linux",
+    remote_execution_properties = {
+        # mwb's rows pass these as booleans, which buck2 sends as "True".
+        "nonroot-workspace": "True",
+        "recycle-runner": "True",
+    },
+    visibility = ["PUBLIC"],
+)
