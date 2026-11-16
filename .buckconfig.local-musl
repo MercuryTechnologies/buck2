@@ -1,0 +1,15 @@
+# Build buck2's static release binaries with buck2 on this machine, with the
+# pinned hermetic toolchains of release_toolchains//:
+#
+#   buck2 build //app/buck2:buck2-bin --config-file .buckconfig.local-musl \
+#       --target-platforms release_platforms//:linux-x86_64-musl
+#
+# `--target-platforms release_platforms//:linux-aarch64-musl` cross-compiles the
+# aarch64 binary on an x86_64 host. The host needs glibc, because the pinned
+# rustc is x86_64-unknown-linux-gnu; the LLVM toolchain is a static musl build.
+
+[cell_aliases]
+toolchains = release_toolchains
+
+[build]
+execution_platforms = release_platforms//:local
