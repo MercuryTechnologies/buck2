@@ -25,6 +25,8 @@ download_llvm_distribution(
     # hermeticbuild/hermetic-llvm's llvm-22.1.7-1 repacked as gzip, mirrored to
     # a release of this fork.
     url = "https://github.com/MercuryTechnologies/buck2/releases/download/toolchains-llvm-22.1.7-2026-10-17/llvm-toolchain-minimal-22.1.7-linux-amd64-musl.tar.gz",
+    # hub_re//:gnu-exec-sysroot-x86_64-selftest links against it.
+    visibility = ["hub_re//..."],
 )
 
 # A target configuration carrying prelude//abi/constraints:musl compiles C
@@ -57,10 +59,15 @@ cxx_llvm_toolchain(
     name = "cxx",
     cxx_compiler_flags = ["-std=c++20"],
     distribution = ":llvm_dist",
-    # The gnu configuration is the execution platform's, which links build
-    # scripts and proc macros against the host's glibc.
     sysroot = select({
-        "DEFAULT": None,
+        # The gnu configuration is the execution platform's, which links the
+        # build scripts and proc macros. On an executor with a nix daemon the
+        # sysroot comes from its store (hub_re/BUCK); elsewhere the host
+        # provides glibc and libgcc.
+        "DEFAULT": select({
+            "DEFAULT": None,
+            "hub_re//:nix_daemon": "hub_re//:gnu-exec-sysroot-x86_64[sysroot]",
+        }),
         "prelude//abi:musl": select({
             "prelude//cpu:arm64": ":musl-sysroot-aarch64",
             "prelude//cpu:x86_64": ":musl-sysroot-x86_64",
@@ -93,6 +100,7 @@ downloaded_rust_toolchain(
         "nightly-2026-05-22": "904b259e0c838741de7a50525c9fc359d12332c71ee236ad51c07598db6544c0",
     },
     default_edition = "2024",
+    host_runtime_libs = "hub_re//:rustc-runtime-libs",
     # Release builds pass e.g. -c rust.rustc_flags="-Copt-level=3 -Cstrip=debuginfo";
     # the default is a debug build, as for cargo.
     rustc_flags = read_root_config("rust", "rustc_flags", "").split(),
