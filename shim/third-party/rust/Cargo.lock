@@ -2628,9 +2628,8 @@ dependencies = [
 
 [[package]]
 name = "hyper"
-version = "1.12.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2c3e324da4c95177d6291d4c8730197c0d1822f8a9766814a4a44fa5ab797c9c"
+version = "1.10.1"
+source = "git+https://github.com/MercuryTechnologies/hyper.git?rev=d3ab1825c70def6bd79ef08daa5195badb074cd0#d3ab1825c70def6bd79ef08daa5195badb074cd0"
 dependencies = [
  "atomic-waker",
  "bytes",
@@ -6770,9 +6769,8 @@ checksum = "7d56353a2a665ad0f41a421187180aab746c8c325620617ad883a99a1cbe66d2"
 
 [[package]]
 name = "tonic"
-version = "0.14.9"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e2cdfc673aabd30fe8fee92e65837b644c37c5d47f0f97ae6d5e0f1237d15e1b"
+version = "0.14.6"
+source = "git+https://github.com/MercuryTechnologies/grpc-rust.git?rev=590fab574c57d80b2c83f7aca30a63942401beae#590fab574c57d80b2c83f7aca30a63942401beae"
 dependencies = [
  "async-trait",
  "axum",
@@ -6794,7 +6792,6 @@ dependencies = [
  "tokio",
  "tokio-rustls 0.26.4",
  "tokio-stream",
- "tokio-util 0.7.19",
  "tower",
  "tower-layer",
  "tower-service",
@@ -6804,9 +6801,8 @@ dependencies = [
 
 [[package]]
 name = "tonic-build"
-version = "0.14.9"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ac6d916d206ed7bdda1778ddff9bda43303789c258877e7bc22fb44ee5c984b4"
+version = "0.14.6"
+source = "git+https://github.com/MercuryTechnologies/grpc-rust.git?rev=590fab574c57d80b2c83f7aca30a63942401beae#590fab574c57d80b2c83f7aca30a63942401beae"
 dependencies = [
  "prettyplease",
  "proc-macro2",
@@ -6816,9 +6812,8 @@ dependencies = [
 
 [[package]]
 name = "tonic-prost"
-version = "0.14.9"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "eba464054e2226f182a34489b8b079bf4c6e3e7ab5fd7fc30e024f24aa92a484"
+version = "0.14.6"
+source = "git+https://github.com/MercuryTechnologies/grpc-rust.git?rev=590fab574c57d80b2c83f7aca30a63942401beae#590fab574c57d80b2c83f7aca30a63942401beae"
 dependencies = [
  "bytes",
  "prost",
@@ -6827,9 +6822,8 @@ dependencies = [
 
 [[package]]
 name = "tonic-prost-build"
-version = "0.14.9"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2ea216ddc448e08e7839ab09e20e60b06b6a1c32745ccb212c0ebd161c199f1b"
+version = "0.14.6"
+source = "git+https://github.com/MercuryTechnologies/grpc-rust.git?rev=590fab574c57d80b2c83f7aca30a63942401beae#590fab574c57d80b2c83f7aca30a63942401beae"
 dependencies = [
  "prettyplease",
  "proc-macro2",
@@ -7259,9 +7253,9 @@ dependencies = [
 
 [[package]]
 name = "want"
-version = "0.3.2"
+version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ec4cdd0dd910afe868b7ef477227d8d538b46b3075031afee8a9f2acb0a2ed0b"
+checksum = "bfa7760aed19e106de2c7c0b581b509f2f25d3dacaf737cb82ac61bc6d760b0e"
 dependencies = [
  "try-lock",
 ]
@@ -7425,9 +7419,9 @@ dependencies = [
 
 [[package]]
 name = "webpki-roots"
-version = "1.0.12"
+version = "1.0.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7265c9301c16a8711c992c2d8da90ee77ef54b1ed51482d6dfeb00dc756b1297"
+checksum = "22cfaf3c063993ff62e73cb4311efde4db1efb31ab78a3e5c457939ad5cc0bed"
 dependencies = [
  "rustls-pki-types",
 ]
