@@ -1,0 +1,39 @@
+load(":defs.bzl", "local_execution_platform")
+
+oncall("build_infra")
+
+# The hermetic release toolchains (release_toolchains//) on the machine running
+# buck2, for `.buckconfig.local-musl`: an x86_64 Linux host with glibc analyses
+# and builds both release targets below, the aarch64 one as a cross-compile,
+# with no remote execution. A remote row for an executor pool is added beside
+# this one by whoever builds there; none is named here.
+local_execution_platform(
+    name = "local",
+    cpu_configuration = "prelude//cpu:x86_64",
+    os_configuration = "prelude//os:linux",
+    visibility = ["PUBLIC"],
+)
+
+# Target configurations for the static release binaries. The musl constraint
+# makes the hermetic toolchains target *-unknown-linux-musl with the musl
+# headers, so the executable is static and runs on any Linux of its
+# architecture; `linux-aarch64-musl` is a cross-compile on x86_64.
+platform(
+    name = "linux-x86_64-musl",
+    constraint_values = [
+        "prelude//abi/constraints:musl",
+        "prelude//cpu/constraints:x86_64",
+        "prelude//os/constraints:linux",
+    ],
+    visibility = ["PUBLIC"],
+)
+
+platform(
+    name = "linux-aarch64-musl",
+    constraint_values = [
+        "prelude//abi/constraints:musl",
+        "prelude//cpu/constraints:arm64",
+        "prelude//os/constraints:linux",
+    ],
+    visibility = ["PUBLIC"],
+)
