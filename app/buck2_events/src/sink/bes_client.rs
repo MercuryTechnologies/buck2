@@ -4872,8 +4872,8 @@ mod tests {
         })
     }
 
-    /// A worker that sends Bazel build events, as lab's `[bes] event_format = bazel` does,
-    /// without the artifact upload, which needs a CAS.
+    /// A worker that sends Bazel build events, as a client configured with
+    /// `[bes] event_format = bazel` does, without the artifact upload, which needs a CAS.
     fn bazel_worker_for(endpoint: String) -> WorkerState {
         let config = BesConfig {
             buffer_size: 3,
