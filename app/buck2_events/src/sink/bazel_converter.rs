@@ -6900,9 +6900,7 @@ fn insert_command_kind_fields(
             insert_string_field(fields, "runner", "remote");
             insert_non_empty_string_field(fields, "action_digest", &command.action_digest);
             insert_bool_field(fields, "cache_hit", command.cache_hit);
-            if let Ok(cache_hit_type) =
-                buck2_data::CacheHitType::try_from(command.cache_hit_type)
-            {
+            if let Ok(cache_hit_type) = buck2_data::CacheHitType::try_from(command.cache_hit_type) {
                 insert_string_field(fields, "cache_hit_type", cache_hit_type.as_str_name());
             }
             insert_optional_duration_field(fields, "queue_time_ms", command.queue_time.as_ref());
