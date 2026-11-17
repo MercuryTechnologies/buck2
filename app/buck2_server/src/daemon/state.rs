@@ -440,6 +440,14 @@ impl DaemonState {
             // takes an empty API key for none: a header whose variable is unset turns BES off
             // for the daemon's life rather than send every stream unauthenticated.
             #[cfg(not(fbcode_build))]
+            let (bes_headers, missing_header_env) = remote::resolve_bes_headers(
+                (bes_headers, missing_header_env),
+                bes_connection
+                    .as_ref()
+                    .map(|connection| connection.headers.as_slice()),
+                |name| std::env::var(name).ok(),
+            );
+            #[cfg(not(fbcode_build))]
             let bes_backend = if missing_header_env.is_empty() {
                 bes_backend
             } else {
@@ -448,15 +456,6 @@ impl DaemonState {
                     remote::missing_bes_header_env_warning(&missing_header_env, "the daemon's")
                 );
                 None
-            };
-            #[cfg(not(fbcode_build))]
-            let bes_headers = if bes_headers.is_empty() {
-                bes_connection
-                    .as_ref()
-                    .map(|connection| connection.headers.clone())
-                    .unwrap_or_default()
-            } else {
-                bes_headers
             };
             #[cfg(not(fbcode_build))]
             let bes_tls = bes_connection

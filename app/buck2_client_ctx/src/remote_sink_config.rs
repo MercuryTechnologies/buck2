@@ -193,16 +193,16 @@ fn read_buckconfig_bes_settings(
             ));
         }
     };
-    let (mut bes_headers, missing_header_env) =
+    let (bes_headers, missing_header_env) = buck2_events::sink::remote::resolve_bes_headers(
         parse_bes_headers(root_config.parse_list::<String>(BuckconfigKeyRef {
             section: "bes",
             property: "header",
-        })?)?;
-    if bes_headers.is_empty() {
-        if let Some(connection) = &connection {
-            bes_headers = connection.headers.clone();
-        }
-    }
+        })?)?,
+        connection
+            .as_ref()
+            .map(|connection| connection.headers.as_slice()),
+        |name| std::env::var(name).ok(),
+    );
     let bes_tls = connection
         .as_ref()
         .map(|connection| BesTls {

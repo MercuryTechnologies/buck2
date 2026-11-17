@@ -160,8 +160,41 @@ pub fn missing_bes_header_env_warning(missing: &[String], whose: &str) -> String
         .collect::<Vec<_>>()
         .join(", ");
     format!(
-        "BES disabled: `bes.header` names {names}, which is not set in {whose} environment, so its value would be sent empty"
+        "BES disabled: `bes.header`, or the `[buck2_re_client] http_headers` it falls back to, names {names}, which is not set in {whose} environment, so its value would be sent empty"
     )
+}
+
+/// The headers the BES sink sends: the `[bes] header` entries, already expanded, or, when
+/// there are none and `[bes] connection = re_client` is set, the remote execution client's
+/// `[buck2_re_client] http_headers`. The variables that expanded to nothing are returned with
+/// them, so the caller turns BES off as it does for a `[bes] header` entry.
+#[cfg(not(fbcode_build))]
+pub fn resolve_bes_headers<F>(
+    header_entries: BesHeadersAndMissingVars,
+    connection_headers: Option<&[(String, String)]>,
+    mut env: F,
+) -> BesHeadersAndMissingVars
+where
+    F: FnMut(&str) -> Option<String>,
+{
+    let (headers, mut missing) = header_entries;
+    if !headers.is_empty() {
+        return (headers, missing);
+    }
+    // The remote execution client expands `$VAR` in these itself when it sends them, so the
+    // config holds references, not values: sent as written, a server refuses the credential.
+    let borrowed = connection_headers
+        .unwrap_or_default()
+        .iter()
+        .map(|(key, value)| {
+            let (key, unset_in_key) = expand_bes_config_env_vars_reporting(key, &mut env);
+            let (value, unset_in_value) = expand_bes_config_env_vars_reporting(value, &mut env);
+            missing.extend(unset_in_key);
+            missing.extend(unset_in_value);
+            (key, value)
+        })
+        .collect();
+    (borrowed, missing)
 }
 
 #[cfg(not(fbcode_build))]
@@ -218,6 +251,43 @@ mod tests {
         assert!(warning.contains("$BUILDBUDDY_API_KEY"), "{warning}");
         assert!(warning.contains("`bes.header`"), "{warning}");
         assert!(!warning.contains("secret"), "{warning}");
+    }
+
+    #[test]
+    fn expands_the_headers_borrowed_from_the_re_client() {
+        let borrowed = vec![(
+            "x-buildbuddy-api-key".to_owned(),
+            "$BUILDBUDDY_API_KEY".to_owned(),
+        )];
+        let (headers, missing) =
+            resolve_bes_headers((Vec::new(), Vec::new()), Some(&borrowed), test_env);
+        assert_eq!(
+            headers,
+            vec![("x-buildbuddy-api-key".to_owned(), "secret".to_owned())]
+        );
+        assert!(missing.is_empty(), "{missing:?}");
+    }
+
+    #[test]
+    fn reports_an_unset_variable_in_a_borrowed_header() {
+        let borrowed = vec![("x-api-key".to_owned(), "${UNSET_KEY}".to_owned())];
+        let (_, missing) = resolve_bes_headers((Vec::new(), Vec::new()), Some(&borrowed), test_env);
+        assert_eq!(missing, vec!["UNSET_KEY".to_owned()]);
+    }
+
+    #[test]
+    fn bes_header_entries_win_over_the_borrowed_headers() {
+        let entries = (
+            vec![("x-buildbuddy-api-key".to_owned(), "secret".to_owned())],
+            Vec::new(),
+        );
+        let borrowed = vec![("x-other".to_owned(), "$UNSET_KEY".to_owned())];
+        let (headers, missing) = resolve_bes_headers(entries, Some(&borrowed), test_env);
+        assert_eq!(
+            headers,
+            vec![("x-buildbuddy-api-key".to_owned(), "secret".to_owned())]
+        );
+        assert!(missing.is_empty(), "{missing:?}");
     }
 
     fn test_env(name: &str) -> Option<String> {
