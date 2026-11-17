@@ -29,3 +29,11 @@ execution_platforms = prelude//platforms:default
 
 [parser]
 target_platform_detector_spec = target:root//...->prelude//platforms:default target:shim//...->prelude//platforms:default
+
+# musl.libc.org answers a HEAD in about 17 s (curl from the workbox, 2026-11-17),
+# and buck2's default 5 s timeout failed the musl-src download there and twice
+# on mwb's runner (run 44004867749). The client makes every http_archive and
+# download_file request, so the longer bounds apply to the whole fetch set.
+[http]
+connect_timeout_ms = 30000
+read_timeout_ms = 60000
