@@ -8,6 +8,10 @@
  * above-listed licenses.
  */
 
+// The doc comments prost generates are Bazel's proto comments, copied as they are, and
+// some of them hold bare type parameters such as `Set<T>` that rustdoc reads as HTML.
+#![allow(rustdoc::invalid_html_tags)]
+
 pub mod blaze {
     tonic::include_proto!("blaze");
 
