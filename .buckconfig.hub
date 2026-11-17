@@ -1,0 +1,33 @@
+# Build buck2's static release binaries with buck2 on Mercury's hub remote
+# execution, from a host hub admits:
+#
+#   buck2 build //app/buck2:buck2-bin --config-file .buckconfig.hub \
+#       --target-platforms release_platforms//:linux-x86_64-musl
+#
+# `--target-platforms release_platforms//:linux-aarch64-musl` cross-compiles
+# the aarch64 binary on the same x86_64 executors. The endpoint, its TLS and
+# the API key are not here: the daemon builds its remote-execution client from
+# the config files it reads with no arguments, so they go in an untracked
+# .buckconfig.local, written from tools/hub/buckconfig.local.template. That
+# file also carries [bes], which buck2 likewise reads only from the root
+# config.
+
+[cell_aliases]
+toolchains = release_toolchains
+
+[build]
+execution_platforms = hub_re//:hub_x86_64
+
+# mwb's builds use SHA256 with hub; hub's acceptance of BLAKE3 is unconfirmed.
+[buck2]
+digest_algorithms = SHA256
+materializations = deferred_skip_final_artifacts
+sqlite_materializer_state = true
+defer_write_actions = true
+
+# Archives download on the client, the prelude's default, so the crate
+# archives need no network from the executor. LLVM downloads on the client
+# too (release_toolchains//:llvm_dist). Two kinds of fetch still run inside
+# actions: the Rust toolchain's install and git_fetch.
+[http_archive]
+remote_download = false

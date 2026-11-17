@@ -7,3 +7,9 @@
 # above-listed licenses.
 
 features = ["force_unix_path_separator"]
+
+# typenum 1.19.0 build.rs writes only OUT_DIR/tests.rs, the generated tests for
+# typenum's own test suite; nothing under src/ includes from OUT_DIR, so the
+# library builds the same without it and the script need not run under buck.
+[buildscript]
+run = false

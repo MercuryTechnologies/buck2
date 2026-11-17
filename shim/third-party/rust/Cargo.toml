@@ -149,6 +149,14 @@ num_cpus = "1.16"
 num_enum = "0.7.6"
 object = { version = "0.36.7", features = ["read", "write"] }
 oid-registry = "0.4"
+# The Mercury fork of opentelemetry-rust, for
+# - https://github.com/open-telemetry/opentelemetry-rust/pull/3586
+# - https://github.com/open-telemetry/opentelemetry-rust/pull/3587
+# pinned at the commit the root Cargo.toml's `branch = "mercury-head"` resolved to.
+opentelemetry = { version = "0.32.0", git = "https://github.com/MercuryTechnologies/opentelemetry-rust.git", rev = "25294f306063813a4432baf91314b92e3efe12cf", features = ["experimental_propagation_env_carrier"] }
+opentelemetry-otlp = { version = "0.32.0", git = "https://github.com/MercuryTechnologies/opentelemetry-rust.git", rev = "25294f306063813a4432baf91314b92e3efe12cf", default-features = false, features = ["trace", "http-proto", "reqwest-blocking-client"] }
+opentelemetry-semantic-conventions = { version = "0.32.0", git = "https://github.com/MercuryTechnologies/opentelemetry-rust.git", rev = "25294f306063813a4432baf91314b92e3efe12cf", features = ["semconv_experimental"] }
+opentelemetry_sdk = { version = "0.32.1", git = "https://github.com/MercuryTechnologies/opentelemetry-rust.git", rev = "25294f306063813a4432baf91314b92e3efe12cf" }
 once_cell = "1.21.4"
 os_str_bytes = { version = "6.6.1", features = ["conversions"] }
 parking_lot = { version = "0.12.1", features = ["arc_lock", "send_guard"] }
@@ -177,6 +185,11 @@ rand_xoshiro = "0.8.1"
 ref-cast = "1.0.26"
 regex = "1.13.1"
 relative-path = { version = "1.7.0", features = ["serde"] }
+# TLS for the OTLP exporter. The root Cargo.toml asks opentelemetry-otlp for
+# `reqwest-rustls`, which forces rustls's aws-lc-rs provider and so aws-lc-sys,
+# whose build script needs cmake. rustls here is ring-only (see its entry above),
+# and with a single provider compiled in, `rustls-no-provider` picks ring.
+reqwest = { version = "0.13.5", default-features = false, features = ["blocking", "rustls-no-provider"] }
 ring = "0.17.14"
 ruff_formatter = "0.0.6"
 ruff_python_ast = "0.0.6"
@@ -263,6 +276,14 @@ windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Globa
 winver = "1"
 
 [patch.crates-io]
+# The root Cargo.toml follows the hyper and grpc-rust forks by branch; the shim pins
+# the revs the root Cargo.lock resolved, so the buck-built and cargo-built buck2 link
+# the same hyper and tonic. Move these with the root Cargo.lock.
+hyper = { git = "https://github.com/MercuryTechnologies/hyper.git", rev = "d3ab1825c70def6bd79ef08daa5195badb074cd0" }
+tonic = { git = "https://github.com/MercuryTechnologies/grpc-rust.git", rev = "590fab574c57d80b2c83f7aca30a63942401beae" }
+tonic-build = { git = "https://github.com/MercuryTechnologies/grpc-rust.git", rev = "590fab574c57d80b2c83f7aca30a63942401beae" }
+tonic-prost = { git = "https://github.com/MercuryTechnologies/grpc-rust.git", rev = "590fab574c57d80b2c83f7aca30a63942401beae" }
+tonic-prost-build = { git = "https://github.com/MercuryTechnologies/grpc-rust.git", rev = "590fab574c57d80b2c83f7aca30a63942401beae" }
 perf-event = { version = "0.4", git = "https://github.com/Nero5023/perf-event.git", rev = "6dae86b6d4807acec081e6dc0a53167f57f8c0f4" }
 perf-event-open-sys = { version = "5.0", git = "https://github.com/Nero5023/perf-event.git", rev = "6dae86b6d4807acec081e6dc0a53167f57f8c0f4" }
 
