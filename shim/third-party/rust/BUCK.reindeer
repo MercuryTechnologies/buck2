@@ -33,6 +33,13 @@ git_fetch(
 )
 
 git_fetch(
+    name = "opentelemetry-rust-47cac287c081d394.git",
+    repo = "https://github.com/MercuryTechnologies/opentelemetry-rust.git",
+    rev = "25294f306063813a4432baf91314b92e3efe12cf",
+    visibility = [],
+)
+
+git_fetch(
     name = "perf-event-7610c6bfd3fa18f3.git",
     repo = "https://github.com/Nero5023/perf-event.git",
     rev = "6dae86b6d4807acec081e6dc0a53167f57f8c0f4",
@@ -1732,6 +1739,37 @@ third_party_rust_library(
     features = [
         "alloc",
         "default",
+        "std",
+    ],
+    platform = {
+        "linux-arm64": dict(),
+        "linux-x86_64": dict(),
+        "macos-arm64": dict(),
+        "macos-x86_64": dict(),
+        "windows-gnu": dict(),
+        "windows-msvc": dict(),
+    },
+    visibility = [],
+)
+
+http_archive(
+    name = "base64-0.23.1.crate",
+    sha256 = "ac07cdecf99051d9a5238b80f35af32cdeba5b336e55d957b318b50137e18da5",
+    strip_prefix = "base64-0.23.1",
+    urls = ["https://static.crates.io/crates/base64/0.23.1/download"],
+    visibility = [],
+)
+
+third_party_rust_library(
+    name = "base64-0.23",
+    srcs = [":base64-0.23.1.crate"],
+    crate = "base64",
+    crate_root = "base64-0.23.1.crate/src/lib.rs",
+    edition = "2021",
+    features = [
+        "alloc",
+        "default",
+        "simd-unsafe",
         "std",
     ],
     platform = {
@@ -8200,7 +8238,10 @@ third_party_rust_library(
     crate = "futures_executor",
     crate_root = "futures-executor-0.3.32.crate/src/lib.rs",
     edition = "2018",
-    features = ["std"],
+    features = [
+        "default",
+        "std",
+    ],
     platform = {
         "linux-arm64": dict(),
         "linux-x86_64": dict(),
@@ -8699,6 +8740,7 @@ third_party_rust_library(
     crate = "getrandom",
     crate_root = "getrandom-0.3.4.crate/src/lib.rs",
     edition = "2021",
+    features = ["std"],
     platform = {
         "linux-arm64": dict(
             deps = [":libc-0.2"],
@@ -8712,12 +8754,8 @@ third_party_rust_library(
         "macos-x86_64": dict(
             deps = [":libc-0.2"],
         ),
-        "windows-gnu": dict(
-            features = ["std"],
-        ),
-        "windows-msvc": dict(
-            features = ["std"],
-        ),
+        "windows-gnu": dict(),
+        "windows-msvc": dict(),
     },
     visibility = [],
     deps = [":cfg-if-1"],
@@ -10203,6 +10241,7 @@ third_party_rust_library(
     features = [
         "client",
         "client-legacy",
+        "client-proxy",
         "default",
         "http1",
         "http2",
@@ -10221,13 +10260,16 @@ third_party_rust_library(
     },
     visibility = [],
     deps = [
+        ":base64-0.22",
         ":bytes-1",
         ":futures-channel-0.3",
         ":futures-util-0.3",
         ":http-1",
         ":http-body-1",
         ":hyper-1",
+        ":ipnet-2",
         ":libc-0.2",
+        ":percent-encoding-2",
         ":pin-project-lite-0.2",
         ":socket2-0.6",
         ":tokio-1",
@@ -10318,6 +10360,361 @@ third_party_rust_library(
         ),
     },
     visibility = [],
+)
+
+http_archive(
+    name = "icu_collections-2.2.0.crate",
+    sha256 = "2984d1cd16c883d7935b9e07e44071dca8d917fd52ecc02c04d5fa0b5a3f191c",
+    strip_prefix = "icu_collections-2.2.0",
+    urls = ["https://static.crates.io/crates/icu_collections/2.2.0/download"],
+    visibility = [],
+)
+
+third_party_rust_library(
+    name = "icu_collections-2",
+    srcs = [":icu_collections-2.2.0.crate"],
+    crate = "icu_collections",
+    crate_root = "icu_collections-2.2.0.crate/src/lib.rs",
+    edition = "2021",
+    platform = {
+        "linux-arm64": dict(),
+        "linux-x86_64": dict(),
+        "macos-arm64": dict(),
+        "macos-x86_64": dict(),
+        "windows-gnu": dict(),
+        "windows-msvc": dict(),
+    },
+    visibility = [],
+    deps = [
+        ":displaydoc-0.2",
+        ":potential_utf-0.1",
+        ":utf8_iter-1",
+        ":yoke-0.8",
+        ":zerofrom-0.1",
+        ":zerovec-0.11",
+    ],
+)
+
+http_archive(
+    name = "icu_locale_core-2.2.0.crate",
+    sha256 = "92219b62b3e2b4d88ac5119f8904c10f8f61bf7e95b640d25ba3075e6cac2c29",
+    strip_prefix = "icu_locale_core-2.2.0",
+    urls = ["https://static.crates.io/crates/icu_locale_core/2.2.0/download"],
+    visibility = [],
+)
+
+third_party_rust_library(
+    name = "icu_locale_core-2",
+    srcs = [":icu_locale_core-2.2.0.crate"],
+    crate = "icu_locale_core",
+    crate_root = "icu_locale_core-2.2.0.crate/src/lib.rs",
+    edition = "2021",
+    features = ["zerovec"],
+    platform = {
+        "linux-arm64": dict(),
+        "linux-x86_64": dict(),
+        "macos-arm64": dict(),
+        "macos-x86_64": dict(),
+        "windows-gnu": dict(),
+        "windows-msvc": dict(),
+    },
+    visibility = [],
+    deps = [
+        ":displaydoc-0.2",
+        ":litemap-0.8",
+        ":tinystr-0.8",
+        ":writeable-0.6",
+        ":zerovec-0.11",
+    ],
+)
+
+http_archive(
+    name = "icu_normalizer-2.2.0.crate",
+    sha256 = "c56e5ee99d6e3d33bd91c5d85458b6005a22140021cc324cea84dd0e72cff3b4",
+    strip_prefix = "icu_normalizer-2.2.0",
+    urls = ["https://static.crates.io/crates/icu_normalizer/2.2.0/download"],
+    visibility = [],
+)
+
+third_party_rust_library(
+    name = "icu_normalizer-2",
+    srcs = [":icu_normalizer-2.2.0.crate"],
+    crate = "icu_normalizer",
+    crate_root = "icu_normalizer-2.2.0.crate/src/lib.rs",
+    edition = "2021",
+    features = ["compiled_data"],
+    platform = {
+        "linux-arm64": dict(),
+        "linux-x86_64": dict(),
+        "macos-arm64": dict(),
+        "macos-x86_64": dict(),
+        "windows-gnu": dict(),
+        "windows-msvc": dict(),
+    },
+    visibility = [],
+    deps = [
+        ":icu_collections-2",
+        ":icu_normalizer_data-2",
+        ":icu_provider-2",
+        ":smallvec-1",
+        ":zerovec-0.11",
+    ],
+)
+
+http_archive(
+    name = "icu_normalizer_data-2.2.0.crate",
+    sha256 = "da3be0ae77ea334f4da67c12f149704f19f81d1adf7c51cf482943e84a2bad38",
+    strip_prefix = "icu_normalizer_data-2.2.0",
+    urls = ["https://static.crates.io/crates/icu_normalizer_data/2.2.0/download"],
+    visibility = [],
+)
+
+third_party_rust_library(
+    name = "icu_normalizer_data-2",
+    srcs = [":icu_normalizer_data-2.2.0.crate"],
+    crate = "icu_normalizer_data",
+    crate_root = "icu_normalizer_data-2.2.0.crate/src/lib.rs",
+    edition = "2021",
+    env = {
+        "OUT_DIR": "$(location :icu_normalizer_data-2-build-script-run[out_dir])",
+    },
+    platform = {
+        "linux-arm64": dict(),
+        "linux-x86_64": dict(),
+        "macos-arm64": dict(),
+        "macos-x86_64": dict(),
+        "windows-gnu": dict(),
+        "windows-msvc": dict(),
+    },
+    rustc_flags = ["@$(location :icu_normalizer_data-2-build-script-run[rustc_flags])"],
+    visibility = [],
+)
+
+third_party_rust_binary(
+    name = "icu_normalizer_data-2-build-script-build",
+    srcs = [":icu_normalizer_data-2.2.0.crate"],
+    crate = "build_script_build",
+    crate_root = "icu_normalizer_data-2.2.0.crate/build.rs",
+    edition = "2021",
+    platform = {
+        "linux-arm64": dict(),
+        "linux-x86_64": dict(),
+        "macos-arm64": dict(),
+        "macos-x86_64": dict(),
+        "windows-gnu": dict(),
+        "windows-msvc": dict(),
+    },
+    visibility = [],
+)
+
+buildscript_run(
+    name = "icu_normalizer_data-2-build-script-run",
+    package_name = "icu_normalizer_data",
+    buildscript_rule = ":icu_normalizer_data-2-build-script-build",
+    platform = {
+        "linux-arm64": dict(),
+        "linux-x86_64": dict(),
+        "macos-arm64": dict(),
+        "macos-x86_64": dict(),
+        "windows-gnu": dict(),
+        "windows-msvc": dict(),
+    },
+    version = "2.2.0",
+)
+
+http_archive(
+    name = "icu_properties-2.2.0.crate",
+    sha256 = "bee3b67d0ea5c2cca5003417989af8996f8604e34fb9ddf96208a033901e70de",
+    strip_prefix = "icu_properties-2.2.0",
+    urls = ["https://static.crates.io/crates/icu_properties/2.2.0/download"],
+    visibility = [],
+)
+
+third_party_rust_library(
+    name = "icu_properties-2",
+    srcs = [":icu_properties-2.2.0.crate"],
+    crate = "icu_properties",
+    crate_root = "icu_properties-2.2.0.crate/src/lib.rs",
+    edition = "2021",
+    features = ["compiled_data"],
+    platform = {
+        "linux-arm64": dict(),
+        "linux-x86_64": dict(),
+        "macos-arm64": dict(),
+        "macos-x86_64": dict(),
+        "windows-gnu": dict(),
+        "windows-msvc": dict(),
+    },
+    visibility = [],
+    deps = [
+        ":icu_collections-2",
+        ":icu_locale_core-2",
+        ":icu_properties_data-2",
+        ":icu_provider-2",
+        ":zerotrie-0.2",
+        ":zerovec-0.11",
+    ],
+)
+
+http_archive(
+    name = "icu_properties_data-2.2.0.crate",
+    sha256 = "8e2bbb201e0c04f7b4b3e14382af113e17ba4f63e2c9d2ee626b720cbce54a14",
+    strip_prefix = "icu_properties_data-2.2.0",
+    urls = ["https://static.crates.io/crates/icu_properties_data/2.2.0/download"],
+    visibility = [],
+)
+
+third_party_rust_library(
+    name = "icu_properties_data-2",
+    srcs = [":icu_properties_data-2.2.0.crate"],
+    crate = "icu_properties_data",
+    crate_root = "icu_properties_data-2.2.0.crate/src/lib.rs",
+    edition = "2021",
+    env = {
+        "OUT_DIR": "$(location :icu_properties_data-2-build-script-run[out_dir])",
+    },
+    platform = {
+        "linux-arm64": dict(),
+        "linux-x86_64": dict(),
+        "macos-arm64": dict(),
+        "macos-x86_64": dict(),
+        "windows-gnu": dict(),
+        "windows-msvc": dict(),
+    },
+    rustc_flags = ["@$(location :icu_properties_data-2-build-script-run[rustc_flags])"],
+    visibility = [],
+)
+
+third_party_rust_binary(
+    name = "icu_properties_data-2-build-script-build",
+    srcs = [":icu_properties_data-2.2.0.crate"],
+    crate = "build_script_build",
+    crate_root = "icu_properties_data-2.2.0.crate/build.rs",
+    edition = "2021",
+    platform = {
+        "linux-arm64": dict(),
+        "linux-x86_64": dict(),
+        "macos-arm64": dict(),
+        "macos-x86_64": dict(),
+        "windows-gnu": dict(),
+        "windows-msvc": dict(),
+    },
+    visibility = [],
+)
+
+buildscript_run(
+    name = "icu_properties_data-2-build-script-run",
+    package_name = "icu_properties_data",
+    buildscript_rule = ":icu_properties_data-2-build-script-build",
+    platform = {
+        "linux-arm64": dict(),
+        "linux-x86_64": dict(),
+        "macos-arm64": dict(),
+        "macos-x86_64": dict(),
+        "windows-gnu": dict(),
+        "windows-msvc": dict(),
+    },
+    version = "2.2.0",
+)
+
+http_archive(
+    name = "icu_provider-2.2.0.crate",
+    sha256 = "139c4cf31c8b5f33d7e199446eff9c1e02decfc2f0eec2c8d71f65befa45b421",
+    strip_prefix = "icu_provider-2.2.0",
+    urls = ["https://static.crates.io/crates/icu_provider/2.2.0/download"],
+    visibility = [],
+)
+
+third_party_rust_library(
+    name = "icu_provider-2",
+    srcs = [":icu_provider-2.2.0.crate"],
+    crate = "icu_provider",
+    crate_root = "icu_provider-2.2.0.crate/src/lib.rs",
+    edition = "2021",
+    features = ["baked"],
+    platform = {
+        "linux-arm64": dict(),
+        "linux-x86_64": dict(),
+        "macos-arm64": dict(),
+        "macos-x86_64": dict(),
+        "windows-gnu": dict(),
+        "windows-msvc": dict(),
+    },
+    visibility = [],
+    deps = [
+        ":displaydoc-0.2",
+        ":icu_locale_core-2",
+        ":writeable-0.6",
+        ":yoke-0.8",
+        ":zerofrom-0.1",
+        ":zerotrie-0.2",
+        ":zerovec-0.11",
+    ],
+)
+
+http_archive(
+    name = "idna-1.1.0.crate",
+    sha256 = "3b0875f23caa03898994f6ddc501886a45c7d3d62d04d2d90788d47be1b1e4de",
+    strip_prefix = "idna-1.1.0",
+    urls = ["https://static.crates.io/crates/idna/1.1.0/download"],
+    visibility = [],
+)
+
+third_party_rust_library(
+    name = "idna-1",
+    srcs = [":idna-1.1.0.crate"],
+    crate = "idna",
+    crate_root = "idna-1.1.0.crate/src/lib.rs",
+    edition = "2018",
+    features = [
+        "alloc",
+        "compiled_data",
+        "std",
+    ],
+    platform = {
+        "linux-arm64": dict(),
+        "linux-x86_64": dict(),
+        "macos-arm64": dict(),
+        "macos-x86_64": dict(),
+        "windows-gnu": dict(),
+        "windows-msvc": dict(),
+    },
+    visibility = [],
+    deps = [
+        ":idna_adapter-1",
+        ":smallvec-1",
+        ":utf8_iter-1",
+    ],
+)
+
+http_archive(
+    name = "idna_adapter-1.2.2.crate",
+    sha256 = "cb68373c0d6620ef8105e855e7745e18b0d00d3bdb07fb532e434244cdb9a714",
+    strip_prefix = "idna_adapter-1.2.2",
+    urls = ["https://static.crates.io/crates/idna_adapter/1.2.2/download"],
+    visibility = [],
+)
+
+third_party_rust_library(
+    name = "idna_adapter-1",
+    srcs = [":idna_adapter-1.2.2.crate"],
+    crate = "idna_adapter",
+    crate_root = "idna_adapter-1.2.2.crate/src/lib.rs",
+    edition = "2024",
+    features = ["compiled_data"],
+    platform = {
+        "linux-arm64": dict(),
+        "linux-x86_64": dict(),
+        "macos-arm64": dict(),
+        "macos-x86_64": dict(),
+        "windows-gnu": dict(),
+        "windows-msvc": dict(),
+    },
+    visibility = [],
+    deps = [
+        ":icu_normalizer-2",
+        ":icu_properties-2",
+    ],
 )
 
 third_party_rust_alias(
@@ -10910,6 +11307,35 @@ third_party_rust_library(
     crate = "inventory",
     crate_root = "inventory-0.3.24.crate/src/lib.rs",
     edition = "2021",
+    platform = {
+        "linux-arm64": dict(),
+        "linux-x86_64": dict(),
+        "macos-arm64": dict(),
+        "macos-x86_64": dict(),
+        "windows-gnu": dict(),
+        "windows-msvc": dict(),
+    },
+    visibility = [],
+)
+
+http_archive(
+    name = "ipnet-2.12.0.crate",
+    sha256 = "d98f6fed1fde3f8c21bc40a1abb88dd75e67924f9cffc3ef95607bad8017f8e2",
+    strip_prefix = "ipnet-2.12.0",
+    urls = ["https://static.crates.io/crates/ipnet/2.12.0/download"],
+    visibility = [],
+)
+
+third_party_rust_library(
+    name = "ipnet-2",
+    srcs = [":ipnet-2.12.0.crate"],
+    crate = "ipnet",
+    crate_root = "ipnet-2.12.0.crate/src/lib.rs",
+    edition = "2018",
+    features = [
+        "default",
+        "std",
+    ],
     platform = {
         "linux-arm64": dict(),
         "linux-x86_64": dict(),
@@ -12263,6 +12689,31 @@ third_party_rust_library(
     platform = {
         "linux-arm64": dict(),
         "linux-x86_64": dict(),
+    },
+    visibility = [],
+)
+
+http_archive(
+    name = "litemap-0.8.2.crate",
+    sha256 = "92daf443525c4cce67b150400bc2316076100ce0b3686209eb8cf3c31612e6f0",
+    strip_prefix = "litemap-0.8.2",
+    urls = ["https://static.crates.io/crates/litemap/0.8.2/download"],
+    visibility = [],
+)
+
+third_party_rust_library(
+    name = "litemap-0.8",
+    srcs = [":litemap-0.8.2.crate"],
+    crate = "litemap",
+    crate_root = "litemap-0.8.2.crate/src/lib.rs",
+    edition = "2021",
+    platform = {
+        "linux-arm64": dict(),
+        "linux-x86_64": dict(),
+        "macos-arm64": dict(),
+        "macos-x86_64": dict(),
+        "windows-gnu": dict(),
+        "windows-msvc": dict(),
     },
     visibility = [],
 )
@@ -15412,6 +15863,260 @@ buildscript_run(
     version = "0.9.118",
 )
 
+third_party_rust_alias(
+    name = "opentelemetry",
+    actual = ":opentelemetry-0.32",
+    platforms = [
+        "linux-arm64",
+        "linux-x86_64",
+        "macos-arm64",
+        "macos-x86_64",
+        "windows-gnu",
+        "windows-msvc",
+    ],
+    visibility = ["PUBLIC"],
+)
+
+third_party_rust_library(
+    name = "opentelemetry-0.32",
+    srcs = [":opentelemetry-rust-47cac287c081d394.git"],
+    crate = "opentelemetry",
+    crate_root = "opentelemetry-rust-47cac287c081d394/opentelemetry/src/lib.rs",
+    edition = "2021",
+    env = {
+        "CARGO_PKG_NAME": "opentelemetry",
+        "CARGO_PKG_VERSION": "0.32.0",
+    },
+    features = [
+        "default",
+        "experimental_propagation_env_carrier",
+        "futures",
+        "futures-core",
+        "futures-sink",
+        "internal-logs",
+        "logs",
+        "metrics",
+        "pin-project-lite",
+        "thiserror",
+        "trace",
+        "tracing",
+    ],
+    platform = {
+        "linux-arm64": dict(),
+        "linux-x86_64": dict(),
+        "macos-arm64": dict(),
+        "macos-x86_64": dict(),
+        "windows-gnu": dict(),
+        "windows-msvc": dict(),
+    },
+    visibility = [],
+    deps = [
+        ":futures-core-0.3",
+        ":futures-sink-0.3",
+        ":pin-project-lite-0.2",
+        ":thiserror-2",
+        ":tracing-0.1",
+    ],
+)
+
+third_party_rust_library(
+    name = "opentelemetry-http-0.32",
+    srcs = [":opentelemetry-rust-47cac287c081d394.git"],
+    crate = "opentelemetry_http",
+    crate_root = "opentelemetry-rust-47cac287c081d394/opentelemetry-http/src/lib.rs",
+    edition = "2021",
+    features = [
+        "reqwest",
+        "reqwest-blocking",
+    ],
+    platform = {
+        "linux-arm64": dict(),
+        "linux-x86_64": dict(),
+        "macos-arm64": dict(),
+        "macos-x86_64": dict(),
+        "windows-gnu": dict(),
+        "windows-msvc": dict(),
+    },
+    visibility = [],
+    deps = [
+        ":async-trait-0.1",
+        ":bytes-1",
+        ":http-1",
+        ":opentelemetry-0.32",
+        ":reqwest-0.13",
+    ],
+)
+
+third_party_rust_alias(
+    name = "opentelemetry-otlp",
+    actual = ":opentelemetry-otlp-0.32",
+    platforms = [
+        "linux-arm64",
+        "linux-x86_64",
+        "macos-arm64",
+        "macos-x86_64",
+        "windows-gnu",
+        "windows-msvc",
+    ],
+    visibility = ["PUBLIC"],
+)
+
+third_party_rust_library(
+    name = "opentelemetry-otlp-0.32",
+    srcs = [":opentelemetry-rust-47cac287c081d394.git"],
+    crate = "opentelemetry_otlp",
+    crate_root = "opentelemetry-rust-47cac287c081d394/opentelemetry-otlp/src/lib.rs",
+    edition = "2021",
+    env = {
+        "CARGO_PKG_NAME": "opentelemetry-otlp",
+        "CARGO_PKG_VERSION": "0.32.0",
+    },
+    features = [
+        "http",
+        "http-proto",
+        "metrics",
+        "opentelemetry-http",
+        "prost",
+        "reqwest",
+        "reqwest-blocking-client",
+        "trace",
+    ],
+    platform = {
+        "linux-arm64": dict(),
+        "linux-x86_64": dict(),
+        "macos-arm64": dict(),
+        "macos-x86_64": dict(),
+        "windows-gnu": dict(),
+        "windows-msvc": dict(),
+    },
+    visibility = [],
+    deps = [
+        ":http-1",
+        ":opentelemetry-0.32",
+        ":opentelemetry-http-0.32",
+        ":opentelemetry-proto-0.32",
+        ":opentelemetry_sdk-0.32",
+        ":prost-0.14",
+        ":reqwest-0.13",
+        ":thiserror-2",
+    ],
+)
+
+third_party_rust_library(
+    name = "opentelemetry-proto-0.32",
+    srcs = [":opentelemetry-rust-47cac287c081d394.git"],
+    crate = "opentelemetry_proto",
+    crate_root = "opentelemetry-rust-47cac287c081d394/opentelemetry-proto/src/lib.rs",
+    edition = "2021",
+    features = [
+        "gen-tonic-messages",
+        "metrics",
+        "prost",
+        "trace",
+    ],
+    platform = {
+        "linux-arm64": dict(),
+        "linux-x86_64": dict(),
+        "macos-arm64": dict(),
+        "macos-x86_64": dict(),
+        "windows-gnu": dict(),
+        "windows-msvc": dict(),
+    },
+    visibility = [],
+    deps = [
+        ":opentelemetry-0.32",
+        ":opentelemetry_sdk-0.32",
+        ":prost-0.14",
+    ],
+)
+
+third_party_rust_alias(
+    name = "opentelemetry-semantic-conventions",
+    actual = ":opentelemetry-semantic-conventions-0.32",
+    platforms = [
+        "linux-arm64",
+        "linux-x86_64",
+        "macos-arm64",
+        "macos-x86_64",
+        "windows-gnu",
+        "windows-msvc",
+    ],
+    visibility = ["PUBLIC"],
+)
+
+third_party_rust_library(
+    name = "opentelemetry-semantic-conventions-0.32",
+    srcs = [":opentelemetry-rust-47cac287c081d394.git"],
+    crate = "opentelemetry_semantic_conventions",
+    crate_root = "opentelemetry-rust-47cac287c081d394/opentelemetry-semantic-conventions/src/lib.rs",
+    edition = "2021",
+    features = [
+        "default",
+        "semconv_experimental",
+    ],
+    platform = {
+        "linux-arm64": dict(),
+        "linux-x86_64": dict(),
+        "macos-arm64": dict(),
+        "macos-x86_64": dict(),
+        "windows-gnu": dict(),
+        "windows-msvc": dict(),
+    },
+    visibility = [],
+)
+
+third_party_rust_alias(
+    name = "opentelemetry_sdk",
+    actual = ":opentelemetry_sdk-0.32",
+    platforms = [
+        "linux-arm64",
+        "linux-x86_64",
+        "macos-arm64",
+        "macos-x86_64",
+        "windows-gnu",
+        "windows-msvc",
+    ],
+    visibility = ["PUBLIC"],
+)
+
+third_party_rust_library(
+    name = "opentelemetry_sdk-0.32",
+    srcs = [":opentelemetry-rust-47cac287c081d394.git"],
+    crate = "opentelemetry_sdk",
+    crate_root = "opentelemetry-rust-47cac287c081d394/opentelemetry-sdk/src/lib.rs",
+    edition = "2021",
+    env = {
+        "CARGO_PKG_NAME": "opentelemetry_sdk",
+        "CARGO_PKG_VERSION": "0.32.1",
+    },
+    features = [
+        "default",
+        "internal-logs",
+        "logs",
+        "metrics",
+        "rand",
+        "trace",
+    ],
+    platform = {
+        "linux-arm64": dict(),
+        "linux-x86_64": dict(),
+        "macos-arm64": dict(),
+        "macos-x86_64": dict(),
+        "windows-gnu": dict(),
+        "windows-msvc": dict(),
+    },
+    visibility = [],
+    deps = [
+        ":futures-channel-0.3",
+        ":futures-executor-0.3",
+        ":futures-util-0.3",
+        ":opentelemetry-0.32",
+        ":percent-encoding-2",
+        ":rand-0.9",
+        ":thiserror-2",
+    ],
+)
+
 http_archive(
     name = "option-ext-0.2.0.crate",
     sha256 = "04744f49eae99ab78e0d5c0b603ab218f515ea8cfe5a456d7629ad883a3b6e7d",
@@ -16718,6 +17423,33 @@ third_party_rust_library(
 )
 
 http_archive(
+    name = "potential_utf-0.1.5.crate",
+    sha256 = "0103b1cef7ec0cf76490e969665504990193874ea05c85ff9bab8b911d0a0564",
+    strip_prefix = "potential_utf-0.1.5",
+    urls = ["https://static.crates.io/crates/potential_utf/0.1.5/download"],
+    visibility = [],
+)
+
+third_party_rust_library(
+    name = "potential_utf-0.1",
+    srcs = [":potential_utf-0.1.5.crate"],
+    crate = "potential_utf",
+    crate_root = "potential_utf-0.1.5.crate/src/lib.rs",
+    edition = "2021",
+    features = ["zerovec"],
+    platform = {
+        "linux-arm64": dict(),
+        "linux-x86_64": dict(),
+        "macos-arm64": dict(),
+        "macos-x86_64": dict(),
+        "windows-gnu": dict(),
+        "windows-msvc": dict(),
+    },
+    visibility = [],
+    deps = [":zerovec-0.11"],
+)
+
+http_archive(
     name = "powerfmt-0.2.0.crate",
     sha256 = "439ee305def115ba05938db6eb1644ff94165c5ab5e9420d1c1bcedbba909391",
     strip_prefix = "powerfmt-0.2.0",
@@ -18011,6 +18743,43 @@ third_party_rust_library(
     ],
 )
 
+http_archive(
+    name = "rand-0.9.5.crate",
+    sha256 = "b9ef1d0d795eb7d84685bca4f72f3649f064e6641543d3a8c415898726a57b41",
+    strip_prefix = "rand-0.9.5",
+    urls = ["https://static.crates.io/crates/rand/0.9.5/download"],
+    visibility = [],
+)
+
+third_party_rust_library(
+    name = "rand-0.9",
+    srcs = [":rand-0.9.5.crate"],
+    crate = "rand",
+    crate_root = "rand-0.9.5.crate/src/lib.rs",
+    edition = "2021",
+    features = [
+        "alloc",
+        "os_rng",
+        "small_rng",
+        "std",
+        "std_rng",
+        "thread_rng",
+    ],
+    platform = {
+        "linux-arm64": dict(),
+        "linux-x86_64": dict(),
+        "macos-arm64": dict(),
+        "macos-x86_64": dict(),
+        "windows-gnu": dict(),
+        "windows-msvc": dict(),
+    },
+    visibility = [],
+    deps = [
+        ":rand_chacha-0.9",
+        ":rand_core-0.9",
+    ],
+)
+
 third_party_rust_alias(
     name = "rand",
     actual = ":rand-0.10",
@@ -18093,6 +18862,36 @@ third_party_rust_library(
     ],
 )
 
+http_archive(
+    name = "rand_chacha-0.9.0.crate",
+    sha256 = "d3022b5f1df60f26e1ffddd6c66e8aa15de382ae63b3a0c1bfc0e4d3e3f325cb",
+    strip_prefix = "rand_chacha-0.9.0",
+    urls = ["https://static.crates.io/crates/rand_chacha/0.9.0/download"],
+    visibility = [],
+)
+
+third_party_rust_library(
+    name = "rand_chacha-0.9",
+    srcs = [":rand_chacha-0.9.0.crate"],
+    crate = "rand_chacha",
+    crate_root = "rand_chacha-0.9.0.crate/src/lib.rs",
+    edition = "2021",
+    features = ["std"],
+    platform = {
+        "linux-arm64": dict(),
+        "linux-x86_64": dict(),
+        "macos-arm64": dict(),
+        "macos-x86_64": dict(),
+        "windows-gnu": dict(),
+        "windows-msvc": dict(),
+    },
+    visibility = [],
+    deps = [
+        ":ppv-lite86-0.2",
+        ":rand_core-0.9",
+    ],
+)
+
 third_party_rust_alias(
     name = "rand_chacha",
     actual = ":rand_chacha-0.10",
@@ -18169,6 +18968,36 @@ third_party_rust_library(
     },
     visibility = [],
     deps = [":getrandom-0.2"],
+)
+
+http_archive(
+    name = "rand_core-0.9.5.crate",
+    sha256 = "76afc826de14238e6e8c374ddcc1fa19e374fd8dd986b0d2af0d02377261d83c",
+    strip_prefix = "rand_core-0.9.5",
+    urls = ["https://static.crates.io/crates/rand_core/0.9.5/download"],
+    visibility = [],
+)
+
+third_party_rust_library(
+    name = "rand_core-0.9",
+    srcs = [":rand_core-0.9.5.crate"],
+    crate = "rand_core",
+    crate_root = "rand_core-0.9.5.crate/src/lib.rs",
+    edition = "2021",
+    features = [
+        "os_rng",
+        "std",
+    ],
+    platform = {
+        "linux-arm64": dict(),
+        "linux-x86_64": dict(),
+        "macos-arm64": dict(),
+        "macos-x86_64": dict(),
+        "windows-gnu": dict(),
+        "windows-msvc": dict(),
+    },
+    visibility = [],
+    deps = [":getrandom-0.3"],
 )
 
 http_archive(
@@ -18661,6 +19490,77 @@ third_party_rust_library(
     },
     visibility = [],
     deps = [":serde-1"],
+)
+
+third_party_rust_alias(
+    name = "reqwest",
+    actual = ":reqwest-0.13",
+    platforms = [
+        "linux-arm64",
+        "linux-x86_64",
+        "macos-arm64",
+        "macos-x86_64",
+        "windows-gnu",
+        "windows-msvc",
+    ],
+    visibility = ["PUBLIC"],
+)
+
+http_archive(
+    name = "reqwest-0.13.5.crate",
+    sha256 = "16a1cfa75cc186dd73d5818e510e042e40927bccc9c236b061cea97e1eb08029",
+    strip_prefix = "reqwest-0.13.5",
+    urls = ["https://static.crates.io/crates/reqwest/0.13.5/download"],
+    visibility = [],
+)
+
+third_party_rust_library(
+    name = "reqwest-0.13",
+    srcs = [":reqwest-0.13.5.crate"],
+    crate = "reqwest",
+    crate_root = "reqwest-0.13.5.crate/src/lib.rs",
+    edition = "2021",
+    features = [
+        "__rustls",
+        "__tls",
+        "blocking",
+        "rustls-no-provider",
+    ],
+    platform = {
+        "linux-arm64": dict(),
+        "linux-x86_64": dict(),
+        "macos-arm64": dict(),
+        "macos-x86_64": dict(),
+        "windows-gnu": dict(),
+        "windows-msvc": dict(),
+    },
+    visibility = [],
+    deps = [
+        ":base64-0.23",
+        ":bytes-1",
+        ":futures-channel-0.3",
+        ":futures-core-0.3",
+        ":futures-util-0.3",
+        ":http-1",
+        ":http-body-1",
+        ":http-body-util-0.1",
+        ":hyper-1",
+        ":hyper-rustls-0.27",
+        ":hyper-util-0.1",
+        ":log-0.4",
+        ":percent-encoding-2",
+        ":pin-project-lite-0.2",
+        ":rustls-0.23",
+        ":rustls-pki-types-1",
+        ":rustls-platform-verifier-0.7",
+        ":sync_wrapper-1",
+        ":tokio-1",
+        ":tokio-rustls-0.26",
+        ":tower-0.5",
+        ":tower-http-0.6",
+        ":tower-service-0.3",
+        ":url-2",
+    ],
 )
 
 http_archive(
@@ -20237,6 +21137,10 @@ third_party_rust_binary(
         ":object-0.36",
         ":oid-registry-0.4",
         ":once_cell-1",
+        ":opentelemetry-0.32",
+        ":opentelemetry-otlp-0.32",
+        ":opentelemetry-semantic-conventions-0.32",
+        ":opentelemetry_sdk-0.32",
         ":os_str_bytes-6",
         ":parking_lot-0.12",
         ":paste-1",
@@ -20264,6 +21168,7 @@ third_party_rust_binary(
         ":ref-cast-1",
         ":regex-1",
         ":relative-path-1",
+        ":reqwest-0.13",
         ":ring-0.17",
         ":ruff_formatter-0.0.6",
         ":ruff_python_ast-0.0.6",
@@ -20938,6 +21843,63 @@ third_party_rust_library(
     },
     visibility = [],
     deps = [":zeroize-1"],
+)
+
+http_archive(
+    name = "rustls-platform-verifier-0.7.0.crate",
+    sha256 = "26d1e2536ce4f35f4846aa13bff16bd0ff40157cdb14cc056c7b14ba41233ba0",
+    strip_prefix = "rustls-platform-verifier-0.7.0",
+    urls = ["https://static.crates.io/crates/rustls-platform-verifier/0.7.0/download"],
+    visibility = [],
+)
+
+third_party_rust_library(
+    name = "rustls-platform-verifier-0.7",
+    srcs = [":rustls-platform-verifier-0.7.0.crate"],
+    crate = "rustls_platform_verifier",
+    crate_root = "rustls-platform-verifier-0.7.0.crate/src/lib.rs",
+    edition = "2021",
+    platform = {
+        "linux-arm64": dict(
+            deps = [
+                ":rustls-native-certs-0.8",
+                ":rustls-webpki-0.103",
+            ],
+        ),
+        "linux-x86_64": dict(
+            deps = [
+                ":rustls-native-certs-0.8",
+                ":rustls-webpki-0.103",
+            ],
+        ),
+        "macos-arm64": dict(
+            deps = [
+                ":core-foundation-0.10",
+                ":core-foundation-sys-0.8",
+                ":security-framework-3",
+                ":security-framework-sys-2",
+            ],
+        ),
+        "macos-x86_64": dict(
+            deps = [
+                ":core-foundation-0.10",
+                ":core-foundation-sys-0.8",
+                ":security-framework-3",
+                ":security-framework-sys-2",
+            ],
+        ),
+        "windows-gnu": dict(
+            deps = [":windows-sys-0.61"],
+        ),
+        "windows-msvc": dict(
+            deps = [":windows-sys-0.61"],
+        ),
+    },
+    visibility = [],
+    deps = [
+        ":log-0.4",
+        ":rustls-0.23",
+    ],
 )
 
 http_archive(
@@ -23596,6 +24558,10 @@ third_party_rust_library(
     crate = "sync_wrapper",
     crate_root = "sync_wrapper-1.0.2.crate/src/lib.rs",
     edition = "2021",
+    features = [
+        "futures",
+        "futures-core",
+    ],
     platform = {
         "linux-arm64": dict(),
         "linux-x86_64": dict(),
@@ -23605,6 +24571,7 @@ third_party_rust_library(
         "windows-msvc": dict(),
     },
     visibility = [],
+    deps = [":futures-core-0.3"],
 )
 
 http_archive(
@@ -25103,6 +26070,36 @@ third_party_rust_library(
 )
 
 http_archive(
+    name = "tinystr-0.8.3.crate",
+    sha256 = "c8323304221c2a851516f22236c5722a72eaa19749016521d6dff0824447d96d",
+    strip_prefix = "tinystr-0.8.3",
+    urls = ["https://static.crates.io/crates/tinystr/0.8.3/download"],
+    visibility = [],
+)
+
+third_party_rust_library(
+    name = "tinystr-0.8",
+    srcs = [":tinystr-0.8.3.crate"],
+    crate = "tinystr",
+    crate_root = "tinystr-0.8.3.crate/src/lib.rs",
+    edition = "2021",
+    features = ["zerovec"],
+    platform = {
+        "linux-arm64": dict(),
+        "linux-x86_64": dict(),
+        "macos-arm64": dict(),
+        "macos-x86_64": dict(),
+        "windows-gnu": dict(),
+        "windows-msvc": dict(),
+    },
+    visibility = [],
+    deps = [
+        ":displaydoc-0.2",
+        ":zerovec-0.11",
+    ],
+)
+
+http_archive(
     name = "tinytemplate-1.2.1.crate",
     sha256 = "be4d6b5f19ff7664e8c98d03e2139cb510db9b0a60b55f8e8709b689d939b6bc",
     strip_prefix = "tinytemplate-1.2.1",
@@ -26096,8 +27093,10 @@ third_party_rust_library(
         "make",
         "pin-project-lite",
         "ready-cache",
+        "retry",
         "slab",
         "sync_wrapper",
+        "timeout",
         "tokio",
         "tokio-util",
         "tracing",
@@ -26124,6 +27123,48 @@ third_party_rust_library(
         ":tower-layer-0.3",
         ":tower-service-0.3",
         ":tracing-0.1",
+    ],
+)
+
+http_archive(
+    name = "tower-http-0.6.11.crate",
+    sha256 = "4cfcf7e2740e6fc6d4d688b4ef00650406bb94adf4731e43c096c3a19fe40840",
+    strip_prefix = "tower-http-0.6.11",
+    urls = ["https://static.crates.io/crates/tower-http/0.6.11/download"],
+    visibility = [],
+)
+
+third_party_rust_library(
+    name = "tower-http-0.6",
+    srcs = [":tower-http-0.6.11.crate"],
+    crate = "tower_http",
+    crate_root = "tower-http-0.6.11.crate/src/lib.rs",
+    edition = "2018",
+    features = [
+        "follow-redirect",
+        "futures-util",
+        "tower",
+    ],
+    platform = {
+        "linux-arm64": dict(),
+        "linux-x86_64": dict(),
+        "macos-arm64": dict(),
+        "macos-x86_64": dict(),
+        "windows-gnu": dict(),
+        "windows-msvc": dict(),
+    },
+    visibility = [],
+    deps = [
+        ":bitflags-2",
+        ":bytes-1",
+        ":futures-util-0.3",
+        ":http-1",
+        ":http-body-1",
+        ":pin-project-lite-0.2",
+        ":tower-0.5",
+        ":tower-layer-0.3",
+        ":tower-service-0.3",
+        ":url-2",
     ],
 )
 
@@ -27244,6 +28285,65 @@ third_party_rust_library(
     srcs = [":unty-0.0.4.crate"],
     crate = "unty",
     crate_root = "unty-0.0.4.crate/src/lib.rs",
+    edition = "2021",
+    platform = {
+        "linux-arm64": dict(),
+        "linux-x86_64": dict(),
+        "macos-arm64": dict(),
+        "macos-x86_64": dict(),
+        "windows-gnu": dict(),
+        "windows-msvc": dict(),
+    },
+    visibility = [],
+)
+
+http_archive(
+    name = "url-2.5.8.crate",
+    sha256 = "ff67a8a4397373c3ef660812acab3268222035010ab8680ec4215f38ba3d0eed",
+    strip_prefix = "url-2.5.8",
+    urls = ["https://static.crates.io/crates/url/2.5.8/download"],
+    visibility = [],
+)
+
+third_party_rust_library(
+    name = "url-2",
+    srcs = [":url-2.5.8.crate"],
+    crate = "url",
+    crate_root = "url-2.5.8.crate/src/lib.rs",
+    edition = "2018",
+    features = [
+        "default",
+        "std",
+    ],
+    platform = {
+        "linux-arm64": dict(),
+        "linux-x86_64": dict(),
+        "macos-arm64": dict(),
+        "macos-x86_64": dict(),
+        "windows-gnu": dict(),
+        "windows-msvc": dict(),
+    },
+    visibility = [],
+    deps = [
+        ":form_urlencoded-1",
+        ":idna-1",
+        ":percent-encoding-2",
+    ],
+)
+
+http_archive(
+    name = "utf8_iter-1.0.4.crate",
+    sha256 = "b6c140620e7ffbb22c2dee59cafe6084a59b5ffc27a8859a5f0d494b5d52b6be",
+    strip_prefix = "utf8_iter-1.0.4",
+    urls = ["https://static.crates.io/crates/utf8_iter/1.0.4/download"],
+    visibility = [],
+)
+
+third_party_rust_library(
+    name = "utf8_iter-1",
+    srcs = [":utf8_iter-1.0.4.crate"],
+    crate = "utf8_iter",
+    crate_root = "utf8_iter-1.0.4.crate/src/lib.rs",
     edition = "2021",
     platform = {
         "linux-arm64": dict(),
@@ -29305,6 +30405,31 @@ third_party_rust_library(
     deps = [":windows-0.48"],
 )
 
+http_archive(
+    name = "writeable-0.6.3.crate",
+    sha256 = "1ffae5123b2d3fc086436f8834ae3ab053a283cfac8fe0a0b8eaae044768a4c4",
+    strip_prefix = "writeable-0.6.3",
+    urls = ["https://static.crates.io/crates/writeable/0.6.3/download"],
+    visibility = [],
+)
+
+third_party_rust_library(
+    name = "writeable-0.6",
+    srcs = [":writeable-0.6.3.crate"],
+    crate = "writeable",
+    crate_root = "writeable-0.6.3.crate/src/lib.rs",
+    edition = "2021",
+    platform = {
+        "linux-arm64": dict(),
+        "linux-x86_64": dict(),
+        "macos-arm64": dict(),
+        "macos-x86_64": dict(),
+        "windows-gnu": dict(),
+        "windows-msvc": dict(),
+    },
+    visibility = [],
+)
+
 third_party_rust_alias(
     name = "x509-parser",
     actual = ":x509-parser-0.18",
@@ -29467,6 +30592,72 @@ third_party_rust_library(
 )
 
 http_archive(
+    name = "yoke-0.8.3.crate",
+    sha256 = "709fe23a0424b6a435d82152b1bd3fdfb0833487d5fa90d05d42762a9891fef5",
+    strip_prefix = "yoke-0.8.3",
+    urls = ["https://static.crates.io/crates/yoke/0.8.3/download"],
+    visibility = [],
+)
+
+third_party_rust_library(
+    name = "yoke-0.8",
+    srcs = [":yoke-0.8.3.crate"],
+    crate = "yoke",
+    crate_root = "yoke-0.8.3.crate/src/lib.rs",
+    edition = "2021",
+    features = [
+        "derive",
+        "zerofrom",
+    ],
+    platform = {
+        "linux-arm64": dict(),
+        "linux-x86_64": dict(),
+        "macos-arm64": dict(),
+        "macos-x86_64": dict(),
+        "windows-gnu": dict(),
+        "windows-msvc": dict(),
+    },
+    visibility = [],
+    deps = [
+        ":stable_deref_trait-1",
+        ":yoke-derive-0.8",
+        ":zerofrom-0.1",
+    ],
+)
+
+http_archive(
+    name = "yoke-derive-0.8.2.crate",
+    sha256 = "de844c262c8848816172cef550288e7dc6c7b7814b4ee56b3e1553f275f1858e",
+    strip_prefix = "yoke-derive-0.8.2",
+    urls = ["https://static.crates.io/crates/yoke-derive/0.8.2/download"],
+    visibility = [],
+)
+
+third_party_rust_library(
+    name = "yoke-derive-0.8",
+    srcs = [":yoke-derive-0.8.2.crate"],
+    crate = "yoke_derive",
+    crate_root = "yoke-derive-0.8.2.crate/src/lib.rs",
+    edition = "2021",
+    platform = {
+        "linux-arm64": dict(),
+        "linux-x86_64": dict(),
+        "macos-arm64": dict(),
+        "macos-x86_64": dict(),
+        "windows-gnu": dict(),
+        "windows-msvc": dict(),
+    },
+    proc_macro = True,
+    visibility = [],
+    deps = [
+        ":proc-macro2-1",
+        ":quote-1",
+        ":syn-2",
+        ":synstructure-0.13",
+    ],
+)
+
+http_archive(
     name = "zerocopy-0.8.39.crate",
     sha256 = "db6d35d663eadb6c932438e763b262fe1a70987f9ae936e60158176d710cae4a",
     strip_prefix = "zerocopy-0.8.39",
@@ -29546,6 +30737,65 @@ third_party_rust_library(
 )
 
 http_archive(
+    name = "zerofrom-0.1.8.crate",
+    sha256 = "0ec05a11813ea801ff6d75110ad09cd0824ddba17dfe17128ea0d5f68e6c5272",
+    strip_prefix = "zerofrom-0.1.8",
+    urls = ["https://static.crates.io/crates/zerofrom/0.1.8/download"],
+    visibility = [],
+)
+
+third_party_rust_library(
+    name = "zerofrom-0.1",
+    srcs = [":zerofrom-0.1.8.crate"],
+    crate = "zerofrom",
+    crate_root = "zerofrom-0.1.8.crate/src/lib.rs",
+    edition = "2021",
+    features = ["derive"],
+    platform = {
+        "linux-arm64": dict(),
+        "linux-x86_64": dict(),
+        "macos-arm64": dict(),
+        "macos-x86_64": dict(),
+        "windows-gnu": dict(),
+        "windows-msvc": dict(),
+    },
+    visibility = [],
+    deps = [":zerofrom-derive-0.1"],
+)
+
+http_archive(
+    name = "zerofrom-derive-0.1.7.crate",
+    sha256 = "11532158c46691caf0f2593ea8358fed6bbf68a0315e80aae9bd41fbade684a1",
+    strip_prefix = "zerofrom-derive-0.1.7",
+    urls = ["https://static.crates.io/crates/zerofrom-derive/0.1.7/download"],
+    visibility = [],
+)
+
+third_party_rust_library(
+    name = "zerofrom-derive-0.1",
+    srcs = [":zerofrom-derive-0.1.7.crate"],
+    crate = "zerofrom_derive",
+    crate_root = "zerofrom-derive-0.1.7.crate/src/lib.rs",
+    edition = "2021",
+    platform = {
+        "linux-arm64": dict(),
+        "linux-x86_64": dict(),
+        "macos-arm64": dict(),
+        "macos-x86_64": dict(),
+        "windows-gnu": dict(),
+        "windows-msvc": dict(),
+    },
+    proc_macro = True,
+    visibility = [],
+    deps = [
+        ":proc-macro2-1",
+        ":quote-1",
+        ":syn-2",
+        ":synstructure-0.13",
+    ],
+)
+
+http_archive(
     name = "zeroize-1.8.2.crate",
     sha256 = "b97154e67e32c85465826e8bcc1c59429aaaf107c1e4a9e53c8d8ccd5eff88d0",
     strip_prefix = "zeroize-1.8.2",
@@ -29572,6 +30822,105 @@ third_party_rust_library(
         "windows-msvc": dict(),
     },
     visibility = [],
+)
+
+http_archive(
+    name = "zerotrie-0.2.4.crate",
+    sha256 = "0f9152d31db0792fa83f70fb2f83148effb5c1f5b8c7686c3459e361d9bc20bf",
+    strip_prefix = "zerotrie-0.2.4",
+    urls = ["https://static.crates.io/crates/zerotrie/0.2.4/download"],
+    visibility = [],
+)
+
+third_party_rust_library(
+    name = "zerotrie-0.2",
+    srcs = [":zerotrie-0.2.4.crate"],
+    crate = "zerotrie",
+    crate_root = "zerotrie-0.2.4.crate/src/lib.rs",
+    edition = "2021",
+    features = [
+        "yoke",
+        "zerofrom",
+    ],
+    platform = {
+        "linux-arm64": dict(),
+        "linux-x86_64": dict(),
+        "macos-arm64": dict(),
+        "macos-x86_64": dict(),
+        "windows-gnu": dict(),
+        "windows-msvc": dict(),
+    },
+    visibility = [],
+    deps = [
+        ":displaydoc-0.2",
+        ":yoke-0.8",
+        ":zerofrom-0.1",
+    ],
+)
+
+http_archive(
+    name = "zerovec-0.11.6.crate",
+    sha256 = "90f911cbc359ab6af17377d242225f4d75119aec87ea711a880987b18cd7b239",
+    strip_prefix = "zerovec-0.11.6",
+    urls = ["https://static.crates.io/crates/zerovec/0.11.6/download"],
+    visibility = [],
+)
+
+third_party_rust_library(
+    name = "zerovec-0.11",
+    srcs = [":zerovec-0.11.6.crate"],
+    crate = "zerovec",
+    crate_root = "zerovec-0.11.6.crate/src/lib.rs",
+    edition = "2021",
+    features = [
+        "derive",
+        "yoke",
+    ],
+    platform = {
+        "linux-arm64": dict(),
+        "linux-x86_64": dict(),
+        "macos-arm64": dict(),
+        "macos-x86_64": dict(),
+        "windows-gnu": dict(),
+        "windows-msvc": dict(),
+    },
+    visibility = [],
+    deps = [
+        ":yoke-0.8",
+        ":zerofrom-0.1",
+        ":zerovec-derive-0.11",
+    ],
+)
+
+http_archive(
+    name = "zerovec-derive-0.11.3.crate",
+    sha256 = "625dc425cab0dca6dc3c3319506e6593dcb08a9f387ea3b284dbd52a92c40555",
+    strip_prefix = "zerovec-derive-0.11.3",
+    urls = ["https://static.crates.io/crates/zerovec-derive/0.11.3/download"],
+    visibility = [],
+)
+
+third_party_rust_library(
+    name = "zerovec-derive-0.11",
+    srcs = [":zerovec-derive-0.11.3.crate"],
+    crate = "zerovec_derive",
+    crate_root = "zerovec-derive-0.11.3.crate/src/lib.rs",
+    edition = "2021",
+    platform = {
+        "linux-arm64": dict(),
+        "linux-x86_64": dict(),
+        "macos-arm64": dict(),
+        "macos-x86_64": dict(),
+        "windows-gnu": dict(),
+        "windows-msvc": dict(),
+    },
+    proc_macro = True,
+    visibility = [],
+    deps = [
+        ":proc-macro2-1",
+        ":quote-1",
+        ":syn-2",
+    ],
 )
 
 third_party_rust_alias(
