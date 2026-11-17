@@ -15,5 +15,12 @@ http_headers         = x-buildbuddy-api-key:$BUILDBUDDY_API_KEY
 # The build's events, to hub's BuildBuddy, through the same connection and
 # credential, so the invocation shows at re.hub.internal.
 [bes]
-connection  = re_client
-results_url = https://re.hub.internal/invocation/
+connection   = re_client
+# BuildBuddy builds an invocation page from Bazel events; buck2's default
+# format is its own (remote_sink_config.rs), which BuildBuddy cannot draw.
+event_format = bazel
+# BuildBuddy acknowledges a stream only at EOF, so buck2 keeps ten times this
+# many events for replay; the default 10,000 lost the tail of large runs
+# (MercuryTechnologies/buck2#79).
+buffer_size  = 100000
+results_url  = https://re.hub.internal/invocation/
