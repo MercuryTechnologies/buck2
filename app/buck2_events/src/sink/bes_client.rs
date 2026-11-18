@@ -125,6 +125,9 @@ pub struct BesConfig {
     pub bazel_artifact_uri_authority: Option<String>,
     pub bazel_artifact_upload_max_bytes: usize,
     pub channel: BesChannelSettings,
+    /// The remote services `[buck2_re_client]` names, which a Bazel-format stream reports as the
+    /// canonical command line's `remote_cache` and `remote_executor` options.
+    pub remote_services: BesRemoteServices,
 }
 
 /// The `[buck2_re_client]` keys that bound how long the sink's connections may go unanswered.
@@ -171,6 +174,15 @@ impl BesChannelSettings {
     }
 }
 
+/// Which remote services the build's remote execution client is configured with. BuildBuddy
+/// labels an invocation's cache and remote execution from the `remote_cache` and
+/// `remote_executor` options of its canonical command line, which buck2's flags never set.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct BesRemoteServices {
+    pub remote_cache: bool,
+    pub remote_executor: bool,
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum BesEventFormat {
     #[default]
@@ -203,6 +215,7 @@ impl Default for BesConfig {
             bazel_artifact_uri_authority: None,
             bazel_artifact_upload_max_bytes: DEFAULT_BAZEL_ARTIFACT_UPLOAD_MAX_BYTES,
             channel: BesChannelSettings::default(),
+            remote_services: BesRemoteServices::default(),
         }
     }
 }
@@ -1969,7 +1982,7 @@ impl WorkerState {
             return Ok(());
         }
         let upload_config = BazelArtifactUploadConfig::from_bes(&self.config, &self.connection)?;
-        let stream = StreamState::new(
+        let mut stream = StreamState::new(
             parsed,
             &self.config.build_metadata,
             upload_config,
@@ -1977,6 +1990,9 @@ impl WorkerState {
             self.counters.clone(),
             self.spill_target.clone(),
         );
+        stream
+            .bazel_converter
+            .set_remote_services(self.config.remote_services);
         self.streams.insert(parsed.invocation_id.clone(), stream);
         Ok(())
     }
