@@ -611,14 +611,20 @@ impl Buck2OssReConfiguration {
                     property: "tls",
                 })?
                 .unwrap_or(true),
-            tls_ca_certs: legacy_config.parse(BuckconfigKeyRef {
-                section: BUCK2_RE_CLIENT_CFG_SECTION,
-                property: "tls_ca_certs",
-            })?,
-            tls_client_cert: legacy_config.parse(BuckconfigKeyRef {
-                section: BUCK2_RE_CLIENT_CFG_SECTION,
-                property: "tls_client_cert",
-            })?,
+            // An empty value unsets the key, so a `.buckconfig.local` can drop a certificate
+            // that a file it includes, or one written by a tool such as nsc, has set.
+            tls_ca_certs: legacy_config
+                .parse::<String>(BuckconfigKeyRef {
+                    section: BUCK2_RE_CLIENT_CFG_SECTION,
+                    property: "tls_ca_certs",
+                })?
+                .filter(|path| !path.trim().is_empty()),
+            tls_client_cert: legacy_config
+                .parse::<String>(BuckconfigKeyRef {
+                    section: BUCK2_RE_CLIENT_CFG_SECTION,
+                    property: "tls_client_cert",
+                })?
+                .filter(|path| !path.trim().is_empty()),
             retries: legacy_config.parse(BuckconfigKeyRef {
                 section: BUCK2_RE_CLIENT_CFG_SECTION,
                 property: "retries",
@@ -903,6 +909,42 @@ mod tests {
         );
         let invalid = parse(&[("config", "[bes]\nretry_window_secs = soon\n")], "config")?;
         assert!(BesReplaySettings::from_legacy_config(&invalid).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn empty_tls_paths_unset_the_certificates() -> buck2_error::Result<()> {
+        // Lab's BuildBuddy config sets `tls = true` beside a grpc:// address and an empty
+        // `tls_client_cert =`, which must not reach the TLS setup as the path "".
+        let legacy_config = parse(
+            &[(
+                "config",
+                "[buck2_re_client]\nengine_address = grpc://reapi.example:443\ntls = true\ntls_ca_certs =\ntls_client_cert =\n",
+            )],
+            "config",
+        )?;
+        let config = Buck2OssReConfiguration::from_legacy_config(&legacy_config, Vec::new())?;
+        assert_eq!(config.tls_ca_certs, None);
+        assert_eq!(config.tls_client_cert, None);
+
+        let connection = BesConnection::from_re_client(&legacy_config)?.expect("engine configured");
+        assert_eq!(connection.tls_ca_certs, None);
+        assert_eq!(connection.tls_client_cert, None);
+        Ok(())
+    }
+
+    #[test]
+    fn a_set_tls_path_is_kept() -> buck2_error::Result<()> {
+        let legacy_config = parse(
+            &[(
+                "config",
+                "[buck2_re_client]\nengine_address = grpc://reapi.example:443\ntls = true\ntls_ca_certs = ../../ca.crt\ntls_client_cert =\n",
+            )],
+            "config",
+        )?;
+        let config = Buck2OssReConfiguration::from_legacy_config(&legacy_config, Vec::new())?;
+        assert_eq!(config.tls_ca_certs.as_deref(), Some("../../ca.crt"));
+        assert_eq!(config.tls_client_cert, None);
         Ok(())
     }
 
