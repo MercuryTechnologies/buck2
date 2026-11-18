@@ -199,7 +199,7 @@ impl ProvidersLabel {
 
     /// Parse a target name and optional subtarget selectors within a resolved package.
     pub fn parse_in_package(package: PackageLabel, target: &str) -> buck2_error::Result<Self> {
-        let (target, providers) = split_providers_name(target, target)?;
+        let (target, providers) = split_providers_name(target)?;
         Ok(Self::new(
             TargetLabel::new(package, TargetNameRef::new(target)?),
             providers,
