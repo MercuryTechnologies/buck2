@@ -30,6 +30,7 @@ use starlark::values::ValueOf;
 use starlark::values::ValueTyped;
 use starlark::values::dict::DictType;
 use starlark::values::list_or_tuple::ListOrTupleType;
+use starlark::values::int::IntView;
 use starlark::values::none::NoneOr;
 use starlark::values::string::StarlarkStr;
 
@@ -125,7 +126,7 @@ pub struct ExternalRunnerTestInfo<'v> {
 
     /// How long the test may run, in milliseconds. When set, a test runner uses it in place of its
     /// own default, so one long test can carry its own limit.
-    timeout_ms: Option<ValueOf<'v, i32>>,
+    timeout_ms: Option<ValueOf<'v, IntView<'v>>>,
 }
 
 /// An `ExternalRunnerTestInfo` kept alive by its owning frozen heap; usable across threads and
@@ -207,7 +208,10 @@ impl<'v> ExternalRunnerTestInfo<'v> {
     }
 
     pub fn timeout_ms(&self) -> Option<u64> {
-        self.timeout_ms.map(|v| v.get() as u64)
+        self.timeout_ms
+            .and_then(|v| v.get().to_integer::<i64>().ok())
+            .filter(|ms| *ms > 0)
+            .map(|ms| ms as u64)
     }
 
     pub fn supports_test_execution_caching(&self) -> bool {
@@ -433,9 +437,15 @@ pub(super) fn visit_env_artifacts<'v>(
 fn validate_external_runner_test_info<'v>(
     info: &ExternalRunnerTestInfo<'v>,
 ) -> buck2_error::Result<()> {
-    if let Some(ms) = info.timeout_ms.map(|v| v.get()) {
+    if let Some(v) = info.timeout_ms {
+        let ms = v.get().to_integer::<i64>().map_err(|e| {
+            buck2_error::buck2_error!(buck2_error::ErrorTag::Input, "`timeout_ms`: {e}")
+        })?;
         if ms <= 0 {
-            return Err(internal_error!("`timeout_ms` must be positive, got {ms}"));
+            return Err(buck2_error::buck2_error!(
+                buck2_error::ErrorTag::Input,
+                "`timeout_ms` must be positive, got {ms}"
+            ));
         }
     }
     check_required_local_resources(info.local_resources, info.required_local_resources)
@@ -477,7 +487,7 @@ fn external_runner_test_info_creator(globals: &mut GlobalsBuilder) {
         #[starlark(require = named, default = NoneOr::None)]
         supports_test_execution_caching: NoneOr<ValueOf<'v, bool>>,
         #[starlark(require = named, default = NoneOr::None)]
-        timeout_ms: NoneOr<ValueOf<'v, i32>>,
+        timeout_ms: NoneOr<ValueOf<'v, IntView<'v>>>,
         eval: &mut Evaluator<'v, '_, '_>,
     ) -> starlark::Result<ValueOf<'v, ExternalRunnerTestInfo<'v>>> {
         let exec_group = exec_group.into_option();
