@@ -34,6 +34,8 @@ use prost_types::Timestamp;
 use prost_types::Value;
 use prost_types::value;
 
+use crate::sink::bes_client::BesRemoteServices;
+
 pub(crate) const BEP_EVENT_TYPE_URL: &str = "type.googleapis.com/build_event_stream.BuildEvent";
 
 const BUILD_TOOL_VERSION: &str = "buck2";
@@ -48,6 +50,12 @@ const MAX_INLINE_FILE_BYTES: usize = 16 * 1024;
 const CANONICAL_COMMAND_LINE_LABEL: &str = "canonical";
 const ORIGINAL_COMMAND_LINE_LABEL: &str = "original";
 const TOOL_COMMAND_LINE_LABEL: &str = "tool";
+// The value of the `remote_cache` and `remote_executor` options the canonical command line
+// carries for the services `[buck2_re_client]` names. BuildBuddy only tests these options for
+// presence to label the invocation, and its pages can be readable without signing in, so the
+// value names the config section that set them rather than the configured address.
+const RE_CLIENT_OPTION_VALUE: &str = "buck2_re_client";
+const RE_CLIENT_OPTION_SOURCE: &str = "buckconfig [buck2_re_client]";
 const STRUCT_TYPE_URL: &str = "type.googleapis.com/google.protobuf.Struct";
 const BUILDBUDDY_VISIBILITY_KEY: &str = "VISIBILITY";
 const BUILDBUDDY_PUBLIC_VISIBILITY: &str = "PUBLIC";
@@ -1271,6 +1279,9 @@ pub(crate) struct BazelEventConverter {
     /// buck2's own exit code when the build had no errors.
     test_executor_exit_code: Option<i32>,
     saw_failing_test_result: bool,
+    /// The remote services the build's `[buck2_re_client]` names, which the canonical
+    /// command line reports as options because buck2's own flags never spell them.
+    remote_services: BesRemoteServices,
 }
 
 impl BazelEventConverter {
@@ -1286,6 +1297,10 @@ impl BazelEventConverter {
             skip_successful_action_events: !upload_successful_action_events,
             ..Self::default()
         }
+    }
+
+    pub(crate) fn set_remote_services(&mut self, remote_services: BesRemoteServices) {
+        self.remote_services = remote_services;
     }
 
     pub(crate) fn convert(
@@ -1384,7 +1399,10 @@ impl BazelEventConverter {
                     is_test_or_coverage_command(&command_name(command));
                 events.push(unstructured_command_line_event(command));
                 events.push(original_structured_command_line_event(command));
-                events.push(canonical_structured_command_line_event(command));
+                events.push(canonical_structured_command_line_event(
+                    command,
+                    self.remote_services,
+                ));
                 events.push(tool_structured_command_line_event());
                 events.push(options_parsed_event(command));
                 events.push(default_configuration_event());
@@ -1922,6 +1940,7 @@ impl BazelEventConverter {
                 &record.cli_args,
                 &command_name,
                 client_env_options_from_metadata(metadata),
+                self.remote_services,
             ),
             events,
         );
@@ -3622,11 +3641,15 @@ fn original_structured_command_line_event_from_args(
     }
 }
 
-fn canonical_structured_command_line_event(command: &buck2_data::CommandStart) -> bep::BuildEvent {
+fn canonical_structured_command_line_event(
+    command: &buck2_data::CommandStart,
+    remote_services: BesRemoteServices,
+) -> bep::BuildEvent {
     canonical_structured_command_line_event_from_args(
         &command.cli_args,
         &command_name(command),
         client_env_options(command),
+        remote_services,
     )
 }
 
@@ -3634,6 +3657,7 @@ fn canonical_structured_command_line_event_from_args(
     args: &[String],
     command_name: &str,
     client_env_options: Vec<cl::Option>,
+    remote_services: BesRemoteServices,
 ) -> bep::BuildEvent {
     let mut sections = Vec::new();
     if let Some(executable) = args.first() {
@@ -3643,6 +3667,8 @@ fn canonical_structured_command_line_event_from_args(
 
     let parsed = ParsedCliArgs::from_args(args, command_name);
     let mut options = parsed.options;
+    let re_client_options = re_client_options(&options, remote_services);
+    options.extend(re_client_options);
     options.extend(client_env_options);
     if !options.is_empty() {
         sections.push(option_section("command options", options));
@@ -3675,6 +3701,41 @@ fn tool_structured_command_line_event() -> bep::BuildEvent {
             },
         )),
         last_message: false,
+    }
+}
+
+/// `remote_cache` and `remote_executor` for the services `[buck2_re_client]` names. buck2 has
+/// no flag that spells either, so a canonical command line built from argv alone never carries
+/// them, and BuildBuddy labels every such invocation "Cache off" (`getCache` in
+/// app/invocation/invocation_model.tsx). A flag on the command line wins: `--no-remote-cache`
+/// already arrives as `remote_cache=0`, and `--local-only` keeps actions off the executor.
+fn re_client_options(
+    command_line_options: &[cl::Option],
+    remote_services: BesRemoteServices,
+) -> Vec<cl::Option> {
+    let has = |name: &str| {
+        command_line_options
+            .iter()
+            .any(|option| option.option_name == name)
+    };
+    let mut options = Vec::new();
+    if remote_services.remote_cache && !has("remote_cache") && !has("unstable_no_remote_cache") {
+        options.push(re_client_option("remote_cache"));
+    }
+    if remote_services.remote_executor && !has("remote_executor") && !has("local_only") {
+        options.push(re_client_option("remote_executor"));
+    }
+    options
+}
+
+fn re_client_option(name: &str) -> cl::Option {
+    cl::Option {
+        combined_form: format!("--{name}={RE_CLIENT_OPTION_VALUE}"),
+        option_name: name.to_owned(),
+        option_value: RE_CLIENT_OPTION_VALUE.to_owned(),
+        effect_tags: Vec::new(),
+        metadata_tags: Vec::new(),
+        source: RE_CLIENT_OPTION_SOURCE.to_owned(),
     }
 }
 
@@ -8768,7 +8829,8 @@ mod tests {
         );
         assert_eq!(chunk_values(original, "residual"), vec!["//:buck2"]);
 
-        let canonical_event = canonical_structured_command_line_event(&command);
+        let canonical_event =
+            canonical_structured_command_line_event(&command, BesRemoteServices::default());
         let canonical = command_line_from_event(&canonical_event);
         let canonical_options = option_values(canonical, "command options");
         assert!(canonical_options.contains(&"--remote-only".to_owned()));
@@ -13814,5 +13876,213 @@ mod tests {
             ),
         );
         assert_eq!(finished_outcome(&events).1, "BUILD_FAILURE");
+    }
+
+    /// The options of the canonical command line, as BuildBuddy's invocation model reads them
+    /// (app/invocation/invocation_model.tsx at 231c9ae, lines 218-227): name to value.
+    fn canonical_options(events: &[bep::BuildEvent]) -> BTreeMap<String, String> {
+        let canonical = events
+            .iter()
+            .find_map(|event| match event.payload.as_ref() {
+                Some(build_event::Payload::StructuredCommandLine(command_line))
+                    if command_line.command_line_label == CANONICAL_COMMAND_LINE_LABEL =>
+                {
+                    Some(command_line)
+                }
+                _ => None,
+            })
+            .expect("canonical structured command line");
+        let mut options = BTreeMap::new();
+        for section in &canonical.sections {
+            if let Some(cl::command_line_section::SectionType::OptionList(list)) =
+                section.section_type.as_ref()
+            {
+                for option in &list.option {
+                    options.insert(option.option_name.clone(), option.option_value.clone());
+                }
+            }
+        }
+        options
+    }
+
+    /// BuildBuddy's `getCache()` label (invocation_model.tsx at 231c9ae, lines 391-405), up to
+    /// the first branch: "Cache off" unless `remote_cache` or `remote_executor` has a value.
+    fn page_cache_label(options: &BTreeMap<String, String>) -> &'static str {
+        let set = |name: &str| options.get(name).is_some_and(|value| !value.is_empty());
+        if !set("remote_cache") && !set("remote_executor") {
+            "Cache off"
+        } else {
+            "Cache on"
+        }
+    }
+
+    fn command_start_with_args(args: &[&str]) -> buck2_data::BuckEvent {
+        trace_event(buck2_data::buck_event::Data::SpanStart(
+            buck2_data::SpanStartEvent {
+                data: Some(buck2_data::span_start_event::Data::Command(
+                    buck2_data::CommandStart {
+                        cli_args: args.iter().map(|arg| (*arg).to_owned()).collect(),
+                        data: Some(buck2_data::command_start::Data::Build(
+                            buck2_data::BuildCommandStart {},
+                        )),
+                        ..Default::default()
+                    },
+                )),
+            },
+        ))
+    }
+
+    fn converter_with_services(remote_cache: bool, remote_executor: bool) -> BazelEventConverter {
+        let mut converter = BazelEventConverter::default();
+        converter.set_remote_services(BesRemoteServices {
+            remote_cache,
+            remote_executor,
+        });
+        converter
+    }
+
+    #[test]
+    fn canonical_command_line_reports_the_re_client_services() {
+        let mut converter = converter_with_services(true, true);
+        let events = converter.convert(1, &command_start_with_args(&["buck2", "build", "//:main"]));
+        let options = canonical_options(&events);
+        assert_eq!(
+            options.get("remote_cache").map(String::as_str),
+            Some(RE_CLIENT_OPTION_VALUE)
+        );
+        assert_eq!(
+            options.get("remote_executor").map(String::as_str),
+            Some(RE_CLIENT_OPTION_VALUE)
+        );
+        assert_eq!(page_cache_label(&options), "Cache on");
+    }
+
+    #[test]
+    fn canonical_command_line_reports_a_cache_without_an_executor() {
+        let mut converter = converter_with_services(true, false);
+        let events = converter.convert(1, &command_start_with_args(&["buck2", "build", "//:main"]));
+        let options = canonical_options(&events);
+        assert!(options.contains_key("remote_cache"));
+        assert!(!options.contains_key("remote_executor"));
+        assert_eq!(page_cache_label(&options), "Cache on");
+    }
+
+    #[test]
+    fn canonical_command_line_has_no_remote_options_without_an_re_client() {
+        let mut converter = BazelEventConverter::default();
+        let events = converter.convert(1, &command_start_with_args(&["buck2", "build", "//:main"]));
+        let options = canonical_options(&events);
+        assert!(!options.contains_key("remote_cache"));
+        assert!(!options.contains_key("remote_executor"));
+        assert_eq!(page_cache_label(&options), "Cache off");
+    }
+
+    #[test]
+    fn command_line_flags_win_over_the_re_client_services() {
+        let mut converter = converter_with_services(true, true);
+        let events = converter.convert(
+            1,
+            &command_start_with_args(&[
+                "buck2",
+                "build",
+                "--remote-cache=grpc://cache.example.com",
+                "--remote-executor=grpc://engine.example.com",
+                "//:main",
+            ]),
+        );
+        let canonical = events
+            .iter()
+            .find_map(|event| match event.payload.as_ref() {
+                Some(build_event::Payload::StructuredCommandLine(command_line))
+                    if command_line.command_line_label == CANONICAL_COMMAND_LINE_LABEL =>
+                {
+                    Some(command_line)
+                }
+                _ => None,
+            })
+            .expect("canonical structured command line");
+        let names = canonical
+            .sections
+            .iter()
+            .filter_map(|section| match section.section_type.as_ref() {
+                Some(cl::command_line_section::SectionType::OptionList(list)) => Some(list),
+                _ => None,
+            })
+            .flat_map(|list| list.option.iter().map(|option| option.option_name.as_str()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            names.iter().filter(|name| **name == "remote_cache").count(),
+            1
+        );
+        assert_eq!(
+            names
+                .iter()
+                .filter(|name| **name == "remote_executor")
+                .count(),
+            1
+        );
+        let options = canonical_options(&events);
+        assert_eq!(options["remote_cache"], "grpc://cache.example.com");
+        assert_eq!(options["remote_executor"], "grpc://engine.example.com");
+    }
+
+    #[test]
+    fn local_only_and_no_remote_cache_keep_their_meaning() {
+        let mut converter = converter_with_services(true, true);
+        let events = converter.convert(
+            1,
+            &command_start_with_args(&["buck2", "build", "--local-only", "//:main"]),
+        );
+        let options = canonical_options(&events);
+        assert!(!options.contains_key("remote_executor"));
+        assert_eq!(
+            options.get("remote_cache").map(String::as_str),
+            Some(RE_CLIENT_OPTION_VALUE)
+        );
+
+        let mut converter = converter_with_services(true, true);
+        let events = converter.convert(
+            1,
+            &command_start_with_args(&["buck2", "build", "--no-remote-cache", "//:main"]),
+        );
+        let options = canonical_options(&events);
+        // `--no-remote-cache` arrives from argv as `remote_cache=0`, and no second option joins it.
+        assert_eq!(options.get("remote_cache").map(String::as_str), Some("0"));
+    }
+
+    #[test]
+    fn invocation_records_report_the_re_client_services() {
+        let args = ["buck2".to_owned(), "build".to_owned(), "//:main".to_owned()];
+        let event = canonical_structured_command_line_event_from_args(
+            &args,
+            "build",
+            Vec::new(),
+            BesRemoteServices {
+                remote_cache: true,
+                remote_executor: true,
+            },
+        );
+        let options = canonical_options(std::slice::from_ref(&event));
+        assert_eq!(page_cache_label(&options), "Cache on");
+    }
+
+    /// Invocation pages can be readable without signing in, so the stream says that a cache
+    /// and an executor are configured and never where: the converter is never handed an
+    /// address, and nothing it emits for a command spells one.
+    #[test]
+    fn remote_options_carry_no_address() {
+        let mut converter = converter_with_services(true, true);
+        let events = converter.convert(1, &command_start_with_args(&["buck2", "build", "//:main"]));
+        for event in &events {
+            let encoded = format!("{event:?}");
+            for needle in ["grpc://", "grpcs://"] {
+                assert!(
+                    !encoded.contains(needle),
+                    "{needle} appears in an emitted event: {encoded}"
+                );
+            }
+        }
+        let options = canonical_options(&events);
+        assert_eq!(options["remote_cache"], RE_CLIENT_OPTION_VALUE);
     }
 }
