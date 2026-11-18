@@ -1,0 +1,24 @@
+# Build buck2 with buck2 on Namespace remote execution:
+#
+#   nsc buck2 setup
+#   ./bootstrap/buck2 build //app/buck2:buck2-bin --config-file .buckconfig.namespace --remote-only
+#
+# The hermetic toolchains in buildbuddy/toolchains (an LLVM archive and a Rust
+# toolchain pinned by hash) replace the shim's system toolchains, and archives
+# are fetched on the workers rather than uploaded from the client.
+# [buck2_re_client] comes from ~/.buckconfig.d/50-namespace.
+
+[cell_aliases]
+toolchains = buildbuddy_toolchains
+
+[build]
+execution_platforms = namespace//:rbe
+
+[http_archive]
+remote_download = true
+
+[buck2]
+digest_algorithms = BLAKE3
+materializations = deferred_skip_final_artifacts
+sqlite_materializer_state = true
+defer_write_actions = true
