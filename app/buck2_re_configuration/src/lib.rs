@@ -755,6 +755,34 @@ pub fn bes_cas_address(legacy_config: &LegacyBuckConfig) -> buck2_error::Result<
     Ok(Some(grpc_backend(address, tls).0))
 }
 
+/// Which remote services `[buck2_re_client]` names: a cache through `action_cache_address`,
+/// `cas_address` or the shared `address`, and an executor through `engine_address` or `address`.
+/// A Bazel-format event stream reports them, without their addresses, because buck2 has no
+/// flag that would otherwise put them on its command line.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ReClientServices {
+    pub remote_cache: bool,
+    pub remote_executor: bool,
+}
+
+pub fn re_client_services(
+    legacy_config: &LegacyBuckConfig,
+) -> buck2_error::Result<ReClientServices> {
+    let set = |property: &str| -> buck2_error::Result<bool> {
+        Ok(legacy_config
+            .parse::<String>(BuckconfigKeyRef {
+                section: BUCK2_RE_CLIENT_CFG_SECTION,
+                property,
+            })?
+            .is_some_and(|value| !value.trim().is_empty()))
+    };
+    let shared = set("address")?;
+    Ok(ReClientServices {
+        remote_cache: shared || set("action_cache_address")? || set("cas_address")?,
+        remote_executor: shared || set("engine_address")?,
+    })
+}
+
 /// `grpcs://host` or `grpc://host` for a remote execution address, and whether that is TLS.
 /// The `tls` key wins over the scheme, as it does for the remote execution client.
 fn grpc_backend(address: &str, tls: Option<bool>) -> (String, bool) {
@@ -918,6 +946,42 @@ mod tests {
     fn bes_connection_is_none_without_an_engine_address() -> buck2_error::Result<()> {
         let legacy_config = parse(&[("config", "")], "config")?;
         assert_eq!(BesConnection::from_re_client(&legacy_config)?, None);
+        Ok(())
+    }
+
+    #[test]
+    fn re_client_services_name_what_the_client_is_configured_with() -> buck2_error::Result<()> {
+        let services = |text: &str| -> buck2_error::Result<ReClientServices> {
+            re_client_services(&parse(&[("config", text)], "config")?)
+        };
+        assert_eq!(services("")?, ReClientServices::default());
+        assert_eq!(
+            services(
+                "[buck2_re_client]\nengine_address = grpc://e:443\naction_cache_address = grpc://c:443\n"
+            )?,
+            ReClientServices {
+                remote_cache: true,
+                remote_executor: true,
+            }
+        );
+        assert_eq!(
+            services("[buck2_re_client]\ncas_address = grpc://c:443\n")?,
+            ReClientServices {
+                remote_cache: true,
+                remote_executor: false,
+            }
+        );
+        assert_eq!(
+            services("[buck2_re_client]\naddress = grpc://all:443\n")?,
+            ReClientServices {
+                remote_cache: true,
+                remote_executor: true,
+            }
+        );
+        assert_eq!(
+            services("[buck2_re_client]\nengine_address =\n")?,
+            ReClientServices::default()
+        );
         Ok(())
     }
 }
