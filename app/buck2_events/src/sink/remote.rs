@@ -17,6 +17,8 @@ use fbinit::FacebookInit;
 #[cfg(not(fbcode_build))]
 pub use crate::sink::bes_client::BesChannelSettings;
 #[cfg(not(fbcode_build))]
+pub use crate::sink::bes_client::BesRemoteServices;
+#[cfg(not(fbcode_build))]
 pub use crate::sink::bes_client::BesTls;
 #[cfg(not(fbcode_build))]
 pub use crate::sink::bes_client::DEFAULT_REPLAY_SPILL_MAX_BYTES;
