@@ -49,8 +49,6 @@ const CANONICAL_COMMAND_LINE_LABEL: &str = "canonical";
 const ORIGINAL_COMMAND_LINE_LABEL: &str = "original";
 const TOOL_COMMAND_LINE_LABEL: &str = "tool";
 const STRUCT_TYPE_URL: &str = "type.googleapis.com/google.protobuf.Struct";
-const BUILDBUDDY_VISIBILITY_KEY: &str = "VISIBILITY";
-const BUILDBUDDY_PUBLIC_VISIBILITY: &str = "PUBLIC";
 const COMMAND_PROFILE_NAME: &str = "command.profile.gz";
 const MAX_PROFILE_SPANS: usize = 50_000;
 
@@ -4255,9 +4253,6 @@ fn build_metadata_from_command(
         metadata.entry("ROLE".to_owned()).or_insert("CI".to_owned());
     }
     metadata
-        .entry(BUILDBUDDY_VISIBILITY_KEY.to_owned())
-        .or_insert_with(|| BUILDBUDDY_PUBLIC_VISIBILITY.to_owned());
-    metadata
 }
 
 fn build_metadata_from_invocation(
@@ -4338,9 +4333,6 @@ fn build_metadata_from_invocation(
     if env::var("CI").is_ok_and(|ci| !ci.is_empty()) {
         metadata.entry("ROLE".to_owned()).or_insert("CI".to_owned());
     }
-    metadata
-        .entry(BUILDBUDDY_VISIBILITY_KEY.to_owned())
-        .or_insert_with(|| BUILDBUDDY_PUBLIC_VISIBILITY.to_owned());
     metadata
 }
 
@@ -8049,6 +8041,9 @@ mod tests {
 
     use super::*;
 
+    // BuildBuddy's key for who may read an invocation (https://www.buildbuddy.io/docs/guide-metadata/).
+    const BUILDBUDDY_VISIBILITY_KEY: &str = "VISIBILITY";
+
     fn trace_event(data: buck2_data::buck_event::Data) -> buck2_data::BuckEvent {
         buck2_data::BuckEvent {
             timestamp: Some(Timestamp {
@@ -8328,7 +8323,8 @@ mod tests {
                 .metadata
                 .get(BUILDBUDDY_VISIBILITY_KEY)
                 .map(String::as_str),
-            Some(BUILDBUDDY_PUBLIC_VISIBILITY)
+            None,
+            "VISIBILITY is the user's to set, as with Bazel's --build_metadata"
         );
         assert_eq!(
             build_metadata.metadata.get("USER").map(String::as_str),
@@ -9941,7 +9937,8 @@ mod tests {
                 .metadata
                 .get(BUILDBUDDY_VISIBILITY_KEY)
                 .map(String::as_str),
-            Some(BUILDBUDDY_PUBLIC_VISIBILITY)
+            None,
+            "VISIBILITY is the user's to set, as with Bazel's --build_metadata"
         );
     }
 
@@ -10109,6 +10106,54 @@ mod tests {
                 .map(String::as_str),
             Some("PRIVATE")
         );
+    }
+
+    #[test]
+    fn user_set_public_visibility_passes_through() {
+        // `[bes] build_metadata = VISIBILITY=PUBLIC` reaches the converter as its configured
+        // metadata, and `[buck2_metadata] VISIBILITY = PUBLIC` as the command's own.
+        for (configured, command) in [
+            (
+                vec![(BUILDBUDDY_VISIBILITY_KEY.to_owned(), "PUBLIC".to_owned())],
+                Default::default(),
+            ),
+            (
+                Vec::new(),
+                [(BUILDBUDDY_VISIBILITY_KEY.to_owned(), "PUBLIC".to_owned())]
+                    .into_iter()
+                    .collect(),
+            ),
+        ] {
+            let mut converter = BazelEventConverter::new_with_options(configured, true);
+            let event = trace_event(buck2_data::buck_event::Data::SpanStart(
+                buck2_data::SpanStartEvent {
+                    data: Some(buck2_data::span_start_event::Data::Command(
+                        buck2_data::CommandStart {
+                            metadata: command,
+                            data: Some(buck2_data::command_start::Data::Build(
+                                buck2_data::BuildCommandStart {},
+                            )),
+                            ..Default::default()
+                        },
+                    )),
+                },
+            ));
+            let events = converter.convert(1, &event);
+            let build_metadata = events
+                .iter()
+                .find_map(|event| match event.payload.as_ref() {
+                    Some(build_event::Payload::BuildMetadata(metadata)) => Some(metadata),
+                    _ => None,
+                })
+                .expect("build metadata");
+            assert_eq!(
+                build_metadata
+                    .metadata
+                    .get(BUILDBUDDY_VISIBILITY_KEY)
+                    .map(String::as_str),
+                Some("PUBLIC")
+            );
+        }
     }
 
     #[test]
