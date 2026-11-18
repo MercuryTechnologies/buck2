@@ -502,6 +502,8 @@ impl InvocationRecorder {
                 bazel_artifact_upload_max_bytes: 10 * 1024 * 1024,
                 #[cfg(not(fbcode_build))]
                 channel: Default::default(),
+                #[cfg(not(fbcode_build))]
+                remote_services: Default::default(),
             },
             critical_path_backend: None,
             bxl_ensure_artifacts_duration: None,
@@ -801,6 +803,8 @@ impl InvocationRecorder {
                 bazel_artifact_upload_max_bytes: 10 * 1024 * 1024,
                 #[cfg(not(fbcode_build))]
                 channel: Default::default(),
+                #[cfg(not(fbcode_build))]
+                remote_services: Default::default(),
             },
         );
         self.health_check_tags_receiver = health_check_tags_receiver;

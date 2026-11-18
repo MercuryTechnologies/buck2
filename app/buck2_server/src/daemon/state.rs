@@ -2624,6 +2624,14 @@ impl DaemonState {
             #[cfg(not(fbcode_build))]
             let re_client_cas_address = buck2_re_configuration::bes_cas_address(root_config)?;
             #[cfg(not(fbcode_build))]
+            let remote_services = {
+                let services = buck2_re_configuration::re_client_services(root_config)?;
+                remote::BesRemoteServices {
+                    remote_cache: services.remote_cache,
+                    remote_executor: services.remote_executor,
+                }
+            };
+            #[cfg(not(fbcode_build))]
             let re_client_instance_name = root_config.parse(BuckconfigKeyRef {
                 section: "buck2_re_client",
                 property: "instance_name",
@@ -2759,6 +2767,8 @@ impl DaemonState {
                     bazel_artifact_upload_max_bytes,
                     #[cfg(not(fbcode_build))]
                     channel: bes_channel,
+                    #[cfg(not(fbcode_build))]
+                    remote_services,
                 },
             )
             .buck_error_context("failed to init scribe sink")?;

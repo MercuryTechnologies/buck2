@@ -16,6 +16,8 @@ use buck2_events::sink::remote::BesChannelSettings;
 #[cfg(not(fbcode_build))]
 use buck2_events::sink::remote::BesEventFormat;
 #[cfg(not(fbcode_build))]
+use buck2_events::sink::remote::BesRemoteServices;
+#[cfg(not(fbcode_build))]
 use buck2_events::sink::remote::BesTls;
 use buck2_events::sink::remote::RemoteEventConfig;
 
@@ -37,6 +39,7 @@ struct BuckconfigBesSettings {
     bes_results_url: Option<String>,
     channel: BesChannelSettings,
     replay: buck2_re_configuration::BesReplaySettings,
+    remote_services: BesRemoteServices,
 }
 
 #[cfg(not(fbcode_build))]
@@ -81,6 +84,7 @@ pub fn with_buckconfig_overrides(
                 config.bazel_artifact_upload_max_bytes = max_bytes;
             }
             config.channel = settings.channel;
+            config.remote_services = settings.remote_services;
             if let Some(secs) = settings.replay.retry_window_secs {
                 config.retry_window = std::time::Duration::from_secs(secs);
             }
@@ -148,6 +152,7 @@ fn read_buckconfig_bes_settings(
             bes_results_url: None,
             channel: BesChannelSettings::default(),
             replay: Default::default(),
+            remote_services: BesRemoteServices::default(),
         });
     };
     let fs = paths.project_root();
@@ -173,6 +178,11 @@ fn read_buckconfig_bes_settings(
         .filter(|s| !s.is_empty())
         .map(str::to_owned);
     let re_client_cas_address = buck2_re_configuration::bes_cas_address(&root_config)?;
+    let services = buck2_re_configuration::re_client_services(&root_config)?;
+    let remote_services = BesRemoteServices {
+        remote_cache: services.remote_cache,
+        remote_executor: services.remote_executor,
+    };
 
     // `[bes] connection = re_client` reuses the remote execution client's endpoint, headers
     // and TLS identity. Explicit `backend` and `header` keys still win.
@@ -318,6 +328,7 @@ fn read_buckconfig_bes_settings(
             })?,
         },
         replay: buck2_re_configuration::BesReplaySettings::from_legacy_config(&root_config)?,
+        remote_services,
     })
 }
 
