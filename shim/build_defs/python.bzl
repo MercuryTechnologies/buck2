@@ -6,6 +6,9 @@
 # of this source tree. You may select, at your option, one of the
 # above-listed licenses.
 
+load("@shim//build_defs:python_binary.bzl", _python_binary = "python_binary")
+load("@shim//build_defs:python_library.bzl", _python_library = "python_library")
+
 # The package defaults `PACKAGE` files set with these configure Meta's Python
 # macros (type checking, opt by default, lazy imports), which open source does
 # not have.
@@ -19,3 +22,6 @@ python = struct(
     set_safer_lazy_imports = _noop,
     set_typing = _noop,
 )
+
+python_binary = _python_binary
+python_library = _python_library
