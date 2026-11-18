@@ -1,0 +1,50 @@
+load("@root//buildbuddy:defs.bzl", "buildbuddy_remote_execution_platform", "local_execution_platform")
+
+oncall("build_infra")
+
+# Namespace remote execution. Its workers are x86_64 Linux and it takes the
+# credentials from [buck2_re_client], which `nsc buck2 setup` writes; the
+# platform only has to say which OS the action wants. No local executor, so a
+# build with --remote-only proves every action ran remotely.
+buildbuddy_remote_execution_platform(
+    name = "rbe",
+    cpu_configuration = "prelude//cpu:x86_64",
+    os_configuration = "prelude//os:linux",
+    os_family = "Linux",
+    visibility = ["PUBLIC"],
+)
+
+# The same toolchains on the machine running buck2, for `.buckconfig.local-musl`:
+# an x86_64 Linux host with glibc builds both release targets below, the
+# aarch64 one as a cross-compile, with no remote execution at all.
+local_execution_platform(
+    name = "local",
+    cpu_configuration = "prelude//cpu:x86_64",
+    os_configuration = "prelude//os:linux",
+    visibility = ["PUBLIC"],
+)
+
+# Target configurations for the release binaries, both built on the x86_64
+# workers above: `--target-platforms namespace//:linux-aarch64-musl` is a
+# cross-compile. The musl constraint makes the hermetic toolchains target
+# *-unknown-linux-musl with the musl headers, so the executable is static
+# and runs on any Linux of its architecture.
+platform(
+    name = "linux-x86_64-musl",
+    constraint_values = [
+        "prelude//abi/constraints:musl",
+        "prelude//cpu/constraints:x86_64",
+        "prelude//os/constraints:linux",
+    ],
+    visibility = ["PUBLIC"],
+)
+
+platform(
+    name = "linux-aarch64-musl",
+    constraint_values = [
+        "prelude//abi/constraints:musl",
+        "prelude//cpu/constraints:arm64",
+        "prelude//os/constraints:linux",
+    ],
+    visibility = ["PUBLIC"],
+)
