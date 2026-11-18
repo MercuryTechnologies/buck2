@@ -10,7 +10,9 @@ load("@prelude//:prelude_rule.bzl", "prelude_rule")
 load("@prelude//decls:common.bzl", "buck")
 load("@prelude//decls:toolchains_common.bzl", "toolchains_common")
 load("@prelude//utils:utils.bzl", "flatten")
-load(":toolchain.bzl", "PythonBootstrapToolchainInfo")
+load(":toolchain.bzl", _PythonBootstrapToolchainInfo = "PythonBootstrapToolchainInfo")
+
+PythonBootstrapToolchainInfo = _PythonBootstrapToolchainInfo
 
 PythonBootstrapSources = provider(fields = {"srcs": provider_field(typing.Any, default = None)})
 
