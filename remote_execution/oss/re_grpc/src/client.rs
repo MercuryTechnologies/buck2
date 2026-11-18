@@ -10,6 +10,7 @@
 
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::collections::hash_map;
 use std::env::VarError;
 use std::io;
 use std::io::Cursor;
@@ -39,6 +40,7 @@ use futures::future::Future;
 use futures::stream::BoxStream;
 use futures::stream::StreamExt;
 use futures::stream::TryStreamExt;
+use hyper_util::client::legacy::connect::HttpConnector;
 use lru::LruCache;
 use prost::Message;
 use re_grpc_proto::build::bazel::remote::execution::v2::ActionResult;
@@ -94,24 +96,32 @@ use tonic::metadata;
 use tonic::metadata::MetadataKey;
 use tonic::metadata::MetadataValue;
 use tonic::service::Interceptor;
+use tonic::transport::Certificate;
 use tonic::transport::Channel;
+use tonic::transport::Endpoint;
+use tonic::transport::Identity;
+use tonic::transport::Uri;
+use tonic::transport::channel::ClientTlsConfig;
 use uuid::Uuid;
 
 use crate::error::*;
 use crate::metadata::*;
-use crate::pool::ChannelConfig;
 use crate::pool::ChannelPool;
+use crate::pool::MakeChannel;
 use crate::pool::PoolConfig;
 use crate::pool::PooledChannel;
-use crate::pool::create_channel;
 use crate::request::*;
 use crate::response::*;
+use crate::stats::CountingConnector;
 
 const DEFAULT_MAX_TOTAL_BATCH_SIZE: usize = 4 * 1000 * 1000;
 const DEFAULT_RETRIES: usize = 5;
 const GRPC_RETRY_INITIAL_DELAY_MILLIS: u64 = 100;
 const DEFAULT_RETRY_MAX_DELAY_MILLIS: u64 = 5000;
 const GRPC_RETRY_JITTER: f64 = 0.1;
+const DEFAULT_GRPC_KEEPALIVE_TIME_SECS: u64 = 30;
+const DEFAULT_GRPC_KEEPALIVE_TIMEOUT_SECS: u64 = 10;
+const DEFAULT_GRPC_KEEPALIVE_WHILE_IDLE: bool = true;
 
 fn tdigest_to(tdigest: &TDigest) -> Digest {
     Digest {
@@ -313,6 +323,91 @@ fn tany_from(any: ::prost_types::Any) -> TAny {
     }
 }
 
+async fn create_tls_config(settings: &GrpcTlsSettings) -> anyhow::Result<ClientTlsConfig> {
+    let config = match settings.tls_ca_certs.as_ref() {
+        Some(tls_ca_certs) => {
+            let tls_ca_certs =
+                substitute_env_vars(tls_ca_certs).context("Invalid `tls_ca_certs`")?;
+            let data = tokio::fs::read(&tls_ca_certs)
+                .await
+                .with_context(|| format!("Error reading `{tls_ca_certs}`"))?;
+            ClientTlsConfig::new().ca_certificate(Certificate::from_pem(data))
+        }
+        None => {
+            // We set the `tls-webpki-roots` feature so we'll get that default.
+            ClientTlsConfig::new().with_enabled_roots()
+        }
+    };
+
+    let config = match settings.tls_client_cert.as_ref() {
+        Some(tls_client_cert) => {
+            let tls_client_cert =
+                substitute_env_vars(tls_client_cert).context("Invalid `tls_client_cert`")?;
+            let data = tokio::fs::read(&tls_client_cert)
+                .await
+                .with_context(|| format!("Error reading `{tls_client_cert}`"))?;
+            config.identity(Identity::from_pem(&data, &data))
+        }
+        None => config,
+    };
+
+    Ok(config)
+}
+
+fn prepare_uri(uri: Uri, tls: Option<bool>) -> anyhow::Result<(Uri, bool)> {
+    // Now do some awkward things with the protocol. Why do we do all this? The reason is
+    // because we'd like our configuration to not be super confusing. We don't want to e.g.
+    // allow setting the address to `https://foobar`; instead we infer TLS from the source
+    // scheme and only accept schemes that are valid in GRPC naming.
+
+    // This is the GRPC spec for naming: https://github.com/grpc/grpc/blob/master/doc/naming.md
+    // Many people (including Bazel), use grpc:// and grpcs://, so we tolerate both.
+    // We also accept http:// and https:// for convenience.
+
+    let scheme_tls = match uri.scheme_str() {
+        Some("grpc") | Some("http") => Some(false),
+        Some("grpcs") | Some("https") => Some(true),
+        Some("dns") | Some("ipv4") | Some("ipv6") | None => None,
+        Some(scheme) => {
+            return Err(anyhow::anyhow!(
+                "Invalid URI scheme: `{}` for `{}` (expected one of grpc, grpcs, http, https, dns, ipv4, ipv6, or no scheme)",
+                scheme,
+                uri,
+            ));
+        }
+    };
+
+    // The `tls` option wins over the scheme, so that `grpc://` with `tls = true` uses TLS, as
+    // many configurations expect. It can't turn TLS off for a scheme that asks for it.
+    let tls = match (scheme_tls, tls) {
+        (Some(true), Some(false)) => {
+            return Err(anyhow::anyhow!(
+                "`tls = false` conflicts with the TLS scheme of `{}`",
+                uri
+            ));
+        }
+        (_, Some(tls)) => tls,
+        (scheme_tls, None) => scheme_tls.unwrap_or(true),
+    };
+
+    // And now, let's put back a proper scheme for Tonic to be happy with. First, because
+    // Tonic will blow up if we don't. Second, so we get port inference.
+    let mut parts = uri.into_parts();
+    parts.scheme = Some(if tls {
+        http::uri::Scheme::HTTPS
+    } else {
+        http::uri::Scheme::HTTP
+    });
+
+    // Is this API actually designed to be unusable? If you've got a scheme, you must
+    // have a path_and_query. I'm sure there's a good reason, so we abide:
+    if parts.path_and_query.is_none() {
+        parts.path_and_query = Some(http::uri::PathAndQuery::from_static("/"));
+    }
+
+    Ok((Uri::from_parts(parts)?, tls))
+}
+
 /// Contains information queried from the Remote Execution Capabilities service.
 pub struct RECapabilities {
     /// Largest size of a message before being uploaded using bytestream service.
@@ -402,15 +497,25 @@ pub struct REClientBuilder;
 
 impl REClientBuilder {
     pub async fn build_and_connect(opts: &Buck2OssReConfiguration) -> anyhow::Result<REClient> {
-        // Create channel config once (reads TLS files)
-        let channel_config = ChannelConfig::new(opts)
-            .await
-            .context("Failed to create channel config")?;
+        // Channels infer TLS from the address scheme, and read the TLS files the
+        // first time one needs them.
+        let tls_config = Arc::new(tokio::sync::OnceCell::new());
+        let channel_settings = GrpcChannelSettings::from_options(opts);
+        let connector = |address: &str| {
+            GrpcChannelConnector::new(
+                address.to_owned(),
+                channel_settings.clone(),
+                tls_config.clone(),
+            )
+        };
 
-        // Create a single channel for fetching capabilities. Other channels are created
-        // on-demand through the connection pool.
+        // Connect a single channel for fetching capabilities, so that an
+        // unreachable remote fails early. Other channels are created on-demand
+        // through the connection pool.
         let engine_address = opts.engine_address.as_ref().context("No engine address")?;
-        let capabilities_channel = create_channel(&channel_config, engine_address)
+        let capabilities_channel = connector(engine_address)
+            .connect()
+            .await
             .context("Error creating Capabilities channel")?;
 
         let interceptor = InjectHeadersInterceptor::new(&opts.http_headers)?;
@@ -482,6 +587,14 @@ impl REClientBuilder {
             .clone()
             .context("No action cache address")?;
 
+        // The pool makes the channels to each address with the same settings.
+        let mut make_channels: HashMap<String, MakeChannel> = HashMap::new();
+        for address in [&cas_address, engine_address, &action_cache_address] {
+            if let hash_map::Entry::Vacant(entry) = make_channels.entry(address.clone()) {
+                entry.insert(connector(address).make_channel().await?);
+            }
+        }
+
         // Create connection pool
         let min_connections = opts.min_connections.unwrap_or(1).max(1);
         let max_connections = opts.max_connections.unwrap_or(100).max(min_connections);
@@ -490,7 +603,15 @@ impl REClientBuilder {
             max_connections,
             max_concurrency_per_connection: opts.max_concurrency_per_connection.unwrap_or(100),
         };
-        let pool = ChannelPool::new(pool_config, channel_config);
+        let pool = ChannelPool::new(
+            pool_config,
+            Box::new(move |address| {
+                make_channels
+                    .get(address)
+                    .cloned()
+                    .with_context(|| format!("No channel settings for `{address}`"))
+            }),
+        );
 
         Ok(REClient::new(
             RERuntimeOpts {
@@ -618,6 +739,123 @@ impl Interceptor for InjectHeadersInterceptor {
 }
 
 type GrpcService = InterceptedService<PooledChannel, InjectHeadersInterceptor>;
+
+#[derive(Clone)]
+struct GrpcTlsSettings {
+    tls_ca_certs: Option<String>,
+    tls_client_cert: Option<String>,
+}
+
+#[derive(Clone)]
+struct GrpcChannelSettings {
+    tls: GrpcTlsSettings,
+    tls_enabled: Option<bool>,
+    grpc_keepalive_time_secs: u64,
+    grpc_keepalive_timeout_secs: u64,
+    grpc_keepalive_while_idle: bool,
+    tcp_keepalive_secs: Option<u64>,
+}
+
+impl GrpcChannelSettings {
+    fn from_options(opts: &Buck2OssReConfiguration) -> Self {
+        Self {
+            tls: GrpcTlsSettings {
+                tls_ca_certs: opts.tls_ca_certs.clone(),
+                tls_client_cert: opts.tls_client_cert.clone(),
+            },
+            tls_enabled: opts.tls,
+            grpc_keepalive_time_secs: opts
+                .grpc_keepalive_time_secs
+                .unwrap_or(DEFAULT_GRPC_KEEPALIVE_TIME_SECS),
+            grpc_keepalive_timeout_secs: opts
+                .grpc_keepalive_timeout_secs
+                .unwrap_or(DEFAULT_GRPC_KEEPALIVE_TIMEOUT_SECS),
+            grpc_keepalive_while_idle: opts
+                .grpc_keepalive_while_idle
+                .unwrap_or(DEFAULT_GRPC_KEEPALIVE_WHILE_IDLE),
+            tcp_keepalive_secs: opts.tcp_keepalive_secs,
+        }
+    }
+}
+
+#[derive(Clone)]
+struct GrpcChannelConnector {
+    address: String,
+    settings: GrpcChannelSettings,
+    tls_config: Arc<tokio::sync::OnceCell<ClientTlsConfig>>,
+}
+
+impl GrpcChannelConnector {
+    fn new(
+        address: String,
+        settings: GrpcChannelSettings,
+        tls_config: Arc<tokio::sync::OnceCell<ClientTlsConfig>>,
+    ) -> Self {
+        Self {
+            address,
+            settings,
+            tls_config,
+        }
+    }
+
+    /// The endpoint, and the address it was made from with variables substituted.
+    async fn endpoint(&self) -> anyhow::Result<(Endpoint, String)> {
+        let address = substitute_env_vars(&self.address).context("Invalid address")?;
+        let uri = address.parse().context("Invalid address")?;
+        let (uri, tls) = prepare_uri(uri, self.settings.tls_enabled).context("Invalid URI")?;
+
+        let mut endpoint = Channel::builder(uri);
+        if tls {
+            let tls_config = self
+                .tls_config
+                .get_or_try_init(|| async {
+                    create_tls_config(&self.settings.tls)
+                        .await
+                        .context("Invalid TLS config")
+                })
+                .await?
+                .clone();
+            endpoint = endpoint.tls_config(tls_config)?;
+        }
+
+        endpoint = endpoint
+            .http2_keep_alive_interval(Duration::from_secs(self.settings.grpc_keepalive_time_secs))
+            .keep_alive_timeout(Duration::from_secs(
+                self.settings.grpc_keepalive_timeout_secs,
+            ))
+            .keep_alive_while_idle(self.settings.grpc_keepalive_while_idle);
+
+        Ok((endpoint, address))
+    }
+
+    fn http_connector(&self) -> CountingConnector<HttpConnector> {
+        // Since we are creating the HttpConnector ourselves, any TCP settings
+        // need to be set here instead of on the endpoint.
+        let mut http = HttpConnector::new();
+        http.enforce_http(false);
+        if let Some(tcp_keepalive_secs) = self.settings.tcp_keepalive_secs {
+            http.set_keepalive(Some(Duration::from_secs(tcp_keepalive_secs)));
+        }
+        CountingConnector::new(http)
+    }
+
+    async fn connect(&self) -> anyhow::Result<Channel> {
+        let (endpoint, address) = self.endpoint().await?;
+        endpoint
+            .connect_with_connector(self.http_connector())
+            .await
+            .with_context(|| format!("Error connecting to `{address}`"))
+    }
+
+    /// Makes channels for the connection pool, which connect when first used.
+    async fn make_channel(&self) -> anyhow::Result<MakeChannel> {
+        let (endpoint, _) = self.endpoint().await?;
+        let connector = self.clone();
+        Ok(Arc::new(move || {
+            endpoint.connect_with_connector_lazy(connector.http_connector())
+        }))
+    }
+}
 
 #[derive(Debug, Copy, Clone)]
 enum DigestRemoteState {
@@ -4375,6 +4613,42 @@ mod tests {
         assert_eq!(substitute_env_vars_impl("foo", getter).unwrap(), "foo");
         assert_eq!(substitute_env_vars_impl("FOO", getter).unwrap(), "FOO");
         assert!(substitute_env_vars_impl("$FOO$BAZ", getter).is_err());
+    }
+
+    #[test]
+    fn prepare_uri_adds_root_path_to_bare_authority() -> anyhow::Result<()> {
+        let (uri, tls) = prepare_uri("remote.buildbuddy.io".parse()?, None)?;
+        assert_eq!(uri.to_string(), "https://remote.buildbuddy.io/");
+        assert!(tls);
+
+        let (uri, tls) = prepare_uri("grpc://localhost:8980".parse()?, None)?;
+        assert_eq!(uri.to_string(), "http://localhost:8980/");
+        assert!(!tls);
+
+        let (uri, tls) = prepare_uri("grpcs://remote.buildbuddy.io/cache".parse()?, None)?;
+        assert_eq!(uri.to_string(), "https://remote.buildbuddy.io/cache");
+        assert!(tls);
+
+        Ok(())
+    }
+
+    #[test]
+    fn prepare_uri_lets_the_tls_option_override_the_scheme() -> anyhow::Result<()> {
+        let (uri, tls) = prepare_uri("grpc://remote.buildbuddy.io".parse()?, Some(true))?;
+        assert_eq!(uri.to_string(), "https://remote.buildbuddy.io/");
+        assert!(tls);
+
+        let (uri, tls) = prepare_uri("localhost:8980".parse()?, Some(false))?;
+        assert_eq!(uri.to_string(), "http://localhost:8980/");
+        assert!(!tls);
+
+        let (_, tls) = prepare_uri("grpcs://remote.buildbuddy.io".parse()?, Some(true))?;
+        assert!(tls);
+
+        assert!(prepare_uri("grpcs://remote.buildbuddy.io".parse()?, Some(false)).is_err());
+        assert!(prepare_uri("https://remote.buildbuddy.io".parse()?, Some(false)).is_err());
+
+        Ok(())
     }
 
     #[test]
