@@ -13,6 +13,8 @@ use std::cell::RefMut;
 use std::fmt;
 use std::fmt::Display;
 use std::fmt::Formatter;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
 use std::time::Instant;
 
 use allocative::Allocative;
@@ -53,6 +55,31 @@ use crate::analysis::anon_promises_dyn::RunAnonPromisesAccessor;
 use crate::analysis::registry::AnalysisRegistry;
 use crate::deferred::calculation::GET_PROMISED_ARTIFACT;
 use crate::interpreter::rule_defs::plugins::AnalysisPlugins;
+
+/// Whether `declare_output` defaults `has_content_based_path` to `true`.
+/// Controlled by the `[buck2] declare_output_has_content_based_path_default` buckconfig.
+static DECLARE_OUTPUT_HAS_CONTENT_BASED_PATH_DEFAULT: AtomicBool = AtomicBool::new(false);
+
+/// Whether artifact-creating actions default `has_content_based_path` to `true` when a string
+/// name is passed as the output (i.e., the action implicitly declares the output).
+/// Controlled by the `[buck2] action_has_content_based_path_default` buckconfig.
+static ACTION_HAS_CONTENT_BASED_PATH_DEFAULT: AtomicBool = AtomicBool::new(false);
+
+pub fn set_declare_output_has_content_based_path_default(value: Option<bool>) {
+    DECLARE_OUTPUT_HAS_CONTENT_BASED_PATH_DEFAULT.store(value.unwrap_or(false), Ordering::Relaxed);
+}
+
+pub fn declare_output_has_content_based_path_default() -> bool {
+    DECLARE_OUTPUT_HAS_CONTENT_BASED_PATH_DEFAULT.load(Ordering::Relaxed)
+}
+
+pub fn set_action_has_content_based_path_default(value: Option<bool>) {
+    ACTION_HAS_CONTENT_BASED_PATH_DEFAULT.store(value.unwrap_or(false), Ordering::Relaxed);
+}
+
+pub fn action_has_content_based_path_default() -> bool {
+    ACTION_HAS_CONTENT_BASED_PATH_DEFAULT.load(Ordering::Relaxed)
+}
 
 /// Functions to allow users to interact with the Actions registry.
 ///
