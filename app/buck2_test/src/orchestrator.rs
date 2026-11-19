@@ -1568,6 +1568,7 @@ impl BuckTestOrchestrator<'_> {
                         // Whether local results are actually published is still up to
                         // the executor config (`allow_cache_uploads`).
                         allow_cache_upload: true,
+                        paths: request.paths(),
                     };
                     let _result = match executor
                         .cache_upload(
