@@ -9648,6 +9648,7 @@ dependencies = [
  "buck2_credential_helper",
  "buck2_re_configuration",
  "buck2_util",
+ "bytes",
  "dupe",
  "futures 0.3.34",
  "h2",
