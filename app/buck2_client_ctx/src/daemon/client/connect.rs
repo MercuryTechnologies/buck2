@@ -1131,8 +1131,14 @@ impl BootstrapBuckdClient {
         reason: &str,
         graceful: Duration,
     ) -> buck2_error::Result<Pid> {
-        kill::kill_with_timeout(&mut self.client, &self.info, reason, graceful, Duration::ZERO)
-            .await?;
+        kill::kill_with_timeout(
+            &mut self.client,
+            &self.info,
+            reason,
+            graceful,
+            Duration::ZERO,
+        )
+        .await?;
         Pid::from_i64(self.info.pid)
     }
 
