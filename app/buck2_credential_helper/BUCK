@@ -1,0 +1,23 @@
+load("@fbsource//tools/build_defs:rust_library.bzl", "rust_library")
+
+oncall("build_infra")
+
+rust_library(
+    name = "buck2_credential_helper",
+    srcs = glob(["src/**/*.rs"]),
+    test_deps = [
+        "fbsource//third-party/rust:tempfile",
+    ],
+    deps = [
+        "fbsource//third-party/rust:anyhow",
+        "fbsource//third-party/rust:jiff",
+        "fbsource//third-party/rust:serde",
+        "fbsource//third-party/rust:serde_json",
+        "fbsource//third-party/rust:shlex",
+        "fbsource//third-party/rust:tokio",
+        "fbsource//third-party/rust:tonic",
+        "fbsource//third-party/rust:tracing",
+        "//buck2/app/buck2_util:buck2_util",
+        "//buck2/gazebo/dupe:dupe",
+    ],
+)
