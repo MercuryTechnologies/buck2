@@ -23,6 +23,8 @@ use std::time::Duration;
 use std::time::Instant;
 
 use allocative::Allocative;
+use buck2_build_api::interpreter::rule_defs::context::set_action_has_content_based_path_default;
+use buck2_build_api::interpreter::rule_defs::context::set_declare_output_has_content_based_path_default;
 use buck2_build_api::spawner::BuckSpawner;
 use buck2_cli_proto::ClientContext;
 use buck2_cli_proto::unstable_dice_dump_request::DiceDumpFormat;
@@ -1001,6 +1003,15 @@ impl TenantState {
             format!("action-freezing-enabled:{}", action_freezing_enabled),
             format!("has-cgroup:{}", shared.memory_tracker.is_some()),
         ];
+
+        set_declare_output_has_content_based_path_default(root_config.parse(BuckconfigKeyRef {
+            section: "buck2",
+            property: "declare_output_has_content_based_path_default",
+        })?);
+        set_action_has_content_based_path_default(root_config.parse(BuckconfigKeyRef {
+            section: "buck2",
+            property: "action_has_content_based_path_default",
+        })?);
 
         let repo = Arc::new(RepoState {
             paths,

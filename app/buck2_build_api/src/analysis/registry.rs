@@ -217,7 +217,13 @@ impl<'v> AnalysisRegistry<'v> {
                     match has_content_based_path {
                         Some(true) => BuckOutPathKind::ContentHash,
                         Some(false) => BuckOutPathKind::Configuration,
-                        None => BuckOutPathKind::ContentHash,
+                        None => {
+                            if crate::interpreter::rule_defs::context::action_has_content_based_path_default() {
+                                BuckOutPathKind::ContentHash
+                            } else {
+                                BuckOutPathKind::default()
+                            }
+                        }
                     },
                     heap,
                 )?;
