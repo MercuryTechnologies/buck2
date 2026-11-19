@@ -108,20 +108,7 @@ impl EventSinkWithStats for OtelEventSink {
 
     fn stats(&self) -> EventSinkStats {
         // The exporter owns its own buffering/retry accounting; this sink keeps no counters.
-        EventSinkStats {
-            successes: 0,
-            failures_invalid_request: 0,
-            failures_unauthorized: 0,
-            failures_rate_limited: 0,
-            failures_pushed_back: 0,
-            failures_enqueue_failed: 0,
-            failures_internal_error: 0,
-            failures_timed_out: 0,
-            failures_unknown: 0,
-            buffered: 0,
-            dropped: 0,
-            bytes_written: 0,
-        }
+        EventSinkStats::default()
     }
 }
 
