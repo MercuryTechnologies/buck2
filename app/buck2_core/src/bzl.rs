@@ -81,7 +81,7 @@ impl ImportPath {
 
     pub fn new_with_build_file_cells(
         path: CellPath,
-        build_file_cell: BuildFileCell,
+        _build_file_cell: BuildFileCell,
     ) -> buck2_error::Result<Self> {
         if path.parent().is_none() {
             return Err(ImportPathError::Invalid(path).into());
@@ -95,6 +95,9 @@ impl ImportPath {
             return Err(ImportPathError::Suffix(path).into());
         }
 
+        // Cell segmentation is off: a .bzl file is one module whatever cell's build file loads
+        // it, so a transitive set type it declares is the same type through every cell alias.
+        let build_file_cell = BuildFileCell::new(path.cell());
         Ok(Self {
             path,
             build_file_cell,
@@ -109,7 +112,7 @@ impl ImportPath {
     /// Do not include the ?as=toml hint as part of the path.
     pub fn new_with_explicit_format(
         path: CellPath,
-        build_file_cell: BuildFileCell,
+        _build_file_cell: BuildFileCell,
         format: ImportFormat,
     ) -> buck2_error::Result<Self> {
         if path.parent().is_none() {
@@ -120,6 +123,9 @@ impl ImportPath {
             return Err(ImportPathError::Invalid(path).into());
         }
 
+        // Cell segmentation is off: a .bzl file is one module whatever cell's build file loads
+        // it, so a transitive set type it declares is the same type through every cell alias.
+        let build_file_cell = BuildFileCell::new(path.cell());
         Ok(Self {
             path,
             build_file_cell,
@@ -138,7 +144,7 @@ impl ImportPath {
     /// LSP creates imports for non-bzl files.
     pub fn new_hack_for_lsp(
         path: CellPath,
-        build_file_cell: BuildFileCell,
+        _build_file_cell: BuildFileCell,
     ) -> buck2_error::Result<Self> {
         if path.parent().is_none() {
             return Err(ImportPathError::Invalid(path).into());
@@ -148,6 +154,9 @@ impl ImportPath {
             return Err(ImportPathError::Invalid(path).into());
         }
 
+        // Cell segmentation is off: a .bzl file is one module whatever cell's build file loads
+        // it, so a transitive set type it declares is the same type through every cell alias.
+        let build_file_cell = BuildFileCell::new(path.cell());
         Ok(Self {
             path,
             build_file_cell,
