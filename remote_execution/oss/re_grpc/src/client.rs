@@ -1778,7 +1778,7 @@ impl Interceptor for InjectHeadersInterceptor {
 struct RequestHeaders {
     interceptor: InjectHeadersInterceptor,
     credential_helper: Option<Arc<CredentialHelper>>,
-    tls_enabled: Option<bool>,
+    tls_enabled: bool,
 }
 
 impl RequestHeaders {
@@ -1790,7 +1790,7 @@ impl RequestHeaders {
         };
         let address = substitute_env_vars(address).context("Invalid address")?;
         let uri = address.parse().context("Invalid address")?;
-        let (uri, _tls) = prepare_uri(uri, self.tls_enabled).context("Invalid URI")?;
+        let uri = crate::pool::prepare_uri(uri, self.tls_enabled).context("Invalid URI")?;
         Ok(self
             .interceptor
             .with_credentials(Some(helper.get(&uri.to_string()).await?)))
@@ -5791,7 +5791,7 @@ mod tests {
             cas_address: Some(address.clone()),
             engine_address: Some(address.clone()),
             action_cache_address: Some(address),
-            tls: Some(false),
+            tls: false,
             capabilities: Some(false),
             retries: Some(0),
             credential_helper: Some(format!("/bin/sh {}", script.display())),
@@ -5854,7 +5854,7 @@ mod tests {
             cas_address: Some(address.clone()),
             engine_address: Some(address.clone()),
             action_cache_address: Some(address),
-            tls: Some(false),
+            tls: false,
             capabilities: Some(false),
             retries: Some(0),
             credential_helper: Some(format!("/bin/sh {}", script.display())),
@@ -6002,7 +6002,7 @@ mod tests {
             cas_address: Some(address.clone()),
             engine_address: Some(address.clone()),
             action_cache_address: Some(address),
-            tls: Some(false),
+            tls: false,
             capabilities: Some(false),
             retries: Some(0),
             credential_helper: Some(format!("/bin/sh {}", script.display())),
@@ -6027,7 +6027,7 @@ mod tests {
             cas_address: Some(address.clone()),
             engine_address: Some(address.clone()),
             action_cache_address: Some(address),
-            tls: Some(false),
+            tls: false,
             capabilities: Some(false),
             retries: Some(3),
             ..Default::default()

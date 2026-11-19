@@ -135,7 +135,7 @@ impl ChannelConfig {
     }
 }
 
-fn prepare_uri(uri: Uri, tls: bool) -> anyhow::Result<Uri> {
+pub(crate) fn prepare_uri(uri: Uri, tls: bool) -> anyhow::Result<Uri> {
     // Now do some awkward things with the protocol. Why do we do all this? The reason is
     // because we'd like our configuration to not be super confusing. We don't want to e.g.
     // allow setting the address to `https://foobar` without enabling TLS (or enabling tls
