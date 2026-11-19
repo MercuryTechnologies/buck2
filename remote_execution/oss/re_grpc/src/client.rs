@@ -31,6 +31,9 @@ use async_compression::tokio::bufread::DeflateDecoder;
 use async_compression::tokio::bufread::DeflateEncoder;
 use async_compression::tokio::bufread::ZstdDecoder;
 use async_compression::tokio::bufread::ZstdEncoder;
+use buck2_credential_helper::CredentialHelper;
+use buck2_credential_helper::CredentialHelperSettings;
+use buck2_credential_helper::Credentials;
 use buck2_re_configuration::Buck2OssReConfiguration;
 use buck2_re_configuration::HttpHeader;
 use dupe::Dupe;
@@ -675,34 +678,66 @@ where
     Fut: Future<Output = anyhow::Result<T>>,
     F: FnMut() -> Fut,
 {
-    retry_grpc_request_with_reconnect(retries, retry_max_delay, request, || async {}).await
+    retry_grpc_request_with_recovery(retries, retry_max_delay, request, |_| async { false }).await
 }
 
-async fn retry_grpc_request_with_reconnect<T, Fut, F, RFut, R>(
+/// What a failed attempt asks of the client before the next one.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+enum Recovery {
+    None,
+    Reconnect,
+    RefreshCredentials,
+}
+
+fn recovery_for_error(err: &anyhow::Error) -> Recovery {
+    if is_broken_connection_error(err) {
+        Recovery::Reconnect
+    } else if error_tcode(err) == Some(TCode::UNAUTHENTICATED) {
+        Recovery::RefreshCredentials
+    } else {
+        Recovery::None
+    }
+}
+
+/// `recover` is asked to reconnect after a broken connection, as before, and to refresh
+/// credentials after UNAUTHENTICATED. A refresh it confirms is followed by one attempt at once,
+/// outside the retry budget and the code's retry policy, and only once per call: a remote that
+/// rejects the refreshed credentials too fails the call instead of running the helper in a loop.
+async fn retry_grpc_request_with_recovery<T, Fut, F, RFut, R>(
     retries: usize,
     retry_max_delay: Duration,
     mut request: F,
-    mut reconnect: R,
+    mut recover: R,
 ) -> anyhow::Result<T>
 where
     Fut: Future<Output = anyhow::Result<T>>,
     F: FnMut() -> Fut,
-    RFut: Future<Output = ()>,
-    R: FnMut() -> RFut,
+    RFut: Future<Output = bool>,
+    R: FnMut(Recovery) -> RFut,
 {
     let mut retry_attempt = 0usize;
     let mut next_delay = Duration::from_millis(GRPC_RETRY_INITIAL_DELAY_MILLIS);
+    let mut credentials_refreshed = false;
 
     loop {
         match request().await {
             Ok(response) => return Ok(response),
             Err(err) => {
+                let recovery = recovery_for_error(&err);
+                if recovery == Recovery::RefreshCredentials
+                    && !credentials_refreshed
+                    && recover(recovery).await
+                {
+                    credentials_refreshed = true;
+                    continue;
+                }
+
                 if retry_attempt >= retries || !is_retryable_grpc_error(&err) {
                     return Err(normalize_grpc_error(err));
                 }
 
-                if is_broken_connection_error(&err) {
-                    reconnect().await;
+                if recovery == Recovery::Reconnect {
+                    recover(recovery).await;
                 }
 
                 let delay = grpc_error_retry_delay(&err)
@@ -733,11 +768,9 @@ where
     Fut: Future<Output = anyhow::Result<T>>,
     F: FnMut() -> Fut,
 {
-    retry_grpc_request_with_reconnect(retries, retry_max_delay, request, || {
+    retry_grpc_request_with_recovery(retries, retry_max_delay, request, |recovery| {
         let grpc_clients = grpc_clients.clone();
-        async move {
-            grpc_clients.reconnect_after_broken_connection(kind).await;
-        }
+        async move { grpc_clients.recover(kind, recovery).await }
     })
     .await
 }
@@ -1343,10 +1376,23 @@ impl REClientBuilder {
         let capabilities_channel = create_channel(&channel_config, engine_address)
             .context("Error creating Capabilities channel")?;
 
-        let interceptor = InjectHeadersInterceptor::new(&opts.http_headers)?;
+        let headers = RequestHeaders {
+            interceptor: InjectHeadersInterceptor::new(&opts.http_headers)?,
+            credential_helper: CredentialHelperSettings::from_options(
+                opts.credential_helper.as_deref(),
+                opts.credential_helper_timeout_secs,
+                opts.credential_helper_cache_secs,
+            )
+            .map(|settings| settings.build())
+            .transpose()?
+            .map(Arc::new),
+            tls_enabled: opts.tls,
+        };
 
-        let mut capabilities_client =
-            CapabilitiesClient::with_interceptor(capabilities_channel, interceptor.dupe());
+        let mut capabilities_client = CapabilitiesClient::with_interceptor(
+            capabilities_channel,
+            headers.interceptor_for(engine_address).await?,
+        );
 
         if let Some(max_decoding_message_size) = opts.max_decoding_message_size {
             capabilities_client =
@@ -1474,7 +1520,7 @@ impl REClientBuilder {
             cas_address,
             engine_address: engine_address.clone(),
             action_cache_address,
-            interceptor,
+            headers,
             max_decoding_message_size: max_decoding_msg_size,
         };
 
@@ -1641,7 +1687,10 @@ impl REClientBuilder {
 
 #[derive(Clone, Dupe)]
 struct InjectHeadersInterceptor {
+    /// Static headers from the configuration.
     headers: Arc<Vec<(MetadataKey<metadata::Ascii>, MetadataValue<metadata::Ascii>)>>,
+    /// Headers from the credential helper, which take precedence over the static ones.
+    credentials: Option<Arc<Credentials>>,
 }
 
 impl InjectHeadersInterceptor {
@@ -1668,7 +1717,16 @@ impl InjectHeadersInterceptor {
 
         Ok(Self {
             headers: Arc::new(headers),
+            credentials: None,
         })
+    }
+
+    /// An interceptor that also injects the headers of `credentials`, if any.
+    fn with_credentials(&self, credentials: Option<Arc<Credentials>>) -> Self {
+        Self {
+            headers: self.headers.dupe(),
+            credentials,
+        }
     }
 }
 
@@ -1680,7 +1738,44 @@ impl Interceptor for InjectHeadersInterceptor {
         for (k, v) in self.headers.iter() {
             request.metadata_mut().insert(k.clone(), v.clone());
         }
+        if let Some(credentials) = &self.credentials {
+            let metadata = request.metadata_mut();
+            // A header from the helper replaces a static header of the same name, but a helper
+            // header with several values keeps all of them.
+            for (k, _) in credentials.headers() {
+                metadata.remove(k.clone());
+            }
+            for (k, v) in credentials.headers() {
+                metadata.append(k.clone(), v.clone());
+            }
+        }
         Ok(request)
+    }
+}
+
+/// The headers every RE request carries: the configured ones, and the credential helper's for
+/// the address the request goes to. Pooled channels outlive credentials, so the helper is asked
+/// each time a client is made for a request, and answers from its cache until they expire.
+#[derive(Clone)]
+struct RequestHeaders {
+    interceptor: InjectHeadersInterceptor,
+    credential_helper: Option<Arc<CredentialHelper>>,
+    tls_enabled: Option<bool>,
+}
+
+impl RequestHeaders {
+    /// The helper is asked for the address with the scheme its TLS setting implies,
+    /// `https://host:port/`, which is what a helper written for Bazel keys its answers on.
+    async fn interceptor_for(&self, address: &str) -> anyhow::Result<InjectHeadersInterceptor> {
+        let Some(helper) = &self.credential_helper else {
+            return Ok(self.interceptor.dupe());
+        };
+        let address = substitute_env_vars(address).context("Invalid address")?;
+        let uri = address.parse().context("Invalid address")?;
+        let (uri, _tls) = prepare_uri(uri, self.tls_enabled).context("Invalid URI")?;
+        Ok(self
+            .interceptor
+            .with_credentials(Some(helper.get(&uri.to_string()).await?)))
     }
 }
 
@@ -1725,7 +1820,7 @@ pub struct GRPCClients {
     cas_address: String,
     engine_address: String,
     action_cache_address: String,
-    interceptor: InjectHeadersInterceptor,
+    headers: RequestHeaders,
     max_decoding_message_size: usize,
 }
 
@@ -1744,7 +1839,9 @@ impl GRPCClients {
     async fn cas_client(&self) -> anyhow::Result<ContentAddressableStorageClient<GrpcService>> {
         Ok(build_cas_client(
             self.channel(GrpcClientKind::Cas).await?,
-            self.interceptor.dupe(),
+            self.headers
+                .interceptor_for(self.address(GrpcClientKind::Cas))
+                .await?,
             self.max_decoding_message_size,
         ))
     }
@@ -1752,7 +1849,9 @@ impl GRPCClients {
     async fn action_cache_client(&self) -> anyhow::Result<ActionCacheClient<GrpcService>> {
         Ok(build_action_cache_client(
             self.channel(GrpcClientKind::ActionCache).await?,
-            self.interceptor.dupe(),
+            self.headers
+                .interceptor_for(self.address(GrpcClientKind::ActionCache))
+                .await?,
             self.max_decoding_message_size,
         ))
     }
@@ -1760,7 +1859,9 @@ impl GRPCClients {
     async fn bytestream_client(&self) -> anyhow::Result<ByteStreamClient<GrpcService>> {
         Ok(build_bytestream_client(
             self.channel(GrpcClientKind::ByteStream).await?,
-            self.interceptor.dupe(),
+            self.headers
+                .interceptor_for(self.address(GrpcClientKind::ByteStream))
+                .await?,
             self.max_decoding_message_size,
         ))
     }
@@ -1770,6 +1871,24 @@ impl GRPCClients {
     async fn reconnect_after_broken_connection(&self, kind: GrpcClientKind) {
         self.pool.reset(self.address(kind)).await;
         tracing::debug!(?kind, "Reconnected gRPC client after transport failure");
+    }
+
+    /// True when the next attempt will carry different credentials.
+    async fn recover(&self, kind: GrpcClientKind, recovery: Recovery) -> bool {
+        match recovery {
+            Recovery::None => false,
+            Recovery::Reconnect => {
+                self.reconnect_after_broken_connection(kind).await;
+                false
+            }
+            Recovery::RefreshCredentials => match &self.headers.credential_helper {
+                Some(helper) => {
+                    helper.invalidate().await;
+                    true
+                }
+                None => false,
+            },
+        }
     }
 }
 
@@ -2041,12 +2160,12 @@ const MAX_EXECUTION_RETRIES: u32 = 5;
 async fn execution_client_for(
     pool: &ChannelPool,
     engine_address: &str,
-    interceptor: &InjectHeadersInterceptor,
+    headers: &RequestHeaders,
 ) -> anyhow::Result<ExecutionClient<GrpcService>> {
     let channel = pool.get(engine_address).await?;
     Ok(ExecutionClient::new(InterceptedService::new(
         channel,
-        interceptor.dupe(),
+        headers.interceptor_for(engine_address).await?,
     )))
 }
 
@@ -2547,7 +2666,7 @@ impl REClient {
             .unwrap_or_default();
 
         let pool = self.grpc_clients.pool.dupe();
-        let interceptor = self.grpc_clients.interceptor.dupe();
+        let headers = self.grpc_clients.headers.clone();
         let engine_address = self.grpc_clients.engine_address.clone();
         let use_fbcode_metadata = self.runtime_opts.use_fbcode_metadata;
         let request = GExecuteRequest {
@@ -2565,13 +2684,13 @@ impl REClient {
         let owned_metadata = metadata.clone();
         let open = move |resume: Option<String>| {
             let pool = pool.dupe();
-            let interceptor = interceptor.dupe();
+            let headers = headers.clone();
             let engine_address = engine_address.clone();
             let metadata = owned_metadata.clone();
             let request = request.clone();
 
             async move {
-                let mut client = execution_client_for(&pool, &engine_address, &interceptor).await?;
+                let mut client = execution_client_for(&pool, &engine_address, &headers).await?;
 
                 let stream = match resume {
                     Some(name) => client
@@ -4361,8 +4480,11 @@ mod tests {
 
     use futures::FutureExt;
     use re_grpc_proto::build::bazel::remote::execution::v2::ActionCacheUpdateCapabilities;
+    use re_grpc_proto::build::bazel::remote::execution::v2::action_cache_server::ActionCache;
+    use re_grpc_proto::build::bazel::remote::execution::v2::action_cache_server::ActionCacheServer;
     use re_grpc_proto::build::bazel::remote::execution::v2::batch_read_blobs_response;
     use re_grpc_proto::build::bazel::remote::execution::v2::batch_update_blobs_response;
+    use tokio_stream::wrappers::TcpListenerStream;
 
     use super::*;
 
@@ -5494,6 +5616,252 @@ mod tests {
         assert!(is_retryable_grpc_error(&err));
         let err = anyhow::Error::from(io::Error::from(io::ErrorKind::PermissionDenied));
         assert!(!is_retryable_grpc_error(&err));
+    }
+
+    #[tokio::test]
+    async fn retry_grpc_request_retries_once_after_credentials_are_refreshed() {
+        let attempts = AtomicU16::new(0);
+        let result: anyhow::Result<()> = retry_grpc_request_with_recovery(
+            0,
+            Duration::from_millis(1),
+            || async {
+                attempts.fetch_add(1, Ordering::Relaxed);
+                Err(anyhow::Error::from(tonic::Status::unauthenticated(
+                    "token expired",
+                )))
+            },
+            |recovery| {
+                assert_eq!(recovery, Recovery::RefreshCredentials);
+                async { true }
+            },
+        )
+        .await;
+
+        let err = result.unwrap_err();
+        let err = err.downcast_ref::<REClientError>().expect("REClientError");
+        assert_eq!(err.code, TCode::UNAUTHENTICATED);
+        assert_eq!(attempts.load(Ordering::Relaxed), 2);
+
+        let attempts = AtomicU16::new(0);
+        retry_grpc_request_with_recovery(
+            0,
+            Duration::from_millis(1),
+            || async {
+                if attempts.fetch_add(1, Ordering::Relaxed) == 0 {
+                    Err(anyhow::Error::from(tonic::Status::unauthenticated(
+                        "token expired",
+                    )))
+                } else {
+                    Ok(())
+                }
+            },
+            |_| async { true },
+        )
+        .await
+        .unwrap();
+        assert_eq!(attempts.load(Ordering::Relaxed), 2);
+    }
+
+    #[tokio::test]
+    async fn retry_grpc_request_does_not_retry_unauthenticated_without_a_helper() {
+        let attempts = AtomicU16::new(0);
+        let result: anyhow::Result<()> =
+            retry_grpc_request(3, Duration::from_millis(1), || async {
+                attempts.fetch_add(1, Ordering::Relaxed);
+                Err(anyhow::Error::from(tonic::Status::unauthenticated(
+                    "token expired",
+                )))
+            })
+            .await;
+
+        let err = result.unwrap_err();
+        let err = err.downcast_ref::<REClientError>().expect("REClientError");
+        assert_eq!(err.code, TCode::UNAUTHENTICATED);
+        assert_eq!(attempts.load(Ordering::Relaxed), 1);
+    }
+
+    struct FakeActionCacheState {
+        expected_token: Mutex<String>,
+        seen_tokens: Mutex<Vec<String>>,
+        hold_next: AtomicBool,
+        arrived: tokio::sync::Notify,
+        release: tokio::sync::Notify,
+    }
+
+    struct FakeActionCache(Arc<FakeActionCacheState>);
+
+    #[tonic::async_trait]
+    impl ActionCache for FakeActionCache {
+        async fn get_action_result(
+            &self,
+            request: tonic::Request<GetActionResultRequest>,
+        ) -> Result<tonic::Response<ActionResult>, tonic::Status> {
+            let state = &self.0;
+            let token = request
+                .metadata()
+                .get("authorization")
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or_default()
+                .to_owned();
+            state.seen_tokens.lock().unwrap().push(token.clone());
+            state.arrived.notify_one();
+            if token != *state.expected_token.lock().unwrap() {
+                return Err(tonic::Status::unauthenticated("bad token"));
+            }
+            if state.hold_next.swap(false, Ordering::SeqCst) {
+                state.release.notified().await;
+            }
+            Ok(tonic::Response::new(ActionResult {
+                execution_metadata: Some(ExecutedActionMetadata::default()),
+                ..Default::default()
+            }))
+        }
+
+        async fn update_action_result(
+            &self,
+            _request: tonic::Request<UpdateActionResultRequest>,
+        ) -> Result<tonic::Response<ActionResult>, tonic::Status> {
+            Err(tonic::Status::unimplemented("not used by this test"))
+        }
+    }
+
+    fn action_result_request() -> ActionResultRequest {
+        ActionResultRequest {
+            digest: TDigest {
+                hash: "ab".repeat(32),
+                size_in_bytes: 1,
+                _dot_dot: (),
+            },
+            platform: None,
+            _dot_dot: (),
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn get_action_result_refreshes_credentials_from_the_helper() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let token_file = dir.path().join("token");
+        std::fs::write(&token_file, "one")?;
+        // Run through `sh`, as the helper crate's tests do, so a concurrent test writing its
+        // own script never makes this exec fail with "text file busy".
+        let script = dir.path().join("helper.sh");
+        std::fs::write(
+            &script,
+            format!(
+                "[ \"$1\" = get ] || exit 3\nprintf '{{\"headers\": {{\"authorization\": [\"Bearer %s\"]}}}}' \"$(cat {})\"\n",
+                token_file.display()
+            ),
+        )?;
+
+        let state = Arc::new(FakeActionCacheState {
+            expected_token: Mutex::new("Bearer one".to_owned()),
+            seen_tokens: Mutex::new(Vec::new()),
+            hold_next: AtomicBool::new(false),
+            arrived: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let address = format!("grpc://{}", listener.local_addr()?);
+        let server = tokio::spawn(
+            tonic::transport::Server::builder()
+                .add_service(ActionCacheServer::new(FakeActionCache(state.clone())))
+                .serve_with_incoming(TcpListenerStream::new(listener)),
+        );
+
+        let opts = Buck2OssReConfiguration {
+            cas_address: Some(address.clone()),
+            engine_address: Some(address.clone()),
+            action_cache_address: Some(address),
+            tls: Some(false),
+            capabilities: Some(false),
+            retries: Some(0),
+            credential_helper: Some(format!("/bin/sh {}", script.display())),
+            ..Default::default()
+        };
+        let client = REClientBuilder::build_and_connect(&opts).await?;
+        let metadata = RemoteExecutionMetadata::default();
+
+        state.hold_next.store(true, Ordering::SeqCst);
+        let held = client.get_action_result(&metadata, action_result_request());
+        let while_held = async {
+            state.arrived.notified().await;
+            std::fs::write(&token_file, "two")?;
+            *state.expected_token.lock().unwrap() = "Bearer two".to_owned();
+
+            client
+                .get_action_result(&metadata, action_result_request())
+                .await?;
+            assert_eq!(
+                *state.seen_tokens.lock().unwrap(),
+                ["Bearer one", "Bearer one", "Bearer two"]
+            );
+
+            state.release.notify_one();
+            anyhow::Ok(())
+        };
+        let (held, while_held) = futures::join!(held, while_held);
+        while_held?;
+        held?;
+
+        assert_eq!(state.seen_tokens.lock().unwrap().len(), 3);
+        server.abort();
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_helpers_credentials_go_out_again_after_a_reconnect() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let script = dir.path().join("helper.sh");
+        std::fs::write(
+            &script,
+            "[ \"$1\" = get ] || exit 3\nprintf '{\"headers\": {\"authorization\": [\"Bearer one\"]}}'\n",
+        )?;
+        let state = Arc::new(FakeActionCacheState {
+            expected_token: Mutex::new("Bearer one".to_owned()),
+            seen_tokens: Mutex::new(Vec::new()),
+            hold_next: AtomicBool::new(false),
+            arrived: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let address = format!("grpc://{}", listener.local_addr()?);
+        let server = tokio::spawn(
+            tonic::transport::Server::builder()
+                .add_service(ActionCacheServer::new(FakeActionCache(state.clone())))
+                .serve_with_incoming(TcpListenerStream::new(listener)),
+        );
+        let opts = Buck2OssReConfiguration {
+            cas_address: Some(address.clone()),
+            engine_address: Some(address.clone()),
+            action_cache_address: Some(address),
+            tls: Some(false),
+            capabilities: Some(false),
+            retries: Some(0),
+            credential_helper: Some(format!("/bin/sh {}", script.display())),
+            ..Default::default()
+        };
+        let client = REClientBuilder::build_and_connect(&opts).await?;
+        let metadata = RemoteExecutionMetadata::default();
+
+        client
+            .get_action_result(&metadata, action_result_request())
+            .await?;
+        client
+            .grpc_clients
+            .reconnect_after_broken_connection(GrpcClientKind::ActionCache)
+            .await;
+        client
+            .get_action_result(&metadata, action_result_request())
+            .await?;
+
+        assert_eq!(
+            *state.seen_tokens.lock().unwrap(),
+            ["Bearer one", "Bearer one"]
+        );
+        server.abort();
+        Ok(())
     }
 
     #[tokio::test]

@@ -2203,6 +2203,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "buck2_credential_helper"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "buck2_util",
+ "dupe",
+ "jiff",
+ "serde",
+ "serde_json",
+ "shlex",
+ "tempfile",
+ "tokio",
+ "tonic",
+ "tracing",
+]
+
+[[package]]
 name = "buck2_critical_path"
 version = "0.1.0"
 dependencies = [
@@ -3308,6 +3325,7 @@ dependencies = [
  "allocative",
  "buck2_common",
  "buck2_core",
+ "buck2_credential_helper",
  "buck2_error",
 ]
 
@@ -9627,6 +9645,7 @@ dependencies = [
  "anyhow",
  "async-compression",
  "blake3",
+ "buck2_credential_helper",
  "buck2_re_configuration",
  "buck2_util",
  "dupe",
@@ -9649,6 +9668,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.21",
  "tokio",
+ "tokio-stream",
  "tokio-util 0.7.20",
  "tonic",
  "tower",
