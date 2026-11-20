@@ -97,8 +97,8 @@ mod tests {
     #[test]
     fn test_spec_value_wins_over_default() {
         let env = build_test_env(vec![(
-                 "LC_CTYPE".to_owned(),
-                 ExternalRunnerSpecValue::Verbatim("from-spec".to_owned()),
+            "LC_CTYPE".to_owned(),
+            ExternalRunnerSpecValue::Verbatim("from-spec".to_owned()),
         )]);
         assert_eq!(lc_ctype(&env), Some("from-spec"));
     }
