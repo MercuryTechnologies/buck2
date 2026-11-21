@@ -387,6 +387,7 @@ impl RemoteExecutionClient {
         meta_internal_extra_params: &MetaInternalExtraParams,
         worker_tool_action_digest: Option<ActionDigest>,
         priority: Option<i32>,
+        uncached_action: Option<&crate::execute::prepared::UncachedAction>,
     ) -> buck2_error::Result<ExecuteResponseOrCancelled> {
         self.data
             .executes
@@ -406,6 +407,7 @@ impl RemoteExecutionClient {
                 meta_internal_extra_params,
                 worker_tool_action_digest,
                 priority,
+                uncached_action,
             ))
             .await
     }
@@ -1642,6 +1644,7 @@ impl RemoteExecutionClientImpl {
         meta_internal_extra_params: &MetaInternalExtraParams,
         worker_tool_action_digest: Option<ActionDigest>,
         priority: Option<i32>,
+        uncached_action: Option<&crate::execute::prepared::UncachedAction>,
     ) -> buck2_error::Result<ExecuteResponseOrCancelled> {
         let _exec_permit = self.exec_semaphore.acquire().await;
 
@@ -1686,6 +1689,10 @@ impl RemoteExecutionClientImpl {
         };
 
         let request = ExecuteRequest {
+            uncached_action: uncached_action.map(|uncached| remote_execution::UncachedAction {
+                action_digest: uncached.digest.to_re(),
+                action: uncached.blob.clone(),
+            }),
             skip_cache_lookup: self.skip_remote_cache
                 || skip_cache_read
                 || induced_cache_miss.is_some(),

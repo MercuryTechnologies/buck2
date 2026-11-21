@@ -223,6 +223,9 @@ pub struct RERuntimeOpts {
     batch_compression_threshold: usize,
     /// How long an operation may stay QUEUED before its action is executed again; None is off.
     queued_operation_timeout: Option<Duration>,
+    /// How long a claimed operation may go without news before its action is executed once
+    /// more, uncached; None is off.
+    stalled_operation_timeout: Option<Duration>,
 }
 
 struct InstanceName(Option<String>);
@@ -400,6 +403,13 @@ impl REClientBuilder {
                 queued_operation_timeout: match opts
                     .queued_operation_timeout_secs
                     .unwrap_or(DEFAULT_QUEUED_OPERATION_TIMEOUT_SECS)
+                {
+                    0 => None,
+                    secs => Some(Duration::from_secs(secs)),
+                },
+                stalled_operation_timeout: match opts
+                    .stalled_operation_timeout_secs
+                    .unwrap_or(DEFAULT_STALLED_OPERATION_TIMEOUT_SECS)
                 {
                     0 => None,
                     secs => Some(Duration::from_secs(secs)),
@@ -977,6 +987,104 @@ where
     }
 }
 
+/// The default for [buck2_re_client] stalled_operation_timeout_secs: 10 minutes, ten of the
+/// updates BuildBuddy publishes every 60 s for a running task.
+const DEFAULT_STALLED_OPERATION_TIMEOUT_SECS: u64 = 600;
+
+/// What one attempt at an action has seen of its operation, across every stream it opens for it.
+///
+/// BuildBuddy republishes a running task's state every 60 s, each time with a new timestamp in the
+/// partial execution metadata, so a claimed operation whose streams send nothing new for long has
+/// lost its task. A WaitExecution replays the last status first, so a message equal to the one
+/// before it does not count as news.
+#[derive(Default)]
+struct StallWatch {
+    queued: bool,
+    claimed: bool,
+    last: Option<Operation>,
+    last_news: Option<tokio::time::Instant>,
+    stalls: u32,
+    executed_again: bool,
+}
+
+impl StallWatch {
+    fn observe(&mut self, operation: &Operation) {
+        if self.last.as_ref() != Some(operation) {
+            self.last_news = Some(tokio::time::Instant::now());
+        }
+        let stage = operation
+            .metadata
+            .as_ref()
+            .and_then(|metadata| ExecuteOperationMetadata::decode(&metadata.value[..]).ok())
+            .and_then(|metadata| execution_stage::Value::try_from(metadata.stage).ok());
+        match stage {
+            Some(execution_stage::Value::Queued) => self.queued = true,
+            Some(execution_stage::Value::Executing | execution_stage::Value::Completed) => {
+                self.claimed = true
+            }
+            Some(execution_stage::Value::CacheCheck) if self.queued => self.claimed = true,
+            _ => {}
+        }
+        self.last = Some(operation.clone());
+    }
+
+    fn start_over(&mut self) {
+        self.queued = false;
+        self.claimed = false;
+        self.last = None;
+        self.last_news = None;
+        self.executed_again = true;
+    }
+}
+
+/// `inner`, ended with DEADLINE_EXCEEDED once its operation, claimed by an executor, has sent no
+/// news for `timeout`. An unclaimed operation has no such deadline here: the QUEUED deadline covers
+/// it.
+fn stall_watched<S>(
+    inner: S,
+    watch: Arc<std::sync::Mutex<StallWatch>>,
+    timeout: Duration,
+) -> BoxStream<'static, Result<Operation, tonic::Status>>
+where
+    S: Stream<Item = Result<Operation, tonic::Status>> + Unpin + Send + 'static,
+{
+    futures::stream::unfold(Some(inner), move |inner| {
+        let watch = watch.dupe();
+        async move {
+            let mut inner = inner?;
+            let deadline = {
+                let mut watch = watch.lock().unwrap();
+                let since = *watch
+                    .last_news
+                    .get_or_insert_with(tokio::time::Instant::now);
+                watch.claimed.then(|| since + timeout)
+            };
+            let next = match deadline {
+                Some(deadline) => match tokio::time::timeout_at(deadline, inner.next()).await {
+                    Ok(next) => next,
+                    Err(_) => {
+                        watch.lock().unwrap().stalls += 1;
+                        let status = tonic::Status::deadline_exceeded(format!(
+                            "the operation, claimed by an executor, sent nothing new for {}s",
+                            timeout.as_secs()
+                        ));
+                        return Some((Err(status), None));
+                    }
+                },
+                None => inner.next().await,
+            };
+            match next? {
+                Ok(operation) => {
+                    watch.lock().unwrap().observe(&operation);
+                    Some((Ok(operation), Some(inner)))
+                }
+                Err(status) => Some((Err(status), Some(inner))),
+            }
+        }
+    })
+    .boxed()
+}
+
 struct ExecutionStreamState<F> {
     /// Opens the message stream for the operation it is given.
     open: F,
@@ -1319,32 +1427,98 @@ impl REClient {
             ..Default::default()
         };
 
+        let uncached_action = execute_request.uncached_action.take();
+        let cas_pool = self.pool.dupe();
+        let cas_address = self.cas_address.clone();
+        let instance_name = self.instance_name.as_str().to_owned();
+        let stalled_operation_timeout = self.runtime_opts.stalled_operation_timeout;
         let owned_metadata = metadata.clone();
-        let open = move |resume: Option<String>| {
+        let open = move |resume: Option<String>, watch: Arc<std::sync::Mutex<StallWatch>>| {
             let pool = pool.dupe();
             let interceptor = interceptor.dupe();
             let engine_address = engine_address.clone();
             let metadata = owned_metadata.clone();
             let request = request.clone();
+            let uncached_action = uncached_action.clone();
+            let cas_pool = cas_pool.dupe();
+            let cas_address = cas_address.clone();
+            let instance_name = instance_name.clone();
 
             async move {
+                let (stalls, executed_again) = {
+                    let watch = watch.lock().unwrap();
+                    (watch.stalls, watch.executed_again)
+                };
+                if stalls > 1 {
+                    return Err(REClientError {
+                        code: TCode::DEADLINE_EXCEEDED,
+                        message: "the action's execution stalled again after it was executed once \
+                                  more, uncached"
+                            .to_owned(),
+                        group: TCodeReasonGroup::UNKNOWN,
+                    }
+                    .into());
+                }
+
                 let mut client = execution_client_for(&pool, &engine_address, &interceptor).await?;
 
-                let stream = match resume {
-                    Some(name) => client
-                        .wait_execution(with_re_metadata(
-                            WaitExecutionRequest { name },
+                let stream = if stalls == 1 && !executed_again {
+                    // BuildBuddy merges an Execute onto a pending execution by action digest, so
+                    // a plain re-Execute could join the stalled one; an Action with
+                    // `do_not_cache` is never merged, and is uploaded only now, when it is needed.
+                    let mut request = request.clone();
+                    request.skip_cache_lookup = true;
+                    if let Some(uncached) = &uncached_action {
+                        ContentAddressableStorageClient::new(InterceptedService::new(
+                            cas_pool.get(&cas_address).await?,
+                            interceptor.dupe(),
+                        ))
+                        .batch_update_blobs(with_re_metadata(
+                            BatchUpdateBlobsRequest {
+                                instance_name: instance_name.clone(),
+                                requests: vec![Request {
+                                    digest: Some(tdigest_to(&uncached.action_digest)),
+                                    data: uncached.action.clone(),
+                                    compressor: compressor::Value::Identity as i32,
+                                }],
+                                ..Default::default()
+                            },
                             &metadata,
                             use_fbcode_metadata,
                         ))
-                        .await?
-                        .into_inner(),
-                    None => client
+                        .await?;
+                        request.action_digest = Some(tdigest_to(&uncached.action_digest));
+                    }
+                    watch.lock().unwrap().start_over();
+                    tracing::warn!(
+                        "Executing RE action once more, with do_not_cache: its claimed operation \
+                         stalled"
+                    );
+                    client
                         .execute(with_re_metadata(request, &metadata, use_fbcode_metadata))
                         .await?
-                        .into_inner(),
+                        .into_inner()
+                } else {
+                    match resume {
+                        Some(name) => client
+                            .wait_execution(with_re_metadata(
+                                WaitExecutionRequest { name },
+                                &metadata,
+                                use_fbcode_metadata,
+                            ))
+                            .await?
+                            .into_inner(),
+                        None => client
+                            .execute(with_re_metadata(request, &metadata, use_fbcode_metadata))
+                            .await?
+                            .into_inner(),
+                    }
                 };
 
+                let stream = match stalled_operation_timeout {
+                    Some(timeout) => stall_watched(stream, watch, timeout),
+                    None => stream.boxed(),
+                };
                 anyhow::Ok(EndAtDone::new(stream))
             }
         };
@@ -1355,7 +1529,9 @@ impl REClient {
         let stream = crate::queued_deadline::with_queued_deadline(
             move || {
                 let open = open.dupe();
-                execution_progress_stream(move |resume| open(resume), cas_ttl_secs).boxed()
+                let watch = Arc::new(std::sync::Mutex::new(StallWatch::default()));
+                execution_progress_stream(move |resume| open(resume, watch.dupe()), cas_ttl_secs)
+                    .boxed()
             },
             self.runtime_opts.queued_operation_timeout,
             MAX_EXECUTION_RETRIES as usize,
@@ -2624,6 +2800,101 @@ mod tests {
         );
     }
 
+    fn staged_operation(stage: execution_stage::Value, note: &str) -> Operation {
+        Operation {
+            name: format!("operations/{note}"),
+            metadata: Some(prost_types::Any {
+                type_url: String::new(),
+                value: ExecuteOperationMetadata {
+                    stage: stage as i32,
+                    stdout_stream_name: note.to_owned(),
+                    ..Default::default()
+                }
+                .encode_to_vec(),
+            }),
+            ..Default::default()
+        }
+    }
+
+    fn watched(
+        items: Vec<Result<Operation, tonic::Status>>,
+    ) -> (
+        BoxStream<'static, Result<Operation, tonic::Status>>,
+        Arc<std::sync::Mutex<StallWatch>>,
+    ) {
+        let watch = Arc::new(std::sync::Mutex::new(StallWatch::default()));
+        let inner = futures::stream::iter(items).chain(futures::stream::pending());
+        (
+            stall_watched(inner, watch.dupe(), Duration::from_secs(600)),
+            watch,
+        )
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_claimed_operation_that_sends_nothing_new_stalls() {
+        let (mut stream, watch) = watched(vec![
+            Ok(staged_operation(execution_stage::Value::Queued, "a")),
+            Ok(staged_operation(execution_stage::Value::Executing, "b")),
+        ]);
+        assert!(stream.next().await.unwrap().is_ok());
+        assert!(stream.next().await.unwrap().is_ok());
+        let status = stream.next().await.unwrap().unwrap_err();
+        assert_eq!(status.code(), tonic::Code::DeadlineExceeded);
+        assert!(stream.next().await.is_none());
+        assert_eq!(watch.lock().unwrap().stalls, 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_unclaimed_operation_does_not_stall() {
+        let (mut stream, watch) = watched(vec![Ok(staged_operation(
+            execution_stage::Value::Queued,
+            "a",
+        ))]);
+        assert!(stream.next().await.unwrap().is_ok());
+        let waited = tokio::time::timeout(Duration::from_secs(100_000), stream.next()).await;
+        assert!(waited.is_err(), "the stream should still be waiting");
+        assert_eq!(watch.lock().unwrap().stalls, 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_repeated_message_is_not_news() {
+        let executing = staged_operation(execution_stage::Value::Executing, "b");
+        let watch = Arc::new(std::sync::Mutex::new(StallWatch::default()));
+        let (tx, rx) = futures::channel::mpsc::unbounded();
+        let mut stream = stall_watched(rx, watch.dupe(), Duration::from_secs(600));
+        tx.unbounded_send(Ok(executing.clone())).unwrap();
+        assert!(stream.next().await.unwrap().is_ok());
+        tokio::time::sleep(Duration::from_secs(400)).await;
+        tx.unbounded_send(Ok(executing)).unwrap();
+        assert!(stream.next().await.unwrap().is_ok());
+        let status = tokio::time::timeout(Duration::from_secs(201), stream.next())
+            .await
+            .expect("the repeat should not have restarted the clock")
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(status.code(), tonic::Code::DeadlineExceeded);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_new_message_restarts_the_clock() {
+        let watch = Arc::new(std::sync::Mutex::new(StallWatch::default()));
+        let (tx, rx) = futures::channel::mpsc::unbounded();
+        let mut stream = stall_watched(rx, watch.dupe(), Duration::from_secs(600));
+        tx.unbounded_send(Ok(staged_operation(execution_stage::Value::Executing, "b")))
+            .unwrap();
+        assert!(stream.next().await.unwrap().is_ok());
+        tokio::time::sleep(Duration::from_secs(400)).await;
+        tx.unbounded_send(Ok(staged_operation(execution_stage::Value::Executing, "c")))
+            .unwrap();
+        assert!(stream.next().await.unwrap().is_ok());
+        let waited = tokio::time::timeout(Duration::from_secs(500), stream.next()).await;
+        assert!(
+            waited.is_err(),
+            "a new message should have restarted the clock"
+        );
+        assert_eq!(watch.lock().unwrap().stalls, 0);
+    }
+
     fn done_op() -> Operation {
         response_op(GExecuteResponse {
             result: Some(ActionResult {
@@ -3157,6 +3428,7 @@ mod tests {
             batch_read_zstd: false,
             batch_compression_threshold: DEFAULT_BATCH_COMPRESSION_THRESHOLD,
             queued_operation_timeout: None,
+            stalled_operation_timeout: None,
         }
     }
 

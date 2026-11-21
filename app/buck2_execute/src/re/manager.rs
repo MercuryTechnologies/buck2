@@ -473,6 +473,7 @@ impl ManagedRemoteExecutionClient {
         meta_internal_extra_params: &MetaInternalExtraParams,
         worker_tool_action_digest: Option<ActionDigest>,
         priority: Option<i32>,
+        uncached_action: Option<&crate::execute::prepared::UncachedAction>,
     ) -> buck2_error::Result<ExecuteResponseOrCancelled> {
         self.lock()?
             .get()
@@ -493,6 +494,7 @@ impl ManagedRemoteExecutionClient {
                 meta_internal_extra_params,
                 worker_tool_action_digest,
                 priority,
+                uncached_action,
             )
             .await
     }

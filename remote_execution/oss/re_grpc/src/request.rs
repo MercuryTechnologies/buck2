@@ -84,9 +84,18 @@ pub struct ExtendDigestsTtlRequest {
     pub _dot_dot: (),
 }
 
+/// An action's Action encoded with `do_not_cache` set, and its digest: what RE executes instead
+/// when an execution of the action stalls, since the server never merges it with the stalled one.
+#[derive(Clone, Debug, Default)]
+pub struct UncachedAction {
+    pub action_digest: TDigest,
+    pub action: Vec<u8>,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct ExecuteRequest {
     pub action_digest: TDigest,
+    pub uncached_action: Option<UncachedAction>,
     pub skip_cache_lookup: bool,
     pub execution_policy: Option<TExecutionPolicy>,
     pub host_runtime_requirements: THostRuntimeRequirements,
