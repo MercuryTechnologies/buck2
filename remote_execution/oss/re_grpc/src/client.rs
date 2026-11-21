@@ -107,6 +107,9 @@ const DEFAULT_MAX_TOTAL_BATCH_SIZE: usize = 4 * 1000 * 1000;
 /// Default minimum `data` size before a batched blob is zstd-compressed.
 const DEFAULT_BATCH_COMPRESSION_THRESHOLD: usize = 100;
 
+/// The default for [buck2_re_client] queued_operation_timeout_secs.
+const DEFAULT_QUEUED_OPERATION_TIMEOUT_SECS: u64 = 900;
+
 fn tdigest_to(tdigest: &TDigest) -> Digest {
     Digest {
         hash: tdigest.hash.clone(),
@@ -218,6 +221,8 @@ pub struct RERuntimeOpts {
     batch_read_zstd: bool,
     /// Minimum `data` size before a batched blob is zstd-compressed in `BatchUpdateBlobs` uploads.
     batch_compression_threshold: usize,
+    /// How long an operation may stay QUEUED before its action is executed again; None is off.
+    queued_operation_timeout: Option<Duration>,
 }
 
 struct InstanceName(Option<String>);
@@ -392,6 +397,13 @@ impl REClientBuilder {
                 batch_compression_threshold: opts
                     .batch_compression_threshold_bytes
                     .unwrap_or(DEFAULT_BATCH_COMPRESSION_THRESHOLD),
+                queued_operation_timeout: match opts
+                    .queued_operation_timeout_secs
+                    .unwrap_or(DEFAULT_QUEUED_OPERATION_TIMEOUT_SECS)
+                {
+                    0 => None,
+                    secs => Some(Duration::from_secs(secs)),
+                },
             },
             capabilities,
             instance_name,
@@ -1337,8 +1349,19 @@ impl REClient {
             }
         };
 
-        let stream = execution_progress_stream(open, self.runtime_opts.cas_ttl_secs)
-            .map_err(normalize_re_error);
+        let cas_ttl_secs = self.runtime_opts.cas_ttl_secs;
+        let open = Arc::new(open);
+        let queued_digest = execute_request.action_digest.to_string();
+        let stream = crate::queued_deadline::with_queued_deadline(
+            move || {
+                let open = open.dupe();
+                execution_progress_stream(move |resume| open(resume), cas_ttl_secs).boxed()
+            },
+            self.runtime_opts.queued_operation_timeout,
+            MAX_EXECUTION_RETRIES as usize,
+            move |message| tracing::warn!("{message} (action {queued_digest})"),
+        )
+        .map_err(normalize_re_error);
 
         // We fill in the action digest a little later here. We do it this way so we don't have to
         // clone the execute_request into every future we create above.
@@ -3133,6 +3156,7 @@ mod tests {
             find_missing_blobs_batch_size: 100,
             batch_read_zstd: false,
             batch_compression_threshold: DEFAULT_BATCH_COMPRESSION_THRESHOLD,
+            queued_operation_timeout: None,
         }
     }
 
