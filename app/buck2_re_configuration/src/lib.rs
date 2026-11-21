@@ -501,6 +501,10 @@ pub struct Buck2OssReConfiguration {
     /// Minimum size in bytes of a blob's `data` before it is zstd-compressed in `BatchUpdateBlobs`
     /// uploads.
     pub batch_compression_threshold_bytes: Option<usize>,
+    /// Time in seconds an operation may stay QUEUED before its action's Execute is sent again,
+    /// beside the first, with the period doubling for each re-Execute. 0 turns it off; unset is
+    /// 900.
+    pub queued_operation_timeout_secs: Option<u64>,
     /// Maximum number of concurrent upload requests for each action.
     pub max_concurrent_uploads_per_action: Option<usize>,
     /// Maximum number of digests to ask about in a single
@@ -627,6 +631,10 @@ impl Buck2OssReConfiguration {
             batch_compression_threshold_bytes: legacy_config.parse(BuckconfigKeyRef {
                 section: BUCK2_RE_CLIENT_CFG_SECTION,
                 property: "batch_compression_threshold_bytes",
+            })?,
+            queued_operation_timeout_secs: legacy_config.parse(BuckconfigKeyRef {
+                section: BUCK2_RE_CLIENT_CFG_SECTION,
+                property: "queued_operation_timeout_secs",
             })?,
             max_concurrent_uploads_per_action: legacy_config.parse(BuckconfigKeyRef {
                 section: BUCK2_RE_CLIENT_CFG_SECTION,
