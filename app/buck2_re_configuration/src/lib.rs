@@ -535,6 +535,10 @@ pub struct Buck2OssReConfiguration {
     /// action is executed once more, as an Action the server neither merges nor caches. A second
     /// such stall fails the action. 0 turns it off; unset is 600.
     pub stalled_operation_timeout_secs: Option<u64>,
+    /// Time in seconds an Execute may wait for its response headers, which the server sends with
+    /// its first Operation, before it is sent again on a new connection, within the execution
+    /// retries. 0 turns it off; unset is 60.
+    pub execute_response_timeout_secs: Option<u64>,
 }
 
 #[derive(Clone, Debug, Default, Allocative)]
@@ -689,6 +693,10 @@ impl Buck2OssReConfiguration {
             stalled_operation_timeout_secs: legacy_config.parse(BuckconfigKeyRef {
                 section: BUCK2_RE_CLIENT_CFG_SECTION,
                 property: "stalled_operation_timeout_secs",
+            })?,
+            execute_response_timeout_secs: legacy_config.parse(BuckconfigKeyRef {
+                section: BUCK2_RE_CLIENT_CFG_SECTION,
+                property: "execute_response_timeout_secs",
             })?,
         })
     }
