@@ -30,11 +30,23 @@ use crate::execute::target::CommandExecutionTarget;
 
 pub struct PreparedAction {
     pub action_and_blobs: ActionDigestAndBlobs,
+    /// The same Action with `do_not_cache` set, encoded, and its digest, or None when the Action
+    /// has it already. RE executes this one when an execution of the action stalls: the server
+    /// merges an Execute with the stalled execution by action digest, and never merges an Action
+    /// with `do_not_cache`, so this Execute cannot join it.
+    pub uncached_action: Option<UncachedAction>,
     pub platform: RE::Platform,
     pub remote_execution_dependencies: Vec<RemoteExecutorDependency>,
     pub re_gang_workers: Vec<ReGangWorker>,
     pub worker_tool_init_action: Option<ActionDigestAndBlobs>,
     pub network_access: Option<NetworkAccess>,
+}
+
+/// An Action encoded with `do_not_cache` set, and its digest.
+#[derive(Clone, Debug)]
+pub struct UncachedAction {
+    pub digest: ActionDigest,
+    pub blob: Vec<u8>,
 }
 
 impl PreparedAction {

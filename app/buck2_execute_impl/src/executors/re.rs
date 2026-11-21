@@ -172,6 +172,7 @@ impl ReExecutor {
         re_gang_workers: &[buck2_core::execution_types::executor_config::ReGangWorker],
         meta_internal_extra_params: &MetaInternalExtraParams,
         worker_tool_action_digest: Option<ActionDigest>,
+        uncached_action: Option<&buck2_execute::execute::prepared::UncachedAction>,
     ) -> ControlFlow<CommandExecutionResult, (CommandExecutionManager, ExecuteResponseWithQueueStats)>
     {
         info!(
@@ -197,6 +198,7 @@ impl ReExecutor {
             meta_internal_extra_params,
             worker_tool_action_digest,
             self.priority,
+            uncached_action,
         );
 
         let execute_response =
@@ -376,6 +378,7 @@ impl PreparedCommandExecutor for ReExecutor {
                     re_gang_workers,
                     worker_tool_init_action,
                     network_access: _,
+                    uncached_action,
                 },
             digest_config,
         } = command;
@@ -474,6 +477,7 @@ impl PreparedCommandExecutor for ReExecutor {
                 &re_gang_workers,
                 command.request.meta_internal_extra_params(),
                 worker_tool_action_digest,
+                uncached_action.as_ref(),
             )
             .await?;
 
