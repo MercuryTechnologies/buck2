@@ -1108,6 +1108,16 @@ where
     .boxed()
 }
 
+/// Puts a retried, resumed or re-executed remote action on the console as well as in the daemon's
+/// log, since a build whose action failed after a few of them reports only the last error. The BES
+/// sink sends console warnings to the build event stream as stderr, so they show on the Build URL.
+fn warn_console(message: &str) {
+    tracing::warn!("{message}");
+    if let Some(dispatcher) = buck2_events::dispatch::get_dispatcher_opt() {
+        dispatcher.console_warning(message.to_owned());
+    }
+}
+
 /// The call an attempt's opener makes.
 #[derive(Debug, PartialEq, Eq)]
 enum ExecuteCall {
@@ -1146,6 +1156,8 @@ impl ExecuteCall {
 }
 
 struct ExecutionStreamState<F> {
+    /// The action's digest, for the console.
+    action: String,
     /// Opens the message stream for the operation it is given.
     open: F,
     /// Which operation to open a stream for: `None` starts a fresh `Execute`,
@@ -1179,6 +1191,7 @@ struct ExecutionStreamState<F> {
 /// transient failure is also started over with `Execute`, and that does spend
 /// the budget.
 fn execution_progress_stream<S, F, Fut>(
+    action: String,
     open: F,
     cas_ttl_secs: i64,
 ) -> impl Stream<Item = anyhow::Result<ExecuteWithProgressResponse>>
@@ -1188,6 +1201,7 @@ where
     Fut: Future<Output = anyhow::Result<S>>,
 {
     let state = ExecutionStreamState {
+        action,
         open,
         operation: None,
         retries_left: MAX_EXECUTION_RETRIES,
@@ -1331,13 +1345,18 @@ impl<F> ExecutionStreamState<F> {
 
         let sleep_for = delay_with_jitter(self.delay);
         self.delay = (self.delay * 2).min(MAX_DELAY);
-        tracing::warn!(
-            "Remote execution failed (retry {}/{}), retrying in {:?}: {:#}",
+        let next = match &self.operation {
+            Some(operation) => format!("resuming operation `{operation}` with WaitExecution"),
+            None => "executing it again".to_owned(),
+        };
+        warn_console(&format!(
+            "Remote execution of action {} failed (retry {}/{}), {next} in {:?}: {:#}",
+            self.action,
             MAX_EXECUTION_RETRIES - self.retries_left,
             MAX_EXECUTION_RETRIES,
             sleep_for,
             err
-        );
+        ));
         tokio::time::sleep(sleep_for).await;
         Ok(())
     }
@@ -1494,7 +1513,10 @@ impl REClient {
         let stalled_operation_timeout = self.runtime_opts.stalled_operation_timeout;
         let execute_response_timeout = self.runtime_opts.execute_response_timeout;
         let owned_metadata = metadata.clone();
+        let action = execute_request.action_digest.to_string();
+        let open_action = action.clone();
         let open = move |resume: Option<String>, watch: Arc<std::sync::Mutex<StallWatch>>| {
+            let action = open_action.clone();
             let pool = pool.dupe();
             let interceptor = interceptor.dupe();
             let engine_address = engine_address.clone();
@@ -1573,15 +1595,15 @@ impl REClient {
                         match call {
                             ExecuteCall::AfterStall => {
                                 watch.lock().unwrap().start_over();
-                                tracing::warn!(
-                                    "Executing RE action once more, with do_not_cache: its \
-                                     claimed operation stalled"
-                                );
+                                warn_console(&format!(
+                                    "Executing RE action {action} once more, with do_not_cache: \
+                                     its claimed operation stalled"
+                                ));
                             }
-                            ExecuteCall::Uncached if uncached.is_some() => tracing::warn!(
-                                "Executing RE action again with do_not_cache set, since the \
-                                 server named no operation for it"
-                            ),
+                            ExecuteCall::Uncached if uncached.is_some() => warn_console(&format!(
+                                "Executing RE action {action} again with do_not_cache set, \
+                                     since the server named no operation for it"
+                            )),
                             _ => {}
                         }
                         let execute = client.execute(with_re_metadata(
@@ -1615,17 +1637,21 @@ impl REClient {
 
         let cas_ttl_secs = self.runtime_opts.cas_ttl_secs;
         let open = Arc::new(open);
-        let queued_digest = execute_request.action_digest.to_string();
+        let queued_digest = action.clone();
         let stream = crate::queued_deadline::with_queued_deadline(
             move || {
                 let open = open.dupe();
                 let watch = Arc::new(std::sync::Mutex::new(StallWatch::default()));
-                execution_progress_stream(move |resume| open(resume, watch.dupe()), cas_ttl_secs)
-                    .boxed()
+                execution_progress_stream(
+                    action.clone(),
+                    move |resume| open(resume, watch.dupe()),
+                    cas_ttl_secs,
+                )
+                .boxed()
             },
             self.runtime_opts.queued_operation_timeout,
             MAX_EXECUTION_RETRIES as usize,
-            move |message| tracing::warn!("{message} (action {queued_digest})"),
+            move |message| warn_console(&format!("{message} (action {queued_digest})")),
         )
         .map_err(normalize_re_error);
 
@@ -3120,7 +3146,9 @@ mod tests {
             }
         };
 
-        let events = execution_progress_stream(open, 0).collect().await;
+        let events = execution_progress_stream("test-action".to_owned(), open, 0)
+            .collect()
+            .await;
         let calls = calls.lock().unwrap().clone();
         (events, calls)
     }
