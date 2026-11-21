@@ -154,11 +154,12 @@ async fn query_action_cache_and_download_result(
     }
 
     let response = match action_cache_response {
-        Err(_) => {
+        Err(error) => {
             // The action cache is best-effort: a failed query degrades to a
             // miss rather than failing the action, but not silently — the
             // failure is recorded on the CacheQuery span end and counted into
-            // the invocation record.
+            // the invocation record, and the console says so as it happens.
+            warn_skipped_cache_lookup(&digest, &error);
             return ControlFlow::Continue(manager);
         }
         Ok(Some(response)) => response,
@@ -363,6 +364,30 @@ impl PreparedCommandOptionalExecutor for RemoteDepFileCacheChecker {
     }
 }
 
+/// Puts an action-cache lookup that failed and was taken as a miss on the console, which the BES
+/// sink carries to the build event stream too. A cache that stops answering costs a slower and
+/// costlier build rather than a failed one, and without this a build that ran every action
+/// because its cache was down looks like one that had nothing cached until it ends.
+fn warn_skipped_cache_lookup(action_digest: &ActionDigest, error: &buck2_error::Error) {
+    tracing::info!(
+        "Ignoring failed remote cache lookup for action `{}` and executing it: {:#}",
+        action_digest,
+        error
+    );
+    if let Some(dispatcher) = buck2_events::dispatch::get_dispatcher_opt() {
+        dispatcher.console_warning(skipped_cache_lookup_message(action_digest, error));
+    }
+}
+
+fn skipped_cache_lookup_message(
+    action_digest: &ActionDigest,
+    error: &buck2_error::Error,
+) -> String {
+    format!(
+        "Remote cache lookup skipped for action {action_digest}: the lookup failed, so the action is executed instead ({error:#})"
+    )
+}
+
 fn command_execution_kind_for_cache_type(
     cache_type: &CacheType,
     details: RemoteCommandExecutionDetails,
@@ -370,5 +395,48 @@ fn command_execution_kind_for_cache_type(
     match cache_type {
         CacheType::ActionCache => CommandExecutionKind::ActionCache { details },
         CacheType::RemoteDepFileCache(_) => CommandExecutionKind::RemoteDepFileCache { details },
+    }
+}
+
+#[cfg(test)]
+mod skipped_cache_lookup_tests {
+    use buck2_events::Event;
+    use buck2_events::create_source_sink_pair;
+    use buck2_events::daemon_id::DaemonId;
+    use buck2_events::dispatch::EventDispatcher;
+    use buck2_events::dispatch::with_dispatcher;
+    use buck2_execute::digest_config::DigestConfig;
+    use buck2_wrapper_common::invocation_id::TraceId;
+
+    use super::*;
+
+    #[test]
+    fn a_skipped_lookup_warns_once_with_its_action_and_error() {
+        let digest = ActionDigest::empty(DigestConfig::testing_default().cas_digest_config());
+        let error = buck2_error::buck2_error!(
+            buck2_error::ErrorTag::Tier0,
+            "status: Cancelled, message: \"Timeout expired\""
+        );
+        let (mut events, sink) = create_source_sink_pair();
+        let dispatcher = EventDispatcher::new(TraceId::new(), DaemonId::new(), sink);
+        with_dispatcher(dispatcher, || warn_skipped_cache_lookup(&digest, &error));
+
+        let mut warnings = Vec::new();
+        while let Some(event) = events.try_receive() {
+            if let Event::Buck(event) = event {
+                if let buck2_data::buck_event::Data::Instant(instant) = event.data() {
+                    if let Some(buck2_data::instant_event::Data::ConsoleWarning(warning)) =
+                        &instant.data
+                    {
+                        warnings.push(warning.message.clone());
+                    }
+                }
+            }
+        }
+        assert_eq!(
+            warnings,
+            vec![skipped_cache_lookup_message(&digest, &error)]
+        );
+        assert!(warnings[0].contains("Timeout expired"));
     }
 }
