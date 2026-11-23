@@ -146,6 +146,15 @@ fn switching_writes_the_config_restarts_the_daemon_and_says_so() {
     p.key();
     let (lines, next) = p.run(&["--profile", "next"]);
     assert!(matches!(next, Next::Exit(0)), "{lines:?}");
+    // The example manifest warns about next on macOS, first.
+    let (warnings, lines): (Vec<String>, Vec<String>) = lines
+        .into_iter()
+        .partition(|l| l.starts_with("buck2: warning:"));
+    assert_eq!(
+        warnings.len(),
+        usize::from(std::env::consts::OS == "macos"),
+        "{warnings:?}"
+    );
     assert_eq!(lines[0], "buck2: profile next (was current)");
     assert_eq!(lines[1], "  binary  mercury-head-next 2b5f3188d9");
     assert!(lines[2].contains("wrote .buckconfig.d/50-local-profile"));
