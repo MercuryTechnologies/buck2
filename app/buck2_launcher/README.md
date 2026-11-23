@@ -123,13 +123,13 @@ Switching to experimental, key present:
       binary  mwb-carry/resilience-v7 48cf950ae3
       config  wrote .buckconfig.d/50-local-profile
                 from tools/buck2/buckconfig.d/experimental
-              tests and builds run on hub RE
+              tests and builds run on staging-hub RE
       key     present
       daemon  stopped (was 2b5f3188d9); restarts on next call
 
     $ buck2 build //app:mwb
     buck2: experimental · buck2 48cf950ae3 · tests and
-      builds on hub RE
+      builds on staging-hub RE
 
 A channel overridden with a commit:
 
