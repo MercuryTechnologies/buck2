@@ -268,6 +268,15 @@ xattr = "1.7.0"
 zip = { version = "9.4.1", features = ["aes-crypto", "bzip2", "deflate", "time"], default-features = false }
 zstd = { version = "0.14.3", features = ["experimental", "zstdmt"] }
 
+# Mercury's otel logging (app/buck2_core/src/logging/otel.rs); the same rev as the root Cargo.lock.
+opentelemetry = { version = "0.32.0", git = "https://github.com/MercuryTechnologies/opentelemetry-rust.git", rev = "25294f306063813a4432baf91314b92e3efe12cf", features = ["experimental_propagation_env_carrier"] }
+opentelemetry-otlp = { version = "0.32.0", git = "https://github.com/MercuryTechnologies/opentelemetry-rust.git", rev = "25294f306063813a4432baf91314b92e3efe12cf", default-features = false, features = ["trace", "http-proto", "reqwest-blocking-client"] }
+opentelemetry-semantic-conventions = { version = "0.32.0", git = "https://github.com/MercuryTechnologies/opentelemetry-rust.git", rev = "25294f306063813a4432baf91314b92e3efe12cf", features = ["semconv_experimental"] }
+opentelemetry_sdk = { version = "0.32.1", git = "https://github.com/MercuryTechnologies/opentelemetry-rust.git", rev = "25294f306063813a4432baf91314b92e3efe12cf" }
+# The OTLP exporter's HTTP client. Not reqwest's rustls feature, which needs aws-lc, which this
+# build omits from rustls (fixups/rustls); buck2_certs installs ring as the default provider.
+reqwest = { version = "0.13", default-features = false, features = ["blocking", "rustls-no-provider"] }
+
 [target.'cfg(target_os = "windows")'.dependencies]
 windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Globalization", "Win32_NetworkManagement_IpHelper", "Win32_NetworkManagement_Ndis", "Win32_NetworkManagement_WindowsFilteringPlatform", "Win32_Security", "Win32_Security_Authorization", "Win32_Security_Credentials", "Win32_Storage_FileSystem", "Win32_System_ApplicationInstallationAndServicing", "Win32_System_Console", "Win32_System_Diagnostics_ToolHelp", "Win32_System_Environment", "Win32_System_IO", "Win32_System_JobObjects", "Win32_System_LibraryLoader", "Win32_System_Memory", "Win32_System_Power", "Win32_System_ProcessStatus", "Win32_System_Rpc", "Win32_System_SystemServices", "Win32_System_Threading", "Win32_UI_Shell"] }
 winver = "1"
