@@ -57,6 +57,10 @@ Optional keys: `state_file` (`.buck2-profile`), `config_dest`
 - A switch, or a call whose binary or config differs from the one the
   worktree's daemon was started under, stops that daemon with the binary that
   started it.
+- buck2 reads `.buckconfig.d` in name order and lets `.buckconfig` itself
+  take precedence over it, so a profile overrides `.buckconfig.d/00-*`..`49-*`
+  but not a value set in `.buckconfig`; keep `.buckconfig` to what must be
+  there, as mercury-web-backend does.
 - A key file is only ever tested for presence; no output contains any part of
   it.
 - `BUCK2_ROLLOUT_BIN` (CI) chooses the binary when set, and says so.
@@ -189,6 +193,14 @@ offers the login when stdin and stderr are a terminal, unless
 Personal keys need the server flag `app.user_owned_keys_enabled` and the
 org's own toggle; a personal key can carry at most cache and CAS writes, and
 an authenticated key may execute.
+
+## Tests
+
+`cargo test -p buck2_launcher` runs the unit and integration tests;
+`tests/e2e.sh <buck2-launcher> <buck2>` builds a small project with a real buck2
+under two profiles and checks that each switch reaches the daemon. CI
+(`.github/workflows/buck2-launcher.yml`) runs both on Linux x86_64 and aarch64
+and macOS aarch64, with upstream's buck2 release checked by digest.
 
 ## Not built yet
 
