@@ -17,6 +17,9 @@ default = "current"
 
 [credentials]
 file = "~/.buckconfig.d/mercury-credentials"   # only its presence is read
+login_url = "https://<buildbuddy app>"          # serves /cli-login
+org = "<org slug>"
+template = "[credentials]\nbuildbuddy_api_key = {key}\n"
 
 [channels.mercury-head]
 exec = "nix/bin/buck2-current"   # a dotslash file or any executable
@@ -172,8 +175,23 @@ Back to zero config:
 The key is never printed, on error paths included; `--profile` says
 only whether one is present.
 
+## Login
+
+`buck2 --login` uses BuildBuddy's CLI login: it listens on 127.0.0.1, opens
+`<login_url>/cli-login?cli_url=http://localhost:<port>&workspace=…&org=…`,
+and the page mints a personal API key and redirects to the listener with it.
+A key pasted on stdin is taken too, for a browser on another machine. The key
+is written into `template` at `file`, mode 600 (its directory 700), through a
+rename, and never printed. Switching to a profile with `needs_key` and no key
+offers the login when stdin and stderr are a terminal, unless
+`BUCK2_LAUNCHER_LOGIN=never`; otherwise it refuses and changes nothing.
+
+Personal keys need the server flag `app.user_owned_keys_enabled` and the
+org's own toggle; a personal key can carry at most cache and CAS writes, and
+an authenticated key may execute.
+
 ## Not built yet
 
-`--login`/`--logout` (BuildBuddy's CLI login), channels from any commit, and
-the published dotslash file. `--login` and a commit channel print a message
-and change nothing.
+Checking a new key against the server (buck2's first remote call rejects a
+bad one), channels from any commit, and the published dotslash file. A
+commit channel prints a message and changes nothing.

@@ -70,6 +70,19 @@ pub struct Profile {
 pub struct Credentials {
     /// The credentials file, `~` for the home directory. Only whether it exists is read.
     pub file: String,
+    /// The BuildBuddy web app whose `/cli-login` page mints a personal key, for `--login`.
+    #[serde(default)]
+    pub login_url: Option<String>,
+    /// The BuildBuddy org (its URL slug) to sign in to.
+    #[serde(default)]
+    pub org: Option<String>,
+    /// What `--login` writes, with `{key}` for the key.
+    #[serde(default = "default_template")]
+    pub template: String,
+}
+
+fn default_template() -> String {
+    "{key}\n".to_owned()
 }
 
 fn default_state_file() -> PathBuf {
@@ -127,6 +140,9 @@ default = "current"
 
 [credentials]
 file = "~/.buckconfig.d/mercury-credentials"
+login_url = "https://hub.example"
+org = "mercury"
+template = "[credentials]\nbuildbuddy_api_key = {key}\n"
 
 [channels.mercury-head]
 exec = "nix/bin/buck2-current"

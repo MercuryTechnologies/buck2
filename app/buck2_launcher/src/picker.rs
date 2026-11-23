@@ -161,7 +161,7 @@ impl<'a> Picker<'a> {
         })
     }
 
-    fn key_file(&self) -> Option<PathBuf> {
+    pub fn key_file(&self) -> Option<PathBuf> {
         let file = &self.manifest.credentials.as_ref()?.file;
         match file.strip_prefix("~/") {
             Some(rest) => self.home.as_ref().map(|home| home.join(rest)),

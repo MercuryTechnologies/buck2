@@ -75,10 +75,13 @@ impl Project {
     fn run(&self, args: &[&str]) -> (Vec<String>, Next) {
         let mut lines = Vec::new();
         let next = crate::run(
-            Path::new("tools/buck2/profiles.toml"),
-            None,
-            &self.root.join("src"),
-            Some(self.home.clone()),
+            crate::Invocation {
+                manifest: Path::new("tools/buck2/profiles.toml"),
+                this_exe: None,
+                interactive: false,
+                cwd: &self.root.join("src"),
+                home: Some(self.home.clone()),
+            },
             |_| None,
             args.iter().map(OsString::from).collect(),
             &mut |l| lines.push(l.to_owned()),
@@ -122,7 +125,17 @@ fn a_profile_that_needs_a_key_is_refused_without_one() {
     std::fs::create_dir_all(p.root.join("src")).unwrap();
     let (lines, next) = p.run(&["--profile", "next"]);
     assert!(matches!(next, Next::Exit(2)));
-    assert!(lines.last().unwrap().contains("needs a key"), "{lines:?}");
+    assert!(
+        lines.last().unwrap().contains("needs a BuildBuddy key"),
+        "{lines:?}"
+    );
+    assert!(
+        lines
+            .last()
+            .unwrap()
+            .contains("no terminal to sign in from"),
+        "{lines:?}"
+    );
     assert!(!p.root.join(".buckconfig.d/50-local-profile").exists());
 }
 
@@ -228,10 +241,13 @@ fn ci_rollout_bin_chooses_the_binary_and_says_so() {
     let mut lines = Vec::new();
     let ci_dir = ci.clone();
     let next = crate::run(
-        Path::new("tools/buck2/profiles.toml"),
-        None,
-        &p.root.join("src"),
-        Some(p.home.clone()),
+        crate::Invocation {
+            manifest: Path::new("tools/buck2/profiles.toml"),
+            this_exe: None,
+            interactive: false,
+            cwd: &p.root.join("src"),
+            home: Some(p.home.clone()),
+        },
         move |name| (name == "BUCK2_ROLLOUT_BIN").then(|| ci_dir.clone().into_os_string()),
         vec![OsString::from("build")],
         &mut |l| lines.push(l.to_owned()),

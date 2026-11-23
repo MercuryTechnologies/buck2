@@ -17,6 +17,7 @@
 //! calls [`run`] with its path.
 
 pub mod args;
+pub mod login;
 pub mod manifest;
 pub mod picker;
 
@@ -44,19 +45,30 @@ pub enum Next {
     },
 }
 
-/// Runs the picker for `args` (without the program name), printing to `out`. `manifest` is the
-/// manifest's path relative to the project root, and `this_exe` the picker's own program, so that
-/// a channel whose program is the picker is refused instead of looping.
+/// Set to `never` to be refused, instead of offered a login, when a profile needs a key.
+const LOGIN_VAR: &str = "BUCK2_LAUNCHER_LOGIN";
+
+/// Where and how the launcher runs.
+pub struct Invocation<'a> {
+    /// The manifest's path relative to the project root.
+    pub manifest: &'a Path,
+    /// The launcher's own program, so that a channel whose program is the launcher is refused
+    /// instead of looping.
+    pub this_exe: Option<&'a Path>,
+    /// Whether a person is at a terminal, which a login needs.
+    pub interactive: bool,
+    pub cwd: &'a Path,
+    pub home: Option<PathBuf>,
+}
+
+/// Runs the launcher for `args` (without the program name), printing to `out`.
 pub fn run(
-    manifest_rel: &Path,
-    this_exe: Option<&Path>,
-    cwd: &Path,
-    home: Option<PathBuf>,
+    inv: Invocation,
     env: impl Fn(&str) -> Option<OsString>,
     args: Vec<OsString>,
     out: &mut dyn FnMut(&str),
 ) -> Next {
-    match run_inner(manifest_rel, this_exe, cwd, home, &env, args, out) {
+    match run_inner(inv, &env, args, out) {
         Ok(next) => next,
         Err(message) => {
             out(&message);
@@ -66,14 +78,18 @@ pub fn run(
 }
 
 fn run_inner(
-    manifest_rel: &Path,
-    this_exe: Option<&Path>,
-    cwd: &Path,
-    home: Option<PathBuf>,
+    inv: Invocation,
     env: &impl Fn(&str) -> Option<OsString>,
     args: Vec<OsString>,
     out: &mut dyn FnMut(&str),
 ) -> Result<Next, String> {
+    let Invocation {
+        manifest: manifest_rel,
+        this_exe,
+        interactive,
+        cwd,
+        home,
+    } = inv;
     let args = args::parse(args)?;
     let root = find_root(cwd, manifest_rel).ok_or_else(|| {
         format!(
@@ -90,11 +106,20 @@ fn run_inner(
     };
     let name = manifest.name.clone();
 
-    if args.login || args.logout {
-        return Err(format!(
-            "{name}: --login and --logout are not built yet; write the key file by hand \
-             (see the README)"
-        ));
+    if args.logout {
+        let file = picker
+            .key_file()
+            .ok_or(format!("{name}: this project has no key file"))?;
+        match std::fs::remove_file(&file) {
+            Ok(()) => out(&format!("{name}: removed {}", file.display())),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                out(&format!("{name}: no key at {}", file.display()))
+            }
+            Err(e) => return Err(format!("{name}: cannot remove {}: {e}", file.display())),
+        }
+    }
+    if args.login {
+        login(&picker, interactive, out)?;
     }
 
     // CI picks its binary with BUCK2_ROLLOUT_BIN, as mercury's nix wrapper does; the picker
@@ -109,6 +134,25 @@ fn run_inner(
             Some(Some(p)) => p.clone(),
             _ => picker.resolve(None, None)?.profile,
         };
+        let needs_key = manifest.profiles.get(&profile).is_some_and(|p| p.needs_key);
+        if needs_key && !picker.key_present() {
+            let opted_out = env(LOGIN_VAR).is_some_and(|v| v == "never");
+            if !interactive || opted_out {
+                let why = if opted_out {
+                    format!("{LOGIN_VAR}=never")
+                } else {
+                    "no terminal to sign in from".to_owned()
+                };
+                return Err(format!(
+                    "{name}: profile {profile} needs a BuildBuddy key; none on this machine, and \
+                     {why}.\n  Run `buck2 --login` in a terminal. Nothing changed."
+                ));
+            }
+            out(&format!(
+                "{name}: profile {profile} needs a BuildBuddy key; none on this machine."
+            ));
+            login(&picker, interactive, out)?;
+        }
         for line in picker.switch(&profile, args.channel.as_deref())? {
             out(&line);
         }
@@ -167,6 +211,48 @@ fn run_inner(
         program,
         args: args.rest,
     })
+}
+
+/// Signs in through the browser, or takes a pasted key, and writes the credentials file.
+fn login(picker: &Picker, interactive: bool, out: &mut dyn FnMut(&str)) -> Result<(), String> {
+    let name = &picker.manifest.name;
+    let creds = picker
+        .manifest
+        .credentials
+        .as_ref()
+        .ok_or(format!("{name}: this project has no key file"))?;
+    let base = creds
+        .login_url
+        .as_deref()
+        .ok_or(format!("{name}: the manifest names no login_url"))?;
+    if !interactive {
+        return Err(format!("{name}: --login needs a terminal"));
+    }
+    let file = picker
+        .key_file()
+        .ok_or(format!("{name}: no home directory for the key file"))?;
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").map_err(|e| e.to_string())?;
+    let port = listener.local_addr().map_err(|e| e.to_string())?.port();
+    let url = login::login_url(base, port, creds.org.as_deref(), picker.root);
+    let opened = login::open_browser(&url);
+    out(&format!(
+        "  sign in: {url}{}",
+        if opened { "   (opening browser)" } else { "" }
+    ));
+    out(&format!(
+        "  or paste a key and press Enter, or Ctrl-C and set {LOGIN_VAR}=never"
+    ));
+    let key = login::wait_for_key(
+        listener,
+        &url,
+        Some(login::stdin_lines()),
+        std::time::Duration::from_secs(600),
+    )
+    .map_err(|e| format!("{name}: {e}"))?;
+    login::write_secret(&file, &creds.template.replace("{key}", &key))
+        .map_err(|e| format!("{name}: cannot write {}: {e}", file.display()))?;
+    out(&format!("{name}: key saved to {}", file.display()));
+    Ok(())
 }
 
 #[cfg(test)]

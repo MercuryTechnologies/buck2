@@ -21,11 +21,16 @@ fn main() {
     let home = std::env::var_os("HOME").map(PathBuf::from);
     let args = std::env::args_os().skip(1).collect();
     let this_exe = std::env::current_exe().ok();
+    use std::io::IsTerminal;
+    let interactive = std::io::stdin().is_terminal() && std::io::stderr().is_terminal();
     let next = buck2_launcher::run(
-        &manifest,
-        this_exe.as_deref(),
-        &cwd,
-        home,
+        buck2_launcher::Invocation {
+            manifest: &manifest,
+            this_exe: this_exe.as_deref(),
+            interactive,
+            cwd: &cwd,
+            home,
+        },
         |name| std::env::var_os(name),
         args,
         &mut |line| eprintln!("{line}"),
