@@ -240,7 +240,7 @@ impl LoadResolver for InterpreterLoadResolver {
                 .is_allowed(file_name)
             {
                 return Err(LoadResolutionError::FormatOverrideNotAllowed {
-                    path: path.clone(),
+                    path,
                     format: format.as_str(),
                     file_name: file_name.unwrap_or_default().to_owned(),
                 }

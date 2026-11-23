@@ -34,7 +34,7 @@ pub(crate) fn build_configured_target_handle(
 ) -> buck2_error::Result<ConfiguredTarget> {
     let label = target.target().unconfigured();
     let providers_label = if cfg!(fbcode_build) {
-        ProvidersLabel::default_for(label.clone())
+        ProvidersLabel::default_for(*label)
     } else {
         target.unconfigured()
     };

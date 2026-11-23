@@ -46,8 +46,7 @@
 // sites for no benefit, so allow it file-wide.
 #![expect(clippy::trivially_copy_pass_by_ref)]
 
-use std::collections::HashMap;
-
+use buck2_hash::BuckMutMap;
 use opentelemetry::Array;
 use opentelemetry::Key;
 use opentelemetry::KeyValue;
@@ -90,7 +89,7 @@ impl Attrs {
     /// produce one (e.g. two install devices sharing an entry key), and overwriting keeps the event
     /// usable rather than emitting an ambiguous pair. First-seen position is preserved.
     fn into_attrs(self) -> Vec<KeyValue> {
-        let mut index: HashMap<String, usize> = HashMap::new();
+        let mut index: BuckMutMap<String, usize> = BuckMutMap::default();
         let mut deduped: Vec<KeyValue> = Vec::with_capacity(self.attrs.len());
         for kv in self.attrs {
             match index.get(kv.key.as_str()) {
@@ -1325,7 +1324,7 @@ fn push_hydration_command_end(_a: &mut Attrs, _e: &buck2_data::HydrationCommandE
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
+    use buck2_hash::IntentionallyStdHashMap;
 
     use super::*;
 
@@ -1405,8 +1404,11 @@ mod tests {
             }),
             // Dynamic passthrough map.
             metadata: Some(buck2_data::TypedMetadata {
-                strings: HashMap::from([("flavor".to_owned(), "vanilla".to_owned())]),
-                ints: HashMap::from([("answer".to_owned(), 42)]),
+                strings: IntentionallyStdHashMap::from([(
+                    "flavor".to_owned(),
+                    "vanilla".to_owned(),
+                )]),
+                ints: IntentionallyStdHashMap::from([("answer".to_owned(), 42)]),
             }),
             // Repeated message -> parallel field-wise arrays. The second error has no category, so
             // `errors.category` is shorter than `errors.message` (it filters out the None).

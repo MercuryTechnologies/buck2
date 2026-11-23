@@ -309,7 +309,7 @@ impl<'c, 'd: 'c> DiceCalculationDelegate<'c, 'd> {
             .filter_map(|(_, module)| match module {
                 OwnedStarlarkModulePath::JsonFile(import)
                 | OwnedStarlarkModulePath::TomlFile(import) => {
-                    Some((import.path().clone(), import.format_override()))
+                    Some((*import.path(), import.format_override()))
                 }
                 _ => None,
             })
@@ -335,14 +335,14 @@ impl<'c, 'd: 'c> DiceCalculationDelegate<'c, 'd> {
                 // at all).
                 return Err(match format_override {
                     Some(format) => DataFileIsolationError::CrossPackageAs {
-                        loader: loader.clone(),
+                        loader,
                         path,
                         format: format.as_str(),
                         loader_package,
                         file_package,
                     },
                     None => DataFileIsolationError::CrossPackage {
-                        loader: loader.clone(),
+                        loader,
                         path,
                         loader_package,
                         file_package,
