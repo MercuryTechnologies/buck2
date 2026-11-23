@@ -159,6 +159,7 @@ members = [
   "app/buck2_util",
   "app/buck2_validation",
   "app/buck2_worker_proto",
+  "app/buck2_launcher",
   "app/buck2_wrapper_common",
   "buck2_sketches",
   "dice/dice",

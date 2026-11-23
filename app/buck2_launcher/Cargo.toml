@@ -1,0 +1,19 @@
+[package]
+name = "buck2_launcher"
+description = "Pick a buck2 binary and a buckconfig profile for a project, then run buck2"
+edition = "2024"
+version = "0.1.0"
+license = { workspace = true }
+repository = { workspace = true }
+
+[[bin]]
+name = "buck2-launcher"
+path = "src/bin/buck2_launcher.rs"
+
+[dependencies]
+regex = { workspace = true }
+serde = { workspace = true }
+toml = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
