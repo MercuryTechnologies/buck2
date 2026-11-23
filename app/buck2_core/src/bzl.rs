@@ -10,6 +10,8 @@
 
 use std::fmt::Display;
 use std::fmt::Formatter;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
 
 use allocative::Allocative;
 use buck2_fs::paths::file_name::FileName;
@@ -51,6 +53,31 @@ impl ImportFormat {
     }
 }
 
+/// Whether a `.bzl` file is evaluated once per cell it lives in rather than once per cell that
+/// loads it: `[buck2] disable_cell_segmentation`, read from the root buckconfig when the daemon
+/// starts. Mercury's rules load a cell's `.bzl` files from several cells and depend on one
+/// evaluation (https://github.com/MercuryTechnologies/buck2/commit/f74d3594e8cf90db0e3cfaaeb748e96ce5b13a62),
+/// so this fork defaults it on. Upstream's own build needs it off: the OSS shim's `oss.bzl` reads
+/// the loading cell to strip `//buck2/` from labels, and buck2's `.buckconfig` turns it off.
+/// meta/buck2#1100 adds the same switch upstream, off by default.
+static DISABLE_CELL_SEGMENTATION: AtomicBool = AtomicBool::new(true);
+
+pub fn set_disable_cell_segmentation(value: Option<bool>) {
+    DISABLE_CELL_SEGMENTATION.store(value.unwrap_or(true), Ordering::Relaxed);
+}
+
+pub fn cell_segmentation_disabled() -> bool {
+    DISABLE_CELL_SEGMENTATION.load(Ordering::Relaxed)
+}
+
+fn effective_build_file_cell(path: &CellPath, build_file_cell: BuildFileCell) -> BuildFileCell {
+    if cell_segmentation_disabled() {
+        BuildFileCell::new(path.cell())
+    } else {
+        build_file_cell
+    }
+}
+
 /// Path of a `.bzl` file.
 #[derive(
     Clone, Hash, StrongHash, Eq, PartialEq, Ord, PartialOrd, Debug, Allocative, Pagable
@@ -81,7 +108,7 @@ impl ImportPath {
 
     pub fn new_with_build_file_cells(
         path: CellPath,
-        _build_file_cell: BuildFileCell,
+        build_file_cell: BuildFileCell,
     ) -> buck2_error::Result<Self> {
         if path.parent().is_none() {
             return Err(ImportPathError::Invalid(path).into());
@@ -95,9 +122,7 @@ impl ImportPath {
             return Err(ImportPathError::Suffix(path).into());
         }
 
-        // Deliberately ignore the user-provided `build_file_cell`.
-        // See: https://github.com/MercuryTechnologies/buck2/commit/f74d3594e8cf90db0e3cfaaeb748e96ce5b13a62
-        let build_file_cell = BuildFileCell::new(path.cell());
+        let build_file_cell = effective_build_file_cell(&path, build_file_cell);
 
         Ok(Self {
             path,
@@ -142,7 +167,7 @@ impl ImportPath {
     /// LSP creates imports for non-bzl files.
     pub fn new_hack_for_lsp(
         path: CellPath,
-        _build_file_cell: BuildFileCell,
+        build_file_cell: BuildFileCell,
     ) -> buck2_error::Result<Self> {
         if path.parent().is_none() {
             return Err(ImportPathError::Invalid(path).into());
@@ -152,9 +177,7 @@ impl ImportPath {
             return Err(ImportPathError::Invalid(path).into());
         }
 
-        // Deliberately ignore the user-provided `build_file_cell`.
-        // See: https://github.com/MercuryTechnologies/buck2/commit/f74d3594e8cf90db0e3cfaaeb748e96ce5b13a62
-        let build_file_cell = BuildFileCell::new(path.cell());
+        let build_file_cell = effective_build_file_cell(&path, build_file_cell);
 
         Ok(Self {
             path,

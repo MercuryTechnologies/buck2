@@ -29,5 +29,11 @@ ignore = \
     .git, \
     target
 
+[buck2]
+# This fork defaults to evaluating a `.bzl` file once per cell it lives in, which Mercury's rules
+# need; buck2's own build needs upstream's per-loading-cell evaluation, because the shim's
+# `oss.bzl` reads the loading cell to strip `//buck2/` (app/buck2_core/src/bzl.rs).
+disable_cell_segmentation = false
+
 [rust]
 default_edition = 2024
