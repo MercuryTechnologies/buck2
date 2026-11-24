@@ -3058,6 +3058,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "buck2_launcher"
+version = "0.1.0"
+dependencies = [
+ "regex",
+ "serde",
+ "tempfile",
+ "toml",
+]
+
+[[package]]
 name = "buck2_log_common"
 version = "0.1.0"
 dependencies = [

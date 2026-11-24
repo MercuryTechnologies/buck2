@@ -1,0 +1,81 @@
+name: buck2 launcher
+on:
+  push:
+    branches:
+      - mercury-head
+      - mercury-head-next
+      - wip/buck2-launcher
+    paths:
+      - app/buck2_launcher/**
+      - .github/workflows/buck2-launcher.yml
+  pull_request:
+    paths:
+      - app/buck2_launcher/**
+      - .github/workflows/buck2-launcher.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: buck2-launcher-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_INCREMENTAL: 0
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
+  # The buck2 the end-to-end test runs behind the launcher: upstream's
+  # 2026-11-15 release, checked by the digest GitHub reports for each asset.
+  E2E_BUCK2_RELEASE: "2026-11-15"
+
+jobs:
+  # The platforms mercury-web-backend ships buck2 for (bin/buck2's dotslash
+  # file): Linux x86_64 and aarch64, macOS aarch64.
+  test:
+    name: test (${{ matrix.name }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x86_64
+            runs-on: ubuntu-latest
+            asset: buck2-x86_64-unknown-linux-gnu.zst
+            sha256: 51d209f834c3509bc83024bf4ede62cd907135e7b289b29ed69d763dcde67b04
+          - name: linux-aarch64
+            runs-on: ubuntu-24.04-arm
+            asset: buck2-aarch64-unknown-linux-gnu.zst
+            sha256: c41f9926e5e2dd58b520ebe3e81eff1ff8e9d98d493c71b6378224eaeb165fbe
+          - name: macos-aarch64
+            runs-on: macos-15
+            asset: buck2-aarch64-apple-darwin.zst
+            sha256: 3464db0c4514fb3ff7a3f37050c737bd5dd100a2e210886530e95ac767d3a109
+    runs-on: ${{ matrix.runs-on }}
+    steps:
+    - uses: actions/checkout@v6
+    - uses: ./.github/actions/setup_cargo_env
+      with:
+        components: clippy
+    - uses: Swatinem/rust-cache@v2
+      with:
+        key: buck2-launcher
+    - name: Unit and integration tests
+      run: cargo test -p buck2_launcher
+    - name: Clippy
+      run: cargo clippy -p buck2_launcher --tests -- -D warnings -A clippy::disallowed_types
+    - name: Build the launcher
+      run: cargo build -p buck2_launcher --bin buck2-launcher
+    - name: Fetch the end-to-end buck2
+      env:
+        ASSET: ${{ matrix.asset }}
+        SHA256: ${{ matrix.sha256 }}
+      run: |
+        mkdir -p "$RUNNER_TEMP/e2e"
+        curl -fsSL -o "$RUNNER_TEMP/e2e/buck2.zst" \
+          "https://github.com/facebook/buck2/releases/download/$E2E_BUCK2_RELEASE/$ASSET"
+        if command -v sha256sum >/dev/null; then sum=sha256sum; else sum="shasum -a 256"; fi
+        echo "$SHA256  $RUNNER_TEMP/e2e/buck2.zst" | $sum -c -
+        zstd -dq "$RUNNER_TEMP/e2e/buck2.zst" -o "$RUNNER_TEMP/e2e/buck2"
+        chmod +x "$RUNNER_TEMP/e2e/buck2"
+        "$RUNNER_TEMP/e2e/buck2" --version
+    - name: End-to-end test with a real buck2
+      run: bash app/buck2_launcher/tests/e2e.sh target/debug/buck2-launcher "$RUNNER_TEMP/e2e/buck2"

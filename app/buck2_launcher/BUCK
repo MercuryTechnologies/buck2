@@ -1,0 +1,28 @@
+load("@fbsource//tools/build_defs:rust_binary.bzl", "rust_binary")
+load("@fbsource//tools/build_defs:rust_library.bzl", "rust_library")
+
+oncall("build_infra")
+
+rust_library(
+    name = "buck2_launcher",
+    srcs = glob(
+        ["src/**/*.rs"],
+        exclude = ["src/bin/**"],
+    ),
+    test_deps = [
+        "fbsource//third-party/rust:tempfile",
+    ],
+    deps = [
+        "fbsource//third-party/rust:regex",
+        "fbsource//third-party/rust:serde",
+        "fbsource//third-party/rust:toml",
+    ],
+)
+
+rust_binary(
+    name = "buck2-launcher",
+    srcs = ["src/bin/buck2_launcher.rs"],
+    deps = [
+        ":buck2_launcher",
+    ],
+)
