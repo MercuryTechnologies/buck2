@@ -31,6 +31,7 @@ rust_library(
         "fbsource//third-party/rust:opentelemetry-semantic-conventions",
         "fbsource//third-party/rust:pin-project",
         # @oss-disable[end= ]: "fbsource//third-party/rust:prost",
+        "fbsource//third-party/rust:prost-types",
         "fbsource//third-party/rust:serde",
         # @oss-disable[end= ]: "fbsource//third-party/rust:serde_json",
         "fbsource//third-party/rust:smallvec",
