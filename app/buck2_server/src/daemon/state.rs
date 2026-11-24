@@ -1012,6 +1012,10 @@ impl TenantState {
             section: "buck2",
             property: "action_has_content_based_path_default",
         })?);
+        buck2_core::bzl::set_disable_cell_segmentation(root_config.parse(BuckconfigKeyRef {
+            section: "buck2",
+            property: "disable_cell_segmentation",
+        })?);
 
         let repo = Arc::new(RepoState {
             paths,

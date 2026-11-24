@@ -154,10 +154,7 @@ impl Buck2TestRunner {
             .iter()
             .map(|s| s.parse())
             .collect::<buck2_error::Result<_>>()?;
-        let env = build_env(
-            spec.env,
-            &config_env,
-        );
+        let env = build_env(spec.env, &config_env);
 
         let target_handle = spec.target.handle;
         let host_sharing_requirements = HostSharingRequirements::default();
