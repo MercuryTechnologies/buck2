@@ -122,6 +122,8 @@ pub fn note_client_soft_error(soft_error: SoftError) {
 }
 
 pub struct InvocationRecorder {
+    /// The invocation record, if it was built before `finalize`.
+    record: Option<BuckEvent>,
     write_to_path: Option<AbsPathBuf>,
     command_name: Option<&'static str>,
     cli_args: Vec<String>,
@@ -359,6 +361,7 @@ impl InvocationRecorder {
         args: Vec<String>,
     ) -> Self {
         Self {
+            record: None,
             write_to_path: None,
             command_name: None,
             cli_args: args,
@@ -826,6 +829,14 @@ impl InvocationRecorder {
             .into_iter()
             .map(process_error_report)
             .collect::<Vec<_>>()
+    }
+
+    /// Builds the invocation record before the command is done with, so that the event log can
+    /// keep it. `finalize` then sends this same record rather than building another.
+    pub(crate) fn create_record_event_early(&mut self) -> BuckEvent {
+        let event = self.create_record_event();
+        self.record = Some(event.clone());
+        event
     }
 
     fn create_record_event(&mut self) -> BuckEvent {
@@ -2910,7 +2921,10 @@ impl EventSubscriber for InvocationRecorder {
         // Can't set this before the daemon forks.
         // Typically initialized already unless the command failed early.
         let fb = buck2_common::fbinit::get_or_init_fbcode_globals();
-        let event = self.create_record_event();
+        let event = match self.record.take() {
+            Some(event) => event,
+            None => self.create_record_event(),
+        };
 
         // Send the record to every enabled remote sink. The OTLP sink has the same interface as the
         // Scribe sink and is not Meta-specific, so it is the export path in OSS builds where the
