@@ -210,6 +210,8 @@ impl CommandExecutor {
             let input_digest = request.paths().input_directory().fingerprint();
 
             let mut platform = self.0.re_platform.clone();
+            #[cfg(not(fbcode_build))]
+            add_dependency_properties(&mut platform, request.remote_execution_dependencies());
             let all_args = if self.0.options.use_bazel_protocol_remote_persistent_workers
                 && let Some(worker) = request.worker()
                 && let Some(key) = worker.remote_key.as_ref()
@@ -518,4 +520,113 @@ fn set_action_network_access(
         ExecutorNetworkAccess::Loopback => RE::NetworkIsolationType::Loopback,
         ExecutorNetworkAccess::Private => RE::NetworkIsolationType::Private,
     } as i32;
+}
+
+/// Puts the request's remote execution dependencies into the Platform, where the open-source
+/// protocol carries them: one property per `smc_tier`, its value the dependencies' ids,
+/// de-duplicated, sorted and joined with ",". The Platform is part of the Command and the Action,
+/// so the dependencies are part of the action key, and the same set in any order gives the same
+/// key. An action with no dependencies keeps its Platform as it was.
+#[cfg(not(fbcode_build))]
+fn add_dependency_properties(
+    platform: &mut RE::Platform,
+    dependencies: &[RemoteExecutorDependency],
+) {
+    if dependencies.is_empty() {
+        return;
+    }
+    let mut by_name: std::collections::BTreeMap<&str, std::collections::BTreeSet<&str>> =
+        std::collections::BTreeMap::new();
+    for dependency in dependencies {
+        by_name
+            .entry(dependency.smc_tier.as_str())
+            .or_default()
+            .insert(dependency.id.as_str());
+    }
+    for (name, ids) in by_name {
+        platform.properties.push(RE::Property {
+            name: name.to_owned(),
+            value: ids.into_iter().collect::<Vec<_>>().join(","),
+        });
+    }
+    platform.properties.sort_by(|a, b| a.name.cmp(&b.name));
+    // Lets a rule author check the folded properties without running the action:
+    // `BUCK_LOG=buck2_execute::execute::command_executor=debug`, then read buckd.stderr.
+    tracing::debug!(properties = ?platform.properties, "remote execution dependencies in Platform");
+}
+
+#[cfg(all(test, not(fbcode_build)))]
+mod add_dependency_properties_tests {
+    use buck2_core::execution_types::executor_config::RemoteExecutorDependency;
+    use buck2_hash::BuckMutInsertionMap;
+    use remote_execution as RE;
+
+    use super::add_dependency_properties;
+
+    fn dep(smc_tier: &str, id: &str) -> RemoteExecutorDependency {
+        RemoteExecutorDependency::parse(BuckMutInsertionMap::from_iter([
+            ("smc_tier", smc_tier),
+            ("id", id),
+        ]))
+        .unwrap()
+    }
+
+    fn props(platform: &RE::Platform) -> Vec<(String, String)> {
+        platform
+            .properties
+            .iter()
+            .map(|p| (p.name.clone(), p.value.clone()))
+            .collect()
+    }
+
+    #[test]
+    fn dependencies_become_sorted_properties_independent_of_order() {
+        let base = RE::Platform {
+            properties: vec![RE::Property {
+                name: "OSFamily".to_owned(),
+                value: "Linux".to_owned(),
+            }],
+        };
+        let mut a = base.clone();
+        add_dependency_properties(
+            &mut a,
+            &[
+                dep("nix-store-paths-file", "b/paths"),
+                dep("nix-daemon-socket", "true"),
+                dep("nix-store-paths-file", "a/paths"),
+                dep("nix-store-paths-file", "b/paths"),
+            ],
+        );
+        let mut b = base.clone();
+        add_dependency_properties(
+            &mut b,
+            &[
+                dep("nix-store-paths-file", "a/paths"),
+                dep("nix-store-paths-file", "b/paths"),
+                dep("nix-daemon-socket", "true"),
+            ],
+        );
+        let expected = vec![
+            ("OSFamily".to_owned(), "Linux".to_owned()),
+            ("nix-daemon-socket".to_owned(), "true".to_owned()),
+            (
+                "nix-store-paths-file".to_owned(),
+                "a/paths,b/paths".to_owned(),
+            ),
+        ];
+        assert_eq!(props(&a), expected);
+        assert_eq!(props(&b), expected);
+    }
+
+    #[test]
+    fn no_dependencies_leave_the_platform_alone() {
+        let mut platform = RE::Platform {
+            properties: vec![RE::Property {
+                name: "z".to_owned(),
+                value: "1".to_owned(),
+            }],
+        };
+        add_dependency_properties(&mut platform, &[]);
+        assert_eq!(props(&platform), vec![("z".to_owned(), "1".to_owned())]);
+    }
 }

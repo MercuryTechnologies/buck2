@@ -1454,13 +1454,16 @@ impl RunAction {
             .with_local_environment_inheritance(EnvironmentInheritance::local_command_exclusions())
             .with_force_full_hybrid_if_capable(self.inner.force_full_hybrid_if_capable)
             .with_unique_input_inodes(self.inner.unique_input_inodes)
-            .with_remote_execution_dependencies(self.inner.remote_execution_dependencies.to_vec())
             .with_re_gang_workers(self.inner.re_gang_workers.to_vec())
             .with_remote_execution_custom_image(
                 self.inner.remote_execution_custom_image.clone().map(|s| *s),
             )
             .with_meta_internal_extra_params(self.inner.meta_internal_extra_params.clone())
             .with_outputs_for_error_handler(outputs_for_error_handler);
+
+        let remote_execution_dependencies =
+            expand_env_dependencies(&self.inner.remote_execution_dependencies, req.env())?;
+        req = req.with_remote_execution_dependencies(remote_execution_dependencies);
 
         if let Some(timeout) = self.inner.timeout {
             req = req.with_timeout(timeout);
@@ -2077,5 +2080,92 @@ mod tests {
     #[test]
     fn test_skip_hidden_visitor_tag_inputs() -> buck2_error::Result<()> {
         check_skip_hidden_visitor("tag_inputs")
+    }
+}
+
+/// A dependency whose `id` is `$NAME` takes the value of the action's environment variable `NAME`,
+/// split on whitespace, one dependency per part. An artifact can't be named by its path at
+/// analysis, since the path holds the configuration hash, but in `env` it's an input and resolves
+/// to its path when the action runs, so this is how a rule names an input file in a dependency.
+fn expand_env_dependencies(
+    dependencies: &[RemoteExecutorDependency],
+    env: &BuckFixedSortedMap<String, String>,
+) -> buck2_error::Result<Vec<RemoteExecutorDependency>> {
+    let mut expanded = Vec::with_capacity(dependencies.len());
+    for dependency in dependencies {
+        let Some(name) = dependency.id.strip_prefix('$') else {
+            expanded.push(dependency.clone());
+            continue;
+        };
+        let value = env.get(name).ok_or_else(|| {
+            buck2_error::buck2_error!(
+                buck2_error::ErrorTag::Input,
+                "remote_execution_dependencies: `{}` for `{}` names no environment variable of the action",
+                dependency.id,
+                dependency.smc_tier
+            )
+        })?;
+        expanded.extend(
+            value
+                .split_whitespace()
+                .map(|part| dependency.with_id(part.to_owned())),
+        );
+    }
+    Ok(expanded)
+}
+
+#[cfg(test)]
+mod expand_env_dependencies_tests {
+    use buck2_core::execution_types::executor_config::RemoteExecutorDependency;
+    use buck2_hash::BuckFixedSortedMap;
+    use buck2_hash::BuckMutInsertionMap;
+
+    use super::expand_env_dependencies;
+
+    fn dep(smc_tier: &str, id: &str) -> RemoteExecutorDependency {
+        RemoteExecutorDependency::parse(BuckMutInsertionMap::from_iter([
+            ("smc_tier", smc_tier),
+            ("id", id),
+        ]))
+        .unwrap()
+    }
+
+    #[test]
+    fn an_env_reference_becomes_one_dependency_per_path() {
+        let env = BuckFixedSortedMap::from_iter([(
+            "NIX_PATHS".to_owned(),
+            "buck-out/v2/gen/a/paths buck-out/v2/gen/b/paths".to_owned(),
+        )]);
+        let got = expand_env_dependencies(
+            &[
+                dep("nix-store-paths-file", "$NIX_PATHS"),
+                dep("nix-daemon-socket", "true"),
+            ],
+            &env,
+        )
+        .unwrap();
+        let ids: Vec<_> = got
+            .iter()
+            .map(|d| (d.smc_tier.as_str(), d.id.as_str()))
+            .collect();
+        assert_eq!(
+            ids,
+            vec![
+                ("nix-store-paths-file", "buck-out/v2/gen/a/paths"),
+                ("nix-store-paths-file", "buck-out/v2/gen/b/paths"),
+                ("nix-daemon-socket", "true"),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_reference_to_a_missing_variable_is_an_error() {
+        let env = BuckFixedSortedMap::from_iter(Vec::<(String, String)>::new());
+        let err =
+            expand_env_dependencies(&[dep("nix-store-paths-file", "$NOPE")], &env).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("names no environment variable"),
+            "{err:#}"
+        );
     }
 }

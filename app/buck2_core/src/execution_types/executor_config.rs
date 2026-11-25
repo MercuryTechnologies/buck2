@@ -221,6 +221,11 @@ fn interpolate_dependency_id(id: &str, username: Option<&str>, hostname: Option<
 }
 
 impl RemoteExecutorDependency {
+    /// The same dependency with `id` in place of its own.
+    pub fn with_id(&self, id: String) -> Self {
+        Self { id, ..self.clone() }
+    }
+
     pub fn parse(
         dep_map: BuckMutInsertionMap<&str, &str>,
     ) -> buck2_error::Result<RemoteExecutorDependency> {
