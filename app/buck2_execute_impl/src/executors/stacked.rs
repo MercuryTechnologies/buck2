@@ -9,6 +9,7 @@
  */
 
 use async_trait::async_trait;
+use buck2_core::execution_types::executor_config::RemoteExecutorDependency;
 use buck2_execute::execute::manager::CommandExecutionManager;
 use buck2_execute::execute::prepared::PreparedCommand;
 use buck2_execute::execute::prepared::PreparedCommandExecutor;
@@ -54,5 +55,9 @@ where
         // fallback.
         self.fallback
             .is_local_execution_possible(executor_preference)
+    }
+
+    fn remote_execution_dependencies(&self) -> &[RemoteExecutorDependency] {
+        self.fallback.remote_execution_dependencies()
     }
 }

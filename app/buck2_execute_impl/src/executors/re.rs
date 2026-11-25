@@ -522,6 +522,10 @@ impl PreparedCommandExecutor for ReExecutor {
     fn is_local_execution_possible(&self, _executor_preference: ExecutorPreference) -> bool {
         false
     }
+
+    fn remote_execution_dependencies(&self) -> &[RemoteExecutorDependency] {
+        &self.dependencies
+    }
 }
 
 #[derive(buck2_error::Error, Debug)]
