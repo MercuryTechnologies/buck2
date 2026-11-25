@@ -5642,7 +5642,11 @@ mod tests {
             retry_backoff: Duration::from_millis(20),
             retry_attempts: 5,
             retry_window: Duration::from_millis(400),
-            grpc_timeout: Duration::from_millis(500),
+            // Once the server is gone each reconnect runs until `grpc_timeout`. Linux refuses a
+            // connect to a closed localhost port at once; Windows retries it for about two
+            // seconds. The timeout has to stay under the bound below, or on Windows this
+            // measures the connect cap instead of the abandonment.
+            grpc_timeout: Duration::from_millis(100),
             ..BesConfig::default()
         };
         let connection = ConnectionConfig {
@@ -5668,6 +5672,11 @@ mod tests {
             .map(|attempt| backoff_for(&config.retry_backoff, attempt))
             .sum::<Duration>();
         let bound = per_message_retry_cost / 4;
+        assert!(
+            config.grpc_timeout < bound,
+            "a reconnect may take grpc_timeout {:?}, at or over the bound {bound:?}",
+            config.grpc_timeout
+        );
         let mut slowest = Duration::ZERO;
 
         slowest = slowest.max(send_queued(&mut worker, &trace_id, command_start_data()).await);
