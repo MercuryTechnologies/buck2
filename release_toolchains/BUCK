@@ -3,7 +3,7 @@ load("@prelude//toolchains:genrule.bzl", "system_genrule_toolchain")
 load("@prelude//toolchains:go.bzl", "system_go_bootstrap_toolchain", "system_go_toolchain")
 load("@prelude//toolchains:haskell.bzl", "system_haskell_toolchain")
 load("@prelude//toolchains:ocaml.bzl", "system_ocaml_toolchain")
-load("@prelude//toolchains:python.bzl", "system_python_bootstrap_toolchain", "system_python_toolchain")
+load("@prelude//toolchains:python.bzl", "python_bootstrap_toolchain", "system_python_bootstrap_toolchain", "system_python_toolchain")
 load("@prelude//toolchains:remote_test_execution.bzl", "remote_test_execution_toolchain")
 load("@prelude//toolchains:rust.bzl", "downloaded_rust_toolchain")
 load("@prelude//toolchains/cxx/llvm:defs.bzl", "cxx_llvm_toolchain", "download_llvm_distribution")
@@ -153,8 +153,47 @@ system_python_toolchain(
     visibility = ["PUBLIC"],
 )
 
+# The bootstrap interpreter runs the prelude's own Python tools, among them git_fetch, which is
+# local_only and so runs on the client. system_python_bootstrap_toolchain runs whichever python3
+# the client has on PATH, and a client with none fails before any remote action. On x86_64 the
+# interpreter is a static CPython, which needs no program loader, so it starts on a glibc, musl or
+# nix-only client alike: python-build-standalone 20250212's CPython 3.13.2, the last release before
+# its musl builds loaded musl dynamically. python-build-standalone has no static aarch64 build, so
+# aarch64 keeps the system interpreter.
+# https://github.com/astral-sh/python-build-standalone/releases/tag/20250212
+http_archive(
+    name = "cpython_x86_64_archive",
+    sha256 = "26ebe06a6276008467a7a65712b29cc752ea17dbb43f73f6fa2cbcce09728dbe",
+    strip_prefix = "python",
+    sub_targets = {
+        "python": ["bin/python3"],
+    },
+    urls = ["https://github.com/astral-sh/python-build-standalone/releases/download/20250212/cpython-3.13.2%2B20250212-x86_64-unknown-linux-musl-install_only_stripped.tar.gz"],
+)
+
+# The interpreter with its archive as a resource, so the standard library is materialized beside
+# bin/python3; a bare sub-target projection would carry the one file.
+command_alias(
+    name = "cpython_x86_64",
+    exe = ":cpython_x86_64_archive[python]",
+    resources = [":cpython_x86_64_archive"],
+)
+
+python_bootstrap_toolchain(
+    name = "python_bootstrap_x86_64",
+    interpreter = ":cpython_x86_64",
+)
+
 system_python_bootstrap_toolchain(
+    name = "python_bootstrap_system",
+)
+
+toolchain_alias(
     name = "python_bootstrap",
+    actual = select({
+        "prelude//cpu:x86_64": ":python_bootstrap_x86_64",
+        "DEFAULT": ":python_bootstrap_system",
+    }),
     visibility = ["PUBLIC"],
 )
 
