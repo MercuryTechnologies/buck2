@@ -81,6 +81,7 @@ use buck2_execute::execute::action_digest_and_blobs::ActionDigestAndBlobs;
 use buck2_execute::execute::cache_uploader::IntoRemoteDepFile;
 use buck2_execute::execute::cache_uploader::force_cache_upload;
 use buck2_execute::execute::command_executor::ActionExecutionTimingData;
+use buck2_execute::execute::command_executor::expand_env_dependencies;
 use buck2_execute::execute::dep_file_digest::DepFileDigest;
 use buck2_execute::execute::environment_inheritance::EnvironmentInheritance;
 use buck2_execute::execute::request::ActionMetadataBlob;
@@ -1422,7 +1423,6 @@ impl RunAction {
             .with_local_environment_inheritance(EnvironmentInheritance::local_command_exclusions())
             .with_force_full_hybrid_if_capable(self.inner.force_full_hybrid_if_capable)
             .with_unique_input_inodes(self.inner.unique_input_inodes)
-            .with_remote_execution_dependencies(self.inner.remote_execution_dependencies.to_vec())
             .with_re_gang_workers(self.inner.re_gang_workers.to_vec())
             .with_remote_execution_custom_image(
                 self.inner.remote_execution_custom_image.clone().map(|s| *s),
@@ -1432,6 +1432,10 @@ impl RunAction {
             )
             .with_meta_internal_extra_params(self.inner.meta_internal_extra_params.clone())
             .with_outputs_for_error_handler(outputs_for_error_handler);
+
+        let remote_execution_dependencies =
+            expand_env_dependencies(&self.inner.remote_execution_dependencies, req.env())?;
+        req = req.with_remote_execution_dependencies(remote_execution_dependencies);
 
         if let Some(timeout) = self.inner.timeout {
             req = req.with_timeout(timeout);

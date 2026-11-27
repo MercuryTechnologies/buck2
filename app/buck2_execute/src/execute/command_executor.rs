@@ -221,6 +221,15 @@ impl CommandExecutor {
             let input_digest = request.paths().input_directory().fingerprint();
 
             let mut platform = self.re_platform_for(request).into_owned();
+            #[cfg(not(fbcode_build))]
+            {
+                let dependencies = platform_dependencies(
+                    self.0.inner.remote_execution_dependencies(),
+                    request.remote_execution_dependencies(),
+                    request.env(),
+                )?;
+                add_dependency_properties(&mut platform, &dependencies);
+            }
             let all_args = if self.0.options.use_bazel_protocol_remote_persistent_workers
                 && let Some(worker) = request.worker()
                 && let Some(key) = worker.remote_key.as_ref()
@@ -732,5 +741,255 @@ mod tests {
                 ("Pool", "usw2"),
             ])
         );
+    }
+}
+
+/// A dependency whose `id` is `$NAME` takes the value of the action's environment variable `NAME`,
+/// split on whitespace, one dependency per part. An artifact can't be named by its path at
+/// analysis, since the path holds the configuration hash, but in `env` it's an input and resolves
+/// to its path when the action runs, so this is how a rule names an input file in a dependency.
+pub fn expand_env_dependencies(
+    dependencies: &[RemoteExecutorDependency],
+    env: &BuckFixedSortedMap<String, String>,
+) -> buck2_error::Result<Vec<RemoteExecutorDependency>> {
+    let mut expanded = Vec::with_capacity(dependencies.len());
+    for dependency in dependencies {
+        let Some(name) = dependency.id.strip_prefix('$') else {
+            expanded.push(dependency.clone());
+            continue;
+        };
+        let value = env.get(name).ok_or_else(|| {
+            buck2_error::buck2_error!(
+                buck2_error::ErrorTag::Input,
+                "remote_execution_dependencies: `{}` for `{}` names no environment variable of the action",
+                dependency.id,
+                dependency.smc_tier
+            )
+        })?;
+        expanded.extend(
+            value
+                .split_whitespace()
+                .map(|part| dependency.with_id(part.to_owned())),
+        );
+    }
+    Ok(expanded)
+}
+
+/// The dependencies that go into the Platform: the executor config's, then the request's, each
+/// `$NAME` taken from the request's env. A test's env is resolved when it runs, as a run action's
+/// is, so the same rule names an input file for both.
+#[cfg(not(fbcode_build))]
+fn platform_dependencies(
+    executor: &[RemoteExecutorDependency],
+    request: &[RemoteExecutorDependency],
+    env: &BuckFixedSortedMap<String, String>,
+) -> buck2_error::Result<Vec<RemoteExecutorDependency>> {
+    let dependencies: Vec<RemoteExecutorDependency> =
+        executor.iter().chain(request).cloned().collect();
+    expand_env_dependencies(&dependencies, env)
+}
+
+/// Puts the request's remote execution dependencies into the Platform, where the open-source
+/// protocol carries them: one property per `smc_tier`, its value the dependencies' ids,
+/// de-duplicated, sorted and joined with ",". The Platform is part of the Command and the Action,
+/// so the dependencies are part of the action key, and the same set in any order gives the same
+/// key. An action with no dependencies keeps its Platform as it was.
+#[cfg(not(fbcode_build))]
+fn add_dependency_properties(
+    platform: &mut RE::Platform,
+    dependencies: &[RemoteExecutorDependency],
+) {
+    if dependencies.is_empty() {
+        return;
+    }
+    let mut by_name: std::collections::BTreeMap<&str, std::collections::BTreeSet<&str>> =
+        std::collections::BTreeMap::new();
+    for dependency in dependencies {
+        by_name
+            .entry(dependency.smc_tier.as_str())
+            .or_default()
+            .insert(dependency.id.as_str());
+    }
+    for (name, ids) in by_name {
+        platform.properties.push(RE::Property {
+            name: name.to_owned(),
+            value: ids.into_iter().collect::<Vec<_>>().join(","),
+        });
+    }
+    platform.properties.sort_by(|a, b| a.name.cmp(&b.name));
+    // Lets a rule author check the folded properties without running the action:
+    // `BUCK_LOG=buck2_execute::execute::command_executor=debug`, then read buckd.stderr.
+    tracing::debug!(properties = ?platform.properties, "remote execution dependencies in Platform");
+}
+
+#[cfg(all(test, not(fbcode_build)))]
+mod add_dependency_properties_tests {
+    use buck2_core::execution_types::executor_config::RemoteExecutorDependency;
+    use buck2_hash::BuckMutInsertionMap;
+    use remote_execution as RE;
+
+    use super::add_dependency_properties;
+
+    fn dep(smc_tier: &str, id: &str) -> RemoteExecutorDependency {
+        RemoteExecutorDependency::parse(BuckMutInsertionMap::from_iter([
+            ("smc_tier", smc_tier),
+            ("id", id),
+        ]))
+        .unwrap()
+    }
+
+    fn props(platform: &RE::Platform) -> Vec<(String, String)> {
+        platform
+            .properties
+            .iter()
+            .map(|p| (p.name.clone(), p.value.clone()))
+            .collect()
+    }
+
+    #[test]
+    fn dependencies_become_sorted_properties_independent_of_order() {
+        let base = RE::Platform {
+            properties: vec![RE::Property {
+                name: "OSFamily".to_owned(),
+                value: "Linux".to_owned(),
+            }],
+        };
+        let mut a = base.clone();
+        add_dependency_properties(
+            &mut a,
+            &[
+                dep("nix-store-paths-file", "b/paths"),
+                dep("nix-daemon-socket", "true"),
+                dep("nix-store-paths-file", "a/paths"),
+                dep("nix-store-paths-file", "b/paths"),
+            ],
+        );
+        let mut b = base.clone();
+        add_dependency_properties(
+            &mut b,
+            &[
+                dep("nix-store-paths-file", "a/paths"),
+                dep("nix-store-paths-file", "b/paths"),
+                dep("nix-daemon-socket", "true"),
+            ],
+        );
+        let expected = vec![
+            ("OSFamily".to_owned(), "Linux".to_owned()),
+            ("nix-daemon-socket".to_owned(), "true".to_owned()),
+            (
+                "nix-store-paths-file".to_owned(),
+                "a/paths,b/paths".to_owned(),
+            ),
+        ];
+        assert_eq!(props(&a), expected);
+        assert_eq!(props(&b), expected);
+    }
+
+    #[test]
+    fn no_dependencies_leave_the_platform_alone() {
+        let mut platform = RE::Platform {
+            properties: vec![RE::Property {
+                name: "z".to_owned(),
+                value: "1".to_owned(),
+            }],
+        };
+        add_dependency_properties(&mut platform, &[]);
+        assert_eq!(props(&platform), vec![("z".to_owned(), "1".to_owned())]);
+    }
+}
+
+#[cfg(test)]
+mod expand_env_dependencies_tests {
+    use buck2_core::execution_types::executor_config::RemoteExecutorDependency;
+    use buck2_hash::BuckFixedSortedMap;
+    use buck2_hash::BuckMutInsertionMap;
+
+    use super::expand_env_dependencies;
+    #[cfg(not(fbcode_build))]
+    use super::platform_dependencies;
+
+    fn dep(smc_tier: &str, id: &str) -> RemoteExecutorDependency {
+        RemoteExecutorDependency::parse(BuckMutInsertionMap::from_iter([
+            ("smc_tier", smc_tier),
+            ("id", id),
+        ]))
+        .unwrap()
+    }
+
+    #[test]
+    fn an_env_reference_becomes_one_dependency_per_path() {
+        let env = BuckFixedSortedMap::from_iter([(
+            "NIX_PATHS".to_owned(),
+            "buck-out/v2/gen/a/paths buck-out/v2/gen/b/paths".to_owned(),
+        )]);
+        let got = expand_env_dependencies(
+            &[
+                dep("nix-store-paths-file", "$NIX_PATHS"),
+                dep("nix-daemon-socket", "true"),
+            ],
+            &env,
+        )
+        .unwrap();
+        let ids: Vec<_> = got
+            .iter()
+            .map(|d| (d.smc_tier.as_str(), d.id.as_str()))
+            .collect();
+        assert_eq!(
+            ids,
+            vec![
+                ("nix-store-paths-file", "buck-out/v2/gen/a/paths"),
+                ("nix-store-paths-file", "buck-out/v2/gen/b/paths"),
+                ("nix-daemon-socket", "true"),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_reference_to_a_missing_variable_is_an_error() {
+        let env = BuckFixedSortedMap::from_iter(Vec::<(String, String)>::new());
+        let err =
+            expand_env_dependencies(&[dep("nix-store-paths-file", "$NOPE")], &env).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("names no environment variable"),
+            "{err:#}"
+        );
+    }
+
+    #[cfg(not(fbcode_build))]
+    #[test]
+    fn executor_dependencies_expand_against_the_request_env() {
+        let env = BuckFixedSortedMap::from_iter([(
+            "NIX_PATHS".to_owned(),
+            "buck-out/a/paths buck-out/b/paths".to_owned(),
+        )]);
+        let got = platform_dependencies(
+            &[
+                dep("nix-store-paths-file", "$NIX_PATHS"),
+                dep("nix-daemon-socket", "true"),
+            ],
+            &[dep("nix-store-paths-file", "buck-out/c/paths")],
+            &env,
+        )
+        .unwrap();
+        let got: Vec<_> = got
+            .iter()
+            .map(|d| (d.smc_tier.as_str(), d.id.as_str()))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                ("nix-store-paths-file", "buck-out/a/paths"),
+                ("nix-store-paths-file", "buck-out/b/paths"),
+                ("nix-daemon-socket", "true"),
+                ("nix-store-paths-file", "buck-out/c/paths"),
+            ]
+        );
+    }
+
+    #[cfg(not(fbcode_build))]
+    #[test]
+    fn no_dependencies_from_either_side_is_empty() {
+        let got = platform_dependencies(&[], &[], &BuckFixedSortedMap::default()).unwrap();
+        assert!(got.is_empty());
     }
 }

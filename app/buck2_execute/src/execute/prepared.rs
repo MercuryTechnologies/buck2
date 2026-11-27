@@ -67,6 +67,13 @@ pub trait PreparedCommandExecutor: Send + Sync {
     /// Checks if there is any possibility for a command with a given executor preference to
     /// be executed locally.
     fn is_local_execution_possible(&self, executor_preference: ExecutorPreference) -> bool;
+
+    /// The executor config's own remote execution dependencies, which `prepare_action` folds into
+    /// the Platform with the request's. A test gets its dependencies only this way (the prelude's
+    /// tests/re_utils.bzl), so without this they never reach the action key.
+    fn remote_execution_dependencies(&self) -> &[RemoteExecutorDependency] {
+        &[]
+    }
 }
 
 #[async_trait]

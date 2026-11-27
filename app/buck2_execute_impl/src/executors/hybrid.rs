@@ -13,6 +13,7 @@ use std::sync::atomic::AtomicI64;
 use std::sync::atomic::Ordering;
 
 use async_trait::async_trait;
+use buck2_core::execution_types::executor_config::RemoteExecutorDependency;
 use buck2_build_signals::env::WaitingData;
 use buck2_common::liveliness_observer::CancelledLivelinessGuard;
 use buck2_common::liveliness_observer::LivelinessGuard;
@@ -373,6 +374,10 @@ where
         }
         res.eligible_for_full_hybrid = !fallback_only;
         res
+    }
+
+    fn remote_execution_dependencies(&self) -> &[RemoteExecutorDependency] {
+        self.remote.remote_execution_dependencies()
     }
 
     fn is_local_execution_possible(&self, executor_preference: ExecutorPreference) -> bool {
