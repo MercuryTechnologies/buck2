@@ -251,32 +251,13 @@ def _downloaded_rust_toolchain_impl(ctx):
         # so pinning the manifest pins the whole toolchain. A pin list that
         # lacks the channel fails here, by name, rather than downloading an
         # unchecked manifest.
-        check = []
-        if pins:
-            if parsed.channel not in pins:
-                fail("no sha256 for rust channel {}; add it to channel_manifest_sha256 from {}.sha256".format(parsed.channel, url))
-            check = [pins[parsed.channel]]
-        download = ctx.actions.write(
-            "download_rust_manifest.sh",
-            [
-                "#!/bin/sh",
-                "set -eu",
-                "curl -fsSL \"$1\" -o \"$2\"",
-                "if [ \"$#\" -gt 2 ]; then echo \"$3  $2\" | sha256sum -c -; fi",
-            ],
-            is_executable = True,
-            has_content_based_path = False,
-        )
-        ctx.actions.run(
-            cmd_args([
-                "/bin/sh",
-                download,
-                url,
-                outputs[manifest].as_output(),
-            ] + check),
-            category = "download_rust_manifest",
-            prefer_remote = True,
-        )
+        #
+        # The download runs on the client, as http_archive's do, because remote
+        # executors may have no network (hub's default since kosmic-kube #2405).
+        # download_file needs the hash, so a channel without a pin fails here.
+        if parsed.channel not in pins:
+            fail("no sha256 for rust channel {}; add it to channel_manifest_sha256 from {}.sha256".format(parsed.channel, url))
+        ctx.actions.download_file(outputs[manifest], url, sha256 = pins[parsed.channel])
 
     ctx.actions.dynamic_output(
         dynamic = [rust_toolchain_file],
@@ -289,21 +270,25 @@ def _downloaded_rust_toolchain_impl(ctx):
         parsed = _parse_rust_toolchain(artifacts[rust_toolchain_file].read_string())
         manifest_contents = artifacts[manifest].read_string()
         components = _dedupe(base_components + parsed.components + extra_components)
-        archives = []
+        packages = []
 
         for component in components:
             package = _component_package(component)
-            package_info = _manifest_package(manifest_contents, package, rustc_host_triple)
-            archives.append(package_info.url)
-            archives.append(package_info.sha256)
+            packages.append((package, rustc_host_triple, _manifest_package(manifest_contents, package, rustc_host_triple)))
 
         # Cross-compiling needs the standard library of the target as well;
         # rustc finds it under lib/rustlib/<target>/ of the same sysroot.
         target_triple = ctx.attrs.rustc_target_triple
         if target_triple and target_triple != rustc_host_triple:
-            package_info = _manifest_package(manifest_contents, "rust-std", target_triple)
-            archives.append(package_info.url)
-            archives.append(package_info.sha256)
+            packages.append(("rust-std", target_triple, _manifest_package(manifest_contents, "rust-std", target_triple)))
+
+        # Each archive downloads on the client against the manifest's sha256, so
+        # the install action below needs no network.
+        archives = []
+        for package, triple, info in packages:
+            archive = ctx.actions.declare_output("rust-dist/{}-{}.tar.xz".format(package, triple), has_content_based_path = False)
+            ctx.actions.download_file(archive, info.url, sha256 = info.sha256)
+            archives.append(archive)
 
         installer = ctx.actions.write(
             "install_rust_toolchain.sh",
@@ -318,15 +303,11 @@ def _downloaded_rust_toolchain_impl(ctx):
                 "mkdir -p \"$work\" \"$out\"",
                 "i=0",
                 "while [ \"$#\" -gt 0 ] && [ \"$1\" != -- ]; do",
-                "  url=\"$1\"",
-                "  sha256=\"$2\"",
-                "  shift 2",
+                "  archive=\"$1\"",
+                "  shift",
                 "  i=$((i + 1))",
                 "  unpack=\"$work/$i\"",
-                "  archive=\"$work/$i.tar.xz\"",
                 "  mkdir -p \"$unpack\"",
-                "  curl -fsSL \"$url\" -o \"$archive\"",
-                "  echo \"$sha256  $archive\" | sha256sum -c -",
                 "  tar -xJf \"$archive\" -C \"$unpack\"",
                 "  install_sh=\"\"",
                 "  for f in \"$unpack\"/*/install.sh; do if [ -f \"$f\" ]; then install_sh=\"$f\"; break; fi; done",
@@ -400,7 +381,7 @@ downloaded_rust_toolchain = rule(
         })),
         # The sha256 of each channel's manifest, keyed by the channel that
         # rust-toolchain names, from the manifest's .sha256 file beside it.
-        # Empty means unchecked, as before.
+        # Required: the manifest downloads on the client, which needs its hash.
         "channel_manifest_sha256": attrs.dict(attrs.string(), attrs.string(), default = {}),
         "extra_components": attrs.list(attrs.string(), default = ["clippy"]),
         # Files, or directories of files, copied into the toolchain's lib/,
