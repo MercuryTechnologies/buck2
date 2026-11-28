@@ -1,0 +1,9 @@
+# Builds buck2 on a Mac, with the same pinned toolchains as .buckconfig.hub (release_toolchains) but
+# every action local, since hub has no macOS executors:
+#   buck2 build //app/buck2:buck2-bin --config-file .buckconfig.macos \
+#     --target-platforms release_platforms//:macos-aarch64
+[cell_aliases]
+toolchains = release_toolchains
+
+[build]
+execution_platforms = release_platforms//:local-macos-aarch64

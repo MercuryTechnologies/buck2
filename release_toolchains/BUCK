@@ -1,4 +1,5 @@
 load("@prelude//tests:test_toolchain.bzl", "noop_test_toolchain")
+load("@prelude//toolchains:cxx.bzl", "system_cxx_toolchain")
 load("@prelude//toolchains:genrule.bzl", "system_genrule_toolchain")
 load("@prelude//toolchains:go.bzl", "system_go_bootstrap_toolchain", "system_go_toolchain")
 load("@prelude//toolchains:haskell.bzl", "system_haskell_toolchain")
@@ -56,7 +57,7 @@ genrule(
 )
 
 cxx_llvm_toolchain(
-    name = "cxx",
+    name = "cxx_linux",
     cxx_compiler_flags = ["-std=c++20"],
     distribution = ":llvm_dist",
     sysroot = select({
@@ -86,6 +87,21 @@ cxx_llvm_toolchain(
     visibility = ["PUBLIC"],
 )
 
+# macOS links against Apple's SDK, which only Xcode or its command-line tools provide and which may
+# not be redistributed, so the compiler and SDK there are the machine's, found through xcrun.
+system_cxx_toolchain(
+    name = "cxx_macos",
+)
+
+toolchain_alias(
+    name = "cxx",
+    actual = select({
+        "DEFAULT": ":cxx_linux",
+        "prelude//os:macos": ":cxx_macos",
+    }),
+    visibility = ["PUBLIC"],
+)
+
 alias(
     name = "cxx_no_default_deps",
     actual = ":cxx",
@@ -101,15 +117,22 @@ downloaded_rust_toolchain(
         "nightly-2026-08-15": "0eee8c54cacbb2a6d8867a9dc9e9cafe936dd45bb6e2f36c8aa3e25b4ddafc38",
     },
     default_edition = "2024",
-    host_runtime_libs = "hub_re//:rustc-runtime-libs",
+    host_runtime_libs = select({
+        "DEFAULT": "hub_re//:rustc-runtime-libs",
+        "prelude//os:macos": None,
+    }),
     # Release builds pass e.g. -c rust.rustc_flags="-Copt-level=3 -Cstrip=debuginfo";
     # the default is a debug build, as for cargo.
     rustc_flags = read_root_config("rust", "rustc_flags", "").split(),
     # The compiler runs on x86_64 Linux whatever the target is; the prelude's
     # default would follow the target configuration and fetch an aarch64 rustc
     # for an aarch64 build.
-    rustc_host_triple = "x86_64-unknown-linux-gnu",
+    rustc_host_triple = select({
+        "DEFAULT": "x86_64-unknown-linux-gnu",
+        "prelude//os:macos": "aarch64-apple-darwin",
+    }),
     rustc_target_triple = select({
+        "prelude//os:macos": "aarch64-apple-darwin",
         "DEFAULT": select({
             "prelude//cpu:arm64": "aarch64-unknown-linux-gnu",
             "prelude//cpu:x86_64": "x86_64-unknown-linux-gnu",
@@ -191,8 +214,11 @@ system_python_bootstrap_toolchain(
 toolchain_alias(
     name = "python_bootstrap",
     actual = select({
-        "prelude//cpu:x86_64": ":python_bootstrap_x86_64",
         "DEFAULT": ":python_bootstrap_system",
+        "prelude//os:linux": select({
+            "DEFAULT": ":python_bootstrap_system",
+            "prelude//cpu:x86_64": ":python_bootstrap_x86_64",
+        }),
     }),
     visibility = ["PUBLIC"],
 )

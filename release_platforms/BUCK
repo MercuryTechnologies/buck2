@@ -37,3 +37,21 @@ platform(
     ],
     visibility = ["PUBLIC"],
 )
+
+# A Mac builds its own buck2 locally: hub has no macOS executors, and Apple's SDK, which every macOS
+# link needs, comes only with Xcode on the machine.
+local_execution_platform(
+    name = "local-macos-aarch64",
+    cpu_configuration = "prelude//cpu:arm64",
+    os_configuration = "prelude//os:macos",
+    visibility = ["PUBLIC"],
+)
+
+platform(
+    name = "macos-aarch64",
+    constraint_values = [
+        "prelude//cpu/constraints:arm64",
+        "prelude//os/constraints:macos",
+    ],
+    visibility = ["PUBLIC"],
+)
