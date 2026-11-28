@@ -13,6 +13,7 @@ use std::sync::Arc;
 use allocative::Allocative;
 use buck2_common::ignores::ignore_set::IgnoreSet;
 use buck2_core::fs::i_project_rel_path::IProjectRelativePath;
+use buck2_core::fs::project_rel_path::ProjectRelativePath;
 
 /// Type that file watchers use to determine if a file is ignored
 ///
@@ -31,5 +32,11 @@ impl FileWatcherIgnores {
 
     pub(crate) fn is_ignored(&self, path: IProjectRelativePath) -> bool {
         self.ignores.is_match(&path)
+    }
+
+    /// Whether the path and everything under it are ignored, so that a crawl need not look
+    /// under it. See `IgnoreSet::ignores_subtree`.
+    pub(crate) fn ignores_subtree(&self, path: &ProjectRelativePath) -> bool {
+        self.ignores.ignores_subtree(path)
     }
 }
